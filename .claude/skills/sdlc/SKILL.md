@@ -28,6 +28,17 @@ One branch per logically cohesive piece of work. Don't stack unrelated changes o
 - Each commit message: short imperative subject (<70 chars), blank line, body that explains *why*. Always include the `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
 - Before pushing, run the checks that match the change (see the `test` and `build` skills). For kernel/code changes: `cargo xtask test` + `cargo xtask smoke`. For docs/process/skill-only branches: at minimum `cargo xtask build` to confirm nothing regressed; the full test + smoke pass isn't required. Don't push red branches.
 
+## Capturing out-of-scope ideas
+
+Any interesting idea, bug, latent TODO, or follow-up task that surfaces mid-work but shouldn't be tackled on the current branch goes into a GitHub issue immediately — don't rely on memory or a chat log to hold it. This applies equally to things the user raises and things Claude notices while poking around (a suspicious `unwrap`, a missing test, a cleanup that would balloon the current PR, a better design for a future milestone).
+
+Use `mcp__github__create_issue` with:
+- A short, specific title.
+- A body that explains *what* and *why* — enough context that someone (including us) coming back cold in a week can act on it.
+- Relevant labels (`bug`, `enhancement`, `milestone-N`, etc.) when they fit.
+
+Link the issue from the current PR if it was spun off mid-review ("deferred to #N"). Then get back to the original task.
+
 ## Opening the PR
 
 When the branch is ready for review:
