@@ -590,7 +590,16 @@ unsafe fn set_pat_bit_4k(
 /// still live.
 pub fn reclaim_bootloader_memory() {
     let hhdm = HHDM_OFFSET.lock().expect("paging::init not called");
-    let orig_pml4_phys = LIMINE_PML4_PHYS.lock().expect("paging::init not called");
+    // Consume the stored PML4 address so subsequent calls are no-ops.
+    let Some(orig_pml4_phys) = LIMINE_PML4_PHYS.lock().take() else {
+        serial_println!("paging: bootloader memory already reclaimed; skipping");
+        return;
+    };
+    assert_ne!(
+        active_pml4_phys(),
+        orig_pml4_phys,
+        "reclaim_bootloader_memory must be called after build_and_switch_kernel_pml4",
+    );
 
     // --- Boot stack protection -------------------------------------------
     // Translate the boot stack virtual address window to physical frames.
@@ -619,6 +628,7 @@ pub fn reclaim_bootloader_memory() {
         }
         virt += 4096;
     }
+    boot_stack_phys.sort_unstable();
 
     // --- Original PML4 walk (accounting only) ----------------------------
     // Walk the now-inactive Limine PML4 to count its intermediate L3/L2/L1
@@ -655,7 +665,7 @@ pub fn reclaim_bootloader_memory() {
             let region_end = entry.base + entry.length;
             let mut phys = entry.base & !0xFFFu64;
             while phys < region_end {
-                if !boot_stack_phys.contains(&phys) {
+                if boot_stack_phys.binary_search(&phys).is_err() {
                     alloc.release_region(super::Region::new(phys, super::FRAME_SIZE));
                     total_bytes += super::FRAME_SIZE;
                 }
@@ -666,7 +676,7 @@ pub fn reclaim_bootloader_memory() {
 
     serial_println!(
         "paging: reclaimed {} KiB bootloader memory \
-         ({} intermediate PML4 table frames, PML4={:#x})",
+         ({} L3/L2/L1 intermediate table frames, PML4={:#x})",
         total_bytes / 1024,
         table_frame_count,
         orig_pml4_phys.as_u64(),
