@@ -2,7 +2,7 @@
 //!
 //! Tasks can hand control back explicitly with [`yield_now`], and the
 //! timer ISR calls [`preempt_tick`] every PIT interrupt to rotate tasks
-//! that never yield. Each task owns a heap-allocated kernel stack and a
+//! that never yield. Each task owns a guard-paged kernel stack and a
 //! saved register context; the hand-written switch in [`switch`] is the
 //! one place that touches `rsp`.
 //!
@@ -17,7 +17,7 @@
 //!
 //! - Priorities, per-CPU queues, tickless idle.
 //! - Blocking primitives — cooperative code polls + yields.
-//! - Per-task address spaces or guard pages.
+//! - Per-task address spaces.
 
 mod scheduler;
 mod switch;
@@ -109,6 +109,32 @@ pub fn yield_now() {
 
     if was_on {
         interrupts::enable();
+    }
+}
+
+/// Check whether `addr` falls within any live kernel task's guard page.
+/// Returns the task ID of the overflowing task, or `None` if no guard
+/// page was hit.
+///
+/// Fully lock-free: derives the answer from the fixed VA layout of the
+/// task stack window, so it is always safe to call from any exception
+/// context — even when the scheduler lock is already held on this CPU.
+pub fn find_stack_overflow(addr: usize) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    use task::{GUARD_SIZE, NEXT_STACK_VA, TASK_SLOT_SIZE, TASK_STACKS_VA_BASE};
+
+    let next_va = NEXT_STACK_VA.load(Ordering::Relaxed);
+    if addr < TASK_STACKS_VA_BASE || addr >= next_va {
+        return None;
+    }
+    let slot_idx = (addr - TASK_STACKS_VA_BASE) / TASK_SLOT_SIZE;
+    let slot_guard_base = TASK_STACKS_VA_BASE + slot_idx * TASK_SLOT_SIZE;
+    // Guard page occupies [slot_guard_base, slot_guard_base + GUARD_SIZE).
+    // Task IDs start at 1, so slot 0 → task 1.
+    if addr < slot_guard_base + GUARD_SIZE {
+        Some(slot_idx + 1)
+    } else {
+        None
     }
 }
 
