@@ -53,6 +53,24 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let addr = x86_64::registers::control::Cr2::read();
+    let addr_u64 = x86_64::registers::control::Cr2::read_raw();
+
+    if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
+        use crate::test_harness::{exit_qemu, QemuExitCode};
+        if addr_u64 == expected {
+            serial_println!("#PF oracle matched addr={:#x} code={:?}", expected, code);
+            exit_qemu(QemuExitCode::Success);
+        } else {
+            serial_println!(
+                "#PF oracle MISMATCH: expected {:#x}, got {:#x} code={:?}",
+                expected,
+                addr_u64,
+                code
+            );
+            exit_qemu(QemuExitCode::Failure);
+        }
+    }
+
     serial_println!(
         "EXCEPTION: #PF addr={:?} code={:?}\n{:#?}",
         addr,

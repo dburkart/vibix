@@ -19,32 +19,40 @@ SECTIONS
     . = 0xffffffff80000000;
 
     .limine_requests : {
+        PROVIDE(__limine_requests_start = .);
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
+        PROVIDE(__limine_requests_end = .);
     } :limine_requests
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .text : {
+        PROVIDE(__text_start = .);
         *(.text .text.*)
+        PROVIDE(__text_end = .);
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .rodata : {
+        PROVIDE(__rodata_start = .);
         *(.rodata .rodata.*)
+        PROVIDE(__rodata_end = .);
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .data : {
+        PROVIDE(__data_start = .);
         *(.data .data.*)
     } :data
 
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
+        PROVIDE(__data_end = .);
     } :data
 
     .dynamic : {
