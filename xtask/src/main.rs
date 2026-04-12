@@ -240,7 +240,7 @@ fn embed_ksymtab(kernel: &Path) -> R<()> {
         if addr == 0 {
             continue;
         }
-        syms.push((addr, name.to_string()));
+        syms.push((addr, rustc_demangle::demangle(name).to_string()));
     }
     syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
     syms.dedup_by(|a, b| a.0 == b.0);
@@ -611,5 +611,20 @@ fn check(status: ExitStatus) -> R<()> {
         Ok(())
     } else {
         Err(format!("command failed: {status}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn demangles_rust_symbol() {
+        let out =
+            rustc_demangle::demangle("_ZN6kernel4main17h1234567890abcdefE").to_string();
+        assert!(out.starts_with("kernel::main"), "got {out}");
+    }
+
+    #[test]
+    fn passes_through_non_rust_symbol() {
+        assert_eq!(rustc_demangle::demangle("memcpy").to_string(), "memcpy");
     }
 }
