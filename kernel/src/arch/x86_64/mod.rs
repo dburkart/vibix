@@ -1,4 +1,5 @@
 pub mod apic;
+pub mod backtrace;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

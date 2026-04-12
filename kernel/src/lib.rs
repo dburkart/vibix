@@ -24,6 +24,8 @@ pub mod boot;
 #[cfg(target_os = "none")]
 pub mod framebuffer;
 #[cfg(target_os = "none")]
+pub mod ksymtab;
+#[cfg(target_os = "none")]
 pub mod serial;
 #[cfg(target_os = "none")]
 pub mod task;

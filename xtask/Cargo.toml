@@ -6,3 +6,6 @@ edition.workspace = true
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[dependencies]
+object = { version = "0.36", default-features = false, features = ["read", "std"] }

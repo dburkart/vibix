@@ -10,6 +10,10 @@ rustflags = [
   "-C", "relocation-model=static",
   "-C", "code-model=kernel",
   "-C", "no-redzone=yes",
+  # The rbp-walking backtrace depends on every non-leaf having the
+  # canonical `push rbp; mov rbp, rsp` prologue; without this LLVM
+  # freely omits it in release builds and the walker dereferences junk.
+  "-C", "force-frame-pointers=yes",
 ]
 # `cargo test` for this target hands each compiled test binary to xtask,
 # which wraps it in an ISO and boots it under QEMU.
