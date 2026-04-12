@@ -3,8 +3,8 @@
 //! take control.
 
 use limine::request::{
-    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest,
-    RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
+    RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
 

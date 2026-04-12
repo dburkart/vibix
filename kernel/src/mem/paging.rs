@@ -15,8 +15,8 @@ use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult, UnmapError};
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
-    Size2MiB, Size4KiB, Translate,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB,
+    Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -131,7 +131,15 @@ pub fn map_phys_into_hhdm(
             // user and we never hand these pages to the frame allocator.
             match unsafe { m.map_to(page, frame, flags, &mut alloc) } {
                 Ok(flush) => flush.flush(),
+                // Already mapped via a 4 KiB PTE — no-op.
                 Err(MapToError::PageAlreadyMapped(_)) => {}
+                // Already covered by a 2 MiB HHDM huge page (see
+                // `populate_hhdm` in the kernel-PML4 build). The
+                // physical address is already reachable at
+                // `hhdm + phys`, which is what the caller wanted; we
+                // accept the coarser flags rather than split the
+                // huge page back into 4 KiB PTEs.
+                Err(MapToError::ParentEntryHugePage) => {}
                 Err(e) => return Err(e),
             }
             addr += 4096;
@@ -275,10 +283,7 @@ fn populate_hhdm(
 /// Map the kernel image section-by-section with tight permissions.
 /// Pages that are unmapped in the *current* (old) tree are skipped so
 /// that the IST guard unmap survives the switch.
-fn populate_kernel_image(
-    mapper: &mut OffsetPageTable<'static>,
-    alloc: &mut KernelFrameAllocator,
-) {
+fn populate_kernel_image(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
     extern "C" {
         static __limine_requests_start: u8;
         static __limine_requests_end: u8;

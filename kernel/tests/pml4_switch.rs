@@ -35,7 +35,10 @@ fn run_tests() {
         ("kernel_text_translates", &(kernel_text_translates as fn())),
         ("heap_ptr_translates", &(heap_ptr_translates as fn())),
         ("stack_local_translates", &(stack_local_translates as fn())),
-        ("heap_grows_after_switch", &(heap_grows_after_switch as fn())),
+        (
+            "heap_grows_after_switch",
+            &(heap_grows_after_switch as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
