@@ -61,6 +61,7 @@ End the body at the Test plan — no "generated with" footer. Commit-level `Co-A
 
 3. Keep the title short (<70 chars); details belong in the body.
 4. If the MCP can't reach auth, fall back to the GitHub compare URL and let the user paste the prepared body manually — never skip the review step by merging locally.
+5. Immediately hand off to the `wait-for-pr` skill — it runs the CI + review-bot wait loop and produces the consolidated report, so both the CI and "Responding to review" steps below flow from one place instead of requiring separate prompts.
 
 ## Responding to review
 
