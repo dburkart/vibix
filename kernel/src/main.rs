@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 
 use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST};
 use vibix::framebuffer::Console;
-use vibix::{exit_qemu, framebuffer, hlt_loop, println, serial_println, QemuExitCode};
+use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -55,6 +55,7 @@ pub extern "C" fn _start() -> ! {
     serial_println!("GDT + IDT loaded");
 
     vibix::mem::init();
+    vibix::time::init();
 
     println!("vibix online.");
     serial_println!("vibix online.");
@@ -65,7 +66,15 @@ pub extern "C" fn _start() -> ! {
         unsafe { core::arch::asm!("ud2") };
     }
 
-    hlt_loop();
+    x86_64::instructions::interrupts::enable();
+    serial_println!("interrupts enabled");
+
+    loop {
+        match vibix::input::read_key() {
+            pc_keyboard::DecodedKey::Unicode(c) => serial_print!("{}", c),
+            pc_keyboard::DecodedKey::RawKey(key) => serial_print!("[{:?}]", key),
+        }
+    }
 }
 
 #[panic_handler]

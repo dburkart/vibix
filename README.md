@@ -2,28 +2,28 @@
 
 A hobby x86_64 kernel, vibe-coded in Rust. Boots under the Limine boot
 protocol, prints to serial + a framebuffer console, installs a minimal
-GDT/TSS + IDT with CPU exception handlers, and has a physical frame
-allocator backing a 1 MiB kernel heap.
+GDT/TSS + IDT with CPU exception handlers, owns a 1 MiB kernel heap,
+and drives a PIT-backed timer + PS/2 keyboard through the legacy 8259
+PIC.
 
 ## Status
 
 Milestones complete:
 
-- **M1 — hello-kernel:**
-  - Limine boot (BIOS + UEFI via a hybrid ISO)
-  - COM1 16550 serial logging
-  - Linear-framebuffer text console (font8x8 glyphs)
-  - GDT + TSS with a dedicated IST stack for `#DF`
-  - IDT handlers for `#DE`, `#UD`, `#GP`, `#PF`, `#DF`
-  - Panic handler that logs + exits QEMU via `isa-debug-exit`
-- **M2 — memory + testing:**
-  - Bump frame allocator over Limine's USABLE memory-map entries
-  - `linked_list_allocator`-backed `#[global_allocator]` (1 MiB heap,
-    mapped via HHDM — no custom paging yet)
-  - Three-layer automated testing story (see below)
+- **M1 — hello-kernel:** Limine boot (BIOS + UEFI), COM1 serial,
+  framebuffer text console (font8x8), GDT/TSS + `#DF` IST, IDT for
+  `#DE`/`#UD`/`#GP`/`#PF`/`#DF`.
+- **M2 — memory + testing:** bump frame allocator over Limine's
+  USABLE map, `linked_list_allocator`-backed `#[global_allocator]`
+  (1 MiB via HHDM — no custom paging yet), three-layer automated
+  testing story (see below).
+- **M3 — interrupts:** 8259 PIC remapped to 0x20/0x28, PIT at 100 Hz
+  driving `time::uptime_ms()`, PS/2 keyboard ISR feeding a ring
+  buffer decoded by `pc-keyboard` on the consumer side. Keystrokes
+  in QEMU echo over serial.
 
 Out of scope for now: paging beyond Limine's defaults, a reclaiming
-frame allocator, PIC/APIC + timer IRQs, keyboard, scheduling, userspace.
+frame allocator, APIC, preemptive scheduling, userspace.
 
 ## Requirements
 
