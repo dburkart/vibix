@@ -27,7 +27,7 @@ Record the number and URL; reuse them for every poll tick.
 
 The PR isn't ready for a summary until **all** are true:
 
-1. Every GitHub Actions check is in a terminal state: `success`, `failure`, `skipped`, or `cancelled`. Nothing `in_progress`, `queued`, or `pending`.
+1. Every GitHub Actions check is in a terminal state: `success`, `failure`, `skipped`, `cancelled`, `neutral`, `timed_out`, or `stale`. Nothing `in_progress`, `queued`, or `pending`.
 2. No check is sitting in `action_required` waiting on manual approval (flag it and stop — the user needs to act).
 3. At least one review-bot comment / review exists, **or** 30 minutes have elapsed since the PR opened (bots may not be wired up on this repo; don't block forever).
 
@@ -128,7 +128,7 @@ Classification matches the `sdlc` skill:
 
 If the 30-min bot timeout hit with no comment, note it explicitly:
 
-> CodeRabbit did not post within 30 min — may not be configured on this repo.
+> Review bots did not post within 30 min — may not be configured on this repo.
 
 ## Never
 
