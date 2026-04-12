@@ -13,8 +13,8 @@ use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult, UnmapError};
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-    Translate,
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -30,6 +30,14 @@ unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         let phys = frame::global().lock().allocate_frame()?;
         Some(PhysFrame::containing_address(PhysAddr::new(phys)))
+    }
+}
+
+impl FrameDeallocator<Size4KiB> for KernelFrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        frame::global()
+            .lock()
+            .deallocate_frame(frame.start_address().as_u64());
     }
 }
 
@@ -142,14 +150,28 @@ pub fn map_phys_into_hhdm(
     })
 }
 
-/// Unmap `page` and flush the TLB. The backing frame is leaked — we
-/// don't have a reclaiming frame allocator yet.
+/// Unmap `page` and flush the TLB. Returns the physical frame the page
+/// was backed by. The caller owns that frame from here on — either
+/// return it to the global allocator with [`unmap_and_free`], or hold
+/// on to it (e.g. when unmapping a physical region the allocator never
+/// owned, like the IST guard page which lives in `.bss`).
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     with_mapper(|m| {
         let (frame, flush) = m.unmap(page)?;
         flush.flush();
         Ok(frame)
     })
+}
+
+/// Unmap `page` and return its backing frame to the global frame
+/// allocator. Use this for mappings whose frame originally came from
+/// [`map`] / [`map_range`].
+pub fn unmap_and_free(page: Page<Size4KiB>) -> Result<(), UnmapError> {
+    let frame = unmap(page)?;
+    // SAFETY: the caller's contract is that `page`'s frame came from
+    // the global allocator — `map` is the only supported producer.
+    unsafe { KernelFrameAllocator.deallocate_frame(frame) };
+    Ok(())
 }
 
 /// Translate a virtual address to its backing physical address, if any.
