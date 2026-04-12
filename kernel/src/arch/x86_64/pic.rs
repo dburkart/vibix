@@ -22,7 +22,11 @@ pub fn init_and_disable() {
         // Mask every line — the IOAPIC routes IRQs now.
         pics.write_masks(0xFF, 0xFF);
     }
-    crate::serial_println!("PIC remapped to {:#x}/{:#x} and masked", PIC_1_OFFSET, PIC_2_OFFSET);
+    crate::serial_println!(
+        "PIC remapped to {:#x}/{:#x} and masked",
+        PIC_1_OFFSET,
+        PIC_2_OFFSET
+    );
 }
 
 /// End-of-interrupt. Forwarded to the LAPIC — the 8259 is fully masked

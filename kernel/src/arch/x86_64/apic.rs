@@ -191,8 +191,7 @@ pub fn route_legacy_irq(isa_irq: u8, vector: u8) {
         .iter()
         .filter_map(|e| e.as_ref())
         .find_map(|io| {
-            let entries =
-                unsafe { io.max_redirection_entries() };
+            let entries = unsafe { io.max_redirection_entries() };
             if gsi >= io.gsi_base && gsi < io.gsi_base + entries {
                 Some((io, gsi - io.gsi_base))
             } else {

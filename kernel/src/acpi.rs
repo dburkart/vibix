@@ -174,8 +174,7 @@ fn find_madt_xsdt(xsdt_phys: u64, hhdm: u64) -> Option<*const SdtHeader> {
     let header = read_sdt(xsdt_phys, hhdm);
     let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
     let count = entries_bytes / 8;
-    let entries_ptr =
-        (xsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u64;
+    let entries_ptr = (xsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u64;
     for i in 0..count {
         let phys = unsafe { entries_ptr.add(i).read_unaligned() };
         let sdt = read_sdt(phys, hhdm);
@@ -190,8 +189,7 @@ fn find_madt_rsdt(rsdt_phys: u64, hhdm: u64) -> Option<*const SdtHeader> {
     let header = read_sdt(rsdt_phys, hhdm);
     let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
     let count = entries_bytes / 4;
-    let entries_ptr =
-        (rsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u32;
+    let entries_ptr = (rsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u32;
     for i in 0..count {
         let phys = unsafe { entries_ptr.add(i).read_unaligned() } as u64;
         let sdt = read_sdt(phys, hhdm);
