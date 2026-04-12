@@ -1,0 +1,12 @@
+# .greptile.yaml
+# Greptile code review configuration
+# See: https://docs.greptile.com/integrations/github
+
+review:
+  auto: true          # Review every PR automatically on open
+
+  # Ignore build artifacts
+  ignore:
+    - "target/**"
+    - "build/**"
+    - "iso/**"
