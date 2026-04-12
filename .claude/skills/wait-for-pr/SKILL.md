@@ -72,19 +72,49 @@ Never pick 300 s — it's the worst of both worlds (cache miss with no payoff). 
 
 Before reporting a failure to the user, check whether it's trivially fixable:
 
-| Failed check pattern | Fix |
-|---|---|
-| `fmt` / `rustfmt` / `format` | `cargo fmt --all` |
-| `clippy` / `lint` | `cargo clippy --fix --allow-dirty --allow-staged` then `cargo fmt --all` |
+| Failed check pattern | Fix | Canonical commit subject |
+|---|---|---|
+| `fmt` / `rustfmt` / `format` | `cargo fmt --all` | `fix: apply rustfmt` |
+| `clippy` / `lint` | `cargo clippy --fix --allow-dirty --allow-staged` then `cargo fmt --all` | `fix: address clippy lints` |
 
-If a fix applies:
+### Detecting prior auto-fix attempts
 
-1. Run the fix.
-2. Commit with a clear subject, e.g. `fix: apply rustfmt` / `fix: address clippy lints`, plus the standard `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
+Before running a fix, verify this branch hasn't already received one for the same check. The canonical commit subjects above are the ground-truth sentinel — a `git log` grep on the PR branch is exact and needs no external state.
+
+Derive the base ref from the PR (don't assume `main` — PRs can target release or hotfix branches) and make sure the remote ref is current before running the check:
+
+```sh
+BASE_REF="$(gh pr view <PR> --json baseRefName --jq .baseRefName)"
+git fetch origin "$BASE_REF" --quiet 2>/dev/null || true
+
+# fmt:
+git log "origin/${BASE_REF}..HEAD" --format='%s' | grep -Fxq 'fix: apply rustfmt'
+# clippy:
+git log "origin/${BASE_REF}..HEAD" --format='%s' | grep -Fxq 'fix: address clippy lints'
+```
+
+If the matching subject is **already present** and the same check just failed again:
+
+- Do **not** apply a second auto-fix — the first one didn't resolve it.
+- Extract the sentinel commit's short SHA for the Summarize report:
+  ```sh
+  git log "origin/${BASE_REF}..HEAD" --format='%h %s' \
+    | grep -F 'fix: apply rustfmt' | head -1 | cut -d' ' -f1
+  ```
+- Skip straight to Summarize, flagging the check as `failure — auto-fix already applied in <short-sha>, did not resolve`.
+
+If the grep finds nothing, proceed with the fix. The commit you create with that exact subject becomes the sentinel for any subsequent re-entry of this skill.
+
+**Commit subjects are load-bearing.** Keep them byte-for-byte identical to the table above. `grep -Fxq` is whole-line and fixed-string on purpose — it prevents false positives from commits that merely mention "rustfmt" in their body or subject.
+
+If `git fetch` fails (offline, auth issue) the `|| true` lets the check fall through to whatever state `origin/${BASE_REF}` was last known at. That's the correct degradation: false-negative "no prior fix" is the same state we'd be in on the first entry, so at worst we run one redundant `cargo fmt` — safer than falsely short-circuiting.
+
+### Applying the fix
+
+1. Run the fix command from the table.
+2. Commit with the canonical subject from the table, plus the standard `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
 3. `git push`.
 4. Re-enter this skill from the top to wait on the fresh run.
-
-**Only auto-fix once per check.** If the same check fails again after a fix commit, stop and report — a second auto-fix loop means the fix didn't work and a human needs eyes on it.
 
 Never auto-fix:
 
