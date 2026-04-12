@@ -41,6 +41,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "GDT + IDT loaded",
     "heap: 1024 KiB",
     "paging: mapper online",
+    "paging: IST guard installed",
     "PIC remapped",
     "timer: 100 Hz",
     "vibix online.",

@@ -45,4 +45,5 @@ pub fn init() {
         .get_response()
         .expect("Limine HHDM response missing");
     paging::init(x86_64::VirtAddr::new(hhdm.offset()));
+    crate::arch::x86_64::ist_guard::install();
 }

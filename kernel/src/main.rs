@@ -8,6 +8,7 @@ use vibix::framebuffer::Console;
 use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
 #[no_mangle]
+#[cfg_attr(feature = "ist-overflow-test", allow(unreachable_code))]
 pub extern "C" fn _start() -> ! {
     vibix::serial::init();
     serial_println!("vibix booting…");
@@ -66,6 +67,26 @@ pub extern "C" fn _start() -> ! {
         unsafe { core::arch::asm!("ud2") };
     }
 
+    #[cfg(feature = "ist-overflow-test")]
+    {
+        // Trigger a real #DF so the CPU switches to the IST stack before
+        // we recurse (recursion happens in the #DF handler itself, in
+        // idt.rs, under the same feature). The cascade: bad RSP → ud2
+        // raises #UD → the #UD handler preamble can't push its frame on
+        // the invalid RSP → #PF → same — push fails again → #DF. The
+        // #DF vector has an IST index, so the CPU finally switches to a
+        // good stack and enters our handler, which then blows it.
+        serial_println!("ist-overflow-test: forcing #DF via bad RSP + ud2");
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {bad}",
+                "ud2",
+                bad = in(reg) 0xFFFF_FFFF_FFFE_F000u64,
+                options(noreturn),
+            );
+        }
+    }
+
     x86_64::instructions::interrupts::enable();
     serial_println!("interrupts enabled");
 
@@ -82,3 +103,4 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
     exit_qemu(QemuExitCode::Failure)
 }
+
