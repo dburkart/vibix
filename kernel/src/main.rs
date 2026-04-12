@@ -7,6 +7,9 @@ use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUE
 use vibix::framebuffer::Console;
 use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
+/// How many PIT ticks between cursor blink toggles (~500 ms at 100 Hz).
+const CURSOR_BLINK_TICKS: u64 = 50;
+
 #[no_mangle]
 #[cfg_attr(
     any(feature = "ist-overflow-test", feature = "panic-test"),
@@ -20,25 +23,6 @@ pub extern "C" fn _start() -> ! {
         BASE_REVISION.is_supported(),
         "Limine base revision unsupported"
     );
-
-    if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
-        if let Some(fb) = fb_response.framebuffers().next() {
-            serial_println!(
-                "framebuffer: {}x{} @ {} bpp, pitch={} bytes",
-                fb.width(),
-                fb.height(),
-                fb.bpp(),
-                fb.pitch()
-            );
-            let console = unsafe { Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch()) };
-            framebuffer::init(console);
-            println!("vibix: framebuffer online");
-        } else {
-            serial_println!("no framebuffer reported by Limine");
-        }
-    } else {
-        serial_println!("no framebuffer response");
-    }
 
     if let Some(memmap) = MEMMAP_REQUEST.get_response() {
         let entries = memmap.entries();
@@ -72,6 +56,32 @@ pub extern "C" fn _start() -> ! {
     vibix::mem::init();
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     vibix::time::init();
+
+    // Console init must come after mem::init() — the character grid and
+    // scrollback buffer are heap-allocated inside Console::new().
+    if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
+        if let Some(fb) = fb_response.framebuffers().next() {
+            serial_println!(
+                "framebuffer: {}x{} @ {} bpp, pitch={} bytes",
+                fb.width(),
+                fb.height(),
+                fb.bpp(),
+                fb.pitch()
+            );
+            if fb.bpp() == 32 {
+                let console =
+                    unsafe { Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch()) };
+                framebuffer::init(console);
+                println!("vibix: framebuffer online");
+            } else {
+                serial_println!("unsupported framebuffer format: {} bpp", fb.bpp());
+            }
+        } else {
+            serial_println!("no framebuffer reported by Limine");
+        }
+    } else {
+        serial_println!("no framebuffer response");
+    }
 
     println!("vibix online.");
     serial_println!("vibix online.");
@@ -113,6 +123,7 @@ pub extern "C" fn _start() -> ! {
 
     vibix::task::init();
     vibix::task::spawn(idle_task);
+    vibix::task::spawn(cursor_blink_task);
 
     loop {
         vibix::task::yield_now();
@@ -127,6 +138,18 @@ fn idle_task() -> ! {
     loop {
         x86_64::instructions::hlt();
         vibix::task::yield_now();
+    }
+}
+
+/// Blink the framebuffer cursor at approximately 1 Hz (toggle every 500 ms).
+fn cursor_blink_task() -> ! {
+    let mut next = vibix::time::ticks() + CURSOR_BLINK_TICKS;
+    loop {
+        while vibix::time::ticks() < next {
+            vibix::task::yield_now();
+        }
+        next = next.wrapping_add(CURSOR_BLINK_TICKS);
+        vibix::framebuffer::toggle_cursor();
     }
 }
 
