@@ -93,6 +93,53 @@ pub fn map_range(
     Ok(())
 }
 
+/// Map a physical range into the HHDM window with the given flags.
+///
+/// Limine's HHDM covers usable RAM by default, but physical regions
+/// we need to poke at (ACPI tables in reserved/ROM ranges, LAPIC /
+/// IOAPIC MMIO) aren't included. This installs a read/write mapping
+/// page-by-page at `hhdm_offset + phys` so callers can keep using the
+/// uniform phys→HHDM translation pattern. Re-mapping an already-mapped
+/// page is a no-op.
+pub fn map_phys_into_hhdm(
+    phys: u64,
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<(), MapToError<Size4KiB>> {
+    if size == 0 {
+        return Ok(());
+    }
+    let start = phys & !0xFFF;
+    // Round the end up to the next page boundary with checked
+    // arithmetic — firmware-provided sizes could in principle push
+    // the sum past u64::MAX. Silent wrap would turn into a mis-map.
+    let end = phys
+        .checked_add(size - 1)
+        .and_then(|v| v.checked_add(0x1000))
+        .expect("map_phys_into_hhdm: physical range overflow")
+        & !0xFFF;
+    with_mapper(|m| {
+        let hhdm_offset = m.phys_offset();
+        let mut alloc = KernelFrameAllocator;
+        let mut addr = start;
+        while addr < end {
+            let page = Page::<Size4KiB>::containing_address(hhdm_offset + addr);
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(addr));
+            // SAFETY: caller is responsible for ensuring the physical
+            // range is safe to alias at this virtual address. For MMIO
+            // and firmware-provided ACPI tables the kernel is the sole
+            // user and we never hand these pages to the frame allocator.
+            match unsafe { m.map_to(page, frame, flags, &mut alloc) } {
+                Ok(flush) => flush.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => {}
+                Err(e) => return Err(e),
+            }
+            addr += 4096;
+        }
+        Ok(())
+    })
+}
+
 /// Unmap `page` and flush the TLB. Backing frame is leaked.
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     with_mapper(|m| {

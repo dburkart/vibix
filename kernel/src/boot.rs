@@ -4,7 +4,7 @@
 
 use limine::request::{
     ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest,
-    RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
+    RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
 
@@ -34,6 +34,10 @@ pub static STACK_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(S
 #[used]
 #[link_section = ".limine_requests"]
 pub static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[link_section = ".limine_requests_start"]
