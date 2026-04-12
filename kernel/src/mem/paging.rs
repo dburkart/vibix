@@ -207,6 +207,16 @@ pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     })
 }
 
+/// Read the page-table flags of the leaf PTE backing `addr`, if any.
+/// Used by tests to verify that `populate_kernel_image` applied the
+/// ELF-derived `{R, W, X}` flags correctly.
+pub fn flags(addr: VirtAddr) -> Option<PageTableFlags> {
+    with_mapper(|m| match m.translate(addr) {
+        TranslateResult::Mapped { flags, .. } => Some(flags),
+        TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
+    })
+}
+
 /// Physical address of the currently-active PML4 (i.e. CR3).
 pub fn active_pml4_phys() -> PhysAddr {
     Cr3::read().0.start_address()
@@ -341,55 +351,16 @@ fn populate_hhdm(
     }
 }
 
-/// Map the kernel image section-by-section with tight permissions.
-/// Pages that are unmapped in the *current* (old) tree are skipped so
-/// that the IST guard unmap survives the switch.
+/// Map the kernel image segment-by-segment with tight permissions.
+/// `{R, W, X}` is derived from each `PT_LOAD`'s `p_flags` via the ELF
+/// program headers Limine hands back — a new kernel section picks up
+/// the right flags without any code change here. Pages unmapped in
+/// the current (old) tree are skipped so that the IST guard hole
+/// survives the switch.
 fn populate_kernel_image(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
-    extern "C" {
-        static __limine_requests_start: u8;
-        static __limine_requests_end: u8;
-        static __text_start: u8;
-        static __text_end: u8;
-        static __rodata_start: u8;
-        static __rodata_end: u8;
-        static __data_start: u8;
-        static __data_end: u8;
-    }
-
-    let present_rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let text_flags = PageTableFlags::PRESENT; // RX
-    let rodata_flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE; // RO
-    let data_flags = present_rw | PageTableFlags::NO_EXECUTE; // RW
-
-    // SAFETY: these are link-time symbols with static addresses; taking
-    // their address is always valid.
-    let regions = unsafe {
-        [
-            (
-                VirtAddr::from_ptr(&__limine_requests_start),
-                VirtAddr::from_ptr(&__limine_requests_end),
-                data_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__text_start),
-                VirtAddr::from_ptr(&__text_end),
-                text_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__rodata_start),
-                VirtAddr::from_ptr(&__rodata_end),
-                rodata_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__data_start),
-                VirtAddr::from_ptr(&__data_end),
-                data_flags,
-            ),
-        ]
-    };
-
-    for (start, end, flags) in regions {
-        clone_range(mapper, alloc, start, end, flags);
+    for seg in super::elf::kernel_load_segments() {
+        let end = VirtAddr::new(seg.vaddr.as_u64() + seg.memsz);
+        clone_range(mapper, alloc, seg.vaddr, end, seg.flags);
     }
 }
 
