@@ -66,14 +66,21 @@ pub use kernel_side::*;
 #[cfg(target_os = "none")]
 mod kernel_side {
     use super::RingBuffer;
+    use core::sync::atomic::{AtomicU64, Ordering};
     use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
     use spin::{Lazy, Mutex};
-    use x86_64::instructions::interrupts::without_interrupts;
+    use x86_64::instructions::interrupts::{self, without_interrupts};
 
     /// Scancodes land here from the keyboard ISR. Sized at 128: a human
     /// typist can't overflow it, and firmware key-repeat bursts are well
     /// under that between consumer polls.
     static SCANCODES: Mutex<RingBuffer<u8, 128>> = Mutex::new(RingBuffer::new());
+
+    /// Count of scancodes dropped because the ring was full when the ISR
+    /// tried to push. Surface via `scancode_overflows()`; a non-zero
+    /// reading means the consumer isn't keeping up and modifier tracking
+    /// may be desynced.
+    static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
     static KEYBOARD: Lazy<Mutex<Keyboard<Us104Key, ScancodeSet1>>> = Lazy::new(|| {
         Mutex::new(Keyboard::new(
@@ -85,14 +92,24 @@ mod kernel_side {
 
     /// Called from the keyboard ISR. Interrupts are already disabled.
     pub fn push_scancode_from_isr(code: u8) {
-        SCANCODES.lock().push(code);
+        if !SCANCODES.lock().push(code) {
+            OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn try_read_scancode() -> Option<u8> {
         without_interrupts(|| SCANCODES.lock().pop())
     }
 
+    pub fn scancode_overflows() -> u64 {
+        OVERFLOWS.load(Ordering::Relaxed)
+    }
+
     /// Block (via `hlt`) until a decoded key is available.
+    ///
+    /// Disabling interrupts before the final empty-check plugs the race
+    /// where an IRQ could enqueue between the drain and `hlt`, parking
+    /// us until some unrelated interrupt arrived.
     pub fn read_key() -> DecodedKey {
         loop {
             while let Some(code) = try_read_scancode() {
@@ -103,7 +120,14 @@ mod kernel_side {
                     }
                 }
             }
-            x86_64::instructions::interrupts::enable_and_hlt();
+            interrupts::disable();
+            if SCANCODES.lock().is_empty() {
+                // enable_and_hlt is atomic: IF=1 and hlt execute with no
+                // window for a pending IRQ to be missed.
+                interrupts::enable_and_hlt();
+            } else {
+                interrupts::enable();
+            }
         }
     }
 }
