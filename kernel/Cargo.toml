@@ -87,3 +87,7 @@ harness = false
 [[test]]
 name = "blocking_sync"
 harness = false
+
+[[test]]
+name = "shell_smoke"
+harness = false

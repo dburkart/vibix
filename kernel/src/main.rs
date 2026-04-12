@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 
 use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST, RSDP_REQUEST};
 use vibix::framebuffer::Console;
-use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
+use vibix::{exit_qemu, framebuffer, println, serial_println, QemuExitCode};
 
 /// How many PIT ticks between cursor blink toggles (~500 ms at 100 Hz).
 const CURSOR_BLINK_TICKS: u64 = 50;
@@ -122,24 +122,12 @@ pub extern "C" fn _start() -> ! {
     serial_println!("interrupts enabled");
 
     vibix::task::init();
-    vibix::task::spawn(idle_task);
+    vibix::task::spawn(vibix::shell::run);
     vibix::task::spawn(cursor_blink_task);
 
-    loop {
-        // `read_key` itself blocks on `hlt` until a scancode arrives;
-        // the PIT preempt tick can switch us out of that wait to any
-        // other ready task.
-        match vibix::input::read_key() {
-            pc_keyboard::DecodedKey::Unicode(c) => serial_print!("{}", c),
-            pc_keyboard::DecodedKey::RawKey(key) => serial_print!("[{:?}]", key),
-        }
-    }
-}
-
-fn idle_task() -> ! {
-    // `hlt` with IRQs on parks the CPU until the next interrupt, at
-    // which point `preempt_tick` may rotate us out. No explicit yield
-    // needed.
+    // Bootstrap task becomes the idle loop. `hlt` with IRQs on parks
+    // the CPU until the next interrupt; the PIT `preempt_tick` then
+    // rotates us to any other ready task (shell, cursor_blink).
     loop {
         x86_64::instructions::hlt();
     }

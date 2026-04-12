@@ -28,6 +28,8 @@ pub mod ksymtab;
 #[cfg(target_os = "none")]
 pub mod serial;
 #[cfg(target_os = "none")]
+pub mod shell;
+#[cfg(target_os = "none")]
 pub mod sync;
 #[cfg(target_os = "none")]
 pub mod task;
