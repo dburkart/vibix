@@ -1,0 +1,16 @@
+# Kernel-specific build flags. We deliberately do NOT set a default
+# `build.target` here — xtask drives kernel builds with an explicit
+# `--target x86_64-unknown-none` plus `-Z build-std`, and xtask itself
+# builds for the host. Keeping target selection out of the global
+# config prevents xtask builds from accidentally pulling in build-std.
+
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-Tkernel/linker.ld",
+  "-C", "relocation-model=static",
+  "-C", "code-model=kernel",
+  "-C", "no-redzone=yes",
+]
+
+[alias]
+xtask = "run --package xtask --release --"

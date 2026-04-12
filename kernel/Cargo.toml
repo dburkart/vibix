@@ -1,0 +1,23 @@
+[package]
+name = "vibix"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vibix"
+path = "src/main.rs"
+
+[dependencies]
+limine = "0.5"
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "lazy"] }
+x86_64 = "0.15"
+uart_16550 = "0.3"
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+
+[features]
+default = []
+# Enable to trigger a UD2 after init; verifies the invalid-opcode handler path.
+fault-test = []
+

@@ -1,0 +1,40 @@
+//! Limine boot-protocol requests. These statics live in dedicated link
+//! sections so the Limine bootloader can find and fill them in before we
+//! take control.
+
+use limine::request::{
+    FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+    StackSizeRequest,
+};
+use limine::BaseRevision;
+
+/// Ask Limine for a 64 KiB bootstrap stack. Comfortable for early init.
+const STACK_SIZE: u64 = 64 * 1024;
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static STACK_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(STACK_SIZE);
+
+#[used]
+#[link_section = ".limine_requests_start"]
+static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+
+#[used]
+#[link_section = ".limine_requests_end"]
+static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
