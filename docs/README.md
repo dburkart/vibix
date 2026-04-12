@@ -16,7 +16,7 @@ sequence, and public API for its subsystem.
 | [acpi.md](acpi.md) | ACPI RSDP/MADT parser | `kernel/src/acpi.rs` |
 | [time.md](time.md) | PIT-driven monotonic clock | `kernel/src/time.rs` |
 | [input.md](input.md) | PS/2 keyboard and ring buffer | `kernel/src/input.rs` |
-| [tasks.md](tasks.md) | Cooperative/preemptive scheduler | `kernel/src/task/` |
+| [tasks.md](tasks.md) | Preemptive scheduler + blocking primitives | `kernel/src/task/`, `kernel/src/sync/` |
 | [diagnostics.md](diagnostics.md) | klog ring, ksymtab, backtrace unwinder | `kernel/src/klog.rs`, `kernel/src/ksymtab.rs`, `kernel/src/arch/x86_64/backtrace.rs` |
 
 ## Initialization Order
