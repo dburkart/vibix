@@ -3,8 +3,8 @@
 //! take control.
 
 use limine::request::{
-    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
-    RequestsStartMarker, RsdpRequest, StackSizeRequest,
+    ExecutableAddressRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
+    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
 
@@ -34,6 +34,10 @@ pub static STACK_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(S
 #[used]
 #[link_section = ".limine_requests"]
 pub static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static KERNEL_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]

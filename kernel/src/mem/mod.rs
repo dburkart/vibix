@@ -13,6 +13,8 @@
 pub mod frame;
 
 #[cfg(target_os = "none")]
+mod elf;
+#[cfg(target_os = "none")]
 pub mod heap;
 #[cfg(target_os = "none")]
 pub mod paging;

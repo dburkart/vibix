@@ -16,6 +16,7 @@ use vibix::{
     test_harness::{test_panic_handler, Testable},
     QemuExitCode,
 };
+use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 #[no_mangle]
@@ -45,6 +46,10 @@ fn run_tests() {
         (
             "heap_grows_after_switch",
             &(heap_grows_after_switch as fn()),
+        ),
+        (
+            "elf_derived_segment_flags",
+            &(elf_derived_segment_flags as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -78,6 +83,47 @@ fn stack_local_translates() {
     let phys = paging::translate(va).expect("stack local not mapped after CR3 switch");
     assert_eq!(local, 0xDEAD_BEEF_DEAD_BEEF);
     serial_println!("  stack @ {va:?} -> {phys:?}");
+}
+
+fn elf_derived_segment_flags() {
+    use vibix::mem::paging;
+
+    // .text — a code address must be PRESENT, executable (no NX),
+    // and not WRITABLE. Use a fn pointer to a function in this test,
+    // which the linker places in `.text`.
+    let fn_ptr: fn() = elf_derived_segment_flags;
+    let text_va = VirtAddr::new(fn_ptr as usize as u64);
+    let text_flags = paging::flags(text_va).expect("text VA not mapped");
+    assert!(text_flags.contains(PageTableFlags::PRESENT));
+    assert!(!text_flags.contains(PageTableFlags::NO_EXECUTE), "text NX");
+    assert!(
+        !text_flags.contains(PageTableFlags::WRITABLE),
+        "text writable"
+    );
+
+    // .rodata — a &'static str literal lives in `.rodata`. Must be
+    // NX and not writable.
+    static RODATA_MARKER: &str = "vibix-rodata-marker";
+    let rodata_va = VirtAddr::new(RODATA_MARKER.as_ptr() as u64);
+    let rodata_flags = paging::flags(rodata_va).expect("rodata VA not mapped");
+    assert!(
+        rodata_flags.contains(PageTableFlags::NO_EXECUTE),
+        "rodata X"
+    );
+    assert!(!rodata_flags.contains(PageTableFlags::WRITABLE), "rodata W");
+
+    // .data — a mutable static lives in `.data`. Must be NX and
+    // writable.
+    static mut DATA_MARKER: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let data_va = VirtAddr::new(core::ptr::addr_of!(DATA_MARKER) as u64);
+    let data_flags = paging::flags(data_va).expect("data VA not mapped");
+    assert!(data_flags.contains(PageTableFlags::NO_EXECUTE), "data X");
+    assert!(
+        data_flags.contains(PageTableFlags::WRITABLE),
+        "data not W: {data_flags:?}"
+    );
+
+    serial_println!("  text={text_flags:?} rodata={rodata_flags:?} data={data_flags:?}");
 }
 
 fn heap_grows_after_switch() {

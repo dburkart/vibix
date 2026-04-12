@@ -11,6 +11,7 @@
 //! actually freeing it (and the `BOOTLOADER_RECLAIMABLE` frames) is
 //! issue #46.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
@@ -207,6 +208,16 @@ pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     })
 }
 
+/// Read the page-table flags of the leaf PTE backing `addr`, if any.
+/// Used by tests to verify that `populate_kernel_image` applied the
+/// ELF-derived `{R, W, X}` flags correctly.
+pub fn flags(addr: VirtAddr) -> Option<PageTableFlags> {
+    with_mapper(|m| match m.translate(addr) {
+        TranslateResult::Mapped { flags, .. } => Some(flags),
+        TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
+    })
+}
+
 /// Physical address of the currently-active PML4 (i.e. CR3).
 pub fn active_pml4_phys() -> PhysAddr {
     Cr3::read().0.start_address()
@@ -341,55 +352,43 @@ fn populate_hhdm(
     }
 }
 
-/// Map the kernel image section-by-section with tight permissions.
-/// Pages that are unmapped in the *current* (old) tree are skipped so
-/// that the IST guard unmap survives the switch.
+/// Map the kernel image segment-by-segment with tight permissions.
+/// `{R, W, X}` is derived from each `PT_LOAD`'s `p_flags` via the ELF
+/// program headers Limine hands back — a new kernel section picks up
+/// the right flags without any code change here. Pages unmapped in
+/// the current (old) tree are skipped so that the IST guard hole
+/// survives the switch.
 fn populate_kernel_image(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
-    extern "C" {
-        static __limine_requests_start: u8;
-        static __limine_requests_end: u8;
-        static __text_start: u8;
-        static __text_end: u8;
-        static __rodata_start: u8;
-        static __rodata_end: u8;
-        static __data_start: u8;
-        static __data_end: u8;
+    // PT_LOAD is byte-granular but a PTE is page-granular: two
+    // segments touching the same 4 KiB page have to agree on flags.
+    // Union per page before mapping (WRITABLE if any covering segment
+    // is writable, NO_EXECUTE only if every covering segment is NX),
+    // then map each page exactly once. Our linker script page-aligns
+    // segment boundaries today, so in practice no page is covered
+    // twice — but relying on that invariant silently would leave a
+    // boundary page mis-permissioned the first time it breaks.
+    let mut per_page: BTreeMap<u64, PageTableFlags> = BTreeMap::new();
+    for seg in super::elf::kernel_load_segments() {
+        let start = seg.vaddr.as_u64() & !0xFFF;
+        let end = (seg.vaddr.as_u64() + seg.memsz + 0xFFF) & !0xFFF;
+        let mut addr = start;
+        while addr < end {
+            let entry = per_page
+                .entry(addr)
+                .or_insert(PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE);
+            if seg.flags.contains(PageTableFlags::WRITABLE) {
+                *entry |= PageTableFlags::WRITABLE;
+            }
+            if !seg.flags.contains(PageTableFlags::NO_EXECUTE) {
+                entry.remove(PageTableFlags::NO_EXECUTE);
+            }
+            addr += 0x1000;
+        }
     }
 
-    let present_rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let text_flags = PageTableFlags::PRESENT; // RX
-    let rodata_flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE; // RO
-    let data_flags = present_rw | PageTableFlags::NO_EXECUTE; // RW
-
-    // SAFETY: these are link-time symbols with static addresses; taking
-    // their address is always valid.
-    let regions = unsafe {
-        [
-            (
-                VirtAddr::from_ptr(&__limine_requests_start),
-                VirtAddr::from_ptr(&__limine_requests_end),
-                data_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__text_start),
-                VirtAddr::from_ptr(&__text_end),
-                text_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__rodata_start),
-                VirtAddr::from_ptr(&__rodata_end),
-                rodata_flags,
-            ),
-            (
-                VirtAddr::from_ptr(&__data_start),
-                VirtAddr::from_ptr(&__data_end),
-                data_flags,
-            ),
-        ]
-    };
-
-    for (start, end, flags) in regions {
-        clone_range(mapper, alloc, start, end, flags);
+    for (va, flags) in per_page {
+        let page_va = VirtAddr::new(va);
+        clone_range(mapper, alloc, page_va, page_va + 0x1000u64, flags);
     }
 }
 
