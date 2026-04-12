@@ -1,7 +1,8 @@
 //! Round-robin scheduler state. Holds the currently-running task and
-//! a FIFO ready queue. Cooperative only — `yield_now()` is the sole
-//! rescheduling point, so we don't need to worry about IRQs mutating
-//! the queue mid-switch.
+//! a FIFO ready queue. Rescheduling happens from either `yield_now()`
+//! (cooperative) or `preempt_tick()` (PIT ISR); `yield_now` masks IRQs
+//! across the lock/switch window so the two paths can't race on the
+//! queue.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
