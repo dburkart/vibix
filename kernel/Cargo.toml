@@ -52,3 +52,7 @@ harness = false
 [[test]]
 name = "paging"
 harness = false
+
+[[test]]
+name = "tasks"
+harness = false

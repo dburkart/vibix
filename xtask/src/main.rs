@@ -57,6 +57,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "timer: 100 Hz",
     "vibix online.",
     "interrupts enabled",
+    "tasks: scheduler online",
 ];
 
 fn main() -> R<()> {
@@ -344,6 +345,7 @@ fn test_all() -> R<()> {
         "should_panic",
         "timer_tick",
         "paging",
+        "tasks",
     ] {
         cmd.arg("--test").arg(t);
     }
