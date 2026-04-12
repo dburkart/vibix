@@ -1,16 +1,20 @@
-//! Physical-frame allocator + kernel heap.
+//! Physical-frame allocator, kernel heap, and paging.
 //!
-//! Milestone 2 keeps things deliberately minimal:
 //!  - `frame::BumpFrameAllocator` bumps through Limine's USABLE regions.
 //!    Pure logic, no `limine`/`x86_64` dependencies → host-testable.
-//!  - `heap` pulls one contiguous 1 MiB slice of frames and hands it to
-//!    `linked_list_allocator::LockedHeap`, which becomes the kernel's
-//!    global allocator. Heap memory is addressed through Limine's HHDM.
+//!    A global instance is installed by `frame::init` and shared by
+//!    the heap and the paging layer.
+//!  - `heap` pulls one contiguous 1 MiB slice of frames from the global
+//!    allocator and hands it to `linked_list_allocator::LockedHeap`.
+//!  - `paging` wraps Limine's active PML4 in an `OffsetPageTable` so
+//!    the kernel can own its own `map`/`unmap`/`translate` API.
 
 pub mod frame;
 
 #[cfg(target_os = "none")]
 pub mod heap;
+#[cfg(target_os = "none")]
+pub mod paging;
 
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;
@@ -29,9 +33,16 @@ impl Region {
     }
 }
 
-/// Initialize memory subsystems in-kernel: build the frame allocator
-/// from Limine's memory map, then bring up the heap.
+/// Initialize memory subsystems in-kernel: snapshot Limine's memory map
+/// into the global frame allocator, bring up the heap, then wrap the
+/// active page tables in our own mapper.
 #[cfg(target_os = "none")]
 pub fn init() {
+    frame::init();
     heap::init();
+
+    let hhdm = crate::boot::HHDM_REQUEST
+        .get_response()
+        .expect("Limine HHDM response missing");
+    paging::init(x86_64::VirtAddr::new(hhdm.offset()));
 }

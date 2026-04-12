@@ -40,6 +40,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "hhdm offset:",
     "GDT + IDT loaded",
     "heap: 1024 KiB",
+    "paging: mapper online",
     "PIC remapped",
     "timer: 100 Hz",
     "vibix online.",
@@ -275,7 +276,7 @@ fn test_all() -> R<()> {
             "-Z", "build-std=core,compiler_builtins,alloc",
             "-Z", "build-std-features=compiler-builtins-mem",
         ]);
-    for t in ["basic_boot", "heap_alloc", "should_panic", "timer_tick"] {
+    for t in ["basic_boot", "heap_alloc", "should_panic", "timer_tick", "paging"] {
         cmd.arg("--test").arg(t);
     }
     check(cmd.status()?)?;

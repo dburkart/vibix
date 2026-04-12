@@ -43,3 +43,7 @@ harness = false
 [[test]]
 name = "timer_tick"
 harness = false
+
+[[test]]
+name = "paging"
+harness = false
