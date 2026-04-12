@@ -213,13 +213,16 @@ impl Console {
         for y in 0..self.height {
             for x in 0..self.width {
                 unsafe {
-                    self.buffer.add(y * self.pitch + x).write_volatile(DEFAULT_BG);
+                    self.buffer
+                        .add(y * self.pitch + x)
+                        .write_volatile(DEFAULT_BG);
                 }
             }
         }
         self.cx = 0;
         self.cy = 0;
-        self.cursor_on = false;
+        self.cursor_on = true;
+        self.draw_cursor(self.cx, self.cy, true);
     }
 
     // ── low-level rendering ───────────────────────────────────────────────
@@ -321,7 +324,9 @@ impl Console {
         for y in last_py..last_py + GLYPH_H {
             for x in 0..self.width {
                 unsafe {
-                    self.buffer.add(y * self.pitch + x).write_volatile(DEFAULT_BG);
+                    self.buffer
+                        .add(y * self.pitch + x)
+                        .write_volatile(DEFAULT_BG);
                 }
             }
         }
@@ -457,7 +462,9 @@ impl Console {
 
             Ansi::Csi => match c {
                 '0'..='9' => {
-                    self.cur_param = self.cur_param.saturating_mul(10)
+                    self.cur_param = self
+                        .cur_param
+                        .saturating_mul(10)
                         .saturating_add(c as u32 - '0' as u32);
                 }
                 ';' => {

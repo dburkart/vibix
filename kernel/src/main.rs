@@ -68,10 +68,15 @@ pub extern "C" fn _start() -> ! {
                 fb.bpp(),
                 fb.pitch()
             );
-            let console =
-                unsafe { Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch()) };
-            framebuffer::init(console);
-            println!("vibix: framebuffer online");
+            if fb.bpp() == 32 {
+                let console = unsafe {
+                    Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch())
+                };
+                framebuffer::init(console);
+                println!("vibix: framebuffer online");
+            } else {
+                serial_println!("unsupported framebuffer format: {} bpp", fb.bpp());
+            }
         } else {
             serial_println!("no framebuffer reported by Limine");
         }
