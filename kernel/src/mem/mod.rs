@@ -1,9 +1,10 @@
 //! Physical-frame allocator, kernel heap, and paging.
 //!
-//!  - `frame::BumpFrameAllocator` bumps through Limine's USABLE regions.
-//!    Pure logic, no `limine`/`x86_64` dependencies → host-testable.
-//!    A global instance is installed by `frame::init` and shared by
-//!    the heap and the paging layer.
+//!  - `frame::BitmapFrameAllocator` tracks one bit per 4 KiB frame over
+//!    Limine's USABLE regions and reclaims frames on `deallocate_frame`.
+//!    Pure logic, no `limine`/`x86_64` dependencies → host-testable. A
+//!    global instance is installed by `frame::init` and shared by the
+//!    heap and the paging layer.
 //!  - `heap` pulls one contiguous 1 MiB slice of frames from the global
 //!    allocator and hands it to `linked_list_allocator::LockedHeap`.
 //!  - `paging` wraps Limine's active PML4 in an `OffsetPageTable` so
@@ -50,4 +51,9 @@ pub fn init() {
 
     heap::init();
     crate::arch::x86_64::ist_guard::install();
+
+    // Build a clean kernel-owned PML4 from the now-populated mapper
+    // state and swap CR3 to it. After this point, Limine's original
+    // page-table tree is no longer reachable.
+    paging::build_and_switch_kernel_pml4();
 }

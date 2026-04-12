@@ -27,8 +27,13 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 fn run_tests() {
-    let tests: &[(&str, &dyn Testable)] =
-        &[("map_roundtrip_unmap", &(map_roundtrip_unmap as fn()))];
+    let tests: &[(&str, &dyn Testable)] = &[
+        ("map_roundtrip_unmap", &(map_roundtrip_unmap as fn())),
+        (
+            "map_unmap_loop_reclaims",
+            &(map_unmap_loop_reclaims as fn()),
+        ),
+    ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
         serial_println!("test {name}");
@@ -64,9 +69,40 @@ fn map_roundtrip_unmap() {
         assert_eq!(ptr.read_volatile(), 0xCAFE_F00D_DEAD_BEEF);
     }
 
-    paging::unmap(page).expect("unmap failed");
+    paging::unmap_and_free(page).expect("unmap failed");
     assert!(
         paging::translate(va).is_none(),
         "translate after unmap still returned Some"
+    );
+}
+
+/// Map / unmap in a loop and assert the free-frame count returns to
+/// baseline — guards against the bump-allocator regression where every
+/// unmap leaked a frame.
+fn map_unmap_loop_reclaims() {
+    use vibix::mem::{frame, paging};
+
+    let va = VirtAddr::new(0xFFFF_C000_BEEF_0000);
+    let page: Page<Size4KiB> = Page::from_start_address(va).unwrap();
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    // First map/unmap lazily allocates intermediate page-table frames
+    // (PDPT/PD/PT) that stay populated across subsequent iterations.
+    // Take the baseline *after* that one-time cost so we measure pure
+    // leaf-frame accounting over the loop below.
+    paging::map(page, flags).expect("warm-up map");
+    paging::unmap_and_free(page).expect("warm-up unmap");
+
+    let baseline = frame::global().lock().free_frames();
+
+    for _ in 0..64 {
+        paging::map(page, flags).expect("map failed in loop");
+        paging::unmap_and_free(page).expect("unmap failed in loop");
+    }
+
+    let after = frame::global().lock().free_frames();
+    assert_eq!(
+        after, baseline,
+        "frame accounting drifted: {baseline} → {after}"
     );
 }
