@@ -354,6 +354,7 @@ fn test_all() -> R<()> {
         "preempt",
         "pml4_switch",
         "apic_online",
+        "page_fault",
     ] {
         cmd.arg("--test").arg(t);
     }

@@ -30,6 +30,8 @@ pub mod task;
 #[cfg(target_os = "none")]
 pub mod test_harness;
 #[cfg(target_os = "none")]
+pub mod test_hook;
+#[cfg(target_os = "none")]
 pub mod time;
 
 #[cfg(target_os = "none")]
