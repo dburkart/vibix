@@ -55,7 +55,13 @@ context_switch:
 
 task_entry_trampoline:
     // Entry fn pointer was primed into r12. It's `fn() -> !`, so a
-    // return here is a bug; `ud2` makes that loud.
+    // return here is a bug; `ud2` makes that loud. `sti` first so a
+    // task entered for the first time from the preempt ISR (which
+    // runs with IF=0 under an interrupt gate) still receives future
+    // timer IRQs and can itself be preempted. `sti` when IF is
+    // already set is a no-op, so the cooperative-yield path is
+    // unaffected.
+    sti
     call r12
     ud2
 "#
