@@ -73,7 +73,7 @@ fn ch_producer() -> ! {
     }
     CH_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 }
 
@@ -85,7 +85,7 @@ fn ch_consumer() -> ! {
     }
     CH_CONS_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 }
 
@@ -100,14 +100,14 @@ fn channel_ping_pong() {
     task::spawn(ch_producer);
     task::spawn(ch_consumer);
 
-    // Drive the scheduler until both workers finish or we time out.
-    // 100_000 yields is comfortably enough for 60 messages through a
-    // capacity-4 channel; failure fails fast instead of hanging CI.
-    for _ in 0..100_000 {
+    // Park the driver on `hlt` until both workers finish or the
+    // deadline passes. `hlt` wakes on the next PIT tick (~10 ms),
+    // handing the CPU to producer/consumer in between.
+    for _ in 0..2_000 {
         if CH_PROD_DONE.load(Ordering::SeqCst) == 1 && CH_CONS_DONE.load(Ordering::SeqCst) == 1 {
             break;
         }
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 
     assert_eq!(
@@ -146,15 +146,16 @@ fn mu_worker() -> ! {
             let mut g = MU.lock();
             *g += 1;
         }
-        // Yield between iterations so the workers actually interleave
-        // — without a yield the 10 ms preempt slice will let each
-        // worker burn through all its rounds while holding nothing
-        // contended, and we wouldn't exercise the blocking path.
-        task::yield_now();
+        // `spin_loop` between iterations so the preempt tick finds a
+        // natural rotation point — without the mutex being contended
+        // on every acquire, three un-yielding workers could each burn
+        // a full 10 ms slice before the next rotation, and we'd
+        // barely exercise the blocking path.
+        core::hint::spin_loop();
     }
     MU_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 }
 
@@ -168,11 +169,11 @@ fn mutex_contention() {
     task::spawn(mu_worker);
     task::spawn(mu_worker);
 
-    for _ in 0..100_000 {
+    for _ in 0..2_000 {
         if MU_DONE.load(Ordering::SeqCst) == 3 {
             break;
         }
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 
     assert_eq!(
@@ -201,7 +202,7 @@ fn wq_waiter() -> ! {
     WQ.wait_while(|| WQ_FLAG.load(Ordering::SeqCst) == 0);
     WQ_WOKEN.fetch_add(1, Ordering::SeqCst);
     loop {
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
 }
 
@@ -212,10 +213,11 @@ fn waitqueue_notify_all() {
     task::spawn(wq_waiter);
     task::spawn(wq_waiter);
 
-    // Let both waiters reach their park. A handful of yields is
-    // enough — round-robin will rotate through them immediately.
-    for _ in 0..200 {
-        task::yield_now();
+    // Let both waiters reach their park. ~20 preempt ticks (200 ms
+    // wall time) is plenty for the round-robin to rotate through
+    // them and for each to park on `WQ`.
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
     }
     // Nobody should be "woken" yet: flag is still 0.
     assert_eq!(
@@ -228,11 +230,11 @@ fn waitqueue_notify_all() {
     WQ_FLAG.store(1, Ordering::SeqCst);
     WQ.notify_all();
 
-    for _ in 0..10_000 {
+    for _ in 0..1_000 {
         if WQ_WOKEN.load(Ordering::SeqCst) == 2 {
             break;
         }
-        task::yield_now();
+        x86_64::instructions::hlt();
     }
     assert_eq!(
         WQ_WOKEN.load(Ordering::SeqCst),
