@@ -22,9 +22,11 @@ use x86_64::{PhysAddr, VirtAddr};
 use super::frame;
 use crate::serial_println;
 
-/// Frame allocator adapter: pulls 4 KiB frames from the global
-/// `BumpFrameAllocator`. Zero-sized; construct ad-hoc wherever you need
-/// to hand the mapper a `FrameAllocator`.
+/// Frame allocator adapter: pulls 4 KiB frames from (and, via
+/// [`FrameDeallocator`], returns them to) the global
+/// [`BitmapFrameAllocator`](frame::BitmapFrameAllocator). Zero-sized;
+/// construct ad-hoc wherever you need to hand the mapper a
+/// `FrameAllocator`.
 pub struct KernelFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {

@@ -167,7 +167,11 @@ mod global {
     use spin::{Mutex, Once};
 
     static REGIONS: Once<([Region; MAX_REGIONS], usize)> = Once::new();
-    static mut BITMAP: [u64; BITMAP_WORDS] = [!0u64; BITMAP_WORDS];
+    // Zero-initialized so the bitmap lives in `.bss` instead of `.data`
+    // (saves ~128 KiB in the kernel image). `BitmapFrameAllocator::new`
+    // writes `!0` to every word before handing out any frame, so the
+    // initial value here is irrelevant for correctness.
+    static mut BITMAP: [u64; BITMAP_WORDS] = [0u64; BITMAP_WORDS];
     static ALLOCATOR: Once<Mutex<BitmapFrameAllocator<'static>>> = Once::new();
 
     pub fn init() {
