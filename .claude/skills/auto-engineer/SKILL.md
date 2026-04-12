@@ -17,7 +17,9 @@ This skill is a deliberate override of the project's default "don't merge your o
 
 ## Iteration budget
 
-Count iterations across a single user-initiated run (stored implicitly via the repeated wake-up chain). **Soft cap: 8 iterations.** After the 8th merged PR, stop and wait for the user to restart. Prevents runaway loops.
+**Soft cap: 8 iterations per user-initiated run.** After the 8th merged PR, stop and wait for the user to restart. Prevents runaway loops.
+
+The iteration counter is carried in the wake-up prompt itself as `/auto-engineer --iteration N` (1-indexed). A bare `/auto-engineer` invocation is iteration 1. This is deliberate: `/compact` can summarize away conversation state, so the count must live in the re-entry prompt, not in context. On entry, parse `--iteration N` out of the invocation; if absent, treat as 1.
 
 ## Cycle
 
@@ -81,6 +83,7 @@ Per `sdlc`:
 - Coherent commits (not a single mega-commit, not micro-commits). Each with the standard `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
 - `git push -u origin <branch>`.
 - Open the PR via `mcp__github__create_pull_request` with the standard Summary + Test plan body. **No "generated with" footer.**
+- **Always include `Closes #<N>`** on its own line near the top of the PR body (where `<N>` is the issue picked in step 1). Without it, the squash-merge in step 7 won't auto-close the issue, the assignment persists, and step 1's `no:assignee` candidate set stays polluted on the next cycle.
 - Record the PR number and URL for the rest of the cycle.
 
 ### 6. Wait for PR, respond to feedback
@@ -109,13 +112,7 @@ Only merge when **all** are true:
 - No unresolved actionable review findings.
 - Either ≥1 review bot posted and every actionable finding is addressed, **or** 30 min elapsed since PR open with nothing actionable.
 
-Determine merge method from recent history:
-
-```sh
-gh pr list --state merged --limit 5 --json number,mergeCommit,title
-```
-
-Match the dominant style (squash is the current default — confirm before each merge). Then:
+Merge method is **always `squash`** — the repo's established convention and the only style auto-engineer uses. Don't try to infer it from recent history; the `gh pr list --json mergeCommit` field returns a SHA for every merge method, so it can't distinguish squash from merge-commit or rebase anyway.
 
 ```
 mcp__github__merge_pull_request(pull_number=<N>, merge_method="squash")
@@ -159,26 +156,28 @@ Before compacting and kicking off the next cycle, run `/usage` and parse the ses
 - **< 10% remaining** → don't start a new cycle; the next one could tip over mid-PR and leave an orphaned branch. Instead:
   1. Read the quota-reset timestamp from `/usage` output.
   2. Compute `secondsUntilReset = reset_ts - now`. Add a 60 s buffer so the wake-up lands *after* the reset, not on its edge.
-  3. `ScheduleWakeup` with `delaySeconds = min(secondsUntilReset + 60, 3300)` (ScheduleWakeup is clamped to ≤ 3600; 3300 leaves headroom), `prompt = "/auto-engineer"`, `reason = "auto-engineer: paused for quota reset at <ts>"`.
-  4. End the turn.
+  3. **Compaction decision:**
+     - If `secondsUntilReset ≤ 90 min`: skip `/compact`. The wait is short enough that one or two un-compacted hops won't burn meaningful quota, and compaction itself costs tokens we want to save.
+     - If `secondsUntilReset > 90 min`: run `/compact` *first*. Otherwise the un-compacted context idles through many 55-min hops and each tick pays full token cost for a large prompt — the compaction one-time cost amortizes.
+  4. `ScheduleWakeup` with `delaySeconds = min(secondsUntilReset + 60, 3300)` (ScheduleWakeup is clamped to ≤ 3600; 3300 leaves headroom), `prompt = "/auto-engineer --iteration <N>"` (preserve the current iteration count), `reason = "auto-engineer: paused for quota reset at <ts>"`.
+  5. End the turn.
 
 When the wake fires, auto-engineer re-enters from step 1. If quota is still < 10% (e.g. because the reset was > 55 min out and we just slept one hop), step 9 will trip again and schedule another hop — the loop naturally chains until the reset actually happens.
-
-**Do not** compact before a quota wait — compaction itself costs tokens, and we want to preserve budget for the next real cycle.
 
 ### 10. Compact and re-enter
 
 If iteration budget not exhausted and no stop condition tripped:
 
 1. Run `/compact` to shrink the context before the next cycle. **Do not** use `/clear` — it wipes the iteration counter, the list of issues already tried this run, and any stop-reason history auto-engineer uses to avoid repeating itself. `/compact` summarizes instead, which is what we want.
-2. Schedule the next cycle:
+2. Schedule the next cycle with the iteration counter incremented:
    ```
    ScheduleWakeup(
      delaySeconds=60,
-     prompt="/auto-engineer",
+     prompt="/auto-engineer --iteration <N+1>",
      reason="auto-engineer: next cycle (iteration N+1 of 8)"
    )
    ```
+   The `--iteration` flag is what enforces the 8-cycle cap across `/compact` boundaries — don't omit it.
 3. End the turn. The next wake-up re-enters this skill from step 1.
 
 ## Stopping
