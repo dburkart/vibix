@@ -50,4 +50,9 @@ pub fn init() {
 
     heap::init();
     crate::arch::x86_64::ist_guard::install();
+
+    // Build a clean kernel-owned PML4 from the now-populated mapper
+    // state and swap CR3 to it. After this point, Limine's original
+    // page-table tree is no longer reachable.
+    paging::build_and_switch_kernel_pml4();
 }

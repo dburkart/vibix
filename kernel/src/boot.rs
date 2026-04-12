@@ -3,8 +3,8 @@
 //! take control.
 
 use limine::request::{
-    FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
-    StackSizeRequest,
+    ExecutableAddressRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest,
+    RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
 };
 use limine::BaseRevision;
 
@@ -30,6 +30,10 @@ pub static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 pub static STACK_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(STACK_SIZE);
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 #[used]
 #[link_section = ".limine_requests_start"]
