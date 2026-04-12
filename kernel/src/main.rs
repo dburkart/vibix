@@ -93,11 +93,22 @@ pub extern "C" fn _start() -> ! {
     x86_64::instructions::interrupts::enable();
     serial_println!("interrupts enabled");
 
+    vibix::task::init();
+    vibix::task::spawn(idle_task);
+
     loop {
+        vibix::task::yield_now();
         match vibix::input::read_key() {
             pc_keyboard::DecodedKey::Unicode(c) => serial_print!("{}", c),
             pc_keyboard::DecodedKey::RawKey(key) => serial_print!("[{:?}]", key),
         }
+    }
+}
+
+fn idle_task() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+        vibix::task::yield_now();
     }
 }
 
