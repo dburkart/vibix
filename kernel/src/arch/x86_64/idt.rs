@@ -58,11 +58,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
         use crate::test_harness::{exit_qemu, QemuExitCode};
         if addr_u64 == expected {
-            serial_println!(
-                "#PF oracle matched addr={:#x} code={:?}",
-                expected,
-                code
-            );
+            serial_println!("#PF oracle matched addr={:#x} code={:?}", expected, code);
             exit_qemu(QemuExitCode::Success);
         } else {
             serial_println!(
