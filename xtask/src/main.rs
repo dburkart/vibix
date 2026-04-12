@@ -240,7 +240,10 @@ fn embed_ksymtab(kernel: &Path) -> R<()> {
         if addr == 0 {
             continue;
         }
-        syms.push((addr, name.to_string()));
+        // `{:#}` strips the trailing disambiguator hash — the goal is readable
+        // names in backtraces, not round-trippable ones, and dropping the hash
+        // saves ~17 bytes per Rust symbol in the strtab.
+        syms.push((addr, format!("{:#}", rustc_demangle::demangle(name))));
     }
     syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
     syms.dedup_by(|a, b| a.0 == b.0);
@@ -611,5 +614,32 @@ fn check(status: ExitStatus) -> R<()> {
         Ok(())
     } else {
         Err(format!("command failed: {status}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn demangles_legacy_rust_symbol() {
+        let out = format!(
+            "{:#}",
+            rustc_demangle::demangle("_ZN6kernel4main17h1234567890abcdefE")
+        );
+        assert_eq!(out, "kernel::main");
+    }
+
+    #[test]
+    fn demangles_v0_rust_symbol() {
+        // v0 mangling (RFC 2603), the default scheme in modern rustc.
+        let out = format!("{:#}", rustc_demangle::demangle("_RNvCs1234_6kernel4main"));
+        assert_eq!(out, "kernel::main");
+    }
+
+    #[test]
+    fn passes_through_non_rust_symbol() {
+        assert_eq!(
+            format!("{:#}", rustc_demangle::demangle("memcpy")),
+            "memcpy"
+        );
     }
 }
