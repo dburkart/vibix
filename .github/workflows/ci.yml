@@ -42,8 +42,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Kernel clippy requires --target x86_64-unknown-none + -Z build-std,
+      # which isn't wired through xtask yet. Scope clippy to the host-crate
+      # (xtask) for now; kernel clippy is a follow-up.
+      - name: cargo clippy (xtask)
+        run: cargo clippy -p xtask --all-targets -- -D warnings
 
       - name: cargo xtask test
         run: cargo xtask test

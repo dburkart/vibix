@@ -13,7 +13,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_error);
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
-    idt.general_protection_fault.set_handler_fn(general_protection);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection);
     idt.page_fault.set_handler_fn(page_fault);
     unsafe {
         idt.double_fault

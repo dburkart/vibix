@@ -27,9 +27,8 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 fn run_tests() {
-    let tests: &[(&str, &dyn Testable)] = &[
-        ("map_roundtrip_unmap", &(map_roundtrip_unmap as fn())),
-    ];
+    let tests: &[(&str, &dyn Testable)] =
+        &[("map_roundtrip_unmap", &(map_roundtrip_unmap as fn()))];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
         serial_println!("test {name}");

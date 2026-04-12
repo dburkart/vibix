@@ -53,26 +53,39 @@ fn main() -> R<()> {
     let release = take_flag(&mut args, "--release");
     let fault_test = take_flag(&mut args, "--fault-test");
 
-    let cmd = args.get(0).map(String::as_str).unwrap_or("run").to_string();
+    let cmd = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("run")
+        .to_string();
     let rest: Vec<String> = args.into_iter().skip(1).collect();
-    let opts = BuildOpts { release, fault_test };
+    let opts = BuildOpts {
+        release,
+        fault_test,
+    };
 
     match cmd.as_str() {
-        "build" => { build(&opts)?; }
-        "iso" => { iso(&opts)?; }
-        "run" => { run(&opts)?; }
+        "build" => {
+            build(&opts)?;
+        }
+        "iso" => {
+            iso(&opts)?;
+        }
+        "run" => {
+            run(&opts)?;
+        }
         "test" => test_all()?,
         "test-runner" => {
-            let kernel = rest
-                .first()
-                .ok_or("test-runner: missing kernel ELF path")?;
+            let kernel = rest.first().ok_or("test-runner: missing kernel ELF path")?;
             test_runner(Path::new(kernel))?;
         }
         "smoke" => smoke(&opts)?,
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: cargo xtask [build|iso|run|test|smoke|clean] [--release] [--fault-test]");
+            eprintln!(
+                "usage: cargo xtask [build|iso|run|test|smoke|clean] [--release] [--fault-test]"
+            );
             std::process::exit(2);
         }
     }
@@ -113,11 +126,16 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
         .arg("build")
-        .arg("--package").arg("vibix")
-        .arg("--bin").arg("vibix")
-        .arg("--target").arg("x86_64-unknown-none")
-        .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
-        .arg("-Z").arg("build-std-features=compiler-builtins-mem");
+        .arg("--package")
+        .arg("vibix")
+        .arg("--bin")
+        .arg("vibix")
+        .arg("--target")
+        .arg("x86_64-unknown-none")
+        .arg("-Z")
+        .arg("build-std=core,compiler_builtins,alloc")
+        .arg("-Z")
+        .arg("build-std-features=compiler-builtins-mem");
     if opts.release {
         cmd.arg("--release");
     }
@@ -139,10 +157,12 @@ fn ensure_limine() -> R<PathBuf> {
     }
     fs::create_dir_all(root.parent().unwrap())?;
     println!("→ cloning limine {LIMINE_TAG}");
-    check(Command::new("git")
-        .args(["clone", "--depth=1", "--branch", LIMINE_TAG, LIMINE_REPO])
-        .arg(&root)
-        .status()?)?;
+    check(
+        Command::new("git")
+            .args(["clone", "--depth=1", "--branch", LIMINE_TAG, LIMINE_REPO])
+            .arg(&root)
+            .status()?,
+    )?;
     check(Command::new("make").arg("-C").arg(&root).status()?)?;
     Ok(root)
 }
@@ -162,26 +182,52 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),
     )?;
-    for f in ["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"] {
+    for f in [
+        "limine-bios.sys",
+        "limine-bios-cd.bin",
+        "limine-uefi-cd.bin",
+    ] {
         fs::copy(limine.join(f), iso_root.join("boot/limine").join(f))?;
     }
-    fs::copy(limine.join("BOOTX64.EFI"), iso_root.join("EFI/BOOT/BOOTX64.EFI"))?;
+    fs::copy(
+        limine.join("BOOTX64.EFI"),
+        iso_root.join("EFI/BOOT/BOOTX64.EFI"),
+    )?;
 
     fs::create_dir_all(iso_out.parent().unwrap())?;
-    check(Command::new("xorriso")
-        .args(["-as", "mkisofs", "-b", "boot/limine/limine-bios-cd.bin",
-               "-no-emul-boot", "-boot-load-size", "4", "-boot-info-table",
-               "--efi-boot", "boot/limine/limine-uefi-cd.bin",
-               "-efi-boot-part", "--efi-boot-image", "--protective-msdos-label"])
-        .arg(&iso_root)
-        .arg("-o").arg(iso_out)
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status()?)?;
+    check(
+        Command::new("xorriso")
+            .args([
+                "-as",
+                "mkisofs",
+                "-b",
+                "boot/limine/limine-bios-cd.bin",
+                "-no-emul-boot",
+                "-boot-load-size",
+                "4",
+                "-boot-info-table",
+                "--efi-boot",
+                "boot/limine/limine-uefi-cd.bin",
+                "-efi-boot-part",
+                "--efi-boot-image",
+                "--protective-msdos-label",
+            ])
+            .arg(&iso_root)
+            .arg("-o")
+            .arg(iso_out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?,
+    )?;
 
-    check(Command::new(limine.join("limine"))
-        .arg("bios-install").arg(iso_out)
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status()?)?;
+    check(
+        Command::new(limine.join("limine"))
+            .arg("bios-install")
+            .arg(iso_out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?,
+    )?;
 
     Ok(())
 }
@@ -197,11 +243,20 @@ fn iso(opts: &BuildOpts) -> R<PathBuf> {
 fn run(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
     let status = Command::new("qemu-system-x86_64")
-        .args(["-M", "q35", "-m", "256M",
-               "-serial", "stdio",
-               "-no-reboot", "-no-shutdown",
-               "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        .arg("-cdrom").arg(&iso)
+        .args([
+            "-M",
+            "q35",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .arg("-cdrom")
+        .arg(&iso)
         .status()?;
     match status.code() {
         Some(c) if c == QEMU_EXIT_FAILURE => Err("kernel panic — see serial log above".into()),
@@ -218,21 +273,28 @@ fn run(opts: &BuildOpts) -> R<()> {
 /// the exit-code protocol (Success=65, Failure=33).
 fn test_runner(kernel: &Path) -> R<()> {
     let name = kernel.file_name().unwrap().to_string_lossy();
-    let iso = workspace_root()
-        .join("target")
-        .join(format!("{name}.iso"));
+    let iso = workspace_root().join("target").join(format!("{name}.iso"));
     make_iso(kernel, &iso, &format!("iso_{name}"))?;
 
     eprintln!("▶ {}", name);
     // Note: no `-no-shutdown` here — it would prevent `isa-debug-exit`
     // from actually terminating QEMU, defeating the exit-code protocol.
     let mut child = Command::new("qemu-system-x86_64")
-        .args(["-M", "q35", "-m", "256M",
-               "-serial", "stdio",
-               "-display", "none",
-               "-no-reboot",
-               "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        .arg("-cdrom").arg(&iso)
+        .args([
+            "-M",
+            "q35",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .arg("-cdrom")
+        .arg(&iso)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
@@ -242,9 +304,7 @@ fn test_runner(kernel: &Path) -> R<()> {
         if let Some(status) = child.try_wait()? {
             return match status.code() {
                 Some(c) if c == QEMU_EXIT_SUCCESS => Ok(()),
-                Some(c) if c == QEMU_EXIT_FAILURE => {
-                    Err(format!("test {name} failed").into())
-                }
+                Some(c) if c == QEMU_EXIT_FAILURE => Err(format!("test {name} failed").into()),
                 other => Err(format!("test {name}: unexpected qemu exit {other:?}").into()),
             };
         }
@@ -259,10 +319,12 @@ fn test_runner(kernel: &Path) -> R<()> {
 fn test_all() -> R<()> {
     // Host unit tests (--lib only; pure-logic modules).
     println!("→ host unit tests");
-    check(Command::new("cargo")
-        .current_dir(workspace_root())
-        .args(["test", "--package", "vibix", "--lib"])
-        .status()?)?;
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["test", "--package", "vibix", "--lib"])
+            .status()?,
+    )?;
 
     // QEMU integration tests. Each is invoked by name so cargo doesn't
     // also try to build the lib's no_std test harness (which would
@@ -270,14 +332,24 @@ fn test_all() -> R<()> {
     // `test-runner <binary>` per compiled test.
     println!("→ integration tests under QEMU");
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(workspace_root())
-        .args([
-            "test", "--package", "vibix",
-            "--target", "x86_64-unknown-none",
-            "-Z", "build-std=core,compiler_builtins,alloc",
-            "-Z", "build-std-features=compiler-builtins-mem",
-        ]);
-    for t in ["basic_boot", "heap_alloc", "should_panic", "timer_tick", "paging"] {
+    cmd.current_dir(workspace_root()).args([
+        "test",
+        "--package",
+        "vibix",
+        "--target",
+        "x86_64-unknown-none",
+        "-Z",
+        "build-std=core,compiler_builtins,alloc",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+    ]);
+    for t in [
+        "basic_boot",
+        "heap_alloc",
+        "should_panic",
+        "timer_tick",
+        "paging",
+    ] {
         cmd.arg("--test").arg(t);
     }
     check(cmd.status()?)?;
@@ -291,12 +363,22 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     // We run QEMU with serial to stdio, capture output, then kill after
     // a short delay — the kernel halts in hlt_loop forever.
     let child = Command::new("qemu-system-x86_64")
-        .args(["-M", "q35", "-m", "256M",
-               "-serial", "stdio",
-               "-display", "none",
-               "-no-reboot", "-no-shutdown",
-               "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        .arg("-cdrom").arg(&iso)
+        .args([
+            "-M",
+            "q35",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .arg("-cdrom")
+        .arg(&iso)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -305,7 +387,9 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let reader_handle = std::thread::spawn(move || -> std::io::Result<String> {
         use std::io::Read;
         let mut out = String::new();
-        if let Some(mut s) = child.stdout { s.read_to_string(&mut out)?; }
+        if let Some(mut s) = child.stdout {
+            s.read_to_string(&mut out)?;
+        }
         Ok(out)
     });
 
@@ -313,7 +397,9 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     // Kill QEMU so the reader thread can drain and return.
     let _ = Command::new("kill").arg(pid.to_string()).status();
 
-    let output = reader_handle.join().map_err(|_| "reader thread panicked")??;
+    let output = reader_handle
+        .join()
+        .map_err(|_| "reader thread panicked")??;
 
     let mut missing = Vec::new();
     for m in SMOKE_MARKERS {
@@ -333,7 +419,12 @@ fn smoke(opts: &BuildOpts) -> R<()> {
 fn clean() -> R<()> {
     let _ = fs::remove_dir_all(workspace_root().join("target"));
     let _ = fs::remove_dir_all(workspace_root().join("build"));
-    check(Command::new("cargo").current_dir(workspace_root()).arg("clean").status()?)?;
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .arg("clean")
+            .status()?,
+    )?;
     Ok(())
 }
 
