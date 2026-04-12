@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod input;
+pub mod klog;
 pub mod mem;
 
 #[cfg(target_os = "none")]

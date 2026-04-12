@@ -124,5 +124,8 @@ fn idle_task() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
+    serial_println!("--- kernel log tail ---");
+    vibix::klog::dump_tail_to_serial(32);
+    serial_println!("--- end kernel log ---");
     exit_qemu(QemuExitCode::Failure)
 }
