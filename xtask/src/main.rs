@@ -154,7 +154,129 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     if !bin.exists() {
         return Err(format!("kernel binary missing at {}", bin.display()).into());
     }
+    strip_debug(&bin)?;
+    embed_ksymtab(&bin)?;
     Ok(bin)
+}
+
+/// Strip DWARF debug sections from the kernel ELF. Without this, rust-lld
+/// leaves `.debug_*` sections as orphans at VMA 0 which get pulled into
+/// the rodata PT_LOAD segment's bounding box, computing a ~2 GiB MemSiz
+/// that wraps past the kernel/user boundary and makes Limine reject the
+/// image ("No higher half PHDRs exist"). `/DISCARD/` in the linker script
+/// doesn't catch them reliably here, so strip post-link.
+fn strip_debug(kernel: &Path) -> R<()> {
+    let status = Command::new("objcopy")
+        .arg("--strip-debug")
+        .arg(kernel)
+        .status()?;
+    check(status)?;
+    Ok(())
+}
+
+/// Post-link step: read the freshly-linked ELF's own symbol table and
+/// patch a compact (addr → name) blob into the reserved `.ksymtab`
+/// section in-place. The kernel's runtime resolver parses it directly
+/// through the linker-provided bounds, giving backtraces symbol names
+/// without a second link pass.
+fn embed_ksymtab(kernel: &Path) -> R<()> {
+    use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+    use std::io::{Seek, SeekFrom, Write};
+
+    let bytes = fs::read(kernel)?;
+    let obj = object::File::parse(&*bytes)?;
+
+    // Locate the reservation by symbol, not by section. We used to own a
+    // dedicated `.ksymtab` output section, but that tripped rust-lld into
+    // grouping `.data`/`.bss` under the read-only rodata PT_LOAD. Riding
+    // in `.rodata` keeps the layout sane; we just need to convert the
+    // reservation's VMA into a file offset via its containing section.
+    let rsv = obj
+        .symbols()
+        .find(|s| s.name().map(|n| n == "KSYMTAB_RESERVATION").unwrap_or(false))
+        .ok_or("KSYMTAB_RESERVATION symbol not found in kernel ELF")?;
+    let rsv_vma = rsv.address();
+    let rsv_size = rsv.size() as usize;
+    if rsv_size == 0 {
+        return Err("KSYMTAB_RESERVATION has zero size".into());
+    }
+    let section = obj
+        .sections()
+        .find(|s| {
+            let (addr, size) = (s.address(), s.size());
+            rsv_vma >= addr && rsv_vma + rsv_size as u64 <= addr + size
+        })
+        .ok_or("no section contains KSYMTAB_RESERVATION")?;
+    let (sec_file_off, _sec_file_size) = section
+        .file_range()
+        .ok_or("section containing KSYMTAB_RESERVATION has no file bytes")?;
+    let sec_off = sec_file_off + (rsv_vma - section.address());
+    let sec_size = rsv_size;
+
+    // Collect text-kind symbols with non-empty names. We keep all
+    // function-like symbols, including compiler-generated ones —
+    // names help even when they're mangled.
+    let mut syms: Vec<(u64, String)> = Vec::new();
+    for sym in obj.symbols() {
+        if !matches!(sym.kind(), SymbolKind::Text | SymbolKind::Unknown) {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let addr = sym.address();
+        if addr == 0 {
+            continue;
+        }
+        syms.push((addr, name.to_string()));
+    }
+    syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    syms.dedup_by(|a, b| a.0 == b.0);
+
+    const HEADER_SIZE: usize = 20;
+    const ENTRY_SIZE: usize = 16;
+
+    let mut entries = Vec::with_capacity(syms.len() * ENTRY_SIZE);
+    let mut strtab = Vec::<u8>::with_capacity(syms.len() * 24);
+    for (addr, name) in &syms {
+        let name_off = strtab.len() as u32;
+        let name_len = name.len() as u32;
+        strtab.extend_from_slice(name.as_bytes());
+        entries.extend_from_slice(&addr.to_le_bytes());
+        entries.extend_from_slice(&name_off.to_le_bytes());
+        entries.extend_from_slice(&name_len.to_le_bytes());
+    }
+
+    let str_off = (HEADER_SIZE + entries.len()) as u32;
+    let str_len = strtab.len() as u32;
+    let count = syms.len() as u32;
+    let used = HEADER_SIZE + entries.len() + strtab.len();
+
+    if used > sec_size {
+        return Err(format!(
+            "ksymtab blob {used} bytes exceeds reservation {sec_size}; bump KSYMTAB_BYTES"
+        )
+        .into());
+    }
+
+    let mut blob = vec![0u8; sec_size];
+    blob[0..4].copy_from_slice(b"KSYM");
+    blob[4] = 1; // version
+    blob[8..12].copy_from_slice(&count.to_le_bytes());
+    blob[12..16].copy_from_slice(&str_off.to_le_bytes());
+    blob[16..20].copy_from_slice(&str_len.to_le_bytes());
+    blob[HEADER_SIZE..HEADER_SIZE + entries.len()].copy_from_slice(&entries);
+    let str_start = HEADER_SIZE + entries.len();
+    blob[str_start..str_start + strtab.len()].copy_from_slice(&strtab);
+
+    drop(obj);
+    let mut f = fs::OpenOptions::new().write(true).open(kernel)?;
+    f.seek(SeekFrom::Start(sec_off))?;
+    f.write_all(&blob)?;
+
+    println!("→ ksymtab: {count} symbols, {used}/{sec_size} bytes");
+    Ok(())
 }
 
 fn ensure_limine() -> R<PathBuf> {
@@ -280,6 +402,9 @@ fn run(opts: &BuildOpts) -> R<()> {
 /// the exit-code protocol (Success=65, Failure=33).
 fn test_runner(kernel: &Path) -> R<()> {
     let name = kernel.file_name().unwrap().to_string_lossy();
+    // Patch the freshly-built test ELF's .ksymtab so backtraces in
+    // integration tests resolve to names.
+    embed_ksymtab(kernel)?;
     let iso = workspace_root().join("target").join(format!("{name}.iso"));
     make_iso(kernel, &iso, &format!("iso_{name}"))?;
 
@@ -352,6 +477,7 @@ fn test_all() -> R<()> {
         "tasks",
         "preempt",
         "apic_online",
+        "backtrace",
     ] {
         cmd.arg("--test").arg(t);
     }

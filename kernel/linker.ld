@@ -51,6 +51,15 @@ SECTIONS
         *(.dynamic)
     } :data :dynamic
 
+    /*
+     * The 256 KiB ksymtab reservation lives as a plain static in
+     * `.rodata` — no custom output section. Giving it its own output
+     * section tripped rust-lld into merging `.data`/`.bss` into the
+     * read-only rodata PT_LOAD, leaving writable globals mapped RO.
+     * xtask locates the reservation by symbol address and patches it
+     * post-link; DWARF debug sections are stripped at the same step so
+     * they don't bloat the rodata PHDR's MemSiz into a 2 GiB wrap.
+     */
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)

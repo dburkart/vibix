@@ -124,6 +124,7 @@ fn idle_task() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
+    vibix::arch::backtrace::dump_to_serial(1);
     serial_println!("--- kernel log tail ---");
     vibix::klog::dump_tail_to_serial(32);
     serial_println!("--- end kernel log ---");
