@@ -3,7 +3,8 @@
 //! Walks an ordered slice of USABLE `Region`s, handing out 4 KiB frames
 //! in ascending physical order. Frames are never returned — this is a
 //! one-way allocator, appropriate for one-shot boot allocations (e.g.
-//! the kernel heap). A reclaiming allocator is a later milestone.
+//! the kernel heap and page-table pages). A reclaiming allocator is a
+//! later milestone.
 //!
 //! Kept free of `limine` and `x86_64` types so its bookkeeping can be
 //! unit-tested on the host.
@@ -80,6 +81,53 @@ impl<'a> BumpFrameAllocator<'a> {
 fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) & !(a - 1)
 }
+
+// --- Global allocator, populated at boot --------------------------------
+
+/// Maximum distinct USABLE regions we snapshot from the Limine memmap.
+/// QEMU's `q35` machine reports ~16 entries with a handful of USABLE —
+/// 64 is comfortable headroom for real hardware.
+pub const MAX_REGIONS: usize = 64;
+
+#[cfg(target_os = "none")]
+mod global {
+    use super::{BumpFrameAllocator, Region, MAX_REGIONS};
+    use crate::boot::MEMMAP_REQUEST;
+    use spin::{Mutex, Once};
+
+    /// Snapshot of USABLE regions taken once at boot. The trailing
+    /// `usize` is the number of populated entries.
+    static REGIONS: Once<([Region; MAX_REGIONS], usize)> = Once::new();
+    static ALLOCATOR: Once<Mutex<BumpFrameAllocator<'static>>> = Once::new();
+
+    pub fn init() {
+        let memmap = MEMMAP_REQUEST
+            .get_response()
+            .expect("Limine memory-map response missing");
+
+        let regions = REGIONS.call_once(|| {
+            let mut buf = [Region::new(0, 0); MAX_REGIONS];
+            let mut n = 0;
+            for entry in memmap.entries() {
+                if entry.entry_type == limine::memory_map::EntryType::USABLE {
+                    assert!(n < MAX_REGIONS, "more USABLE regions than MAX_REGIONS");
+                    buf[n] = Region::new(entry.base, entry.length);
+                    n += 1;
+                }
+            }
+            (buf, n)
+        });
+        let slice: &'static [Region] = &regions.0[..regions.1];
+        ALLOCATOR.call_once(|| Mutex::new(BumpFrameAllocator::new(slice)));
+    }
+
+    pub fn global() -> &'static Mutex<BumpFrameAllocator<'static>> {
+        ALLOCATOR.get().expect("frame::init not called")
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use global::{global, init};
 
 #[cfg(test)]
 mod tests {
