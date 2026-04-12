@@ -200,7 +200,11 @@ fn embed_ksymtab(kernel: &Path) -> R<()> {
     // reservation's VMA into a file offset via its containing section.
     let rsv = obj
         .symbols()
-        .find(|s| s.name().map(|n| n == "KSYMTAB_RESERVATION").unwrap_or(false))
+        .find(|s| {
+            s.name()
+                .map(|n| n == "KSYMTAB_RESERVATION")
+                .unwrap_or(false)
+        })
         .ok_or("KSYMTAB_RESERVATION symbol not found in kernel ELF")?;
     let rsv_vma = rsv.address();
     let rsv_size = rsv.size() as usize;
