@@ -47,6 +47,10 @@ static A: AtomicUsize = AtomicUsize::new(0);
 static B: AtomicUsize = AtomicUsize::new(0);
 const ROUNDS: usize = 50;
 
+// M5 has no task-exit primitive, so worker tasks that finish their
+// real work park in a yield loop. They stay in the ready queue for
+// subsequent tests in this binary — safe because later tests only
+// assert on counters/flags of their own, not on queue shape.
 fn task_a() -> ! {
     for _ in 0..ROUNDS {
         A.fetch_add(1, Ordering::SeqCst);

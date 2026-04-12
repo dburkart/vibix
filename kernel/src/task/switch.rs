@@ -23,6 +23,10 @@ unsafe extern "C" {
     /// - `next_rsp` must be a valid saved rsp produced either by a
     ///   prior `context_switch` or by `Task::new`'s stack priming.
     pub fn context_switch(prev_rsp: *mut usize, next_rsp: usize);
+
+    /// First-entry trampoline for a freshly primed task. The entry fn
+    /// pointer is passed in `r12`; the trampoline just `call`s it.
+    pub fn task_entry_trampoline();
 }
 
 global_asm!(
@@ -56,7 +60,3 @@ task_entry_trampoline:
     ud2
 "#
 );
-
-unsafe extern "C" {
-    pub fn task_entry_trampoline();
-}
