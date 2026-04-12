@@ -66,5 +66,9 @@ name = "preempt"
 harness = false
 
 [[test]]
+name = "pml4_switch"
+harness = false
+
+[[test]]
 name = "apic_online"
 harness = false
