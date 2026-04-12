@@ -100,7 +100,7 @@ Called from the timer ISR (with IRQs already masked by the interrupt gate):
 ### `task::find_stack_overflow(addr) -> Option<usize>`
 
 Lock-free check: given a fault address, determine whether it falls inside a
-kernel task's guard page. Returns the task ID (slot index + 1) if so. Called
+kernel task's guard page. Returns the slot index (zero-based) if so. Called
 from the `#PF` and `#DF` exception handlers.
 
 ## Constants
