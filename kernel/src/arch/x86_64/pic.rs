@@ -1,9 +1,10 @@
-//! Legacy 8259 PIC pair, remapped past the CPU exception vectors.
+//! Legacy 8259 PIC pair — remapped and then fully disabled.
 //!
-//! Vectors 0x00–0x1F are reserved for CPU exceptions, so we remap the
-//! master PIC to 0x20–0x27 and the slave to 0x28–0x2F. `init()` must
-//! run after the IDT is loaded so we don't take an IRQ into a stale
-//! handler; callers still gate `sti` until they're ready.
+//! The APIC (see `apic.rs`) drives interrupts on this kernel. We still
+//! run through the 8259 init sequence once at boot so any leftover IRQ
+//! lines raised by firmware land on our remapped (0x20+) vectors
+//! rather than smashing into CPU exception vectors, then we mask every
+//! line on both chips. EOI goes through the LAPIC now.
 
 use pic8259::ChainedPics;
 use spin::Mutex;
@@ -14,19 +15,18 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
-pub fn init() {
+pub fn init_and_disable() {
     let mut pics = PICS.lock();
     unsafe {
         pics.initialize();
-        // Unmask IRQ0 (timer) and IRQ1 (keyboard); keep everything else
-        // masked until we wire up a device for it.
-        pics.write_masks(0b1111_1100, 0b1111_1111);
+        // Mask every line — the IOAPIC routes IRQs now.
+        pics.write_masks(0xFF, 0xFF);
     }
-    crate::serial_println!("PIC remapped to {:#x}/{:#x}", PIC_1_OFFSET, PIC_2_OFFSET);
+    crate::serial_println!("PIC remapped to {:#x}/{:#x} and masked", PIC_1_OFFSET, PIC_2_OFFSET);
 }
 
-/// Safely notify end-of-interrupt for a vector previously raised by the
-/// PIC. Called from ISRs.
-pub fn notify_eoi(vector: u8) {
-    unsafe { PICS.lock().notify_end_of_interrupt(vector) };
+/// End-of-interrupt. Forwarded to the LAPIC — the 8259 is fully masked
+/// and never delivers here.
+pub fn notify_eoi(_vector: u8) {
+    super::apic::lapic_eoi();
 }

@@ -95,6 +95,43 @@ pub fn map_range(
     Ok(())
 }
 
+/// Map a physical range into the HHDM window with the given flags.
+///
+/// Limine's HHDM covers usable RAM by default, but physical regions
+/// we need to poke at (ACPI tables in reserved/ROM ranges, LAPIC /
+/// IOAPIC MMIO) aren't included. This installs a read/write mapping
+/// page-by-page at `hhdm_offset + phys` so callers can keep using the
+/// uniform phys→HHDM translation pattern. Re-mapping an already-mapped
+/// page is a no-op.
+pub fn map_phys_into_hhdm(
+    phys: u64,
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<(), MapToError<Size4KiB>> {
+    let start = phys & !0xFFF;
+    let end = (phys + size + 0xFFF) & !0xFFF;
+    let hhdm_offset = with_mapper(|m| m.phys_offset());
+    with_mapper(|m| {
+        let mut alloc = KernelFrameAllocator;
+        let mut addr = start;
+        while addr < end {
+            let page = Page::<Size4KiB>::containing_address(hhdm_offset + addr);
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(addr));
+            // SAFETY: caller is responsible for ensuring the physical
+            // range is safe to alias at this virtual address. For MMIO
+            // and firmware-provided ACPI tables the kernel is the sole
+            // user and we never hand these pages to the frame allocator.
+            match unsafe { m.map_to(page, frame, flags, &mut alloc) } {
+                Ok(flush) => flush.flush(),
+                Err(MapToError::PageAlreadyMapped(_)) => {}
+                Err(e) => return Err(e),
+            }
+            addr += 4096;
+        }
+        Ok(())
+    })
+}
+
 /// Unmap `page` and flush the TLB. The backing frame is leaked — we
 /// don't have a reclaiming frame allocator yet.
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
