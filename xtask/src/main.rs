@@ -342,6 +342,7 @@ fn test_all() -> R<()> {
     for t in [
         "basic_boot",
         "heap_alloc",
+        "heap_grow",
         "should_panic",
         "timer_tick",
         "paging",

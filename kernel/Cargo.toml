@@ -56,3 +56,7 @@ harness = false
 [[test]]
 name = "tasks"
 harness = false
+
+[[test]]
+name = "heap_grow"
+harness = false

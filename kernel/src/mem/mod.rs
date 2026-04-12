@@ -39,11 +39,15 @@ impl Region {
 #[cfg(target_os = "none")]
 pub fn init() {
     frame::init();
-    heap::init();
 
+    // Paging comes up before the heap now — `heap::init` maps its
+    // initial slab through `paging::map_range` instead of carving
+    // HHDM-addressed frames directly.
     let hhdm = crate::boot::HHDM_REQUEST
         .get_response()
         .expect("Limine HHDM response missing");
     paging::init(x86_64::VirtAddr::new(hhdm.offset()));
+
+    heap::init();
     crate::arch::x86_64::ist_guard::install();
 }
