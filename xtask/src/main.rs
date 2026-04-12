@@ -413,8 +413,10 @@ fn run(opts: &BuildOpts) -> R<()> {
 /// the exit-code protocol (Success=65, Failure=33).
 fn test_runner(kernel: &Path) -> R<()> {
     let name = kernel.file_name().unwrap().to_string_lossy();
-    // Patch the freshly-built test ELF's .ksymtab so backtraces in
-    // integration tests resolve to names.
+    // Mirror the build() post-link fixups so integration-test ELFs pass
+    // Limine's PHDR validation and their panic-path backtraces resolve
+    // to symbol names.
+    strip_debug(kernel)?;
     embed_ksymtab(kernel)?;
     let iso = workspace_root().join("target").join(format!("{name}.iso"));
     make_iso(kernel, &iso, &format!("iso_{name}"))?;

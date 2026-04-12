@@ -109,9 +109,12 @@ fn entries() -> Option<&'static [Entry]> {
     let blob = raw()?;
     let hdr = header()?;
     let count = { hdr.count } as usize;
+    // Checked arithmetic: a malformed blob can't be allowed to overflow
+    // the bounds math and trick us into a giant slice.
+    let entries_bytes = size_of::<Entry>().checked_mul(count)?;
     let entries_off = size_of::<Header>();
-    let entries_bytes = count * size_of::<Entry>();
-    if entries_off + entries_bytes > blob.len() {
+    let end = entries_off.checked_add(entries_bytes)?;
+    if end > blob.len() {
         return None;
     }
     // SAFETY: bounds checked above; Entry is repr(C, packed).

@@ -40,7 +40,10 @@ pub fn walk<F: FnMut(Frame)>(skip: usize, mut f: F) {
     }
     let mut emitted = 0usize;
     let mut skipped = 0usize;
-    while emitted < MAX_FRAMES {
+    // Cap on total frames *visited* (emitted + skipped). Bounding only
+    // emitted would let a large `skip` let us walk arbitrarily far into
+    // a corrupt chain.
+    while emitted + skipped < MAX_FRAMES {
         if !is_valid_rbp(rbp) {
             break;
         }
