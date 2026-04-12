@@ -6,9 +6,10 @@
 //! those are in place, [`build_and_switch_kernel_pml4`] constructs a
 //! clean tree that maps only what the kernel actually needs — kernel
 //! image per section with tight flags, HHDM via 2 MiB pages, heap, IST
-//! stack sans guard, framebuffer — and swaps CR3 to it. From that point
-//! on Limine's original tree is unreachable; actually freeing it (and
-//! the `BOOTLOADER_RECLAIMABLE` frames) is issue #46.
+//! stack sans guard, framebuffer (4 KiB PTEs with PAT=WC) — and swaps
+//! CR3 to it. From that point on Limine's original tree is unreachable;
+//! actually freeing it (and the `BOOTLOADER_RECLAIMABLE` frames) is
+//! issue #46.
 
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
@@ -228,18 +229,24 @@ pub fn build_and_switch_kernel_pml4() {
         clone_heap(&mut new_mapper, &mut alloc);
         clone_ist_stack(&mut new_mapper, &mut alloc);
         clone_boot_stack(&mut new_mapper, &mut alloc);
-        map_framebuffer(&mut new_mapper, &mut alloc);
+        map_framebuffer(&mut new_mapper, hhdm, &mut alloc);
     }
 
     // Atomic swap. IRQs off so no handler runs while CR3 and MAPPER
     // are in a mid-transition state. TLB is wholly flushed by the CR3
-    // load.
+    // load; WBINVD then drops any WB-cached lines (notably framebuffer
+    // pixels written through Limine's WB HHDM mapping) so that the new
+    // WC framebuffer mapping isn't silently clobbered by stale cache
+    // evictions.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let (_old, flags) = Cr3::read();
         unsafe { Cr3::write(new_pml4_frame, flags) };
         let l4 = unsafe { pml4_as_mut(new_pml4_frame, hhdm) };
         let mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
         *MAPPER.lock() = Some(mapper);
+        // SAFETY: WBINVD is serializing and has no operands. Safe to
+        // issue in kernel mode with IRQs off.
+        unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
     });
 
     serial_println!("paging: switched to kernel PML4");
@@ -298,9 +305,12 @@ fn populate_hhdm(
             EntryType::USABLE
             | EntryType::BOOTLOADER_RECLAIMABLE
             | EntryType::EXECUTABLE_AND_MODULES
-            | EntryType::FRAMEBUFFER
             | EntryType::ACPI_RECLAIMABLE
             | EntryType::ACPI_NVS => {}
+            // FRAMEBUFFER is intentionally excluded: it gets its own
+            // 4 KiB PTEs with PAT=WC installed by `map_framebuffer`.
+            // A 2 MiB HHDM huge page here would force WB cacheability
+            // on the same virtual range and defeat the point.
             _ => continue,
         }
         let start = entry.base & !(TWO_MIB - 1);
@@ -452,11 +462,104 @@ fn clone_boot_stack(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFra
     clone_range(mapper, alloc, base, top, flags);
 }
 
-fn map_framebuffer(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
-    // The framebuffer lives inside HHDM (Limine maps it there), and
-    // HHDM already covers every memory-map entry including
-    // `EntryType::FRAMEBUFFER`. Nothing to do beyond HHDM. Kept as a
-    // seam for later — direct non-HHDM framebuffer mapping (e.g. with
-    // write-combining) is a follow-up.
-    let _ = (mapper, alloc);
+/// Install the linear framebuffer at its HHDM VA with 4 KiB PTEs that
+/// select the WC slot we programmed in `pat::init`. `populate_hhdm`
+/// deliberately leaves FRAMEBUFFER memory-map entries uncovered so we
+/// can own those virtual pages here with the right memory type.
+fn map_framebuffer(
+    mapper: &mut OffsetPageTable<'static>,
+    hhdm: VirtAddr,
+    alloc: &mut KernelFrameAllocator,
+) {
+    use limine::memory_map::EntryType;
+
+    let memmap = crate::boot::MEMMAP_REQUEST
+        .get_response()
+        .expect("Limine memory-map response missing");
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+
+    for entry in memmap.entries() {
+        if entry.entry_type != EntryType::FRAMEBUFFER {
+            continue;
+        }
+        assert!(
+            entry.base & 0xFFF == 0 && entry.length & 0xFFF == 0,
+            "framebuffer range not 4 KiB-aligned: base={:#x} len={:#x}",
+            entry.base,
+            entry.length
+        );
+        let mut phys = entry.base;
+        let end = entry.base + entry.length;
+        while phys < end {
+            let page = Page::<Size4KiB>::containing_address(hhdm + phys);
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+            // SAFETY: fresh tree, not yet live. FRAMEBUFFER memory-map
+            // entries are carved out of HHDM coverage above, so no
+            // existing 2 MiB page straddles this range.
+            match unsafe { mapper.map_to(page, frame, flags, alloc) } {
+                Ok(f) => f.ignore(),
+                Err(e) => panic!("framebuffer WC map {:#x} failed: {:?}", phys, e),
+            }
+            // SAFETY: the mapping we just installed is the only
+            // reference to this PTE; OR-ing the PAT bit flips memory
+            // type from default (WB, slot 0) to WC (slot 4).
+            unsafe { set_pat_bit_4k(mapper, hhdm, page) };
+            phys += 4096;
+        }
+    }
+}
+
+/// OR the PAT bit (bit 7) onto the L1 entry backing `page` in
+/// `mapper`'s tree. Walks L4→L3→L2→L1 through the HHDM window.
+///
+/// # Safety
+/// `mapper`'s tree must be a well-formed 4-level tree reachable via
+/// `hhdm`, and `page` must already be mapped via 4 KiB PTEs (the walk
+/// panics on a huge-page parent, which would mean a broken invariant
+/// upstream in `populate_hhdm` — not a recoverable error).
+unsafe fn set_pat_bit_4k(
+    mapper: &mut OffsetPageTable<'static>,
+    hhdm: VirtAddr,
+    page: Page<Size4KiB>,
+) {
+    // SAFETY: the returned `&mut PageTable` aliases an HHDM view of a
+    // distinct physical frame (the child table), never `parent` itself,
+    // so no `&mut` overlap is created. Tying `'a` to `parent` keeps the
+    // borrow relationship explicit; taking `&'a mut` anchors the
+    // reborrow chain from the root `level_4_table()` down.
+    unsafe fn next_table<'a>(
+        parent: &'a mut PageTable,
+        index: x86_64::structures::paging::page_table::PageTableIndex,
+        hhdm: VirtAddr,
+    ) -> &'a mut PageTable {
+        let entry = &parent[index];
+        assert!(
+            !entry.flags().contains(PageTableFlags::HUGE_PAGE),
+            "set_pat_bit_4k: walked into a huge-page parent"
+        );
+        let phys = entry
+            .frame()
+            .expect("set_pat_bit_4k: missing table")
+            .start_address();
+        let virt = hhdm + phys.as_u64();
+        // SAFETY: page-table frames reached via HHDM, exclusive access
+        // granted by the caller's `&mut OffsetPageTable`.
+        unsafe { &mut *(virt.as_mut_ptr::<PageTable>()) }
+    }
+
+    let l4 = mapper.level_4_table_mut();
+    // SAFETY: `next_table` is unsafe by signature (raw pointer deref into
+    // HHDM). Each call walks to a distinct child table frame, so the
+    // &'a mut reborrow chain doesn't alias.
+    let l3 = unsafe { next_table(l4, page.p4_index(), hhdm) };
+    let l2 = unsafe { next_table(l3, page.p3_index(), hhdm) };
+    let l1 = unsafe { next_table(l2, page.p2_index(), hhdm) };
+    let entry = &mut l1[page.p1_index()];
+    let ptr = entry as *mut _ as *mut u64;
+    // SAFETY: `entry` is a live &mut reference; writing through its raw
+    // pointer is fine and avoids the `x86_64` crate's flag validation.
+    unsafe {
+        ptr.write_volatile(ptr.read_volatile() | super::pat::PAT_BIT_4K);
+    }
 }
