@@ -346,6 +346,7 @@ fn test_all() -> R<()> {
         "timer_tick",
         "paging",
         "tasks",
+        "preempt",
     ] {
         cmd.arg("--test").arg(t);
     }

@@ -25,7 +25,12 @@ impl InterruptIndex {
 
 pub extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
     crate::time::on_tick();
+    // EOI before any attempt to preempt. If we switched to another
+    // task first and *that* task ever re-entered this ISR, the PIC
+    // would be carrying an un-acked IRQ and subsequent ticks would
+    // stall.
     notify_eoi(InterruptIndex::Timer.as_u8());
+    crate::task::preempt_tick();
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {

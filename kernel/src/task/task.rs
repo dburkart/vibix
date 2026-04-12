@@ -7,6 +7,7 @@ use alloc::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use alloc::boxed::Box;
 
 use super::switch::task_entry_trampoline;
+use super::DEFAULT_SLICE_MS;
 
 /// 16 KiB per task — plenty for the handful of kernel frames
 /// cooperative tasks build up between `yield_now()` calls. Aligned to
@@ -24,6 +25,11 @@ pub(super) struct Task {
     /// `0` is a sentinel meaning "not yet saved" — legal only for the
     /// bootstrap task before its first yield.
     pub rsp: usize,
+    /// Milliseconds left in this task's current CPU slice. The PIT ISR
+    /// decrements this by `TICK_MS`; when it hits zero the task rotates
+    /// to the back of the ready queue and the counter is reloaded from
+    /// `DEFAULT_SLICE_MS`.
+    pub slice_remaining_ms: u32,
 }
 
 impl Task {
@@ -34,6 +40,7 @@ impl Task {
         Self {
             _stack: None,
             rsp: 0,
+            slice_remaining_ms: DEFAULT_SLICE_MS,
         }
     }
 
@@ -81,6 +88,7 @@ impl Task {
         Self {
             _stack: Some(stack),
             rsp,
+            slice_remaining_ms: DEFAULT_SLICE_MS,
         }
     }
 }
