@@ -57,9 +57,14 @@ impl GrowingHeap {
 
     /// Map the next `GROW_CHUNK_BYTES` (or less if we're bumping the
     /// cap) past the current top and call `Heap::extend`. Returns false
-    /// if we're already at the cap or the map failed.
-    fn grow(&self) -> bool {
-        let _g = self.grow_lock.lock();
+    /// if we're already at the cap or no pages could be mapped.
+    ///
+    /// Must be called with `grow_lock` held. Maps page-by-page so that
+    /// if the frame allocator fails partway through we still extend the
+    /// heap by the successful prefix rather than leaking those frames
+    /// and leaving the heap permanently stuck (`paging::map_range`
+    /// documents that earlier pages stay mapped on partial failure).
+    fn grow_locked(&self) -> bool {
         let mapped = self.mapped.load(Ordering::Acquire);
         if mapped >= HEAP_MAX_SIZE {
             return false;
@@ -68,19 +73,26 @@ impl GrowingHeap {
         let chunk = GROW_CHUNK_BYTES.min(remaining);
         let start = VirtAddr::new((HEAP_BASE + mapped) as u64);
         let frames = (chunk as u64) / FRAME_SIZE;
-        if paging::map_range(
-            start,
-            frames,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        )
-        .is_err()
-        {
+        let mut grown: usize = 0;
+        for i in 0..frames {
+            if paging::map_range(
+                start + i * FRAME_SIZE,
+                1,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            )
+            .is_err()
+            {
+                break;
+            }
+            grown += FRAME_SIZE as usize;
+        }
+        if grown == 0 {
             return false;
         }
-        // SAFETY: just mapped `chunk` bytes contiguous with the current
+        // SAFETY: `grown` bytes were mapped contiguously at the current
         // heap top; they're owned by the heap from here on.
-        unsafe { self.inner.lock().extend(chunk) };
-        self.mapped.fetch_add(chunk, Ordering::Release);
+        unsafe { self.inner.lock().extend(grown) };
+        self.mapped.fetch_add(grown, Ordering::Release);
         true
     }
 }
@@ -92,7 +104,16 @@ unsafe impl GlobalAlloc for GrowingHeap {
             if !p.is_null() {
                 return p;
             }
-            if !self.grow() {
+            // Double-checked: take the grow lock, then re-try the alloc
+            // before growing. Without this, two threads that both see
+            // null can each call `grow_locked` serially and burn two
+            // chunks of the 16 MiB cap when one would have sufficed.
+            let _g = self.grow_lock.lock();
+            let p = self.inner.alloc(layout);
+            if !p.is_null() {
+                return p;
+            }
+            if !self.grow_locked() {
                 return ptr::null_mut();
             }
         }
