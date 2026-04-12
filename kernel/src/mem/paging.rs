@@ -120,8 +120,8 @@ pub fn map_phys_into_hhdm(
         .and_then(|v| v.checked_add(0x1000))
         .expect("map_phys_into_hhdm: physical range overflow")
         & !0xFFF;
-    let hhdm_offset = with_mapper(|m| m.phys_offset());
     with_mapper(|m| {
+        let hhdm_offset = m.phys_offset();
         let mut alloc = KernelFrameAllocator;
         let mut addr = start;
         while addr < end {
