@@ -246,10 +246,14 @@ pub fn drain_to<W: Write>(w: &mut W) -> fmt::Result {
 
 /// Dump the last `n` records to `w`. Use from the panic handler.
 pub fn tail_to<W: Write>(w: &mut W, n: usize) -> fmt::Result {
-    let total = with_ring(|r| r.record_count());
-    let skip = total.saturating_sub(n);
     let mut err: fmt::Result = Ok(());
     with_ring(|r| {
+        // Count + iterate under the same lock: a split across two
+        // `with_ring` calls would let an ISR push + evict between them,
+        // making `skip` larger than the post-eviction record count and
+        // producing an empty tail right when we need it most (panic).
+        let total = r.record_count();
+        let skip = total.saturating_sub(n);
         let mut i = 0usize;
         r.for_each(|lvl, payload| {
             if err.is_err() {
