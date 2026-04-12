@@ -69,9 +69,8 @@ pub extern "C" fn _start() -> ! {
                 fb.pitch()
             );
             if fb.bpp() == 32 {
-                let console = unsafe {
-                    Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch())
-                };
+                let console =
+                    unsafe { Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch()) };
                 framebuffer::init(console);
                 println!("vibix: framebuffer online");
             } else {
