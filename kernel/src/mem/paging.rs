@@ -523,8 +523,13 @@ unsafe fn set_pat_bit_4k(
     hhdm: VirtAddr,
     page: Page<Size4KiB>,
 ) {
-    fn next_table<'a>(
-        parent: &PageTable,
+    // SAFETY: the returned `&mut PageTable` aliases an HHDM view of a
+    // distinct physical frame (the child table), never `parent` itself,
+    // so no `&mut` overlap is created. Tying `'a` to `parent` keeps the
+    // borrow relationship explicit; taking `&'a mut` anchors the
+    // reborrow chain from the root `level_4_table()` down.
+    unsafe fn next_table<'a>(
+        parent: &'a mut PageTable,
         index: x86_64::structures::paging::page_table::PageTableIndex,
         hhdm: VirtAddr,
     ) -> &'a mut PageTable {
@@ -543,10 +548,13 @@ unsafe fn set_pat_bit_4k(
         unsafe { &mut *(virt.as_mut_ptr::<PageTable>()) }
     }
 
-    let l4 = mapper.level_4_table();
-    let l3 = next_table(l4, page.p4_index(), hhdm);
-    let l2 = next_table(l3, page.p3_index(), hhdm);
-    let l1 = next_table(l2, page.p2_index(), hhdm);
+    let l4 = mapper.level_4_table_mut();
+    // SAFETY: `next_table` is unsafe by signature (raw pointer deref into
+    // HHDM). Each call walks to a distinct child table frame, so the
+    // &'a mut reborrow chain doesn't alias.
+    let l3 = unsafe { next_table(l4, page.p4_index(), hhdm) };
+    let l2 = unsafe { next_table(l3, page.p3_index(), hhdm) };
+    let l1 = unsafe { next_table(l2, page.p2_index(), hhdm) };
     let entry = &mut l1[page.p1_index()];
     let ptr = entry as *mut _ as *mut u64;
     // SAFETY: `entry` is a live &mut reference; writing through its raw
