@@ -34,8 +34,14 @@ pub const PAT_BIT_4K: u64 = 1 << 7;
 /// Reprogram IA32_PAT so slot 4 = WC. Must run on every CPU that will
 /// use WC mappings; today that's just the BSP.
 pub fn init() {
-    let pat = WB | (WT << 8) | (UC_MINUS << 16) | (UC << 24)
-        | (WC << 32) | (WT << 40) | (UC_MINUS << 48) | (UC << 56);
+    let pat = WB
+        | (WT << 8)
+        | (UC_MINUS << 16)
+        | (UC << 24)
+        | (WC << 32)
+        | (WT << 40)
+        | (UC_MINUS << 48)
+        | (UC << 56);
 
     // SAFETY: writing architecturally defined memory-type encodings to
     // IA32_PAT. No existing PTE sets the PAT bit, so slot 4's change

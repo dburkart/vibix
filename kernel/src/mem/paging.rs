@@ -533,7 +533,10 @@ unsafe fn set_pat_bit_4k(
             !entry.flags().contains(PageTableFlags::HUGE_PAGE),
             "set_pat_bit_4k: walked into a huge-page parent"
         );
-        let phys = entry.frame().expect("set_pat_bit_4k: missing table").start_address();
+        let phys = entry
+            .frame()
+            .expect("set_pat_bit_4k: missing table")
+            .start_address();
         let virt = hhdm + phys.as_u64();
         // SAFETY: page-table frames reached via HHDM, exclusive access
         // granted by the caller's `&mut OffsetPageTable`.
