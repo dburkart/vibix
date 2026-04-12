@@ -75,9 +75,14 @@ pub fn yield_now() {
     };
 
     // SAFETY: `prev_rsp_ptr` points at the `rsp` field of a Box<Task>
-    // inside the ready queue. On a single CPU with cooperative
-    // scheduling, nothing else runs between here and the write inside
-    // `context_switch`, and the VecDeque isn't resized by that write.
+    // in the ready queue. The Box indirection pins the Task's address
+    // — a VecDeque reallocation would move the Box, not the Task
+    // itself — so the pointer stays valid even if an IRQ fires before
+    // `context_switch` reaches its write. The Task can't be dropped
+    // until someone re-acquires SCHED and pops it, which can't happen
+    // between this lock drop and that write on a single CPU. This
+    // relies on no IRQ handler calling `spawn`/`yield_now`; the
+    // current timer + keyboard handlers don't.
     unsafe {
         context_switch(prev_rsp_ptr, next_rsp);
     }

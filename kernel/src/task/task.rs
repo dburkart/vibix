@@ -42,9 +42,10 @@ impl Task {
     ///
     /// Primed layout (low → high):
     /// ```text
-    ///   r15=0  r14=0  r13=0  r12=entry  rbp=0  rbx=0  ret=trampoline
-    ///   ^ saved rsp                                    ^ stack top
+    ///   r15=0  r14=0  r13=0  r12=entry  rbp=0  rbx=0  ret=trampoline  <top>
+    ///   ^ saved rsp (initial)                          ^ rsp after 6 pops
     /// ```
+    /// `ret` then consumes the last slot and lands rsp on `<top>`.
     pub fn new(entry: fn() -> !) -> Self {
         let layout = Layout::new::<Stack>();
         // SAFETY: Stack has non-zero size and align 16; alloc_zeroed
