@@ -14,9 +14,9 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use vibix::{
-    exit_qemu, serial_println, task, time,
+    exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
-    QemuExitCode,
+    time, QemuExitCode,
 };
 
 #[no_mangle]
