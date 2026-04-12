@@ -40,7 +40,7 @@ the keyboard state machine. It maps raw scancodes to `DecodedKey` values
 
 ## ISR Path
 
-```
+```text
 keyboard ISR
   → input::push_scancode_from_isr(code)
       → SCANCODES.lock().push(code)
@@ -51,7 +51,7 @@ send EOI. No decoding, no logging, no sleeping.
 
 ## Consumer Path
 
-```
+```rust
 input::read_key() -> DecodedKey
 ```
 

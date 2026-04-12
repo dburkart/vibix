@@ -33,7 +33,7 @@ stack the faulting code was on.
 
 A 20 KiB static buffer (`DOUBLE_FAULT_STACK`) is allocated page-aligned. The
 TSS points its IST[0] entry to the top of this buffer. The lowest 4 KiB page
-of the buffer becomes the guard page (unmapped by `ist_guard::init()`) after
+of the buffer becomes the guard page (unmapped by `ist_guard::install()`) after
 paging is up, leaving 16 KiB of usable stack for the `#DF` handler.
 
 `df_stack_guard_addr()` returns the virtual address of the guard page so
@@ -173,7 +173,7 @@ ISRs are deliberately thin: no decoding, no logging, no blocking I/O.
 
 ## IST Guard Page (`ist_guard.rs`)
 
-After paging is initialized, `ist_guard::init()` unmaps the 4 KiB page at
+After paging is initialized, `ist_guard::install()` unmaps the 4 KiB page at
 `gdt::df_stack_guard_addr()`. This is the lowest page of the `DOUBLE_FAULT_STACK`
 buffer. An overflow of the `#DF` IST stack walks RSP downward into this unmapped
 page, triggering a `#PF` with a fault address that identifies the overflow,

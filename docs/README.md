@@ -31,7 +31,13 @@ arch::init()            — GDT + TSS, IDT, 8259 PIC remapped + masked
 mem::init()             — frame allocator, paging mapper, heap
 arch::init_apic()       — ACPI parse, LAPIC + IOAPIC init, IRQ routing
 time::init()            — PIT at 100 Hz
-sti                     — interrupts enabled (done by the caller)
+                          (vibix::init() returns; interrupts still disabled)
+```
+
+After `vibix::init()` returns, the caller (`main.rs`) completes initialization:
+
+```
+sti                     — interrupts enabled
 task::init()            — bootstrap task, scheduler online
 ```
 

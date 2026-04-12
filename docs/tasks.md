@@ -109,7 +109,7 @@ from the `#PF` and `#DF` exception handlers.
 |---|---|---|
 | `DEFAULT_SLICE_MS` | 10 | Preemption time slice per task |
 | `GUARD_SIZE` | 4096 | Guard page size (one 4 KiB page) |
-| `STACK_SIZE` | 64 KiB | Usable kernel stack per task |
+| `STACK_SIZE` | 16 KiB | Usable kernel stack per task |
 | `TASK_SLOT_SIZE` | `GUARD_SIZE + STACK_SIZE` | VA bytes reserved per task |
 | `TASK_STACKS_VA_BASE` | (higher-half) | Base VA for the task stack window |
 

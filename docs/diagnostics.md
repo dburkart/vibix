@@ -25,7 +25,7 @@ symbolicated panic backtraces:
 
 The ring buffer stores records in the format:
 
-```
+```text
 [level: u8][len_lo: u8][len_hi: u8][utf8 payload: len bytes]
 ```
 

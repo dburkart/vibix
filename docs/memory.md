@@ -12,7 +12,7 @@
 The memory subsystem manages all physical and virtual memory used by the kernel.
 It has three layers that build on each other:
 
-```
+```text
 Physical frames  ←  BitmapFrameAllocator   (frame.rs)
 Virtual mappings ←  OffsetPageTable / PML4  (paging.rs)
 Heap allocations ←  GrowingHeap            (heap.rs)
@@ -23,7 +23,7 @@ Heap allocations ←  GrowingHeap            (heap.rs)
 ```rust
 pub fn init() {
     frame::init();   // scan Limine memmap, build bitmap
-    paging::init();  // wrap Limine's PML4, build kernel-owned PML4, switch CR3
+    paging::init(hhdm_offset);  // wrap Limine's PML4, build kernel-owned PML4, switch CR3
     heap::init();    // map initial 1 MiB slab, register #[global_allocator]
 }
 ```
@@ -122,7 +122,7 @@ frames is tracked in issue #46.
 
 | Function | Description |
 |---|---|
-| `paging::init(hhdm)` | Wraps Limine's PML4 in `MAPPER` |
+| `paging::init(hhdm_offset)` | Wraps Limine's PML4 in `MAPPER` |
 | `map_range(start, frames, flags)` | Maps `frames` pages at `start` VA, allocating PTs from the frame pool |
 | `unmap_page(page)` | Unmaps a single page and returns its frame to the pool |
 | `map_phys_into_hhdm(phys, size, flags)` | Maps a physical range into the HHDM window (used by ACPI + APIC) |
