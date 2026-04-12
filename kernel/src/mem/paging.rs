@@ -7,31 +7,40 @@
 //! clean tree that maps only what the kernel actually needs — kernel
 //! image per section with tight flags, HHDM via 2 MiB pages, heap, IST
 //! stack sans guard, framebuffer — and swaps CR3 to it. From that point
-//! on Limine's original tree is unreachable; it (and
-//! `BOOTLOADER_RECLAIMABLE` frames) will be freed once a reclaiming
-//! allocator lands (issue #13).
+//! on Limine's original tree is unreachable; actually freeing it (and
+//! the `BOOTLOADER_RECLAIMABLE` frames) is issue #46.
 
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult, UnmapError};
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB,
-    Size4KiB, Translate,
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size2MiB, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::frame;
 use crate::serial_println;
 
-/// Frame allocator adapter: pulls 4 KiB frames from the global
-/// `BumpFrameAllocator`. Zero-sized; construct ad-hoc wherever you need
-/// to hand the mapper a `FrameAllocator`.
+/// Frame allocator adapter: pulls 4 KiB frames from (and, via
+/// [`FrameDeallocator`], returns them to) the global
+/// [`BitmapFrameAllocator`](frame::BitmapFrameAllocator). Zero-sized;
+/// construct ad-hoc wherever you need to hand the mapper a
+/// `FrameAllocator`.
 pub struct KernelFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         let phys = frame::global().lock().allocate_frame()?;
         Some(PhysFrame::containing_address(PhysAddr::new(phys)))
+    }
+}
+
+impl FrameDeallocator<Size4KiB> for KernelFrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        frame::global()
+            .lock()
+            .deallocate_frame(frame.start_address().as_u64());
     }
 }
 
@@ -156,13 +165,28 @@ pub fn map_phys_into_hhdm(
     })
 }
 
-/// Unmap `page` and flush the TLB. Backing frame is leaked.
+/// Unmap `page` and flush the TLB. Returns the physical frame the page
+/// was backed by. The caller owns that frame from here on — either
+/// return it to the global allocator with [`unmap_and_free`], or hold
+/// on to it (e.g. when unmapping a physical region the allocator never
+/// owned, like the IST guard page which lives in `.bss`).
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     with_mapper(|m| {
         let (frame, flush) = m.unmap(page)?;
         flush.flush();
         Ok(frame)
     })
+}
+
+/// Unmap `page` and return its backing frame to the global frame
+/// allocator. Use this for mappings whose frame originally came from
+/// [`map`] / [`map_range`].
+pub fn unmap_and_free(page: Page<Size4KiB>) -> Result<(), UnmapError> {
+    let frame = unmap(page)?;
+    // SAFETY: the caller's contract is that `page`'s frame came from
+    // the global allocator — `map` is the only supported producer.
+    unsafe { KernelFrameAllocator.deallocate_frame(frame) };
+    Ok(())
 }
 
 /// Translate a virtual address to its backing physical address, if any.
@@ -181,8 +205,8 @@ pub fn active_pml4_phys() -> PhysAddr {
 // -- PML4 construction + CR3 swap ---------------------------------------
 
 /// Build a fresh kernel PML4 and switch CR3 to it. Drops Limine's
-/// original tree (leaks its intermediate tables until a reclaiming
-/// allocator lands).
+/// original tree (leaks its intermediate tables until #46 reclaims
+/// them explicitly).
 pub fn build_and_switch_kernel_pml4() {
     let hhdm = HHDM_OFFSET
         .lock()
