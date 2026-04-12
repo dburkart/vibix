@@ -13,7 +13,10 @@ pub extern "C" fn _start() -> ! {
     vibix::serial::init();
     serial_println!("vibix booting…");
 
-    assert!(BASE_REVISION.is_supported(), "Limine base revision unsupported");
+    assert!(
+        BASE_REVISION.is_supported(),
+        "Limine base revision unsupported"
+    );
 
     if let Some(fb_response) = FRAMEBUFFER_REQUEST.get_response() {
         if let Some(fb) = fb_response.framebuffers().next() {
@@ -103,4 +106,3 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
     exit_qemu(QemuExitCode::Failure)
 }
-

@@ -24,7 +24,11 @@ impl<'a> BumpFrameAllocator<'a> {
     /// should be non-overlapping; ordering is not required but starting
     /// at the lowest `start` gives deterministic output.
     pub fn new(regions: &'a [Region]) -> Self {
-        let mut me = Self { regions, cursor: 0, region_idx: 0 };
+        let mut me = Self {
+            regions,
+            cursor: 0,
+            region_idx: 0,
+        };
         me.advance_to_next_region();
         me
     }
@@ -167,7 +171,7 @@ mod tests {
     #[test]
     fn walks_across_multiple_regions() {
         let regions = [
-            Region::new(0x1000, 0x2000), // 2 frames
+            Region::new(0x1000, 0x2000),  // 2 frames
             Region::new(0x10000, 0x1000), // 1 frame
         ];
         let mut a = BumpFrameAllocator::new(&regions);
@@ -189,7 +193,7 @@ mod tests {
     #[test]
     fn allocate_contiguous_stays_within_a_region() {
         let regions = [
-            Region::new(0x1000, 0x2000), // 2 frames — too small
+            Region::new(0x1000, 0x2000),   // 2 frames — too small
             Region::new(0x10000, 0x10000), // 16 frames
         ];
         let mut a = BumpFrameAllocator::new(&regions);

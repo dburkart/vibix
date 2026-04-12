@@ -31,7 +31,10 @@ fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
         ("simple_box", &(simple_box as fn())),
         ("large_vec", &(large_vec as fn())),
-        ("many_allocations_reclaim", &(many_allocations_reclaim as fn())),
+        (
+            "many_allocations_reclaim",
+            &(many_allocations_reclaim as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {

@@ -108,9 +108,7 @@ pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
 /// Translate a virtual address to its backing physical address, if any.
 pub fn translate(addr: VirtAddr) -> Option<PhysAddr> {
     with_mapper(|m| match m.translate(addr) {
-        TranslateResult::Mapped { frame, offset, .. } => {
-            Some(frame.start_address() + offset)
-        }
+        TranslateResult::Mapped { frame, offset, .. } => Some(frame.start_address() + offset),
         TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
     })
 }

@@ -16,9 +16,9 @@ const BG: u32 = 0x0000_0000;
 
 pub struct Console {
     buffer: *mut u32,
-    width: usize,   // pixels
-    height: usize,  // pixels
-    pitch: usize,   // u32s per row
+    width: usize,  // pixels
+    height: usize, // pixels
+    pitch: usize,  // u32s per row
     cols: usize,
     rows: usize,
     cx: usize,
