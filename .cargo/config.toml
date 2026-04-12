@@ -11,6 +11,19 @@ rustflags = [
   "-C", "code-model=kernel",
   "-C", "no-redzone=yes",
 ]
+# `cargo test` for this target hands each compiled test binary to xtask,
+# which wraps it in an ISO and boots it under QEMU.
+runner = "target/release/xtask test-runner"
+
+# `build-std` is intentionally NOT in [unstable] here — it would apply
+# to host `cargo test --lib` too and clash with the sysroot's std.
+# xtask passes `-Z build-std=...` explicitly whenever it invokes cargo
+# for the kernel target.
+[unstable]
+# Without this, `cargo test` ignores panic="abort" and forces
+# panic="unwind", producing a second `core` build that clashes with the
+# kernel's panic-abort core. Our no_std tests need abort regardless.
+panic-abort-tests = true
 
 [alias]
 xtask = "run --package xtask --release --"

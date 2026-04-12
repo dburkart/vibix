@@ -1,29 +1,15 @@
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
-
-mod arch;
-mod boot;
-mod framebuffer;
-mod serial;
 
 use core::panic::PanicInfo;
 
-use crate::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST};
-use crate::framebuffer::Console;
-
-/// Shut QEMU down with exit code 0x11 (= (0x10 << 1) | 1) via the
-/// `isa-debug-exit` device so test/panic flows return non-zero from
-/// `cargo xtask run`. Harmless if the device isn't present.
-fn qemu_exit_failure() {
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") 0xf4_u16, in("al") 0x10_u8);
-    }
-}
+use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST};
+use vibix::framebuffer::Console;
+use vibix::{exit_qemu, framebuffer, hlt_loop, println, serial_println, QemuExitCode};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    serial::init();
+    vibix::serial::init();
     serial_println!("vibix booting…");
 
     assert!(BASE_REVISION.is_supported(), "Limine base revision unsupported");
@@ -37,9 +23,7 @@ pub extern "C" fn _start() -> ! {
                 fb.bpp(),
                 fb.pitch()
             );
-            let console = unsafe {
-                Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch())
-            };
+            let console = unsafe { Console::new(fb.addr(), fb.width(), fb.height(), fb.pitch()) };
             framebuffer::init(console);
             println!("vibix: framebuffer online");
         } else {
@@ -67,8 +51,11 @@ pub extern "C" fn _start() -> ! {
         serial_println!("hhdm offset: {:#x}", hhdm.offset());
     }
 
-    arch::init();
+    vibix::arch::init();
     serial_println!("GDT + IDT loaded");
+
+    vibix::mem::init();
+
     println!("vibix online.");
     serial_println!("vibix online.");
 
@@ -78,16 +65,11 @@ pub extern "C" fn _start() -> ! {
         unsafe { core::arch::asm!("ud2") };
     }
 
-    loop {
-        x86_64::instructions::hlt();
-    }
+    hlt_loop();
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
-    qemu_exit_failure();
-    loop {
-        x86_64::instructions::hlt();
-    }
+    exit_qemu(QemuExitCode::Failure)
 }
