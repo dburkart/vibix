@@ -108,8 +108,18 @@ pub fn map_phys_into_hhdm(
     size: u64,
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
+    if size == 0 {
+        return Ok(());
+    }
     let start = phys & !0xFFF;
-    let end = (phys + size + 0xFFF) & !0xFFF;
+    // Round the end up to the next page boundary with checked
+    // arithmetic — firmware-provided sizes could in principle push
+    // the sum past u64::MAX. Silent wrap would turn into a mis-map.
+    let end = phys
+        .checked_add(size - 1)
+        .and_then(|v| v.checked_add(0x1000))
+        .expect("map_phys_into_hhdm: physical range overflow")
+        & !0xFFF;
     let hhdm_offset = with_mapper(|m| m.phys_offset());
     with_mapper(|m| {
         let mut alloc = KernelFrameAllocator;

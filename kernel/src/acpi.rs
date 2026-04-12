@@ -68,21 +68,6 @@ impl AcpiInfo {
         }
         (irq as u32, 0)
     }
-
-    /// Find the IOAPIC that owns the given GSI. Returned pair is
-    /// `(ioapic, gsi_offset_within_ioapic)`. None if no IOAPIC claims
-    /// it — typically a firmware bug.
-    pub fn ioapic_for_gsi(&self, gsi: u32) -> Option<(&IoApic, u32)> {
-        for io in self.ioapics() {
-            // Without the Max Redirection Entry reg we can't know the
-            // upper bound exactly, but for the legacy ISA range (< 24)
-            // the first IOAPIC with gsi_base == 0 is correct.
-            if gsi >= io.gsi_base && gsi < io.gsi_base + 240 {
-                return Some((io, gsi - io.gsi_base));
-            }
-        }
-        None
-    }
 }
 
 static INFO: Once<AcpiInfo> = Once::new();
@@ -136,8 +121,24 @@ pub fn init(rsdp_phys: usize, hhdm_offset: u64) {
     // HHDM doesn't cover. Map the RSDP page (with some slack for the
     // extended part) into HHDM before we touch it.
     map_phys(rsdp_phys as u64, mem::size_of::<Rsdp>() as u64);
-    let rsdp = unsafe { &*((rsdp_phys as u64 + hhdm_offset) as *const Rsdp) };
+    let rsdp_virt = rsdp_phys as u64 + hhdm_offset;
+    let rsdp = unsafe { &*(rsdp_virt as *const Rsdp) };
     assert_eq!(&rsdp.signature, b"RSD PTR ", "bad RSDP signature");
+    // RSDP checksum: the first 20 bytes (fields through rsdt_address)
+    // must sum to 0 mod 256. For revision ≥ 2 the full `length` bytes
+    // must also checksum to zero, covering the extended fields.
+    assert!(
+        checksum(rsdp_virt as *const u8, 20) == 0,
+        "bad RSDP v1 checksum"
+    );
+    if rsdp.revision >= 2 {
+        let len = rsdp.length as usize;
+        assert!(len >= mem::size_of::<Rsdp>(), "RSDP length too small");
+        assert!(
+            checksum(rsdp_virt as *const u8, len) == 0,
+            "bad RSDP v2 checksum"
+        );
+    }
 
     let xsdt_phys = rsdp.xsdt_address;
     let rsdt_phys = rsdp.rsdt_address;
@@ -165,9 +166,30 @@ fn read_sdt(phys: u64, hhdm: u64) -> &'static SdtHeader {
     // once we know its length. Both calls are no-ops if the range is
     // already mapped.
     map_phys(phys, mem::size_of::<SdtHeader>() as u64);
-    let header = unsafe { &*((phys + hhdm) as *const SdtHeader) };
-    map_phys(phys, header.length as u64);
+    let virt = phys + hhdm;
+    let header = unsafe { &*(virt as *const SdtHeader) };
+    let len = header.length as usize;
+    assert!(
+        len >= mem::size_of::<SdtHeader>(),
+        "SDT length {len} smaller than header"
+    );
+    map_phys(phys, len as u64);
+    assert!(
+        checksum(virt as *const u8, len) == 0,
+        "bad SDT checksum (sig {:?})",
+        header.signature
+    );
     header
+}
+
+/// Sum `len` bytes starting at `ptr`, returning the low 8 bits. ACPI
+/// tables are valid when this sum is 0.
+fn checksum(ptr: *const u8, len: usize) -> u8 {
+    let mut sum: u8 = 0;
+    for i in 0..len {
+        sum = sum.wrapping_add(unsafe { *ptr.add(i) });
+    }
+    sum
 }
 
 fn find_madt_xsdt(xsdt_phys: u64, hhdm: u64) -> Option<*const SdtHeader> {
@@ -212,15 +234,20 @@ fn map_phys(phys: u64, size: u64) {
 fn parse_madt(madt: *const SdtHeader) -> AcpiInfo {
     let header = unsafe { &*madt };
     let total_len = header.length as usize;
+    // MADT layout after the SDT header: u32 local_apic_address, u32
+    // flags, then variable-length entries. Anything shorter than
+    // header + the two u32s is malformed.
+    const MADT_FIXED_FIELDS: usize = 8;
+    assert!(
+        total_len >= mem::size_of::<SdtHeader>() + MADT_FIXED_FIELDS,
+        "MADT length {total_len} too small"
+    );
+    let body_len = total_len - mem::size_of::<SdtHeader>();
 
-    // MADT layout after the SDT header:
-    //   u32 local_apic_address
-    //   u32 flags
-    //   variable-length entries
     let body = unsafe {
         slice::from_raw_parts(
             (madt as *const u8).add(mem::size_of::<SdtHeader>()),
-            total_len - mem::size_of::<SdtHeader>(),
+            body_len,
         )
     };
 
