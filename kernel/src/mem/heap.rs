@@ -133,6 +133,24 @@ pub fn mapped_size() -> usize {
     ALLOCATOR.mapped_size()
 }
 
+/// Snapshot of heap occupancy. `used + free == mapped_size()`.
+pub struct HeapStats {
+    pub used: usize,
+    pub free: usize,
+    pub mapped: usize,
+}
+
+/// Read a consistent snapshot of the heap. Briefly locks the inner
+/// allocator — do not call from allocation-sensitive paths.
+pub fn stats() -> HeapStats {
+    let h = ALLOCATOR.inner.lock();
+    HeapStats {
+        used: h.used(),
+        free: h.free(),
+        mapped: ALLOCATOR.mapped_size(),
+    }
+}
+
 /// Map the initial slab and hand it to the inner heap. Requires
 /// `paging::init` to have run so `map_range` is live.
 pub fn init() {

@@ -66,6 +66,38 @@ pub fn spawn(entry: fn() -> !) {
     sched.ready.push_back(Box::new(Task::new(entry)));
 }
 
+/// Snapshot of one task's diagnostic-relevant fields. Returned by
+/// [`for_each_task`] so callers (e.g. the shell's `tasks` builtin) can
+/// enumerate live tasks without touching the scheduler's internals.
+#[derive(Clone, Copy)]
+pub struct TaskInfo {
+    pub id: usize,
+    pub slice_remaining_ms: u32,
+    /// `true` for the currently-running task, `false` for ready-queue entries.
+    pub is_current: bool,
+}
+
+/// Invoke `f` once per live task (current first, then ready queue in
+/// FIFO order). Holds the scheduler lock for the duration, so `f` must
+/// not call back into `task::*`.
+pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
+    let sched = SCHED.lock();
+    if let Some(cur) = sched.current.as_ref() {
+        f(TaskInfo {
+            id: cur.id,
+            slice_remaining_ms: cur.slice_remaining_ms,
+            is_current: true,
+        });
+    }
+    for t in sched.ready.iter() {
+        f(TaskInfo {
+            id: t.id,
+            slice_remaining_ms: t.slice_remaining_ms,
+            is_current: false,
+        });
+    }
+}
+
 /// Check whether `addr` falls within any live kernel task's guard page.
 /// Returns the task ID of the overflowing task, or `None` if no guard
 /// page was hit.

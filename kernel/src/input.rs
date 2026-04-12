@@ -101,6 +101,22 @@ mod kernel_side {
         without_interrupts(|| SCANCODES.lock().pop())
     }
 
+    /// Non-blocking counterpart to [`read_key`]. Drains any queued
+    /// scancodes through the `pc-keyboard` state machine and returns the
+    /// first decoded key produced, or `None` if the ring is empty or the
+    /// drained codes only advanced modifier state.
+    pub fn try_read_key() -> Option<DecodedKey> {
+        while let Some(code) = try_read_scancode() {
+            let mut kbd = KEYBOARD.lock();
+            if let Ok(Some(event)) = kbd.add_byte(code) {
+                if let Some(key) = kbd.process_keyevent(event) {
+                    return Some(key);
+                }
+            }
+        }
+        None
+    }
+
     pub fn scancode_overflows() -> u64 {
         OVERFLOWS.load(Ordering::Relaxed)
     }

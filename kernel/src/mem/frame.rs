@@ -229,6 +229,13 @@ mod global {
 #[cfg(target_os = "none")]
 pub use global::{global, init};
 
+/// Number of free 4 KiB physical frames in the global allocator. Briefly
+/// locks the allocator — suitable for diagnostics, not hot paths.
+#[cfg(target_os = "none")]
+pub fn free_frames() -> usize {
+    global().lock().free_frames()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
