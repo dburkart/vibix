@@ -27,6 +27,9 @@ pc-keyboard = "0.8"
 default = []
 # Enable to trigger a UD2 after init; verifies the invalid-opcode handler path.
 fault-test = []
+# Enable to fire a deliberate `panic!()` after init; useful for eyeballing
+# the panic-path backtrace end-to-end on a real boot.
+panic-test = []
 # Enable to deliberately overflow the #DF IST stack after init; verifies
 # that the guard page below the stack catches overflow as a #PF instead
 # of letting it silently corrupt .bss. Manual verification only —

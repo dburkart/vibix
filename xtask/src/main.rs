@@ -10,7 +10,7 @@
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   clean         — remove build artifacts
 //!
-//! Flags (apply where sensible): --release, --fault-test
+//! Flags (apply where sensible): --release, --fault-test, --panic-test
 
 use std::env;
 use std::error::Error;
@@ -68,6 +68,7 @@ fn main() -> R<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
     let release = take_flag(&mut args, "--release");
     let fault_test = take_flag(&mut args, "--fault-test");
+    let panic_test = take_flag(&mut args, "--panic-test");
 
     let cmd = args
         .first()
@@ -78,6 +79,7 @@ fn main() -> R<()> {
     let opts = BuildOpts {
         release,
         fault_test,
+        panic_test,
     };
 
     match cmd.as_str() {
@@ -101,7 +103,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test]"
+                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test]"
             );
             std::process::exit(2);
         }
@@ -121,6 +123,7 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
 struct BuildOpts {
     release: bool,
     fault_test: bool,
+    panic_test: bool,
 }
 
 fn workspace_root() -> PathBuf {
@@ -149,6 +152,9 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     }
     if opts.fault_test {
         cmd.arg("--features").arg("fault-test");
+    }
+    if opts.panic_test {
+        cmd.arg("--features").arg("panic-test");
     }
     check(cmd.status()?)?;
     let bin = kernel_binary(opts);

@@ -8,7 +8,10 @@ use vibix::framebuffer::Console;
 use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
 #[no_mangle]
-#[cfg_attr(feature = "ist-overflow-test", allow(unreachable_code))]
+#[cfg_attr(
+    any(feature = "ist-overflow-test", feature = "panic-test"),
+    allow(unreachable_code)
+)]
 pub extern "C" fn _start() -> ! {
     vibix::serial::init();
     serial_println!("vibix booting…");
@@ -77,6 +80,12 @@ pub extern "C" fn _start() -> ! {
     {
         serial_println!("fault-test: triggering #UD via ud2");
         unsafe { core::arch::asm!("ud2") };
+    }
+
+    #[cfg(feature = "panic-test")]
+    {
+        serial_println!("panic-test: triggering deliberate panic");
+        panic!("panic-test: eyeball the backtrace");
     }
 
     #[cfg(feature = "ist-overflow-test")]
