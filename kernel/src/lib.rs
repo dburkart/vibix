@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod input;
 pub mod mem;
 
 #[cfg(target_os = "none")]
@@ -23,17 +24,21 @@ pub mod framebuffer;
 pub mod serial;
 #[cfg(target_os = "none")]
 pub mod test_harness;
+#[cfg(target_os = "none")]
+pub mod time;
 
 #[cfg(target_os = "none")]
 pub use test_harness::{exit_qemu, QemuExitCode, Testable};
 
 /// Bring up core kernel subsystems in the right order. Callable from
-/// both the main bin and from integration-test `_start`s.
+/// both the main bin and from integration-test `_start`s. Interrupts
+/// remain **disabled** on return — callers `sti` when they're ready.
 #[cfg(target_os = "none")]
 pub fn init() {
     serial::init();
     arch::init();
     mem::init();
+    time::init();
 }
 
 /// Halt forever. Handy in panic paths and as a terminal call in tests.

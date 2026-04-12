@@ -3,3 +3,5 @@
 /limine
 Cargo.lock
 *.iso
+.env
+.claude/settings.local.json
