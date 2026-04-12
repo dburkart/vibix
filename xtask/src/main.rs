@@ -54,6 +54,9 @@ const SMOKE_MARKERS: &[&str] = &[
     "paging: mapper online",
     "paging: IST guard installed",
     "PIC remapped",
+    "acpi: MADT parsed",
+    "apic: BSP online",
+    "ioapic: initialized",
     "timer: 100 Hz",
     "vibix online.",
     "interrupts enabled",
@@ -348,6 +351,7 @@ fn test_all() -> R<()> {
         "paging",
         "tasks",
         "preempt",
+        "apic_online",
     ] {
         cmd.arg("--test").arg(t);
     }

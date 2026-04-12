@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST};
+use vibix::boot::{BASE_REVISION, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST, RSDP_REQUEST};
 use vibix::framebuffer::Console;
 use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
@@ -51,14 +51,23 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
-    if let Some(hhdm) = HHDM_REQUEST.get_response() {
-        serial_println!("hhdm offset: {:#x}", hhdm.offset());
-    }
+    let hhdm_offset = HHDM_REQUEST
+        .get_response()
+        .map(|h| h.offset())
+        .expect("Limine HHDM response missing");
+    serial_println!("hhdm offset: {:#x}", hhdm_offset);
+
+    let rsdp_ptr = RSDP_REQUEST
+        .get_response()
+        .map(|r| r.address())
+        .expect("Limine RSDP response missing");
+    serial_println!("rsdp: {:#x}", rsdp_ptr);
 
     vibix::arch::init();
     serial_println!("GDT + IDT loaded");
 
     vibix::mem::init();
+    vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     vibix::time::init();
 
     println!("vibix online.");

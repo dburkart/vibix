@@ -15,6 +15,8 @@ pub mod input;
 pub mod mem;
 
 #[cfg(target_os = "none")]
+pub mod acpi;
+#[cfg(target_os = "none")]
 pub mod arch;
 #[cfg(target_os = "none")]
 pub mod boot;
@@ -38,8 +40,17 @@ pub use test_harness::{exit_qemu, QemuExitCode, Testable};
 #[cfg(target_os = "none")]
 pub fn init() {
     serial::init();
+    let hhdm = boot::HHDM_REQUEST
+        .get_response()
+        .expect("Limine HHDM response missing")
+        .offset();
+    let rsdp = boot::RSDP_REQUEST
+        .get_response()
+        .expect("Limine RSDP response missing")
+        .address();
     arch::init();
     mem::init();
+    arch::init_apic(rsdp, hhdm);
     time::init();
 }
 
