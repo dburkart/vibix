@@ -142,12 +142,19 @@ pub struct HeapStats {
 
 /// Read a consistent snapshot of the heap. Briefly locks the inner
 /// allocator — do not call from allocation-sensitive paths.
+///
+/// `mapped` is derived from `used + free` inside the same lock scope so
+/// it can't disagree with the other two fields. Reading `mapped` from
+/// the separate `AtomicUsize` would race with `grow_locked`, which
+/// releases the inner lock between `extend()` and the atomic bump.
 pub fn stats() -> HeapStats {
     let h = ALLOCATOR.inner.lock();
+    let used = h.used();
+    let free = h.free();
     HeapStats {
-        used: h.used(),
-        free: h.free(),
-        mapped: ALLOCATOR.mapped_size(),
+        used,
+        free,
+        mapped: used + free,
     }
 }
 

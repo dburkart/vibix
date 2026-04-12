@@ -22,6 +22,10 @@ use crate::{input, serial_print, serial_println, task, time};
 pub static SHELL_ONLINE: AtomicBool = AtomicBool::new(false);
 
 const PROMPT: &str = "vibix> ";
+/// Maximum line length in bytes. Additional keystrokes past this cap
+/// are silently dropped so a stuck key or keyboard auto-repeat can't
+/// grow the input buffer unchecked against the 16 MiB heap ceiling.
+const MAX_LINE_LEN: usize = 256;
 
 /// Task entry point. Spawn as `task::spawn(shell::run)`.
 pub fn run() -> ! {
@@ -45,8 +49,10 @@ pub fn run() -> ! {
                 }
             }
             Some(DecodedKey::Unicode(c)) if !c.is_control() => {
-                line.push(c);
-                serial_print!("{}", c);
+                if line.len() + c.len_utf8() <= MAX_LINE_LEN {
+                    line.push(c);
+                    serial_print!("{}", c);
+                }
             }
             Some(_) => {}
             // Nothing in the scancode ring. Halt until the next IRQ
