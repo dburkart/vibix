@@ -66,6 +66,12 @@ pub extern "C" fn _start() -> ! {
         unsafe { core::arch::asm!("ud2") };
     }
 
+    #[cfg(feature = "ist-overflow-test")]
+    {
+        serial_println!("ist-overflow-test: recursing to blow the IST guard");
+        recurse(core::hint::black_box(0));
+    }
+
     x86_64::instructions::interrupts::enable();
     serial_println!("interrupts enabled");
 
@@ -81,4 +87,16 @@ pub extern "C" fn _start() -> ! {
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
     exit_qemu(QemuExitCode::Failure)
+}
+
+/// Recurse forever, consuming stack on each frame. Used by
+/// `ist-overflow-test` to force the #DF handler to chew through its
+/// IST stack and run into the guard page below.
+#[cfg(feature = "ist-overflow-test")]
+#[inline(never)]
+#[allow(unconditional_recursion)]
+fn recurse(depth: u64) -> u64 {
+    let buf = [depth; 64];
+    let next = core::hint::black_box(depth).wrapping_add(1);
+    recurse(next).wrapping_add(core::hint::black_box(buf[0]))
 }
