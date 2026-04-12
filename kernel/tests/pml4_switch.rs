@@ -20,7 +20,14 @@ use x86_64::VirtAddr;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    let before = vibix::mem::paging::active_pml4_phys();
     vibix::init();
+    let after = vibix::mem::paging::active_pml4_phys();
+    assert_ne!(
+        before, after,
+        "CR3 did not change — build_and_switch_kernel_pml4 regressed"
+    );
+    serial_println!("  CR3 swapped {before:?} -> {after:?}");
     run_tests();
     exit_qemu(QemuExitCode::Success);
 }

@@ -133,13 +133,21 @@ pub fn map_phys_into_hhdm(
                 Ok(flush) => flush.flush(),
                 // Already mapped via a 4 KiB PTE — no-op.
                 Err(MapToError::PageAlreadyMapped(_)) => {}
-                // Already covered by a 2 MiB HHDM huge page (see
-                // `populate_hhdm` in the kernel-PML4 build). The
-                // physical address is already reachable at
-                // `hhdm + phys`, which is what the caller wanted; we
-                // accept the coarser flags rather than split the
-                // huge page back into 4 KiB PTEs.
-                Err(MapToError::ParentEntryHugePage) => {}
+                // A 2 MiB HHDM huge page already covers this address
+                // with write-back cacheable flags. That's fine for RAM
+                // (ACPI tables, reclaimable regions), but wrong for
+                // device MMIO — caching LAPIC/IOAPIC reads silently
+                // corrupts interrupt handling. Accept the collision
+                // only when the caller isn't demanding a specific
+                // memory type; otherwise treat it as a bug (a caller
+                // wanting NO_CACHE means populate_hhdm should have
+                // skipped this physical range).
+                Err(e @ MapToError::ParentEntryHugePage) => {
+                    let mmio_bits = PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
+                    if flags.intersects(mmio_bits) {
+                        return Err(e);
+                    }
+                }
                 Err(e) => return Err(e),
             }
             addr += 4096;
@@ -195,6 +203,7 @@ pub fn build_and_switch_kernel_pml4() {
         populate_kernel_image(&mut new_mapper, &mut alloc);
         clone_heap(&mut new_mapper, &mut alloc);
         clone_ist_stack(&mut new_mapper, &mut alloc);
+        clone_boot_stack(&mut new_mapper, &mut alloc);
         map_framebuffer(&mut new_mapper, &mut alloc);
     }
 
@@ -251,32 +260,41 @@ fn populate_hhdm(
         .get_response()
         .expect("Limine memory-map response missing");
 
-    // Cover [0, top) where `top` is the max end across *all* entries —
-    // that pulls in framebuffer MMIO, ACPI tables, and reclaimable
-    // regions, matching what Limine's HHDM did for us.
-    let mut top: u64 = 0;
-    for entry in memmap.entries() {
-        let end = entry.base + entry.length;
-        if end > top {
-            top = end;
-        }
-    }
-    let top = (top + TWO_MIB - 1) & !(TWO_MIB - 1);
-
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let mut phys: u64 = 0;
-    while phys < top {
-        let page = Page::<Size2MiB>::containing_address(hhdm + phys);
-        let frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(phys));
-        // SAFETY: HHDM is a fresh mapping into an empty tree; we own
-        // it; flushing isn't required because this PML4 isn't live.
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, alloc)
-                .expect("HHDM 2 MiB map failed")
-                .ignore();
+
+    // Iterate the memory-map entries and HHDM-map only ranges that
+    // hold real RAM or firmware data. Skipping RESERVED and BAD_MEMORY
+    // leaves MMIO holes (LAPIC/IOAPIC) uncovered so `map_phys_into_hhdm`
+    // can install 4 KiB PTEs with the correct NO_CACHE/WRITE_THROUGH
+    // attributes for device MMIO. Sparse high-address entries on real
+    // hardware also don't force us to densely map every 2 MiB below them.
+    use limine::memory_map::EntryType;
+    for entry in memmap.entries() {
+        match entry.entry_type {
+            EntryType::USABLE
+            | EntryType::BOOTLOADER_RECLAIMABLE
+            | EntryType::EXECUTABLE_AND_MODULES
+            | EntryType::FRAMEBUFFER
+            | EntryType::ACPI_RECLAIMABLE
+            | EntryType::ACPI_NVS => {}
+            _ => continue,
         }
-        phys += TWO_MIB;
+        let start = entry.base & !(TWO_MIB - 1);
+        let end = (entry.base + entry.length + TWO_MIB - 1) & !(TWO_MIB - 1);
+        let mut phys = start;
+        while phys < end {
+            let page = Page::<Size2MiB>::containing_address(hhdm + phys);
+            let frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(phys));
+            // SAFETY: HHDM into a fresh tree we own; flush unneeded
+            // since this PML4 isn't live yet.
+            match unsafe { mapper.map_to(page, frame, flags, alloc) } {
+                Ok(f) => f.ignore(),
+                // Adjacent entries may share a rounded-up 2 MiB page.
+                Err(MapToError::PageAlreadyMapped(_)) => {}
+                Err(e) => panic!("HHDM 2 MiB map {:#x} failed: {:?}", phys, e),
+            }
+            phys += TWO_MIB;
+        }
     }
 }
 
@@ -357,6 +375,12 @@ fn clone_range(
                 match mapper.map_to(page, frame, flags, alloc) {
                     Ok(f) => f.ignore(),
                     Err(MapToError::PageAlreadyMapped(_)) => {}
+                    // Already covered by a 2 MiB HHDM huge page — e.g.
+                    // Limine's boot stack lives in HHDM-mapped RAM, so
+                    // its virtual address is reachable via the same
+                    // backing frame through the huge page. Safe to
+                    // skip; the translation is already correct.
+                    Err(MapToError::ParentEntryHugePage) => {}
                     Err(e) => panic!("clone_range map_to {:#x} failed: {:?}", addr.as_u64(), e),
                 }
             }
@@ -377,6 +401,31 @@ fn clone_ist_stack(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFram
     // populate_kernel_image. Nothing extra to do here; kept as a seam
     // for when IST stacks move out of .bss into dedicated allocations.
     let _ = (mapper, alloc);
+}
+
+/// Preserve the current (Limine-provided) boot stack across the CR3
+/// switch. Limine's `StackSizeRequest` stack is allocated from
+/// bootloader-reclaimable memory and is NOT guaranteed to live in the
+/// HHDM window — we must explicitly clone its virtual mapping into the
+/// new tree or the CPU will fault on the very next push after CR3
+/// reloads.
+fn clone_boot_stack(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
+    // Read RSP at this exact frame — we know the stack lives somewhere
+    // that contains this address. Limine gave us STACK_SIZE bytes; clone
+    // a generous window of 2× on either side so we cover the whole
+    // stack regardless of where RSP currently sits inside it. `clone_range`
+    // skips pages that aren't mapped in the old tree, so over-covering
+    // is harmless.
+    let rsp: u64;
+    // SAFETY: reading RSP is always defined.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    let window = 2 * crate::boot::STACK_REQUEST.size();
+    let base = VirtAddr::new(rsp.saturating_sub(window));
+    let top = VirtAddr::new(rsp.saturating_add(window));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    clone_range(mapper, alloc, base, top, flags);
 }
 
 fn map_framebuffer(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
