@@ -16,6 +16,8 @@ pub mod frame;
 pub mod heap;
 #[cfg(target_os = "none")]
 pub mod paging;
+#[cfg(target_os = "none")]
+pub mod pat;
 
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;
@@ -40,6 +42,10 @@ impl Region {
 #[cfg(target_os = "none")]
 pub fn init() {
     frame::init();
+
+    // Reprogram PAT before we build any PTE that sets the PAT bit.
+    // Today that's just the framebuffer WC mapping in the new PML4.
+    pat::init();
 
     // Paging comes up before the heap now — `heap::init` maps its
     // initial slab through `paging::map_range` instead of carving
