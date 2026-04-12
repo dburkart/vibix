@@ -2,7 +2,7 @@
 //!
 //! Tasks can hand control back explicitly with [`yield_now`], and the
 //! timer ISR calls [`preempt_tick`] every PIT interrupt to rotate tasks
-//! that never yield. Each task owns a heap-allocated kernel stack and a
+//! that never yield. Each task owns a guard-paged kernel stack and a
 //! saved register context; the hand-written switch in [`switch`] is the
 //! one place that touches `rsp`.
 //!
@@ -17,7 +17,7 @@
 //!
 //! - Priorities, per-CPU queues, tickless idle.
 //! - Blocking primitives — cooperative code polls + yields.
-//! - Per-task address spaces or guard pages.
+//! - Per-task address spaces.
 
 mod scheduler;
 mod switch;
@@ -110,6 +110,28 @@ pub fn yield_now() {
     if was_on {
         interrupts::enable();
     }
+}
+
+/// Check whether `addr` falls within any live kernel task's guard page.
+/// Returns the task ID of the overflowing task, or `None` if no guard
+/// page was hit.
+///
+/// Uses `try_lock` so it is safe to call from an exception handler where
+/// the scheduler lock might already be held. If the lock is contended the
+/// check is skipped (the fault will be logged generically by the caller).
+pub fn find_stack_overflow(addr: usize) -> Option<usize> {
+    let sched = SCHED.try_lock()?;
+    if let Some(t) = sched.current.as_deref() {
+        if t.is_guard_hit(addr) {
+            return Some(t.id);
+        }
+    }
+    for t in &sched.ready {
+        if t.is_guard_hit(addr) {
+            return Some(t.id);
+        }
+    }
+    None
 }
 
 /// Called from the timer ISR after `notify_eoi`. Decrements the

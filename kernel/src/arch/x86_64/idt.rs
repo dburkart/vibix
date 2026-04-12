@@ -71,6 +71,19 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         }
     }
 
+    // Check whether the fault address lands inside a kernel task's guard
+    // page — if so, this is a stack overflow, not a generic fault.
+    if let Some(task_id) = crate::task::find_stack_overflow(addr_u64 as usize) {
+        serial_println!(
+            "EXCEPTION: #PF task {} stack overflow addr={:#x} code={:?}\n{:#?}",
+            task_id,
+            addr_u64,
+            code,
+            frame
+        );
+        hang();
+    }
+
     serial_println!(
         "EXCEPTION: #PF addr={:?} code={:?}\n{:#?}",
         addr,
