@@ -629,8 +629,7 @@ pub fn reclaim_bootloader_memory() {
     // PML4's HHDM window explicitly covers BOOTLOADER_RECLAIMABLE so the
     // old table frames are still reachable. No CPU walks the old tree (CR3
     // has been updated) and interrupts are off during mem::init.
-    let table_frame_count =
-        unsafe { count_pml4_intermediate_tables(orig_pml4_phys, hhdm) };
+    let table_frame_count = unsafe { count_pml4_intermediate_tables(orig_pml4_phys, hhdm) };
 
     // --- BOOTLOADER_RECLAIMABLE release ----------------------------------
     // Iterate the memory map and release every frame in BOOTLOADER_RECLAIMABLE
