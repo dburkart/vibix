@@ -618,8 +618,7 @@ fn check(status: ExitStatus) -> R<()> {
 mod tests {
     #[test]
     fn demangles_rust_symbol() {
-        let out =
-            rustc_demangle::demangle("_ZN6kernel4main17h1234567890abcdefE").to_string();
+        let out = rustc_demangle::demangle("_ZN6kernel4main17h1234567890abcdefE").to_string();
         assert!(out.starts_with("kernel::main"), "got {out}");
     }
 
