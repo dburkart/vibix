@@ -500,6 +500,7 @@ fn test_all() -> R<()> {
         "apic_online",
         "backtrace",
         "page_fault",
+        "blocking_sync",
     ] {
         cmd.arg("--test").arg(t);
     }

@@ -16,20 +16,24 @@
 //! ## What's *not* here (yet)
 //!
 //! - Priorities, per-CPU queues, tickless idle.
-//! - Blocking primitives — cooperative code polls + yields.
 //! - Per-task address spaces.
+//!
+//! Blocking primitives (mutex-that-sleeps, channels, waitqueues) live
+//! in [`crate::sync`] and are built on top of [`block_current`] and
+//! [`wake`] below.
 
 mod scheduler;
 mod switch;
 mod task;
 
 use alloc::boxed::Box;
+use core::sync::atomic::Ordering;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
 
 use scheduler::Scheduler;
 use switch::context_switch;
-use task::Task;
+use task::{Task, TaskState};
 
 use crate::serial_println;
 use crate::time::TICK_MS;
@@ -76,14 +80,16 @@ pub fn yield_now() {
     // deadlock the incoming task's own call to `yield_now`.
     let (prev_rsp_ptr, next_rsp) = {
         let mut sched = SCHED.lock();
-        let Some(next) = sched.ready.pop_front() else {
+        let Some(mut next) = sched.ready.pop_front() else {
             if was_on {
                 interrupts::enable();
             }
             return;
         };
-        let prev = sched.current.take().expect("yield_now before task::init");
+        let mut prev = sched.current.take().expect("yield_now before task::init");
 
+        prev.state = TaskState::Ready;
+        next.state = TaskState::Running;
         let next_rsp = next.rsp;
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
@@ -169,14 +175,16 @@ pub fn preempt_tick() {
         }
     }
 
-    let Some(next) = sched.ready.pop_front() else {
+    let Some(mut next) = sched.ready.pop_front() else {
         // Slice expired but nobody else is ready. Reload and keep
         // running — prevents repeated try_lock churn on every tick.
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         return;
     };
 
-    let prev = sched.current.take().unwrap();
+    let mut prev = sched.current.take().unwrap();
+    prev.state = TaskState::Ready;
+    next.state = TaskState::Running;
     let next_rsp = next.rsp;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
@@ -191,5 +199,169 @@ pub fn preempt_tick() {
     // lock drop and the context switch.
     unsafe {
         context_switch(prev_rsp_ptr, next_rsp);
+    }
+}
+
+/// Return the id of the currently-running task.
+///
+/// Must be called after [`init`]. Briefly locks the scheduler, so do
+/// not call from an ISR context or while holding any lock whose
+/// ordering places it *after* `SCHED`.
+pub fn current_id() -> usize {
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .expect("current_id before task::init")
+        .id
+}
+
+/// Block the current task until some later [`wake`] call with its id.
+///
+/// Callers are responsible for registering the current task with a
+/// wakeup source (e.g. pushing their id onto a
+/// [`crate::sync::WaitQueue`]) *before* invoking this function — see
+/// [`crate::sync::WaitQueue::wait_while`] for the standard pattern.
+///
+/// The function is race-free against a [`wake`] call that fires
+/// between "register" and "block": [`wake`] sets the target task's
+/// `wake_pending` flag if the task is still Running or Ready, and the
+/// fast path here consumes the flag and returns without parking.
+///
+/// # Panics
+///
+/// Panics if there is no other task in the ready queue — blocking the
+/// sole runnable task would halt the kernel forever. In practice the
+/// bootstrap task is always ready, so this only fires if something
+/// genuinely wedged the scheduler.
+pub fn block_current() {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+
+    let (prev_rsp_ptr, next_rsp) = {
+        let mut sched = SCHED.lock();
+
+        // Fast path: a prior wake() set wake_pending while we were
+        // still Running. Clear and return without parking — this
+        // closes the wake-before-park race.
+        //
+        // AcqRel on swap: Acquire pairs with wake()'s Release store so
+        // anything the waker published before setting the flag is
+        // visible to us; Release on the clear keeps later reads (e.g.
+        // the condition in wait_while) from being hoisted above this
+        // point.
+        if sched
+            .current
+            .as_ref()
+            .expect("block_current before task::init")
+            .wake_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            drop(sched);
+            if was_on {
+                interrupts::enable();
+            }
+            return;
+        }
+
+        let Some(mut next) = sched.ready.pop_front() else {
+            panic!("task::block_current: no ready task to switch to");
+        };
+        let mut prev = sched.current.take().unwrap();
+        prev.state = TaskState::Blocked;
+        next.state = TaskState::Running;
+        let prev_id = prev.id;
+        let next_rsp = next.rsp;
+        sched.current = Some(next);
+        sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        sched.parked.insert(prev_id, prev);
+
+        let prev_ref = sched
+            .parked
+            .get_mut(&prev_id)
+            .expect("just inserted into parked");
+        // SAFETY: `prev_ref` is `&mut Box<Task>`; the Box heap-allocates
+        // the Task, so `&mut prev_ref.rsp` points at stable memory that
+        // survives any BTreeMap rebalance (rebalancing moves the Box,
+        // not the heap-allocated Task it points at). Same invariant as
+        // yield_now's ready-queue push.
+        let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
+
+        (prev_rsp_ptr, next_rsp)
+    };
+
+    // SAFETY: same switch invariant as yield_now — IRQs are masked,
+    // the SCHED lock is dropped so the incoming task can re-enter the
+    // scheduler, and prev_rsp_ptr targets stable heap memory.
+    unsafe {
+        context_switch(prev_rsp_ptr, next_rsp);
+    }
+
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Unpark the task with id `id`, or record a pending wake if the task
+/// is still Running / Ready so that its next [`block_current`] call
+/// returns without parking.
+///
+/// Task-context only. The scheduler lock is the same one `preempt_tick`
+/// uses with `try_lock`, so calling this from an ISR is a deadlock risk
+/// if the ISR interrupts a task already holding it. If you need an
+/// ISR-originating wake, defer it through a lock-free queue drained by
+/// a kernel task — the keyboard input ring is the pattern.
+///
+/// A wake on an unknown id (task exited — which M6 doesn't have yet —
+/// or never existed) is silently ignored.
+pub fn wake(id: usize) {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+
+    let mut sched = SCHED.lock();
+
+    // Parked → Ready is the happy path: move the Box across and hand
+    // the task a fresh slice so it gets a full tick the next time the
+    // scheduler rotates through.
+    if let Some(mut task) = sched.parked.remove(&id) {
+        task.state = TaskState::Ready;
+        task.slice_remaining_ms = DEFAULT_SLICE_MS;
+        sched.ready.push_back(task);
+        drop(sched);
+        if was_on {
+            interrupts::enable();
+        }
+        return;
+    }
+
+    // Task is Running or Ready. Set wake_pending so the next
+    // block_current call on it returns immediately. This is the
+    // wake-before-park race cure — see `block_current`'s fast path.
+    if let Some(current) = sched.current.as_ref() {
+        if current.id == id {
+            current.wake_pending.store(true, Ordering::Release);
+            drop(sched);
+            if was_on {
+                interrupts::enable();
+            }
+            return;
+        }
+    }
+    for task in sched.ready.iter() {
+        if task.id == id {
+            task.wake_pending.store(true, Ordering::Release);
+            drop(sched);
+            if was_on {
+                interrupts::enable();
+            }
+            return;
+        }
+    }
+
+    // Unknown id — drop the wake on the floor. Tasks don't exit yet so
+    // this only fires if somebody handed us a stale or invented id.
+    drop(sched);
+    if was_on {
+        interrupts::enable();
     }
 }
