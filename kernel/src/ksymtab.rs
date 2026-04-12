@@ -76,6 +76,13 @@ struct Entry {
     name_len: u32,
 }
 
+// Pin the on-wire layout. xtask hardcodes matching `HEADER_SIZE` /
+// `ENTRY_SIZE` constants when building the blob; if either struct
+// changes, this assert fires and whoever edited it has to update
+// xtask in lockstep.
+const _: () = assert!(size_of::<Header>() == 20);
+const _: () = assert!(size_of::<Entry>() == 16);
+
 /// Pointer to the start of the reservation's bytes. Routed through a
 /// volatile read of a self-referential constant to defeat rustc's
 /// const-folding: without this, LLVM sees `KSYMTAB_RESERVATION`'s

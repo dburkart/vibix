@@ -245,6 +245,10 @@ fn embed_ksymtab(kernel: &Path) -> R<()> {
     syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
     syms.dedup_by(|a, b| a.0 == b.0);
 
+    // These must stay in sync with `size_of::<Header>()` and
+    // `size_of::<Entry>()` in kernel/src/ksymtab.rs — that file pins
+    // the layout with `const _: () = assert!(...)` so any drift
+    // there breaks the kernel build before we can ship a bad blob.
     const HEADER_SIZE: usize = 20;
     const ENTRY_SIZE: usize = 16;
 
