@@ -11,6 +11,7 @@
 //! actually freeing it (and the `BOOTLOADER_RECLAIMABLE` frames) is
 //! issue #46.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
@@ -358,9 +359,36 @@ fn populate_hhdm(
 /// the current (old) tree are skipped so that the IST guard hole
 /// survives the switch.
 fn populate_kernel_image(mapper: &mut OffsetPageTable<'static>, alloc: &mut KernelFrameAllocator) {
+    // PT_LOAD is byte-granular but a PTE is page-granular: two
+    // segments touching the same 4 KiB page have to agree on flags.
+    // Union per page before mapping (WRITABLE if any covering segment
+    // is writable, NO_EXECUTE only if every covering segment is NX),
+    // then map each page exactly once. Our linker script page-aligns
+    // segment boundaries today, so in practice no page is covered
+    // twice — but relying on that invariant silently would leave a
+    // boundary page mis-permissioned the first time it breaks.
+    let mut per_page: BTreeMap<u64, PageTableFlags> = BTreeMap::new();
     for seg in super::elf::kernel_load_segments() {
-        let end = VirtAddr::new(seg.vaddr.as_u64() + seg.memsz);
-        clone_range(mapper, alloc, seg.vaddr, end, seg.flags);
+        let start = seg.vaddr.as_u64() & !0xFFF;
+        let end = (seg.vaddr.as_u64() + seg.memsz + 0xFFF) & !0xFFF;
+        let mut addr = start;
+        while addr < end {
+            let entry = per_page
+                .entry(addr)
+                .or_insert(PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE);
+            if seg.flags.contains(PageTableFlags::WRITABLE) {
+                *entry |= PageTableFlags::WRITABLE;
+            }
+            if !seg.flags.contains(PageTableFlags::NO_EXECUTE) {
+                entry.remove(PageTableFlags::NO_EXECUTE);
+            }
+            addr += 0x1000;
+        }
+    }
+
+    for (va, flags) in per_page {
+        let page_va = VirtAddr::new(va);
+        clone_range(mapper, alloc, page_va, page_va + 0x1000u64, flags);
     }
 }
 

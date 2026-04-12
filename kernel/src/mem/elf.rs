@@ -90,14 +90,21 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
     let phoff = ehdr.e_phoff as usize;
     let phnum = ehdr.e_phnum as usize;
     let phsz = ehdr.e_phentsize as usize;
-    assert!(
-        phoff + phnum * phsz <= size,
-        "kernel ELF phdr table out of range"
-    );
+    let phdr_table_end = phnum
+        .checked_mul(phsz)
+        .and_then(|bytes| phoff.checked_add(bytes))
+        .expect("kernel ELF phdr table size overflow");
+    assert!(phdr_table_end <= size, "kernel ELF phdr table out of range");
 
-    // SAFETY: bounds checked above; the slice covers only phdrs.
-    let phdrs: &[Elf64Phdr] =
-        unsafe { core::slice::from_raw_parts(base.add(phoff) as *const Elf64Phdr, phnum) };
+    // SAFETY: bounds checked above; the slice covers only phdrs, and
+    // the alignment assertion guarantees the cast-to-reference is
+    // sound even on toolchains that place `e_phoff` oddly.
+    let phdr_ptr = unsafe { base.add(phoff) } as *const Elf64Phdr;
+    assert!(
+        phdr_ptr.align_offset(core::mem::align_of::<Elf64Phdr>()) == 0,
+        "kernel ELF phdr table misaligned"
+    );
+    let phdrs: &[Elf64Phdr] = unsafe { core::slice::from_raw_parts(phdr_ptr, phnum) };
 
     phdrs.iter().filter_map(|ph| {
         if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
