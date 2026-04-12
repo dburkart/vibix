@@ -11,6 +11,7 @@
 //! actually freeing it (and the `BOOTLOADER_RECLAIMABLE` frames) is
 //! issue #46.
 
+use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, TranslateResult, UnmapError};
@@ -56,10 +57,18 @@ static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 /// response.
 static HHDM_OFFSET: Mutex<Option<VirtAddr>> = Mutex::new(None);
 
+/// Physical address of the original Limine PML4, captured at [`init`]
+/// before any CR3 change. Used by [`reclaim_bootloader_memory`] to walk
+/// and account for the old tree's intermediate page-table frames.
+static LIMINE_PML4_PHYS: Mutex<Option<PhysAddr>> = Mutex::new(None);
+
 /// Install the kernel mapper over Limine's active PML4. Must be called
 /// after `frame::init` and before any caller tries to `map`/`unmap`.
 pub fn init(hhdm_offset: VirtAddr) {
     let (cr3_frame, _) = Cr3::read();
+    // Stash the original Limine PML4 frame before any CR3 change so
+    // reclaim_bootloader_memory can walk the old tree after the switch.
+    *LIMINE_PML4_PHYS.lock() = Some(cr3_frame.start_address());
     let l4 = unsafe { pml4_as_mut(cr3_frame, hhdm_offset) };
     let mapper = unsafe { OffsetPageTable::new(l4, hhdm_offset) };
     *MAPPER.lock() = Some(mapper);
@@ -562,4 +571,171 @@ unsafe fn set_pat_bit_4k(
     unsafe {
         ptr.write_volatile(ptr.read_volatile() | super::pat::PAT_BIT_4K);
     }
+}
+
+// -- Bootloader memory reclamation ----------------------------------------
+
+/// Release Limine's original PML4 intermediate page-table frames and all
+/// `BOOTLOADER_RECLAIMABLE` physical regions back to the global frame
+/// allocator. Must be called after [`build_and_switch_kernel_pml4`].
+///
+/// The original PML4's L3/L2/L1 intermediate frames are a subset of
+/// `BOOTLOADER_RECLAIMABLE`; the broad region release below covers them.
+/// We walk the old tree first purely for accounting so the log line
+/// reports how many page-table frames were among the reclaimed memory.
+///
+/// The bootstrap task (`Task::bootstrap`) inherits the Limine boot stack
+/// and runs on it permanently — its physical frames are excluded from
+/// reclamation so the allocator cannot reuse them while the stack is
+/// still live.
+pub fn reclaim_bootloader_memory() {
+    let hhdm = HHDM_OFFSET.lock().expect("paging::init not called");
+    let orig_pml4_phys = LIMINE_PML4_PHYS.lock().expect("paging::init not called");
+
+    // --- Boot stack protection -------------------------------------------
+    // Translate the boot stack virtual address window to physical frames.
+    // We use the same window as clone_boot_stack so we protect every page
+    // that was explicitly cloned into the kernel PML4. translate() takes
+    // the MAPPER lock per call, so we collect all frames before we acquire
+    // the frame-allocator lock below (no nested locking).
+    let rsp: u64;
+    // SAFETY: reading RSP is always valid.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) rsp,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let stack_window = 2 * crate::boot::STACK_REQUEST.size();
+    let stack_virt_base = rsp.saturating_sub(stack_window) & !0xFFFu64;
+    let stack_virt_top = (rsp.saturating_add(stack_window) + 0xFFF) & !0xFFFu64;
+
+    let mut boot_stack_phys: Vec<u64> = Vec::new();
+    let mut virt = stack_virt_base;
+    while virt < stack_virt_top {
+        if let Some(phys) = translate(VirtAddr::new(virt)) {
+            boot_stack_phys.push(phys.as_u64() & !0xFFFu64);
+        }
+        virt += 4096;
+    }
+
+    // --- Original PML4 walk (accounting only) ----------------------------
+    // Walk the now-inactive Limine PML4 to count its intermediate L3/L2/L1
+    // frames. The new kernel PML4's HHDM covers BOOTLOADER_RECLAIMABLE with
+    // 2 MiB pages, so the old table frames remain readable via HHDM.
+    //
+    // SAFETY: orig_pml4_phys was captured before the CR3 switch. The new
+    // PML4's HHDM window explicitly covers BOOTLOADER_RECLAIMABLE so the
+    // old table frames are still reachable. No CPU walks the old tree (CR3
+    // has been updated) and interrupts are off during mem::init.
+    let table_frame_count =
+        unsafe { count_pml4_intermediate_tables(orig_pml4_phys, hhdm) };
+
+    // --- BOOTLOADER_RECLAIMABLE release ----------------------------------
+    // Iterate the memory map and release every frame in BOOTLOADER_RECLAIMABLE
+    // regions, skipping the frames that back the active boot stack.
+    //
+    // release_region is idempotent (clears bitmap bits unconditionally) so
+    // releasing a frame that was already freed or that overlaps with the
+    // PML4 intermediate-table walk above is harmless. We read the memory-
+    // map response here — before releasing its physical frames — so the
+    // data is still valid; the allocator never zeroes memory on release.
+    use limine::memory_map::EntryType;
+    let memmap = crate::boot::MEMMAP_REQUEST
+        .get_response()
+        .expect("Limine memory-map response missing");
+
+    let mut total_bytes: u64 = 0;
+    {
+        let mut alloc = frame::global().lock();
+        for entry in memmap.entries() {
+            if entry.entry_type != EntryType::BOOTLOADER_RECLAIMABLE {
+                continue;
+            }
+            let region_end = entry.base + entry.length;
+            let mut phys = entry.base & !0xFFFu64;
+            while phys < region_end {
+                if !boot_stack_phys.contains(&phys) {
+                    alloc.release_region(super::Region::new(phys, super::FRAME_SIZE));
+                    total_bytes += super::FRAME_SIZE;
+                }
+                phys += super::FRAME_SIZE;
+            }
+        }
+    }
+
+    serial_println!(
+        "paging: reclaimed {} KiB bootloader memory \
+         ({} intermediate PML4 table frames, PML4={:#x})",
+        total_bytes / 1024,
+        table_frame_count,
+        orig_pml4_phys.as_u64(),
+    );
+}
+
+/// Walk the now-inactive Limine PML4 (accessible via the HHDM) and return
+/// the total count of intermediate L3/L2/L1 page-table frames. Does not
+/// free anything; frames are reclaimed by the broad `BOOTLOADER_RECLAIMABLE`
+/// region release in [`reclaim_bootloader_memory`].
+///
+/// # Safety
+/// * `pml4_phys` must be the physical address of a formerly-active PML4
+///   whose frames are still mapped via `hhdm` (guaranteed when the new
+///   kernel PML4's HHDM covers `BOOTLOADER_RECLAIMABLE`).
+/// * No CPU may be walking the tree (CR3 must have been switched away).
+unsafe fn count_pml4_intermediate_tables(pml4_phys: PhysAddr, hhdm: VirtAddr) -> usize {
+    let mut count = 0usize;
+
+    let l4_virt = hhdm + pml4_phys.as_u64();
+    // SAFETY: l4_virt is in the HHDM window, pointing at the old PML4 frame.
+    let l4: &PageTable = unsafe { &*(l4_virt.as_mut_ptr::<PageTable>()) };
+
+    for l4_entry in l4.iter() {
+        if !l4_entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        // L4 entries in x86_64 cannot be huge pages; frame() always succeeds.
+        let Ok(l3_frame) = l4_entry.frame() else {
+            continue;
+        };
+        let l3_virt = hhdm + l3_frame.start_address().as_u64();
+        let l3: &PageTable = unsafe { &*(l3_virt.as_mut_ptr::<PageTable>()) };
+        count += 1; // this L3 frame is an intermediate page table
+
+        for l3_entry in l3.iter() {
+            if !l3_entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            // 1 GiB huge page: L3 entry is a leaf; there is no L2 child table.
+            if l3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                continue;
+            }
+            let Ok(l2_frame) = l3_entry.frame() else {
+                continue;
+            };
+            let l2_virt = hhdm + l2_frame.start_address().as_u64();
+            let l2: &PageTable = unsafe { &*(l2_virt.as_mut_ptr::<PageTable>()) };
+            count += 1; // this L2 frame is an intermediate page table
+
+            for l2_entry in l2.iter() {
+                if !l2_entry.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                // 2 MiB huge page: L2 entry is a leaf; there is no L1 child table.
+                if l2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                // L1 table frame: contains 4 KiB PTEs (leaf entries pointing at
+                // actual data frames). We count the L1 frame itself as an
+                // intermediate table but do not descend into its entries —
+                // those leaf frames belong to kernel data or USABLE memory.
+                if l2_entry.frame().is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    count
 }

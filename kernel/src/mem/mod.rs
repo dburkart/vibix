@@ -62,4 +62,9 @@ pub fn init() {
     // state and swap CR3 to it. After this point, Limine's original
     // page-table tree is no longer reachable.
     paging::build_and_switch_kernel_pml4();
+
+    // Reclaim the original Limine PML4's intermediate page-table frames
+    // and all BOOTLOADER_RECLAIMABLE regions now that we no longer need
+    // the bootloader's page-table tree or its data structures.
+    paging::reclaim_bootloader_memory();
 }
