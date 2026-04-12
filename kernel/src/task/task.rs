@@ -18,7 +18,7 @@
 //! new task lands in `task_entry_trampoline`, which then calls the entry
 //! function.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
@@ -27,6 +27,19 @@ use crate::mem::paging;
 
 use super::switch::task_entry_trampoline;
 use super::DEFAULT_SLICE_MS;
+
+/// Scheduling state of a [`Task`].
+///
+/// `Running` and `Ready` tasks live on `Scheduler::current` or in
+/// `Scheduler::ready`; `Blocked` tasks are parked in `Scheduler::parked`
+/// and invisible to the round-robin rotation until something calls
+/// [`super::wake`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TaskState {
+    Running,
+    Ready,
+    Blocked,
+}
 
 /// Usable stack per task.
 const STACK_SIZE: usize = 16 * 1024;
@@ -65,6 +78,16 @@ pub(super) struct Task {
     /// to the back of the ready queue and the counter is reloaded from
     /// `DEFAULT_SLICE_MS`.
     pub slice_remaining_ms: u32,
+    /// Current scheduling state — Running (is `Scheduler::current`),
+    /// Ready (in `Scheduler::ready`), or Blocked (parked in
+    /// `Scheduler::parked`).
+    pub state: TaskState,
+    /// Set by [`super::wake`] when the target task is Running or Ready
+    /// at wake time. The task's next [`super::block_current`] call
+    /// consumes the flag and returns without parking — this is what
+    /// guards against the "wake before park" lost-wakeup race in
+    /// [`crate::sync::WaitQueue::wait_while`].
+    pub wake_pending: AtomicBool,
 }
 
 impl Task {
@@ -77,6 +100,8 @@ impl Task {
             guard_base: 0,
             rsp: 0,
             slice_remaining_ms: DEFAULT_SLICE_MS,
+            state: TaskState::Running,
+            wake_pending: AtomicBool::new(false),
         }
     }
 
@@ -143,6 +168,8 @@ impl Task {
             guard_base,
             rsp,
             slice_remaining_ms: DEFAULT_SLICE_MS,
+            state: TaskState::Ready,
+            wake_pending: AtomicBool::new(false),
         }
     }
 
