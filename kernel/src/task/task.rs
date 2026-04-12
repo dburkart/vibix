@@ -20,7 +20,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::mem::paging;
@@ -31,18 +31,18 @@ use super::DEFAULT_SLICE_MS;
 /// Usable stack per task.
 const STACK_SIZE: usize = 16 * 1024;
 /// Guard page size (one 4 KiB page, never mapped).
-const GUARD_SIZE: usize = 4096;
+pub(super) const GUARD_SIZE: usize = 4096;
 /// Total VA consumed per task slot: guard page + stack pages.
-const TASK_SLOT_SIZE: usize = GUARD_SIZE + STACK_SIZE;
+pub(super) const TASK_SLOT_SIZE: usize = GUARD_SIZE + STACK_SIZE;
 
 /// Base of the dedicated VA window for kernel task stacks. Chosen to sit
 /// well above the heap cap (`HEAP_BASE` + 16 MiB = `0xFFFF_C000_1000_0000`)
 /// and below the kernel image at `0xFFFF_FFFF_8000_0000`.
-const TASK_STACKS_VA_BASE: usize = 0xFFFF_D000_0000_0000;
+pub(super) const TASK_STACKS_VA_BASE: usize = 0xFFFF_D000_0000_0000;
 
 /// Bump allocator for task-stack VA slots. Monotonically increments;
 /// task stacks are never freed (tasks don't exit yet).
-static NEXT_STACK_VA: AtomicUsize = AtomicUsize::new(TASK_STACKS_VA_BASE);
+pub(super) static NEXT_STACK_VA: AtomicUsize = AtomicUsize::new(TASK_STACKS_VA_BASE);
 
 /// Sequential task IDs. 0 is reserved for the bootstrap task.
 static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(1);
@@ -103,9 +103,11 @@ impl Task {
 
         // Map only the stack pages. The guard page at `guard_base` is left
         // unmapped intentionally — touching it raises a #PF.
-        // `Page::from_start_address` (used internally by `map_range` via
-        // `containing_address`) will catch misalignment loudly if the VA
-        // calculation is ever wrong, matching the IST guard discipline.
+        // Assert alignment explicitly: map_range uses containing_address
+        // (which rounds down silently), so we validate here to catch any
+        // future drift in the VA constants.
+        Page::<Size4KiB>::from_start_address(VirtAddr::new(stack_base as u64))
+            .expect("task stack base must be page aligned");
         let stack_page_count = (STACK_SIZE / 4096) as u64;
         paging::map_range(
             VirtAddr::new(stack_base as u64),

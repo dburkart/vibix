@@ -52,7 +52,6 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
-    let addr = x86_64::registers::control::Cr2::read();
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
@@ -85,8 +84,8 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     }
 
     serial_println!(
-        "EXCEPTION: #PF addr={:?} code={:?}\n{:#?}",
-        addr,
+        "EXCEPTION: #PF addr={:#x} code={:?}\n{:#?}",
+        addr_u64,
         code,
         frame
     );
@@ -94,6 +93,20 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u64) -> ! {
+    // The most common task stack overflow pattern: PUSH/CALL walks RSP into
+    // the guard page, the CPU cannot write the #PF frame there (also
+    // unmapped), so it escalates to #DF. The #DF frame's stack_pointer
+    // holds the faulted RSP — check it before the generic diagnostic.
+    let faulted_rsp = frame.stack_pointer.as_u64() as usize;
+    if let Some(task_id) = crate::task::find_stack_overflow(faulted_rsp) {
+        serial_println!(
+            "EXCEPTION: #DF task {} stack overflow rsp={:#x}\n{:#?}",
+            task_id,
+            faulted_rsp,
+            frame
+        );
+        hang();
+    }
     serial_println!("EXCEPTION: #DF (double fault)\n{:#?}", frame);
     #[cfg(feature = "ist-overflow-test")]
     {
