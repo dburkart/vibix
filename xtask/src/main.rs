@@ -352,6 +352,7 @@ fn test_all() -> R<()> {
         "tasks",
         "preempt",
         "apic_online",
+        "page_fault",
     ] {
         cmd.arg("--test").arg(t);
     }

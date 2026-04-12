@@ -68,3 +68,7 @@ harness = false
 [[test]]
 name = "apic_online"
 harness = false
+
+[[test]]
+name = "page_fault"
+harness = false
