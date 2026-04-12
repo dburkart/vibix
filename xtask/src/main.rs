@@ -7,6 +7,7 @@
 //!   test          — run host unit tests + QEMU integration tests
 //!   test-runner   — (internal) boot a pre-built test kernel ELF in QEMU
 //!   smoke         — boot the kernel and assert on expected serial markers
+//!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   clean         — remove build artifacts
 //!
 //! Flags (apply where sensible): --release, --fault-test
@@ -80,11 +81,12 @@ fn main() -> R<()> {
             test_runner(Path::new(kernel))?;
         }
         "smoke" => smoke(&opts)?,
+        "lint" => lint()?,
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|test|smoke|clean] [--release] [--fault-test]"
+                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test]"
             );
             std::process::exit(2);
         }
@@ -414,6 +416,48 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         eprintln!("--- captured serial ---\n{output}\n-----------------------");
         Err(format!("smoke: missing markers {:?}", missing).into())
     }
+}
+
+fn lint() -> R<()> {
+    println!("→ clippy: xtask (host)");
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "clippy",
+                "--package",
+                "xtask",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .status()?,
+    )?;
+
+    println!("→ clippy: vibix (kernel, x86_64-unknown-none)");
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "clippy",
+                "--package",
+                "vibix",
+                "--target",
+                "x86_64-unknown-none",
+                "-Z",
+                "build-std=core,compiler_builtins,alloc",
+                "-Z",
+                "build-std-features=compiler-builtins-mem",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .status()?,
+    )?;
+
+    Ok(())
 }
 
 fn clean() -> R<()> {
