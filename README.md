@@ -41,7 +41,7 @@ Milestones complete:
   backtraces emitted to serial, structured klog ring (64 KiB, leveled,
   dumped on panic).
 
-Out of scope for now: SMP / AP bringup, preemptive userspace, blocking
+Out of scope for now: SMP / AP bring-up, preemptive userspace, blocking
 primitives, task priorities, tickless idle.
 
 ## Requirements
@@ -114,6 +114,7 @@ kernel/              # the kernel crate (lib + thin bin)
     serial.rs        # COM1 writer + serial_print!/serial_println!
     framebuffer.rs   # font8x8 console + print!/println!
     test_harness.rs  # QemuExitCode, Testable, test panic handler
+    test_hook.rs     # one-shot #PF expectation hooks for fault-injection tests
     klog.rs          # 64 KiB leveled ring-buffer log (Error/Warn/Info/Debug/Trace)
     ksymtab.rs       # embedded kernel symbol table (addr→name, patched post-link)
     acpi.rs          # RSDP→XSDT/RSDT→MADT parser; extracts LAPIC/IOAPIC topology
