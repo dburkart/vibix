@@ -428,7 +428,7 @@ fn lint() -> R<()> {
             .status()?,
     )?;
 
-    println!("→ clippy: vibix (kernel, x86_64-unknown-none)");
+    println!("→ clippy: vibix (kernel, {KERNEL_TARGET})");
     check(
         Command::new("cargo")
             .current_dir(workspace_root())
