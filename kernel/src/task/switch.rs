@@ -5,7 +5,8 @@
 //! (`rbx`, `rbp`, `r12`-`r15`) plus `rsp` of the outgoing task, then
 //! loads the incoming task's state symmetrically. That's the entire
 //! saved context — caller-saved registers belong to whichever function
-//! called `yield_now()` and Rust/LLVM handle them for us.
+//! called into the scheduler (`preempt_tick` or `block_current`) and
+//! Rust/LLVM handle them for us.
 //!
 //! A new task's stack is primed so that the first `context_switch`
 //! into it returns into `task_entry_trampoline`, which reads the entry
