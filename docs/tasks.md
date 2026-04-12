@@ -77,9 +77,13 @@ preempted or parked task it is the instruction after the call to
 
 ### `task::init()`
 
-Wraps the current thread as the bootstrap task. Must be called once, after
-`mem::init()` (stacks are mapped via `paging::map_range`) and after interrupts are enabled (so
-preemption ticks can arrive).
+Wraps the current thread as the bootstrap task. Must be called once after
+`mem::init()` (stacks are mapped via `paging::map_range`). Safe to run
+either before or after interrupts are enabled: `preempt_tick` short-
+circuits on `sched.current.is_none()`, so a stray PIT tick that arrives
+before the bootstrap task exists simply returns. Integration tests
+initialize tasks first and then enable IRQs; `main.rs` does the reverse
+for historical reasons and both work.
 
 ### `task::spawn(entry: fn() -> !)`
 

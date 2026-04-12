@@ -138,20 +138,25 @@ fn channel_ping_pong() {
 static MU: BlockingMutex<u64> = BlockingMutex::new(0);
 static MU_DONE: AtomicUsize = AtomicUsize::new(0);
 
-const MU_ROUNDS: u64 = 200;
+const MU_ROUNDS: u64 = 10;
+/// Busy-work inside the critical section, sized so each lock holder
+/// spans at least one preempt tick (~10 ms). Without this, three
+/// workers each complete their rounds in <1 ms — the mutex is never
+/// actually contended because one worker releases before the next
+/// even tries to acquire, and the `wait_while` / `notify_one` park
+/// path goes untested. ~200k `pause` ≈ 1–2 ms on typical QEMU; the
+/// preempt tick falls inside it and the other workers run headlong
+/// into a lock that's still held.
+const MU_CRIT_SPINS: usize = 200_000;
 
 fn mu_worker() -> ! {
     for _ in 0..MU_ROUNDS {
-        {
-            let mut g = MU.lock();
-            *g += 1;
+        let mut g = MU.lock();
+        for _ in 0..MU_CRIT_SPINS {
+            core::hint::spin_loop();
         }
-        // `spin_loop` between iterations so the preempt tick finds a
-        // natural rotation point — without the mutex being contended
-        // on every acquire, three un-yielding workers could each burn
-        // a full 10 ms slice before the next rotation, and we'd
-        // barely exercise the blocking path.
-        core::hint::spin_loop();
+        *g += 1;
+        // Guard dropped at end of scope -> notify_one wakes a waiter.
     }
     MU_DONE.fetch_add(1, Ordering::SeqCst);
     loop {

@@ -60,8 +60,7 @@ task_entry_trampoline:
     // task entered for the first time from the preempt ISR (which
     // runs with IF=0 under an interrupt gate) still receives future
     // timer IRQs and can itself be preempted. `sti` when IF is
-    // already set is a no-op, so the cooperative-yield path is
-    // unaffected.
+    // already set is a no-op.
     sti
     call r12
     ud2

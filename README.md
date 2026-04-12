@@ -139,7 +139,7 @@ kernel/              # the kernel crate (lib + thin bin)
       task.rs        # per-task kernel stack + saved register context
       scheduler.rs   # round-robin ready queue
       switch.rs      # hand-written context-switch assembly
-  tests/             # one no_std kernel binary per file (12 total)
+  tests/             # one no_std kernel binary per file (13 total)
     basic_boot.rs
     heap_alloc.rs
     heap_grow.rs
@@ -150,6 +150,7 @@ kernel/              # the kernel crate (lib + thin bin)
     page_fault.rs
     tasks.rs
     preempt.rs
+    blocking_sync.rs
     apic_online.rs
     backtrace.rs
 xtask/               # build/iso/run/test/smoke/lint orchestrator

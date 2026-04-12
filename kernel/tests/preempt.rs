@@ -1,7 +1,7 @@
 //! Integration test: the PIT preempts tasks that never yield.
 //!
-//! Spawns two workers that spin on a counter with no cooperative
-//! cooperative yield, then the driver sleeps on `hlt` watching `uptime_ms()`
+//! Spawns two workers that spin on a counter with no voluntary park,
+//! then the driver sleeps on `hlt` watching `uptime_ms()`
 //! until the deadline passes. Both workers must have made progress —
 //! if either counter is still zero, preemption didn't rotate through.
 
