@@ -7,6 +7,16 @@ description: The vibix software-delivery workflow — how changes move from idea
 
 All non-trivial changes move through the same flow: **branch → commit → push → PR → review → merge**. `main` is a review-only integration branch; nothing lands there directly.
 
+## Picking an issue
+
+When the user asks open-endedly to "pick an issue", "grab something to work on", or "what's next" — restrict the candidate set to **unassigned** issues. Fetch with:
+
+```sh
+gh issue list --search 'no:assignee' --state open
+```
+
+This rule does not apply when the user names a specific issue (*"let's do #12"*, *"start on the dmesg one"*) — work that issue regardless of assignee.
+
 ## Starting work
 
 Before writing any code for a new milestone or task:
@@ -14,7 +24,10 @@ Before writing any code for a new milestone or task:
 ```sh
 git checkout main && git pull
 git checkout -b <topic-branch>
+gh issue edit <N> --add-assignee dburkart   # if this branch corresponds to a tracked issue
 ```
+
+Assigning the issue signals "someone is actively on this" so concurrent sessions don't race on the same ticket. Skip only if there's no tracked issue for the work.
 
 Branch naming:
 - Milestones: `m<N>-<slug>` (e.g. `m3-interrupts`, `m4-paging`).
