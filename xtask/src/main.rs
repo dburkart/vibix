@@ -7,6 +7,7 @@
 //!   test          — run host unit tests + QEMU integration tests
 //!   test-runner   — (internal) boot a pre-built test kernel ELF in QEMU
 //!   smoke         — boot the kernel and assert on expected serial markers
+//!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   clean         — remove build artifacts
 //!
 //! Flags (apply where sensible): --release, --fault-test
@@ -22,6 +23,16 @@ type R<T> = Result<T, Box<dyn Error>>;
 
 const LIMINE_TAG: &str = "v8.x-binary";
 const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
+
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const KERNEL_BUILD_STD_ARGS: &[&str] = &[
+    "--target",
+    KERNEL_TARGET,
+    "-Z",
+    "build-std=core,compiler_builtins,alloc",
+    "-Z",
+    "build-std-features=compiler-builtins-mem",
+];
 
 // QEMU process exit codes produced by `isa-debug-exit` writing our
 // QemuExitCode values. See kernel/src/test_harness.rs.
@@ -80,11 +91,12 @@ fn main() -> R<()> {
             test_runner(Path::new(kernel))?;
         }
         "smoke" => smoke(&opts)?,
+        "lint" => lint()?,
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|test|smoke|clean] [--release] [--fault-test]"
+                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test]"
             );
             std::process::exit(2);
         }
@@ -117,7 +129,7 @@ fn kernel_binary(opts: &BuildOpts) -> PathBuf {
     let profile = if opts.release { "release" } else { "debug" };
     workspace_root()
         .join("target")
-        .join("x86_64-unknown-none")
+        .join(KERNEL_TARGET)
         .join(profile)
         .join("vibix")
 }
@@ -125,17 +137,8 @@ fn kernel_binary(opts: &BuildOpts) -> PathBuf {
 fn build(opts: &BuildOpts) -> R<PathBuf> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
-        .arg("build")
-        .arg("--package")
-        .arg("vibix")
-        .arg("--bin")
-        .arg("vibix")
-        .arg("--target")
-        .arg("x86_64-unknown-none")
-        .arg("-Z")
-        .arg("build-std=core,compiler_builtins,alloc")
-        .arg("-Z")
-        .arg("build-std-features=compiler-builtins-mem");
+        .args(["build", "--package", "vibix", "--bin", "vibix"])
+        .args(KERNEL_BUILD_STD_ARGS);
     if opts.release {
         cmd.arg("--release");
     }
@@ -332,17 +335,9 @@ fn test_all() -> R<()> {
     // `test-runner <binary>` per compiled test.
     println!("→ integration tests under QEMU");
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(workspace_root()).args([
-        "test",
-        "--package",
-        "vibix",
-        "--target",
-        "x86_64-unknown-none",
-        "-Z",
-        "build-std=core,compiler_builtins,alloc",
-        "-Z",
-        "build-std-features=compiler-builtins-mem",
-    ]);
+    cmd.current_dir(workspace_root())
+        .args(["test", "--package", "vibix"])
+        .args(KERNEL_BUILD_STD_ARGS);
     for t in [
         "basic_boot",
         "heap_alloc",
@@ -414,6 +409,36 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         eprintln!("--- captured serial ---\n{output}\n-----------------------");
         Err(format!("smoke: missing markers {:?}", missing).into())
     }
+}
+
+fn lint() -> R<()> {
+    println!("→ clippy: xtask (host)");
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "clippy",
+                "--package",
+                "xtask",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .status()?,
+    )?;
+
+    println!("→ clippy: vibix (kernel, {KERNEL_TARGET})");
+    check(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["clippy", "--package", "vibix"])
+            .args(KERNEL_BUILD_STD_ARGS)
+            .args(["--all-targets", "--", "-D", "warnings"])
+            .status()?,
+    )?;
+
+    Ok(())
 }
 
 fn clean() -> R<()> {
