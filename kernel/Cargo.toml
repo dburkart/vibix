@@ -83,3 +83,7 @@ harness = false
 [[test]]
 name = "page_fault"
 harness = false
+
+[[test]]
+name = "blocking_sync"
+harness = false
