@@ -92,15 +92,15 @@ place by `cargo xtask build` / `cargo xtask iso` after the kernel is linked:
 
 1. The linker produces the kernel ELF.
 2. `xtask` reads the ELF's symbol table (`.symtab`), encodes address/name pairs
-   into a compact binary format, and writes them into the reserved `.rodata`
-   region using the `KERNEL_FILE_REQUEST` Limine response.
+   into a compact binary format, and patches them into the reserved `.rodata`
+   region by overwriting the kernel ELF file in place (via `objcopy --update-section`).
 3. At runtime, `ksymtab` reads that patched region to resolve addresses.
 
 ### API
 
 ```rust
-// Resolve a return address to a name (if known):
-ksymtab::lookup(addr: u64) -> Option<&'static str>;
+// Resolve a return address to (name, offset) if known:
+ksymtab::resolve(addr: u64) -> Option<(&'static str, u64)>;
 
 // Format an address as "name+offset" or "0x<hex>" if unknown:
 ksymtab::format_addr(w: &mut impl Write, addr: u64) -> fmt::Result;
@@ -108,7 +108,7 @@ ksymtab::format_addr(w: &mut impl Write, addr: u64) -> fmt::Result;
 
 `format_addr` is used by the backtrace printer to produce output like:
 
-```
+```text
 backtrace:
   #0  vibix::arch::backtrace::dump_to_serial+0x3c
   #1  vibix::_start::panic+0x18
@@ -132,7 +132,7 @@ mov  rbp, rsp
 This creates a linked list of saved-RBP values on the stack. Each frame looks
 like:
 
-```
+```text
 [rbp + 0]  saved RBP of caller
 [rbp + 8]  return address into caller
 ```

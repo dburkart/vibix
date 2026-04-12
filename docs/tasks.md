@@ -27,7 +27,7 @@ A single `Lazy<Mutex<Scheduler>>` holds:
 ### Task Struct
 
 Each `Task` contains:
-- A heap-allocated kernel stack (see constants below).
+- A mapped kernel stack region (via `paging::map_range`, see constants below).
 - An unmapped guard page at the base of the stack.
 - `rsp: usize` — the saved stack pointer, updated by `context_switch`.
 - `slice_remaining_ms: u32` — remaining preemption budget in milliseconds.
@@ -70,7 +70,7 @@ preempted or yielded task it is the instruction after the call to
 ### `task::init()`
 
 Wraps the current thread as the bootstrap task. Must be called once, after
-`mem::init()` (stacks are heap-allocated) and after interrupts are enabled (so
+`mem::init()` (stacks are mapped via `paging::map_range`) and after interrupts are enabled (so
 preemption ticks can arrive).
 
 ### `task::spawn(entry: fn() -> !)`

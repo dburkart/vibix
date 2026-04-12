@@ -143,11 +143,9 @@ low) before writing the IOAPIC redirection entry.
 
 ### EOI Protocol
 
-Both the LAPIC and the legacy PIC need an EOI (End-Of-Interrupt) signal at the
-end of each ISR. `pic::notify_eoi(vector)` handles both: it always writes to
-the LAPIC EOI register, and if the vector is in the slave PIC range it also
-sends an EOI to the slave PIC's command port. This keeps the hybrid path working
-during the brief window between PIC remap and APIC takeover.
+EOI handling is centralized in `pic::notify_eoi(vector)`: it always writes to
+the LAPIC EOI register. No PIC EOI is needed — the 8259 is fully masked after
+`pic::init_and_disable()` and never delivers interrupts.
 
 ---
 

@@ -21,7 +21,7 @@ sequence, and public API for its subsystem.
 
 ## Initialization Order
 
-The kernel brings subsystems up in a fixed sequence. The `vibix::init()`
+The kernel initializes subsystems in a fixed sequence. The `vibix::init()`
 function (in `kernel/src/lib.rs`) encodes the mandatory ordering for code
 shared between the main binary and integration tests:
 
@@ -29,7 +29,8 @@ shared between the main binary and integration tests:
 serial::init()          — COM1 online; all subsequent output is visible
 arch::init()            — GDT + TSS, IDT, 8259 PIC remapped + masked
 mem::init()             — frame allocator, paging mapper, heap
-arch::init_apic()       — ACPI parse, LAPIC + IOAPIC init, IRQ routing
+arch::init_apic(rsdp_phys, hhdm_offset)
+                        — ACPI parse, LAPIC + IOAPIC init, IRQ routing
 time::init()            — PIT at 100 Hz
                           (vibix::init() returns; interrupts still disabled)
 ```
