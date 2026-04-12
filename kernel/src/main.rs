@@ -8,6 +8,7 @@ use vibix::framebuffer::Console;
 use vibix::{exit_qemu, framebuffer, println, serial_print, serial_println, QemuExitCode};
 
 #[no_mangle]
+#[cfg_attr(feature = "ist-overflow-test", allow(unreachable_code))]
 pub extern "C" fn _start() -> ! {
     vibix::serial::init();
     serial_println!("vibix booting…");
@@ -68,8 +69,22 @@ pub extern "C" fn _start() -> ! {
 
     #[cfg(feature = "ist-overflow-test")]
     {
-        serial_println!("ist-overflow-test: recursing to blow the IST guard");
-        recurse(core::hint::black_box(0));
+        // Trigger a real #DF so the CPU switches to the IST stack before
+        // we recurse (recursion happens in the #DF handler itself, in
+        // idt.rs, under the same feature). The cascade: bad RSP → ud2
+        // raises #UD → the #UD handler preamble can't push its frame on
+        // the invalid RSP → #PF → same — push fails again → #DF. The
+        // #DF vector has an IST index, so the CPU finally switches to a
+        // good stack and enters our handler, which then blows it.
+        serial_println!("ist-overflow-test: forcing #DF via bad RSP + ud2");
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {bad}",
+                "ud2",
+                bad = in(reg) 0xFFFF_FFFF_FFFE_F000u64,
+                options(noreturn),
+            );
+        }
     }
 
     x86_64::instructions::interrupts::enable();
@@ -89,14 +104,3 @@ fn panic(info: &PanicInfo) -> ! {
     exit_qemu(QemuExitCode::Failure)
 }
 
-/// Recurse forever, consuming stack on each frame. Used by
-/// `ist-overflow-test` to force the #DF handler to chew through its
-/// IST stack and run into the guard page below.
-#[cfg(feature = "ist-overflow-test")]
-#[inline(never)]
-#[allow(unconditional_recursion)]
-fn recurse(depth: u64) -> u64 {
-    let buf = [depth; 64];
-    let next = core::hint::black_box(depth).wrapping_add(1);
-    recurse(next).wrapping_add(core::hint::black_box(buf[0]))
-}

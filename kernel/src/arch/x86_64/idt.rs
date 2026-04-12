@@ -63,5 +63,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u64) -> ! {
     serial_println!("EXCEPTION: #DF (double fault)\n{:#?}", frame);
+    #[cfg(feature = "ist-overflow-test")]
+    {
+        // We're running on the IST stack now — the whole point. Burn
+        // through it so overflow walks into the guard page below and
+        // surfaces as a #PF with a fault address inside the guard.
+        serial_println!("ist-overflow-test: recursing inside #DF handler");
+        df_recurse(core::hint::black_box(0));
+    }
     hang();
+}
+
+#[cfg(feature = "ist-overflow-test")]
+#[inline(never)]
+#[allow(unconditional_recursion)]
+fn df_recurse(depth: u64) -> u64 {
+    let buf = [depth; 64];
+    let next = core::hint::black_box(depth).wrapping_add(1);
+    df_recurse(next).wrapping_add(core::hint::black_box(buf[0]))
 }

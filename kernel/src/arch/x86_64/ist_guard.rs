@@ -19,7 +19,11 @@ use crate::serial_println;
 
 pub fn install() {
     let guard = gdt::df_stack_guard_addr();
-    let page: Page<Size4KiB> = Page::containing_address(guard);
+    // `from_start_address` instead of `containing_address`: the guard VA
+    // must be exactly page-aligned — otherwise we'd silently round down
+    // and unmap something that isn't the guard.
+    let page: Page<Size4KiB> =
+        Page::from_start_address(guard).expect("IST guard address must be page-aligned");
     paging::unmap(page).expect("failed to unmap IST guard page");
     serial_println!("paging: IST guard installed @ {:#x}", guard.as_u64());
 }
