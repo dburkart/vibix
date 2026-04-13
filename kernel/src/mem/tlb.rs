@@ -104,8 +104,7 @@ impl Drop for Flusher {
         assert!(
             self.finished,
             "Flusher dropped without finish(): {} queued, overflow={}",
-            self.len,
-            self.overflow,
+            self.len, self.overflow,
         );
     }
 }

@@ -42,8 +42,9 @@ fn run_tests() {
 
 const TEST_VA: u64 = 0xFFFF_C000_F1B0_0000;
 const SENTINEL: u64 = 0xCAFE_F00D_DEAD_BEEF;
-const FLAGS_RW: PageTableFlags =
-    PageTableFlags::from_bits_truncate(PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits());
+const FLAGS_RW: PageTableFlags = PageTableFlags::from_bits_truncate(
+    PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits(),
+);
 
 /// Map a page, stash a sentinel, unmap+flush via Flusher, then remap
 /// the *same VA* to a fresh (zeroed) frame. The remap must be visible
