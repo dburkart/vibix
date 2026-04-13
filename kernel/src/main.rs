@@ -64,6 +64,10 @@ pub extern "C" fn _start() -> ! {
         serial_println!("userspace module ELF missing");
     }
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
+    match vibix::hpet::init() {
+        Ok(()) => {}
+        Err(e) => serial_println!("hpet: unavailable ({:?}), falling back to PIT", e),
+    }
     vibix::time::init();
     vibix::pci::scan();
 

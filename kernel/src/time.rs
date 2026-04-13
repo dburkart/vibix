@@ -108,14 +108,16 @@ const RTC_SNAPSHOT_RETRIES: usize = 4;
 pub fn init() {
     use x86_64::instructions::port::Port;
 
-    let divisor: u16 = (PIT_FREQ_HZ / TICK_HZ) as u16;
-    unsafe {
-        // Command: channel 0, access lobyte/hibyte, mode 2 (rate gen),
-        // binary counting = 0b00_11_010_0 = 0x34.
-        Port::<u8>::new(0x43).write(0x34);
-        let mut data: Port<u8> = Port::new(0x40);
-        data.write((divisor & 0xff) as u8);
-        data.write((divisor >> 8) as u8);
+    if !crate::hpet::active() {
+        let divisor: u16 = (PIT_FREQ_HZ / TICK_HZ) as u16;
+        unsafe {
+            // Command: channel 0, access lobyte/hibyte, mode 2 (rate
+            // gen), binary counting = 0b00_11_010_0 = 0x34.
+            Port::<u8>::new(0x43).write(0x34);
+            let mut data: Port<u8> = Port::new(0x40);
+            data.write((divisor & 0xff) as u8);
+            data.write((divisor >> 8) as u8);
+        }
     }
     crate::serial_println!("timer: {} Hz", TICK_HZ);
     match wall_clock() {
