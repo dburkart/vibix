@@ -58,7 +58,9 @@ fn map_roundtrip_unmap() {
 
     let page: Page<Size4KiB> = Page::containing_address(va);
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let _frame = paging::map(page, flags).expect("map failed");
+    let mut flusher = vibix::mem::tlb::Flusher::new_active();
+    let _frame = paging::map(page, flags, &mut flusher).expect("map failed");
+    flusher.finish();
 
     let phys = paging::translate(va).expect("translate after map returned None");
     serial_println!("  mapped {va:?} -> {phys:?}");
@@ -69,7 +71,9 @@ fn map_roundtrip_unmap() {
         assert_eq!(ptr.read_volatile(), 0xCAFE_F00D_DEAD_BEEF);
     }
 
-    paging::unmap_and_free(page).expect("unmap failed");
+    let mut flusher = vibix::mem::tlb::Flusher::new_active();
+    paging::unmap_and_free(page, &mut flusher).expect("unmap failed");
+    flusher.finish();
     assert!(
         paging::translate(va).is_none(),
         "translate after unmap still returned Some"
@@ -90,14 +94,18 @@ fn map_unmap_loop_reclaims() {
     // (PDPT/PD/PT) that stay populated across subsequent iterations.
     // Take the baseline *after* that one-time cost so we measure pure
     // leaf-frame accounting over the loop below.
-    paging::map(page, flags).expect("warm-up map");
-    paging::unmap_and_free(page).expect("warm-up unmap");
+    let mut flusher = vibix::mem::tlb::Flusher::new_active();
+    paging::map(page, flags, &mut flusher).expect("warm-up map");
+    paging::unmap_and_free(page, &mut flusher).expect("warm-up unmap");
+    flusher.finish();
 
     let baseline = frame::global().lock().free_frames();
 
     for _ in 0..64 {
-        paging::map(page, flags).expect("map failed in loop");
-        paging::unmap_and_free(page).expect("unmap failed in loop");
+        let mut flusher = vibix::mem::tlb::Flusher::new_active();
+        paging::map(page, flags, &mut flusher).expect("map failed in loop");
+        paging::unmap_and_free(page, &mut flusher).expect("unmap failed in loop");
+        flusher.finish();
     }
 
     let after = frame::global().lock().free_frames();

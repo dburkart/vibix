@@ -12,6 +12,7 @@
 
 pub mod frame;
 pub mod refcount;
+pub mod tlb;
 
 #[cfg(any(target_os = "none", test))]
 pub(crate) mod elf;

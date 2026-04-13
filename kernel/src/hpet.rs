@@ -108,6 +108,7 @@ pub fn init() -> Result<(), HpetError> {
     let base_phys = unsafe { ptr::addr_of!((*table).base_address).read_unaligned() };
 
     // The register block is 1024 bytes per spec; one page covers it.
+    let mut flusher = crate::mem::tlb::Flusher::new_active();
     paging::map_phys_into_hhdm(
         base_phys,
         0x1000,
@@ -115,8 +116,10 @@ pub fn init() -> Result<(), HpetError> {
             | PageTableFlags::WRITABLE
             | PageTableFlags::NO_EXECUTE
             | PageTableFlags::NO_CACHE,
+        &mut flusher,
     )
     .expect("failed to map HPET MMIO");
+    flusher.finish();
 
     let base = (base_phys + hhdm) as *mut u8;
     let caps = unsafe { read64(base, REG_CAPS) };

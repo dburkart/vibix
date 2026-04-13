@@ -25,6 +25,7 @@ use x86_64::VirtAddr;
 
 use super::elf;
 use super::paging;
+use super::tlb::Flusher;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -69,15 +70,21 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     }
 
     let mut segments = 0usize;
+    let mut flusher = Flusher::new_active();
     for seg in parsed.load_segments() {
-        map_segment(bytes, seg)?;
+        map_segment(bytes, seg, &mut flusher)?;
         segments += 1;
     }
+    flusher.finish();
 
     Ok(LoadedImage { entry, segments })
 }
 
-fn map_segment(bytes: &[u8], seg: elf::LoadSegment) -> Result<(), LoadError> {
+fn map_segment(
+    bytes: &[u8],
+    seg: elf::LoadSegment,
+    flusher: &mut Flusher,
+) -> Result<(), LoadError> {
     if (seg.vaddr.as_u64() >> 63) != 1 {
         return Err(LoadError::SegmentNotUpperHalf);
     }
@@ -97,7 +104,7 @@ fn map_segment(bytes: &[u8], seg: elf::LoadSegment) -> Result<(), LoadError> {
     for i in 0..page_count {
         let va = seg.vaddr + i * PAGE_SIZE;
         let page = Page::<Size4KiB>::containing_address(va);
-        let frame = paging::map(page, seg.flags).map_err(LoadError::MapFailed)?;
+        let frame = paging::map(page, seg.flags, flusher).map_err(LoadError::MapFailed)?;
 
         // Fill this page through the HHDM window. The frame allocator
         // doesn't zero its output, so we clear the whole page first

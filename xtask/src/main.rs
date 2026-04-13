@@ -628,6 +628,7 @@ fn test_all() -> R<()> {
         "fpu_context_switch",
         "task_exit",
         "addrspace",
+        "tlb_flusher",
     ] {
         cmd.arg("--test").arg(t);
     }

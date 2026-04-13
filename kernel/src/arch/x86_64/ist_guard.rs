@@ -15,6 +15,7 @@ use x86_64::structures::paging::{Page, Size4KiB};
 
 use super::gdt;
 use crate::mem::paging;
+use crate::mem::tlb::Flusher;
 use crate::serial_println;
 
 pub fn install() {
@@ -24,6 +25,8 @@ pub fn install() {
     // and unmap something that isn't the guard.
     let page: Page<Size4KiB> =
         Page::from_start_address(guard).expect("IST guard address must be page-aligned");
-    paging::unmap(page).expect("failed to unmap IST guard page");
+    let mut flusher = Flusher::new_active();
+    paging::unmap(page, &mut flusher).expect("failed to unmap IST guard page");
+    flusher.finish();
     serial_println!("paging: IST guard installed @ {:#x}", guard.as_u64());
 }
