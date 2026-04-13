@@ -236,6 +236,48 @@ pub fn free_frames() -> usize {
     global().lock().free_frames()
 }
 
+/// Allocate one 4 KiB physical frame and set its refcount to 1. The
+/// "1" is the allocator's handle: the caller owns exactly one reference
+/// to the returned frame. Use [`put`] to drop that reference (which may
+/// return the frame to the pool), or [`super::refcount::inc_refcount`]
+/// to share it further.
+#[cfg(target_os = "none")]
+pub fn alloc() -> Option<u64> {
+    let phys = global().lock().allocate_frame()?;
+    super::refcount::init_on_alloc(phys);
+    Some(phys)
+}
+
+/// Return a frame whose refcount has already been brought to `0` to the
+/// pool. Panics if the refcount is non-zero — callers that share frames
+/// (CoW, `fork`) must decrement first with
+/// [`super::refcount::dec_refcount`]. Most callers should use [`put`]
+/// instead, which combines the decrement with the release.
+#[cfg(target_os = "none")]
+pub fn free(phys: u64) {
+    super::refcount::assert_zero_for_free(phys);
+    global().lock().deallocate_frame(phys);
+}
+
+/// Drop one reference to `phys`. If this brings the refcount to `0`
+/// the frame is returned to the pool. This is the "ordinary" release
+/// path for callers that treat an allocation as a single-owner resource
+/// (heap, page tables, IST stacks); CoW and fork decrement explicitly
+/// and release on `prev == 1` themselves so they can issue the right
+/// memory fence between their `Release` decrement and the allocator
+/// handing the frame out again.
+#[cfg(target_os = "none")]
+pub fn put(phys: u64) {
+    let prev = super::refcount::dec_refcount(phys);
+    if prev == 1 {
+        // Pair our `Release` on the decrement with an `Acquire` before
+        // reclaim, so subsequent allocators observe every write that
+        // happened under the previous owner.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        global().lock().deallocate_frame(phys);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

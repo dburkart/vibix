@@ -34,16 +34,14 @@ pub struct KernelFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let phys = frame::global().lock().allocate_frame()?;
+        let phys = frame::alloc()?;
         Some(PhysFrame::containing_address(PhysAddr::new(phys)))
     }
 }
 
 impl FrameDeallocator<Size4KiB> for KernelFrameAllocator {
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
-        frame::global()
-            .lock()
-            .deallocate_frame(frame.start_address().as_u64());
+        frame::put(frame.start_address().as_u64());
     }
 }
 
