@@ -16,14 +16,24 @@ use core::arch::global_asm;
 
 unsafe extern "C" {
     /// Save the outgoing task's callee-saved regs + rsp into
-    /// `*prev_rsp`, then load `next_rsp` and the incoming task's regs.
+    /// `*prev_rsp`, then load `next_rsp` and the incoming task's regs,
+    /// then load `next_cr3` into CR3.
+    ///
+    /// The CR3 write happens after the stack swap — kernel task stacks
+    /// live in the shared upper half, so the new stack is reachable
+    /// through either PML4 and the ordering is symmetric.
     ///
     /// # Safety
     /// - `prev_rsp` must be a valid, aligned, writable `*mut usize`
     ///   pointing at stable storage that outlives this call.
     /// - `next_rsp` must be a valid saved rsp produced either by a
     ///   prior `context_switch` or by `Task::new`'s stack priming.
-    pub fn context_switch(prev_rsp: *mut usize, next_rsp: usize);
+    /// - `next_cr3` must be the physical address of a PML4 whose upper
+    ///   half mirrors the current kernel PML4 (i.e. produced by
+    ///   `paging::new_task_pml4` or captured from the kernel PML4
+    ///   itself). A PML4 with a stale kernel upper half will fault on
+    ///   the next kernel-space access.
+    pub fn context_switch(prev_rsp: *mut usize, next_rsp: usize, next_cr3: u64);
 
     /// First-entry trampoline for a freshly primed task. The entry fn
     /// pointer is passed in `r12`; the trampoline just `call`s it.
@@ -37,7 +47,7 @@ global_asm!(
     .global task_entry_trampoline
 
 context_switch:
-    // rdi = prev_rsp (*mut usize), rsi = next_rsp (usize)
+    // rdi = prev_rsp (*mut usize), rsi = next_rsp (usize), rdx = next_cr3 (u64)
     push rbx
     push rbp
     push r12
@@ -46,6 +56,11 @@ context_switch:
     push r15
     mov [rdi], rsp
     mov rsp, rsi
+    // Load the incoming task's PML4. Non-global kernel mappings are
+    // flushed by the CR3 write; we use no PTE_GLOBAL today so this
+    // alone is sufficient. New stack is already live; both PML4s agree
+    // on upper-half mappings so the ongoing `ret` walk keeps working.
+    mov cr3, rdx
     pop r15
     pop r14
     pop r13

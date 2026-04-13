@@ -509,6 +509,7 @@ fn test_all() -> R<()> {
         "blocking_sync",
         "shell_smoke",
         "priority",
+        "per_task_cr3",
     ] {
         cmd.arg("--test").arg(t);
     }

@@ -20,7 +20,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::mem::paging;
@@ -98,6 +99,15 @@ pub(super) struct Task {
     /// kernel; exists so affinity APIs keep a stable shape once SMP
     /// lands.
     pub affinity: u64,
+    /// Physical frame holding this task's PML4. Loaded into CR3 on
+    /// every `context_switch` into this task. The bootstrap task's
+    /// PML4 is the kernel PML4 built by
+    /// [`crate::mem::paging::build_and_switch_kernel_pml4`]; spawned
+    /// tasks get a fresh PML4 from
+    /// [`crate::mem::paging::new_task_pml4`] whose upper half shares
+    /// kernel mappings and whose lower half is empty — groundwork for
+    /// per-task userspace address spaces (#26).
+    pub cr3: PhysFrame<Size4KiB>,
 }
 
 impl Task {
@@ -114,6 +124,10 @@ impl Task {
             wake_pending: AtomicBool::new(false),
             priority: DEFAULT_PRIORITY,
             affinity: AFFINITY_ALL,
+            // The bootstrap task runs on the kernel PML4 that
+            // build_and_switch_kernel_pml4 installed — capture whatever
+            // CR3 currently points at.
+            cr3: Cr3::read().0,
         }
     }
 
@@ -156,6 +170,13 @@ impl Task {
         )
         .expect("failed to map task stack");
 
+        // Build the per-task PML4 *after* mapping the stack — the new
+        // PML4 snapshots the kernel PML4's upper half, and we want the
+        // fresh stack's L4 entry to already be in place. Later tasks'
+        // stacks fall under the same L4 entry and propagate by alias
+        // through the shared L3 subtree.
+        let cr3 = paging::new_task_pml4();
+
         let top = stack_base + STACK_SIZE;
 
         // Seven 8-byte slots: [r15, r14, r13, r12, rbp, rbx, ret].
@@ -187,6 +208,7 @@ impl Task {
             wake_pending: AtomicBool::new(false),
             priority: super::priority::clamp_priority(priority),
             affinity: AFFINITY_ALL,
+            cr3,
         }
     }
 

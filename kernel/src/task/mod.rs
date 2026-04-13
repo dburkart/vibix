@@ -448,6 +448,7 @@ pub fn preempt_tick() {
     prev.state = TaskState::Ready;
     next.state = TaskState::Running;
     let next_rsp = next.rsp;
+    let next_cr3 = next.cr3.start_address().as_u64();
     let prev_prio = prev.priority;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
@@ -469,9 +470,11 @@ pub fn preempt_tick() {
     // allocated Task it points at — so the pointer stays valid even
     // though the VecDeque could mutate from under us. IRQs are already
     // masked inside the ISR, so no other scheduler path can race us
-    // between lock drop and the context switch.
+    // between lock drop and the context switch. `next_cr3` is a valid
+    // PML4 whose upper half mirrors the kernel PML4 (by construction
+    // in `Task::new` / `Task::bootstrap`).
     unsafe {
-        context_switch(prev_rsp_ptr, next_rsp);
+        context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 }
 
@@ -511,7 +514,7 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, next_rsp) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -545,6 +548,7 @@ pub fn block_current() {
         next.state = TaskState::Running;
         let prev_id = prev.id;
         let next_rsp = next.rsp;
+        let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         sched.parked.insert(prev_id, prev);
@@ -560,14 +564,15 @@ pub fn block_current() {
         // preempt_tick's ready-queue push.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
 
-        (prev_rsp_ptr, next_rsp)
+        (prev_rsp_ptr, next_rsp, next_cr3)
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
     // incoming task can re-enter the scheduler, and prev_rsp_ptr
     // targets stable heap memory (see the insert comment above).
+    // `next_cr3` is a valid per-task PML4 (see preempt_tick).
     unsafe {
-        context_switch(prev_rsp_ptr, next_rsp);
+        context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 
     if was_on {

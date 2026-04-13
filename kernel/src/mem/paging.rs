@@ -223,6 +223,48 @@ pub fn active_pml4_phys() -> PhysAddr {
     Cr3::read().0.start_address()
 }
 
+/// Build a fresh PML4 for a new task, sharing the kernel's upper half.
+///
+/// The returned frame holds a page table whose lower half (entries
+/// `0..256`) is zero and whose upper half (entries `256..512`) is a
+/// verbatim copy of the currently-active PML4's upper half. That gives
+/// the task its own lower-half VA space while all kernel mappings
+/// (HHDM, heap, IST, kernel image, task stacks, framebuffer) remain
+/// reachable at the same VAs.
+///
+/// # Invariant
+///
+/// Kernel upper-half L4 entries must be fully populated before this is
+/// called for the first time, and must not subsequently gain *new* L4
+/// entries. The kernel populates L4 entries 256 (HHDM), 384 (heap),
+/// 416 (task stacks — populated when the first task stack is mapped),
+/// and 511 (kernel image) during boot and first-task construction.
+/// Further kernel mappings only populate lower levels below those L4
+/// entries, which are shared by alias across all task PML4s. A future
+/// feature that installs a brand-new upper-half L4 entry after tasks
+/// exist would leave the older PML4s blind to it — that's the
+/// groundwork #61/SMP-level TLB-shootdown will have to take care of.
+pub fn new_task_pml4() -> PhysFrame<Size4KiB> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before new_task_pml4");
+    // SAFETY: freshly allocated, exclusively owned, zeroed through HHDM.
+    let new_frame = unsafe { alloc_zeroed_frame(hhdm) };
+    let active = Cr3::read().0;
+
+    // SAFETY: `active` is the live PML4 (CR3), which is always mapped in
+    // the HHDM. `new_frame` was just allocated for our exclusive use.
+    // PageTable is repr(C) `[PageTableEntry; 512]` and PageTableEntry is
+    // repr(transparent) u64 — copy the raw 64-bit slots to avoid
+    // depending on the entry type's Clone impl.
+    unsafe {
+        let src = pml4_as_mut(active, hhdm) as *const PageTable as *const u64;
+        let dst = pml4_as_mut(new_frame, hhdm) as *mut PageTable as *mut u64;
+        core::ptr::copy_nonoverlapping(src.add(256), dst.add(256), 256);
+    }
+    new_frame
+}
+
 // -- PML4 construction + CR3 swap ---------------------------------------
 
 /// Build a fresh kernel PML4 and switch CR3 to it. Drops Limine's
