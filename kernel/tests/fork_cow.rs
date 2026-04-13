@@ -19,8 +19,8 @@ use vibix::mem::addrspace::AddressSpace;
 use vibix::mem::frame;
 use vibix::mem::paging;
 use vibix::mem::tlb::Flusher;
-use vibix::mem::vmobject::{Access, AnonObject, VmObject};
 use vibix::mem::vmatree::{Share, Vma};
+use vibix::mem::vmobject::{Access, AnonObject, VmObject};
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
@@ -94,7 +94,9 @@ fn prefault_page(aspace: &AddressSpace, page_index: usize) {
         let vma = aspace.find(FORK_VA).expect("vma not found");
         Arc::clone(&vma.object)
     };
-    let phys = obj.fault(obj_offset, Access::Write).expect("VmObject::fault failed");
+    let phys = obj
+        .fault(obj_offset, Access::Write)
+        .expect("VmObject::fault failed");
     let va = FORK_VA + page_index * 4096;
     let page =
         Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64)).expect("page-aligned VA");
@@ -119,10 +121,7 @@ fn fork_cow_vma_tree_is_cloned() {
     assert_eq!(pvma.end, cvma.end);
     assert_eq!(pvma.share, cvma.share);
     assert!(
-        core::ptr::addr_eq(
-            Arc::as_ptr(&pvma.object),
-            Arc::as_ptr(&cvma.object),
-        ),
+        core::ptr::addr_eq(Arc::as_ptr(&pvma.object), Arc::as_ptr(&cvma.object),),
         "child object should be Arc::clone of parent's"
     );
     drop(parent);

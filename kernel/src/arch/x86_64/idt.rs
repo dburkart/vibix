@@ -166,8 +166,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                 Ok(phys) => {
                     let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
                         .expect("#PF: VmObject returned unaligned phys");
-                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags)
-                    {
+                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
                         Ok(()) => return,
                         Err(e) => {
                             // map_existing_in_pml4 failed (OOM allocating page-table
@@ -177,11 +176,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                             // see a phantom PTE reference.
                             #[cfg(target_os = "none")]
                             crate::mem::refcount::dec_refcount(phys);
-                            serial_println!(
-                                "#PF demand map failed addr={:#x}: {:?}",
-                                addr_u64,
-                                e
-                            )
+                            serial_println!("#PF demand map failed addr={:#x}: {:?}", addr_u64, e)
                         }
                     }
                 }
