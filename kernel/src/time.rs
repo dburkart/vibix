@@ -90,8 +90,9 @@ pub fn init() {
         data.write((divisor >> 8) as u8);
     }
     crate::serial_println!("timer: {} Hz", TICK_HZ);
-    if let Some(now) = wall_clock() {
-        crate::serial_println!("rtc: {}", now);
+    match wall_clock() {
+        Some(now) => crate::serial_println!("rtc: {}", now),
+        None => crate::serial_println!("rtc: unavailable"),
     }
 }
 
@@ -131,6 +132,9 @@ fn decode_wall_clock(raw: RawRtc) -> Option<DateTime> {
     let year = decode_component(raw.year, binary_mode)?;
     let hour = decode_hour(raw.hour, binary_mode, mode_24h)?;
 
+    if binary_mode && year > 99 {
+        return None;
+    }
     if second > 59 || minute > 59 || hour > 23 {
         return None;
     }
@@ -229,8 +233,12 @@ fn read_cmos(register: u8) -> u8 {
     unsafe {
         let mut index = Port::<u8>::new(0x70);
         let mut data = Port::<u8>::new(0x71);
-        index.write(register);
-        data.read()
+        let previous = index.read();
+        let nmi_mask = previous & RTC_PM_BIT;
+        index.write(nmi_mask | register);
+        let value = data.read();
+        index.write(previous);
+        value
     }
 }
 
@@ -301,6 +309,22 @@ mod tests {
                 month: 0x04,
                 year: 0x26,
                 status_b: RTC_24_HOUR_MODE,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_binary_year() {
+        assert_eq!(
+            decode_wall_clock(RawRtc {
+                second: 59,
+                minute: 58,
+                hour: 21,
+                day: 1,
+                month: 12,
+                year: 0xff,
+                status_b: RTC_BINARY_MODE | RTC_24_HOUR_MODE,
             }),
             None
         );
