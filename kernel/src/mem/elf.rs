@@ -160,21 +160,51 @@ pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     }
     // SAFETY: Limine keeps module file bytes resident for kernel use.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(base, size) };
-    let parsed = parse_elf64(bytes);
+    let parsed = try_parse_elf64(bytes)?;
     Some((parsed.entry(), parsed.load_segments().count()))
+}
+
+pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
+    if bytes.len() < core::mem::size_of::<Elf64Ehdr>() {
+        return None;
+    }
+
+    // SAFETY: length checked above and we use `read_unaligned` so no
+    // alignment assumptions are required for the input slice.
+    let ehdr = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Elf64Ehdr>()) };
+    if ehdr.e_ident[..4] != ELF_MAGIC || ehdr.e_ident[4] != ELFCLASS64 {
+        return None;
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
+        return None;
+    }
+
+    let phoff = ehdr.e_phoff as usize;
+    let phnum = ehdr.e_phnum as usize;
+    let phsz = ehdr.e_phentsize as usize;
+    let phdr_table_end = phnum.checked_mul(phsz)?.checked_add(phoff)?;
+    if phdr_table_end > bytes.len() {
+        return None;
+    }
+
+    Some(ParsedElf {
+        ehdr,
+        phdr_bytes: &bytes[phoff..phdr_table_end],
+        phnum,
+    })
 }
 
 pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
     assert!(
         bytes.len() >= core::mem::size_of::<Elf64Ehdr>(),
-        "kernel ELF too small for Ehdr"
+        "ELF too small for Ehdr"
     );
 
     // SAFETY: length checked above and we use `read_unaligned` so no
     // alignment assumptions are required for the input slice.
     let ehdr = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Elf64Ehdr>()) };
-    assert_eq!(ehdr.e_ident[..4], ELF_MAGIC, "kernel ELF bad magic");
-    assert_eq!(ehdr.e_ident[4], ELFCLASS64, "kernel ELF not ELFCLASS64");
+    assert_eq!(ehdr.e_ident[..4], ELF_MAGIC, "ELF bad magic");
+    assert_eq!(ehdr.e_ident[4], ELFCLASS64, "ELF not ELFCLASS64");
     assert_eq!(
         ehdr.e_phentsize as usize,
         core::mem::size_of::<Elf64Phdr>(),
@@ -187,11 +217,8 @@ pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
     let phdr_table_end = phnum
         .checked_mul(phsz)
         .and_then(|n| phoff.checked_add(n))
-        .expect("kernel ELF phdr table size overflow");
-    assert!(
-        phdr_table_end <= bytes.len(),
-        "kernel ELF phdr table out of range"
-    );
+        .expect("ELF phdr table size overflow");
+    assert!(phdr_table_end <= bytes.len(), "ELF phdr table out of range");
 
     ParsedElf {
         ehdr,
@@ -202,7 +229,7 @@ pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_elf64;
+    use super::{parse_elf64, try_parse_elf64};
     use x86_64::structures::paging::PageTableFlags;
 
     const EHDR_SIZE: usize = 64;
@@ -270,10 +297,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "kernel ELF bad magic")]
+    #[should_panic(expected = "ELF bad magic")]
     fn rejects_bad_magic() {
         let mut bytes = sample_elf_bytes();
         bytes[0] = 0;
         let _ = parse_elf64(&bytes);
+    }
+
+    #[test]
+    fn try_parse_rejects_bad_magic() {
+        let mut bytes = sample_elf_bytes();
+        bytes[0] = 0;
+        assert!(try_parse_elf64(&bytes).is_none());
     }
 }
