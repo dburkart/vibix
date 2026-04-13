@@ -143,49 +143,54 @@ fn idle_forever() -> ! {
 fn nice_sets_visible_priority() {
     // With DEFAULT_PRIORITY=19, nice=10 maps to priority 9 and
     // nice=-5 maps to priority 24. The task list must reflect both
-    // mappings. Doesn't depend on the spawned tasks running — a
-    // lower-priority task would starve against the default-priority
-    // driver and that's the point.
-    task::spawn_with_nice(idle_forever, 10);
-    task::spawn_with_nice(idle_forever, -5);
+    // mappings.
+    //
+    // Wrap the spawn→demote window in `without_interrupts` so a PIT
+    // tick can't preempt the driver to the freshly-spawned nice=-5
+    // task (priority 24 > driver's 19) before we demote it — that
+    // would hang the test since idle_forever never yields.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        task::spawn_with_nice(idle_forever, 10);
+        task::spawn_with_nice(idle_forever, -5);
 
-    let lo_prio = task::priority_from_nice(10);
-    let hi_prio = task::priority_from_nice(-5);
-    // Round-trip across the full legal nice range.
-    for nice in task::NICE_MIN..=task::NICE_MAX {
-        let p = task::priority_from_nice(nice);
-        assert!(p <= task::MAX_PRIORITY);
-        assert_eq!(task::nice_from_priority(p), nice);
-    }
-    // Edge cases: nice extremes must not saturate before mapping.
-    assert_eq!(task::priority_from_nice(task::NICE_MIN), task::MAX_PRIORITY);
-    assert_eq!(task::priority_from_nice(task::NICE_MAX), 0);
+        let lo_prio = task::priority_from_nice(10);
+        let hi_prio = task::priority_from_nice(-5);
+        // Round-trip across the full legal nice range.
+        for nice in task::NICE_MIN..=task::NICE_MAX {
+            let p = task::priority_from_nice(nice);
+            assert!(p <= task::MAX_PRIORITY);
+            assert_eq!(task::nice_from_priority(p), nice);
+        }
+        // Edge cases: nice extremes must not saturate before mapping.
+        assert_eq!(task::priority_from_nice(task::NICE_MIN), task::MAX_PRIORITY);
+        assert_eq!(task::priority_from_nice(task::NICE_MAX), 0);
 
-    let mut saw_low = false;
-    let mut saw_high = false;
-    task::for_each_task(|info| {
-        assert!(info.priority <= task::MAX_PRIORITY);
-        assert!(info.nice >= task::NICE_MIN && info.nice <= task::NICE_MAX);
-        assert_eq!(task::nice_from_priority(info.priority), info.nice);
-        if info.nice == 10 && info.priority == lo_prio {
-            saw_low = true;
-        }
-        if info.nice == -5 && info.priority == hi_prio {
-            saw_high = true;
-        }
+        let mut saw_low = false;
+        let mut saw_high = false;
+        task::for_each_task(|info| {
+            assert!(info.priority <= task::MAX_PRIORITY);
+            assert!(info.nice >= task::NICE_MIN && info.nice <= task::NICE_MAX);
+            assert_eq!(task::nice_from_priority(info.priority), info.nice);
+            if info.nice == 10 && info.priority == lo_prio {
+                saw_low = true;
+            }
+            if info.nice == -5 && info.priority == hi_prio {
+                saw_high = true;
+            }
+        });
+        assert!(saw_low, "task list missing the nice=10 worker");
+        assert!(saw_high, "task list missing the nice=-5 worker");
+
+        // Demote every task we just spawned so the next test's driver
+        // isn't starved. The kernel doesn't support task exit yet.
+        demote_non_driver_tasks();
     });
-    assert!(saw_low, "task list missing the nice=10 worker");
-    assert!(saw_high, "task list missing the nice=-5 worker");
-
-    // Demote every task we just spawned so the next test's driver
-    // isn't starved. The kernel doesn't support task exit yet.
-    demote_non_driver_tasks();
 }
 
 /// Drop every non-driver task's priority to 1 so the bootstrap task
-/// (priority 20) gets CPU in the next test. Tasks in this test binary
-/// spawn for their lifetime — there's no exit path — so we settle for
-/// keeping them harmlessly below the driver instead.
+/// (DEFAULT_PRIORITY, 19) gets CPU in the next test. Tasks in this
+/// test binary spawn for their lifetime — there's no exit path — so
+/// we settle for keeping them harmlessly below the driver instead.
 fn demote_non_driver_tasks() {
     let driver_id = task::current_id();
     let mut ids = alloc::vec::Vec::new();
@@ -200,41 +205,47 @@ fn demote_non_driver_tasks() {
 }
 
 fn set_priority_round_trip() {
-    // Spawn a task at nice=5 (priority 15), then promote via
+    // Spawn a task at nice=5 (priority 14), then promote via
     // set_priority and verify the introspection picks up the change.
-    task::spawn_with_nice(idle_forever, 5);
-    let mut target_id = 0usize;
-    task::for_each_task(|info| {
-        if info.nice == 5 && target_id == 0 {
-            target_id = info.id;
-        }
+    // The promote lifts the target above the driver's priority; if a
+    // PIT tick lands in that window it would preempt to the target
+    // (idle_forever, hangs the test), so wrap the whole promote→demote
+    // region in without_interrupts.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        task::spawn_with_nice(idle_forever, 5);
+        let mut target_id = 0usize;
+        task::for_each_task(|info| {
+            if info.nice == 5 && target_id == 0 {
+                target_id = info.id;
+            }
+        });
+        assert!(target_id != 0, "didn't find freshly-spawned nice=5 task");
+
+        assert!(task::set_priority(target_id, 30));
+        let mut new_prio = None;
+        task::for_each_task(|info| {
+            if info.id == target_id {
+                new_prio = Some(info.priority);
+            }
+        });
+        assert_eq!(new_prio, Some(30));
+
+        assert!(!task::set_priority(usize::MAX, 10), "accepted unknown id");
+
+        // adjust_nice on the target: priority 30 -> nice -11 (with
+        // DEFAULT_PRIORITY=19). Bump by +3 → nice -8 → priority 27.
+        let new_nice = task::adjust_nice(target_id, 3);
+        assert_eq!(new_nice, Some(-8));
+        let mut adjusted_prio = None;
+        task::for_each_task(|info| {
+            if info.id == target_id {
+                adjusted_prio = Some(info.priority);
+            }
+        });
+        assert_eq!(adjusted_prio, Some(27));
+
+        demote_non_driver_tasks();
     });
-    assert!(target_id != 0, "didn't find freshly-spawned nice=5 task");
-
-    assert!(task::set_priority(target_id, 30));
-    let mut new_prio = None;
-    task::for_each_task(|info| {
-        if info.id == target_id {
-            new_prio = Some(info.priority);
-        }
-    });
-    assert_eq!(new_prio, Some(30));
-
-    assert!(!task::set_priority(usize::MAX, 10), "accepted unknown id");
-
-    // adjust_nice on the target: priority 30 -> nice -11 (with
-    // DEFAULT_PRIORITY=19). Bump by +3 → nice -8 → priority 27.
-    let new_nice = task::adjust_nice(target_id, 3);
-    assert_eq!(new_nice, Some(-8));
-    let mut adjusted_prio = None;
-    task::for_each_task(|info| {
-        if info.id == target_id {
-            adjusted_prio = Some(info.priority);
-        }
-    });
-    assert_eq!(adjusted_prio, Some(27));
-
-    demote_non_driver_tasks();
 }
 
 static AFF_RAN: AtomicBool = AtomicBool::new(false);

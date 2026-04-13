@@ -23,9 +23,6 @@ pub const MAX_PRIORITY: u8 = 39;
 /// priority 0.
 pub const DEFAULT_PRIORITY: u8 = 19;
 
-/// Number of distinct priority levels (0..=MAX_PRIORITY).
-pub const NUM_PRIORITIES: usize = MAX_PRIORITY as usize + 1;
-
 /// Lowest legal nice value — equivalent to the hottest priority.
 pub const NICE_MIN: i8 = -20;
 /// Highest legal nice value — equivalent to the coldest priority.
