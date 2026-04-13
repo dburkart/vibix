@@ -64,6 +64,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
+    "userspace module ELF entry=",
 ];
 
 fn main() -> R<()> {
@@ -136,6 +137,28 @@ fn workspace_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+fn userspace_hello_binary() -> PathBuf {
+    workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join("userspace_hello")
+}
+
+fn build_userspace_hello() -> R<PathBuf> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .args(["build", "--package", "userspace_hello"])
+        .args(KERNEL_BUILD_STD_ARGS);
+    check(cmd.status()?)?;
+    let bin = userspace_hello_binary();
+    if !bin.exists() {
+        return Err(format!("userspace hello binary missing at {}", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
 }
 
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
@@ -327,12 +350,14 @@ fn ensure_limine() -> R<PathBuf> {
 /// (so parallel test runs don't stomp each other).
 fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let limine = ensure_limine()?;
+    let userspace_hello = build_userspace_hello()?;
     let iso_root = workspace_root().join("build").join(staging);
     let _ = fs::remove_dir_all(&iso_root);
     fs::create_dir_all(iso_root.join("boot/limine"))?;
     fs::create_dir_all(iso_root.join("EFI/BOOT"))?;
 
     fs::copy(kernel, iso_root.join("boot/vibix"))?;
+    fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
     fs::copy(
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),
@@ -513,6 +538,7 @@ fn test_all() -> R<()> {
         "priority",
         "per_task_cr3",
         "demand_paging",
+        "userspace_module",
     ] {
         cmd.arg("--test").arg(t);
     }

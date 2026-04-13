@@ -1,0 +1,10 @@
+[package]
+name = "userspace_hello"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "userspace_hello"
+path = "src/main.rs"

@@ -34,6 +34,7 @@ the bootloader can efficiently scan it.
 | `KERNEL_ADDRESS_REQUEST` | `ExecutableAddressRequest` | Physical + virtual base of the loaded kernel image (used by ksymtab) |
 | `KERNEL_FILE_REQUEST` | `ExecutableFileRequest` | The kernel ELF file itself (used by ksymtab to embed the symbol table) |
 | `RSDP_REQUEST` | `RsdpRequest` | Physical address of the ACPI RSDP (passed to `acpi::init`) |
+| `MODULE_REQUEST` | `ModuleRequest` | Boot modules (`/boot/userspace_hello.elf`) for early userspace bring-up |
 
 ## Usage
 
