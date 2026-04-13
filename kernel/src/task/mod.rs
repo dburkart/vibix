@@ -458,7 +458,12 @@ pub fn current_vma_lookup(
     let vma = guard.find(addr)?;
     let page_aligned = addr & !(4096 - 1);
     let offset = page_aligned - vma.start + vma.object_offset;
-    Some((alloc::sync::Arc::clone(&vma.object), offset, vma.prot_pte, vma.share))
+    Some((
+        alloc::sync::Arc::clone(&vma.object),
+        offset,
+        vma.prot_pte,
+        vma.share,
+    ))
 }
 
 /// Terminate the currently-running task. Reclaims the task's mapped

@@ -240,14 +240,21 @@ fn debug_assert_task_ctx() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
     use crate::mem::vmatree::{Share, Vma};
     use crate::mem::vmobject::AnonObject;
+    use alloc::sync::Arc;
 
     fn anon(start: usize, end: usize) -> Vma {
         let pages = (end - start) / 4096;
-        Vma::new(start, end, 0x3 /* PROT_READ|WRITE */, 0, Share::Private,
-                 AnonObject::new(Some(pages)), 0)
+        Vma::new(
+            start,
+            end,
+            0x3, /* PROT_READ|WRITE */
+            0,
+            Share::Private,
+            AnonObject::new(Some(pages)),
+            0,
+        )
     }
 
     #[test]
@@ -313,14 +320,22 @@ mod tests {
         let kernel_half = Vma::new(
             USER_VA_END as usize,
             (USER_VA_END as usize) + 0x1000,
-            0, 0, Share::Private, Arc::clone(&obj), 0,
+            0,
+            0,
+            Share::Private,
+            Arc::clone(&obj),
+            0,
         );
         assert!(!AddressSpace::vma_in_user_range(&kernel_half));
 
         let high_user = Vma::new(
             (USER_VA_END as usize) - 0x2000,
             USER_VA_END as usize,
-            0, 0, Share::Private, obj, 0,
+            0,
+            0,
+            Share::Private,
+            obj,
+            0,
         );
         assert!(AddressSpace::vma_in_user_range(&high_user));
     }

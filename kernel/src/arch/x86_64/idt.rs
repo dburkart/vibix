@@ -145,9 +145,9 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     if let Some((object, offset, prot_pte, _share)) =
         crate::task::current_vma_lookup(addr_u64 as usize)
     {
+        use crate::mem::vmobject::Access;
         use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
         use x86_64::{PhysAddr, VirtAddr};
-        use crate::mem::vmobject::Access;
 
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
         let active = x86_64::registers::control::Cr3::read().0;
@@ -157,20 +157,20 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
 
         if !is_prot {
             // Not-present fault: ask the VmObject for the backing frame.
-            let access = if is_write { Access::Write } else { Access::Read };
+            let access = if is_write {
+                Access::Write
+            } else {
+                Access::Read
+            };
             match object.fault(offset, access) {
                 Ok(phys) => {
                     let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
                         .expect("#PF: VmObject returned unaligned phys");
-                    match crate::mem::paging::map_existing_in_pml4(
-                        active, page, frame, pte_flags,
-                    ) {
+                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
                         Ok(()) => return,
-                        Err(e) => serial_println!(
-                            "#PF demand map failed addr={:#x}: {:?}",
-                            addr_u64,
-                            e
-                        ),
+                        Err(e) => {
+                            serial_println!("#PF demand map failed addr={:#x}: {:?}", addr_u64, e)
+                        }
                     }
                 }
                 Err(e) => {
@@ -185,9 +185,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                 Ok(phys) => {
                     let source = PhysFrame::from_start_address(PhysAddr::new(phys))
                         .expect("#PF: VmObject returned unaligned phys for CoW source");
-                    match crate::mem::paging::cow_copy_and_remap(
-                        active, page, source, pte_flags,
-                    ) {
+                    match crate::mem::paging::cow_copy_and_remap(active, page, source, pte_flags) {
                         Ok(_) => return,
                         Err(e) => serial_println!(
                             "#PF CoW copy-and-remap failed addr={:#x}: {:?}",

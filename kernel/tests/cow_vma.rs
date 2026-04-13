@@ -93,10 +93,22 @@ fn vmatree_find_remove_roundtrip() {
     let mut aspace = AddressSpace::new_empty();
     let prot_pte = (PageTableFlags::PRESENT | PageTableFlags::WRITABLE).bits();
     let a = Vma::new(
-        0x1000, 0x2000, 0x3, prot_pte, Share::Private, AnonObject::new(Some(1)), 0,
+        0x1000,
+        0x2000,
+        0x3,
+        prot_pte,
+        Share::Private,
+        AnonObject::new(Some(1)),
+        0,
     );
     let b = Vma::new(
-        0x3000, 0x4000, 0x3, prot_pte, Share::Private, AnonObject::new(Some(1)), 0,
+        0x3000,
+        0x4000,
+        0x3,
+        prot_pte,
+        Share::Private,
+        AnonObject::new(Some(1)),
+        0,
     );
     aspace.insert(a);
     aspace.insert(b);
