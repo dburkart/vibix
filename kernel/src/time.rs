@@ -65,10 +65,12 @@ const CMOS_STATUS_A: u8 = 0x0A;
 #[cfg(target_os = "none")]
 const CMOS_STATUS_B: u8 = 0x0B;
 #[cfg(target_os = "none")]
+const CMOS_NMI_MASK: u8 = 0x80;
+#[cfg(target_os = "none")]
 const RTC_UPDATE_IN_PROGRESS: u8 = 0x80;
 const RTC_BINARY_MODE: u8 = 0x04;
 const RTC_24_HOUR_MODE: u8 = 0x02;
-const RTC_PM_BIT: u8 = 0x80;
+const RTC_HOUR_PM_BIT: u8 = 0x80;
 #[cfg(target_os = "none")]
 const RTC_MAX_READY_POLLS: usize = 1_000_000;
 #[cfg(target_os = "none")]
@@ -166,8 +168,8 @@ fn decode_component(raw: u8, binary_mode: bool) -> Option<u8> {
 }
 
 fn decode_hour(raw: u8, binary_mode: bool, mode_24h: bool) -> Option<u8> {
-    let pm = !mode_24h && (raw & RTC_PM_BIT) != 0;
-    let hour = decode_component(raw & !RTC_PM_BIT, binary_mode)?;
+    let pm = !mode_24h && (raw & RTC_HOUR_PM_BIT) != 0;
+    let hour = decode_component(raw & !RTC_HOUR_PM_BIT, binary_mode)?;
     if mode_24h {
         if hour > 23 {
             return None;
@@ -234,7 +236,7 @@ fn read_cmos(register: u8) -> u8 {
         let mut index = Port::<u8>::new(0x70);
         let mut data = Port::<u8>::new(0x71);
         let previous = index.read();
-        let nmi_mask = previous & RTC_PM_BIT;
+        let nmi_mask = previous & CMOS_NMI_MASK;
         index.write(nmi_mask | register);
         let value = data.read();
         index.write(previous);
@@ -245,7 +247,7 @@ fn read_cmos(register: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wall_clock, DateTime, RawRtc, RTC_24_HOUR_MODE, RTC_BINARY_MODE, RTC_PM_BIT,
+        decode_wall_clock, DateTime, RawRtc, RTC_24_HOUR_MODE, RTC_BINARY_MODE, RTC_HOUR_PM_BIT,
     };
 
     #[test]
@@ -278,7 +280,7 @@ mod tests {
         let decoded = decode_wall_clock(RawRtc {
             second: 59,
             minute: 58,
-            hour: RTC_PM_BIT | 9,
+            hour: RTC_HOUR_PM_BIT | 9,
             day: 1,
             month: 12,
             year: 30,
