@@ -1,0 +1,112 @@
+name: Issue Backfill
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50   # enough history to see recent momentum
+
+      - name: Run Claude Code — propose 5 next issues
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --allowed-tools
+            "Bash(git log:*)"
+            "Bash(git show:*)"
+            "Bash(git diff:*)"
+            "Bash(git shortlog:*)"
+            "Bash(find:*)"
+            "Bash(cat:*)"
+            "Bash(ls:*)"
+            "Bash(gh issue list:*)"
+            "Bash(gh issue create:*)"
+          prompt: |
+            You are a technical project manager for the vibix kernel — a hobby OS kernel written in Rust.
+
+            Your job: propose and file exactly 5 GitHub issues that represent the most valuable
+            near-term work, based on recent project momentum and what is already tracked.
+
+            ## Step 1 — understand recent progress
+
+            Run the following to orient yourself:
+
+            ```
+            git log --oneline -30
+            git shortlog -sn --no-merges -30
+            ```
+
+            Then read the most recent 5 commits in detail:
+            ```
+            git log -5 --stat
+            ```
+
+            Skim the key source files relevant to the areas touched by those commits
+            (use `find kernel/src -name '*.rs' | head -40` to locate them).
+
+            ## Step 2 — read all open issues
+
+            ```
+            gh issue list --state open --limit 100 --json number,title,labels,body
+            ```
+
+            ## Step 3 — identify gaps
+
+            Cross-reference what was recently merged with what is already filed.
+            Look for:
+            - Follow-up work that is a natural next step from a merged PR
+              (e.g. a feature was added without tests, docs, or a companion subsystem)
+            - Cleanup / hardening that is obviously needed but not yet filed
+            - The next layer of the kernel that needs to be built given current foundations
+            - Known TODOs / FIXMEs in the source code:
+              `grep -r "TODO\|FIXME\|HACK\|XXX\|unimplemented!()" kernel/src --include='*.rs' -n | head -60`
+
+            Avoid filing anything that duplicates an open issue (check titles and bodies carefully).
+
+            ## Step 4 — file exactly 5 issues
+
+            For each issue run:
+            ```
+            gh issue create --title "<title>" --body "<body>"
+            ```
+
+            Each issue body must follow this template:
+
+            ```
+            ## Motivation
+            <1-3 sentences: why this matters and what it unblocks>
+
+            ## Work
+            - [ ] <concrete sub-task 1>
+            - [ ] <concrete sub-task 2>
+            - [ ] ...
+
+            ## Context
+            <relevant commit hashes, file paths, or existing issue numbers that informed this>
+            ```
+
+            Guidelines:
+            - Titles should be concise imperative phrases (≤ 72 chars), no emoji.
+            - Prefer specificity over vagueness — name files, structs, and functions where known.
+            - Cover a spread of concerns (correctness, performance, testing, docs, next subsystem).
+            - Do NOT create duplicate issues. If you cannot find 5 distinct gaps, file fewer.
+
+            After filing all issues, print a one-line summary of each issue number and title
+            so it appears in the workflow log.
