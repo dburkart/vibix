@@ -166,15 +166,16 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             let fd = a0;
             let buf_va = a1 as usize;
             let len = a2 as usize;
-            if fd == 1 && len > 0 {
-                // Validate the whole `[buf_va, buf_va + len)` range up
-                // front so a cross-boundary buffer fails with -EFAULT
-                // *before* any bytes hit the UART. Per-chunk validation
-                // alone would emit partial output on a later-chunk
-                // failure — non-atomic observable side effects.
+            // Validate the whole `[buf_va, buf_va + len)` range up
+            // front regardless of fd, so a kernel-half or wrapping
+            // pointer returns -EFAULT even for unsupported fds.
+            // Zero-length writes skip the check (no pointer access).
+            if len > 0 {
                 if let Err(e) = uaccess::check_user_range(buf_va, len) {
                     return e.as_errno();
                 }
+            }
+            if fd == 1 && len > 0 {
                 // Chunk through a small kernel-stack bounce buffer so the
                 // ring-0 access window stays short and bounded — a single
                 // STAC/CLAC bracket per chunk, not per byte.
