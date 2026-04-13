@@ -186,6 +186,16 @@ pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
     if phdr_table_end > bytes.len() {
         return None;
     }
+    VirtAddr::try_new(ehdr.e_entry).ok()?;
+    for i in 0..phnum {
+        let off = phoff + i * phsz;
+        // SAFETY: `phdr_table_end` bounds-check above guarantees every
+        // header read in this loop stays within `bytes`.
+        let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
+        if ph.p_type == PT_LOAD && ph.p_memsz != 0 {
+            VirtAddr::try_new(ph.p_vaddr).ok()?;
+        }
+    }
 
     Some(ParsedElf {
         ehdr,
@@ -219,6 +229,22 @@ pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
         .and_then(|n| phoff.checked_add(n))
         .expect("ELF phdr table size overflow");
     assert!(phdr_table_end <= bytes.len(), "ELF phdr table out of range");
+    assert!(
+        VirtAddr::try_new(ehdr.e_entry).is_ok(),
+        "ELF entry address is non-canonical"
+    );
+    for i in 0..phnum {
+        let off = phoff + i * phsz;
+        // SAFETY: `phdr_table_end` bounds-check above guarantees every
+        // header read in this loop stays within `bytes`.
+        let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
+        if ph.p_type == PT_LOAD && ph.p_memsz != 0 {
+            assert!(
+                VirtAddr::try_new(ph.p_vaddr).is_ok(),
+                "ELF PT_LOAD virtual address is non-canonical"
+            );
+        }
+    }
 
     ParsedElf {
         ehdr,
@@ -309,5 +335,28 @@ mod tests {
         let mut bytes = sample_elf_bytes();
         bytes[0] = 0;
         assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_non_canonical_entry() {
+        let mut bytes = sample_elf_bytes();
+        put64(&mut bytes, 24, 0x0001_0000_0000_0000);
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_non_canonical_load_vaddr() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        put64(&mut bytes, p0 + 16, 0x0001_0000_0000_0000);
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "ELF entry address is non-canonical")]
+    fn parse_panics_non_canonical_entry() {
+        let mut bytes = sample_elf_bytes();
+        put64(&mut bytes, 24, 0x0001_0000_0000_0000);
+        let _ = parse_elf64(&bytes);
     }
 }
