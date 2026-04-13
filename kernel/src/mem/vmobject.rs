@@ -195,15 +195,29 @@ impl AnonObject {
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     /// Incremented by the host stub of [`release_frame`] each time `Drop`
-    /// calls it. Tests that exercise reclamation sample the counter
-    /// before and after dropping the object to confirm `Drop` actually
-    /// walked the cache.
+    /// calls it. Observed only by [`drop_releases_every_cached_frame`]
+    /// and serialised via [`release_test_lock`] so the delta is
+    /// deterministic even under `cargo test`'s parallel harness.
     pub(super) static HOST_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Serialises every host test whose body drops an `AnonObject` that
+    /// still holds synthetic frames. The observer test takes this lock
+    /// and resets the counter under it; other tests hold it for the
+    /// span of their own drops so their `release_frame` calls never
+    /// leak into the observer's delta.
+    fn release_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        // `unwrap_or_else` keeps a prior panicked test from poisoning
+        // the rest of the suite; the `()` guard carries no state.
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn cached_fault_returns_same_frame() {
+        let _g = release_test_lock();
         let obj = AnonObject::new(Some(8));
         obj.insert_for_test(3, 0x1234_5000);
         let p = obj.fault(3 * 4096, Access::Read).unwrap();
@@ -215,6 +229,7 @@ mod tests {
 
     #[test]
     fn fault_past_bound_returns_out_of_range() {
+        // No cached frames, so no release_frame traffic; skip the lock.
         let obj = AnonObject::new(Some(4));
         let err = obj.fault(4 * 4096, Access::Read).unwrap_err();
         assert_eq!(err, VmFault::OutOfRange);
@@ -225,6 +240,7 @@ mod tests {
 
     #[test]
     fn fault_at_last_page_is_legal() {
+        let _g = release_test_lock();
         let obj = AnonObject::new(Some(4));
         obj.insert_for_test(3, 0xdead_0000);
         let p = obj.fault(3 * 4096, Access::Read).unwrap();
@@ -233,6 +249,7 @@ mod tests {
 
     #[test]
     fn unbounded_object_accepts_any_offset() {
+        let _g = release_test_lock();
         let obj = AnonObject::new(None);
         obj.insert_for_test(1_000_000, 0xabcd_0000);
         let p = obj.fault(1_000_000 * 4096, Access::Read).unwrap();
@@ -254,23 +271,20 @@ mod tests {
 
     #[test]
     fn clone_for_fork_shares_cache() {
+        let _g = release_test_lock();
         // Arc-clone is the default for fork; the forked object sees the
         // same cached frames as the parent until the CoW path diverges
         // them at the PTE layer.
-        let obj: Arc<dyn VmObject> = AnonObject::new(Some(4));
-        // Downcast-free seed via the concrete type.
         let anon = AnonObject::new(Some(4));
         anon.insert_for_test(0, 0x4000);
         let parent: Arc<dyn VmObject> = anon;
         let forked = clone_for_fork(&parent);
         assert_eq!(forked.fault(0, Access::Read).unwrap(), 0x4000);
-        // `obj` is kept live so an unused-Arc-drop doesn't race the
-        // assert above.
-        drop(obj);
     }
 
     #[test]
     fn drop_releases_every_cached_frame() {
+        let _g = release_test_lock();
         // Seed three cached frames, drop the object, confirm
         // `release_frame` was invoked once per frame.
         let before = HOST_RELEASE_COUNT.load(Ordering::Relaxed);
