@@ -9,6 +9,8 @@ pub mod pic;
 /// Bring up arch-specific interrupt plumbing that doesn't depend on
 /// the kernel mapper. Interrupts stay disabled throughout.
 pub fn init() {
+    // Feature detection first — everything below may query cpu::has().
+    crate::cpu::init();
     gdt::init();
     idt::init();
     // Remap + mask the 8259 before touching ACPI/APIC. Leaving it in

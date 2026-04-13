@@ -33,7 +33,15 @@ pub const PAT_BIT_4K: u64 = 1 << 7;
 
 /// Reprogram IA32_PAT so slot 4 = WC. Must run on every CPU that will
 /// use WC mappings; today that's just the BSP.
+///
+/// Skipped if the CPU does not report PAT support via CPUID. On such
+/// hardware the default PAT layout remains in effect and the framebuffer
+/// falls back to its Limine-assigned memory type.
 pub fn init() {
+    if !crate::cpu::has(crate::cpu::Feature::Pat) {
+        crate::serial_println!("pat: PAT not supported, skipping WC slot setup");
+        return;
+    }
     let pat = WB
         | (WT << 8)
         | (UC_MINUS << 16)
