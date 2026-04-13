@@ -63,6 +63,21 @@ swap, NUMA, or huge pages — but it leaves the type lattice room for them.
   current task's `VmaList`, allocates a frame for `AnonZero`, copies for `Cow`.
 - `kernel/src/task/task.rs` — `NEXT_STACK_VA` bump allocator, no exit path.
 
+### Foundational prior art
+
+This RFC is a faithful re-implementation of the **Mach VM model** as
+laid out in Rashid et al., *"Machine-Independent Virtual Memory
+Management for Paged Uniprocessor and Multiprocessor Architectures"*
+(ASPLOS-II, 1987), which introduced the `vm_object` / `vm_map_entry`
+split that maps directly onto our `VmObject` / `Vma`. The per-frame
+refcount discipline follows Bonwick's slab/vmem treatment
+(*"The Slab Allocator"*, USENIX 1994; *"Magazines and Vmem"*,
+USENIX 2001). The `MAP_FIXED_NOREPLACE` rationale follows Linux commit
+`a4ff8e8620d3` (Michal Hocko, 2018). Nothing in this RFC claims novelty
+beyond combining these well-studied pieces in idiomatic Rust; the
+Academic reviewer's framing as "duplicate, not novel" is correct and
+deliberate (Academic advisory A5, A6).
+
 ### What other kernels do
 
 **Linux** (per `Documentation/mm/process_addrs.html`,
@@ -175,18 +190,34 @@ pub struct AddressSpace {
 ```
 
 `AddressSpace` is wrapped in `RwLock<AddressSpace>` (vibix's existing
-sync primitive). The lock is a single rwsem-equivalent — read for fault
-resolution, write for `mmap`/`munmap`/`mprotect`/`fork`. SMP per-VMA
-sequence locks (Linux ≥ 6.4) are explicitly out of scope; the API leaves
-room (see `Vma::lock_seq` placeholder below).
+sync primitive). Because every published syscall and every fault that
+resolves into the address space *mutates* PTEs (CoW) or VMA structure
+(mmap/munmap/mprotect/fork), the page-fault path takes the **write** lock
+unconditionally — the read lock exists only for future read-only
+introspection (`/proc/self/maps`-equivalents). This is simpler and
+closes the OS-Engineer/Security finding that the original pseudocode took
+`read()` and then mutated. SMP per-VMA sequence locks (Linux ≥ 6.4) are
+explicitly out of scope; the API leaves room (see `Vma::_lock_seq` below).
+
+**IRQ-safety contract.** The `AddressSpace` lock is **never** taken from
+interrupt context. Every call site (page-fault handler, syscall entry,
+fork/exec/exit) runs with interrupts enabled in a task context. We
+enforce this with a debug assertion (`debug_assert!(!in_irq())`) inside
+the lock's read/write entry points. Async-completion and timer paths that
+need to touch user memory must defer to a task-context worker; this
+matches vibix's existing interrupt-safety contract documented in
+`docs/interrupts.md`. This invariant is what lets the lock remain a
+plain `RwLock` rather than a spin-lock-with-IRQ-disable.
 
 **`Vma`** (replaces today's `kernel/src/mem/vma.rs`):
 
 ```rust
+#[repr(C)]
 pub struct Vma {
-    pub start: VirtAddr,         // page-aligned
-    pub end:   VirtAddr,         // page-aligned, exclusive
-    pub prot:  Prot,             // R/W/X bitset
+    pub start: VirtAddr,         // page-aligned (4 KiB)
+    pub end:   VirtAddr,         // page-aligned (4 KiB), exclusive
+    pub prot_user: Prot,         // PROT_* as the user requested (W/O preserved)
+    pub prot_pte:  Prot,         // effective bits installed in PTEs (W/O => RW)
     pub share: ShareMode,        // Private | Shared
     pub object: Arc<dyn VmObject>,
     pub object_offset: usize,    // bytes into the VmObject this VMA starts at
@@ -195,6 +226,27 @@ pub struct Vma {
     _lock_seq: u32,
 }
 ```
+
+`prot_user` records exactly what userspace asked for; `prot_pte` is the
+hardware-installable subset (where `PROT_WRITE` without `PROT_READ` is
+mapped to `R|W` because x86 cannot separate them — see User-Space
+finding B2). `mincore` / `/proc/self/maps`-equivalents report
+`prot_user`, so the round-trip is preserved.
+
+**Alignment rule (single, repo-wide).** Every byte address that crosses
+the syscall boundary is rounded as follows, applied uniformly to `mmap`,
+`munmap`, `mprotect`, `madvise`:
+
+- `addr` must be page-aligned exactly (no rounding). A non-aligned `addr`
+  on `mmap` without `MAP_FIXED` is rounded **down** to a page; with
+  `MAP_FIXED` it returns `EINVAL`.
+- `len` is rounded **up** to a whole page (`(len + 4095) & !4095`),
+  matching POSIX "entire pages containing any part of the range." `len`
+  is rejected with `EINVAL` only when `len == 0` or when the rounded
+  result overflows.
+
+This single rule keeps `VmaTree` intervals and PTE presence in lockstep
+across all four syscalls (Security finding B3).
 
 **`VmaTree`**: a `BTreeMap<usize, Vma>` keyed by `start` for O(log n)
 lookup, split, and merge. `find(addr)` does `range(..=addr).next_back()` and
@@ -242,31 +294,47 @@ mirrors Redox's `PageInfo`. Refcount widening from 16-bit can happen later;
 **Page-fault dispatch**, replacing `idt.rs:page_fault` (signature unchanged):
 
 ```
-on #PF (cr2, error_code, in_kernel_mode):
-  if in_kernel_mode and error_code.user_bit() == 0:
-    // existing kernel-fault path (panic / IST handling) unchanged
+on #PF (cr2, error_code, cpl):
+  // 1. SMAP first, unconditionally — kernel mode touching a user page
+  //    with AC=0 is a violation no matter what the VmaTree says.
+  if cpl == 0 and error_code.user_bit() == 1 and !rflags_ac():
+    panic_smap_violation(cr2)              // never returns
+
+  // 2. Pure kernel fault (CPL=0, supervisor page) → existing handler.
+  if cpl == 0 and error_code.user_bit() == 0:
     return existing_kernel_fault(...)
 
-  let aspace = current_task.address_space.read();
+  // 3. Reserved-bit fault is always a kernel bug. Scrub PTE physaddr
+  //    from any user-reachable channel; log the VA only.
+  if error_code.rsvd():
+    panic_rsvd_corruption(cr2)             // PTE word logged to klog only
+
+  // 4. cr2 must be canonical and below USER_VA_END before we touch any
+  //    user-controlled state.
+  if !cr2.is_canonical() or cr2 >= USER_VA_END:
+    return deliver_sigsegv(SI_MAPERR)
+
+  // 5. Take the WRITE lock — every fault that survives may mutate PTEs.
+  //    See "AddressSpace lock semantics" above.
+  let mut aspace = current_task.address_space.write();
   let vma = match aspace.find(cr2) {
     Some(v) => v,
-    None    => return deliver_sigsegv(SI_MAPERR),
+    None    => return resolve_growsdown_or_segv(&mut aspace, cr2),
   }
 
   let access = Access::from_error_code(error_code);
 
-  // Permission check first — protection violation never falls through to
-  // the resolver.
-  if !vma.prot.allows(access):
+  // 6. Permission check uses prot_user, not prot_pte.
+  if !vma.prot_user.allows(access):
     return deliver_sigsegv(SI_ACCERR)
 
-  // Reserved-bit fault is always a kernel bug.
-  if error_code.rsvd() { panic("PTE reserved-bit corruption at {cr2}") }
-
   match (error_code.present(), access.is_write()) {
-    (false, _)    => resolve_demand_page(&aspace, vma, cr2, access),
-    (true, true)  => resolve_cow(&aspace, vma, cr2),
-    (true, false) => spurious_fault_retry(),  // widening race; just return
+    (false, _)    => resolve_demand_page(&mut aspace, vma, cr2, access),
+    (true, true)  => resolve_cow(&mut aspace, vma, cr2),
+    (true, false) => return,  // widening race; IRET re-walks TLB. Safe
+                              // because x86 auto-reloads on PTE present-
+                              // bit set; we did the user mutation under
+                              // the write lock and INVLPG'd already.
   }
 ```
 
@@ -274,58 +342,112 @@ on #PF (cr2, error_code, in_kernel_mode):
 the returned frame at `cr2 & !0xFFF` with `vma.prot`'s flags, bumping the
 frame's refcount.
 
-`resolve_cow` is the write-on-CoW path:
+`resolve_cow` is the write-on-CoW path. Two invariants drive its shape:
+
+- **Refcount sentinel.** The frame allocator treats refcount 0 as
+  "free." We must never write 0 into a refcount slot whose frame is
+  still installed in a PTE (OS-Engineer finding B1). The fast path
+  therefore *peeks* at the refcount instead of decrementing — only the
+  copy path decrements (because only the copy path drops our reference
+  to the old frame).
+- **PTE U/S=1.** Before mutating any PTE in CoW, verify that its U/S
+  bit is set. A write fault routed here against a kernel-installed PTE
+  (a kernel bug elsewhere) must panic, not silently turn a kernel page
+  user-writable (Security finding B5).
 
 ```
+// Held: aspace.write() — exclusive over this address space.
 let pte = aspace.page_table.lookup_mut(cr2);
+assert!(pte.user(), "CoW resolver entered with U/S=0 PTE; kernel bug");
 let old_frame = pte.frame();
-let rc = page_refcount(old_frame).fetch_sub(1, Acquire);
+
+// Acquire-load the refcount to synchronize with any concurrent decrement
+// elsewhere; we do NOT modify it on the fast path.
+let rc = page_refcount(old_frame).load(Acquire);
 if rc == 1:
-  // we were the last sharer — just upgrade to writable in-place.
+  // We are the last sharer (refcount 1 — only this PTE references the
+  // frame). Promote in place. No decrement: refcount stays 1, matching
+  // the new sole-owner state. The Acquire load synchronizes-with all
+  // prior writes from any previous owner.
   pte.set_writable(true);
-  invlpg(cr2);
+  flusher.invalidate(cr2);
 else:
-  // need a private copy.
-  let new_frame = frame_alloc()?;
+  // Need a private copy.
+  let new_frame = frame_alloc()?;       // refcount[new_frame] = 1 by alloc
   copy_4k_via_hhdm(old_frame, new_frame);
-  pte.set_frame(new_frame); pte.set_writable(true);
-  invlpg(cr2);
-  // old_frame's refcount already decremented above.
+  pte.set_frame(new_frame);
+  pte.set_writable(true);
+  flusher.invalidate(cr2);
+  // Now drop our reference to old_frame. Release on the dec orders the
+  // PTE update before any observer that subsequently sees rc==1 and
+  // tries to write the old frame. If this dec brings it to 0, the
+  // allocator reclaims; an Acquire fence happens inside frame_free
+  // before the frame is handed out again.
+  let prev = page_refcount(old_frame).fetch_sub(1, Release);
+  if prev == 1:
+    atomic::fence(Acquire);
+    frame_free(old_frame);
 ```
 
-The single-sharer fast path matches Linux's `wp_page_reuse` and Serenity's
-`if (page_slot->ref_count() == 1)` optimisation.
+This matches Linux's `wp_page_reuse` (fast path) and `wp_page_copy` (slow
+path) shape and adopts the canonical Arc-style memory ordering called
+out by the OS-Engineer reviewer (B4) and the Academic reviewer (A1, A3).
+The "ownership invariant" the Academic reviewer asks be made explicit:
+*VMAs hold strong references to their `VmObject`s via `Arc`; the
+per-frame `page_refcount` tracks how many PTEs across all address spaces
+reference each frame and is independent of the `Arc` graph. Refcount is
+either exact or over-approximated; it is never under-approximated.* The
+fork path's `Release`-ordered increment and the CoW path's
+`Release`-ordered decrement form a release-acquire chain via the atomic
+fence above.
 
-**`fork()` page-table copy** (called from process duplication):
+**`fork()` page-table copy** (called from process duplication). Takes a
+`Flusher` so the parent's W-strip is shootdown-correct on every CPU in
+`parent.used_by` (OS-Engineer finding B5):
 
 ```
-fn fork_address_space(parent: &AddressSpace) -> Result<AddressSpace, Errno> {
+fn fork_address_space(
+    parent: &mut AddressSpace,    // write lock held
+    flusher: &mut Flusher,        // covers parent.used_by
+) -> Result<AddressSpace, Errno> {
   let mut child = AddressSpace::new_empty()?;   // fresh PML4, kernel half copied
   for vma in parent.vmas.iter():
-    let child_vma = vma.clone_metadata(); // same object, same offset, same prot
+    let child_vma = vma.clone_metadata();
     if vma.share == ShareMode::Private:
-      // CoW both sides: walk PTEs in [vma.start, vma.end), strip W in
-      // parent, install identical PTE (also W-stripped) in child, and
-      // bump page_refcount[frame].
       for (va, pte) in parent.page_table.range_mut(vma.start, vma.end):
         if pte.is_present():
+          // Bump refcount BEFORE stripping W in the parent. Order: a
+          // future CoW resolver in the parent (which loads refcount with
+          // Acquire) must observe rc>=2 once it sees the W-stripped PTE.
+          // Relaxed is sufficient on the inc; the Release on subsequent
+          // CoW dec is what publishes frame contents.
+          if page_refcount(pte.frame()).fetch_add(1, Relaxed) == u16::MAX:
+            // Saturation: roll back this VMA's increments and copy the
+            // frame eagerly. If allocation fails, roll back the entire
+            // fork. (See "Refcount saturation" in Security below.)
+            return Err(rollback_fork(parent, child, vma, va))
           pte.set_writable(false);
-          page_refcount(pte.frame()).fetch_add(1, Release);
-          child.page_table.install(va, pte.value());
-      // queue local INVLPGs (or full TLB flush; see Performance below)
-    else:
-      // Shared: PTEs simply duplicated, no W-strip. Refcount still bumps.
+          child.page_table.install(va, pte.with_writable(false));
+          flusher.invalidate(va);   // parent CPUs lose stale W TLB entry
+    else: // ShareMode::Shared
       for (va, pte) in parent.page_table.range(vma.start, vma.end):
         if pte.is_present():
-          page_refcount(pte.frame()).fetch_add(1, Release);
+          if page_refcount(pte.frame()).fetch_add(1, Relaxed) == u16::MAX:
+            return Err(rollback_fork(parent, child, vma, va))
           child.page_table.install(va, pte.value());
     child.vmas.insert(child_vma);
+  // CRITICAL: flusher.finish() runs before fork() returns to userspace.
+  // Otherwise the parent could observe stale W=1 TLB entries and bypass
+  // CoW, silently corrupting the child's view (Security advisory A7).
+  flusher.finish();
   Ok(child)
 }
 ```
 
-The W-strip happens in the *parent* as well as the child. Both sides take
-a write fault on first store and CoW-resolve independently.
+The W-strip happens in the *parent* as well as the child. Both sides
+take a write fault on first store and CoW-resolve independently. The
+`flusher.finish()` call is mandatory before return — `fork_address_space`
+asserts on drop that `flusher` was finished.
 
 **`mmap` / `munmap` / `mprotect`** all flow through three primitives on
 `VmaTree`: `insert(vma)` (with merge), `unmap_range(start, end)` (with
@@ -333,6 +455,16 @@ split at boundaries), `change_protection(start, end, new_prot)` (with
 split + merge). Splits clone the `Arc<dyn VmObject>`; merges require the
 adjacent VMAs to have matching prot/share/object/object_offset and be
 contiguous.
+
+**Lock ordering invariant for the future.** When threads land and a
+single process can hold two `AddressSpace`s open simultaneously
+(`fork()` is the canonical case), the parent's lock is acquired before
+the child's. We adopt the Linux convention: when two `AddressSpace`s
+must be locked together, lock by ascending pointer-address of the
+`AddressSpace` heap allocation (Academic advisory A2). This is free
+today (only one is locked at a time outside of fork, and fork constructs
+the child *after* taking the parent lock) and prevents the deadlock
+class once a future RFC adds `clone(CLONE_VM)`-style sharing.
 
 **TLB invalidation** is funnelled through a `Flusher` (`kernel/src/mem/tlb.rs`):
 
@@ -370,21 +502,83 @@ slated). The minimal POSIX-shaped surface:
 | TBD | `brk`       | `(addr) → new_break`                                     | grow/shrink anon region        |
 | TBD | `madvise`   | `(addr, len, advice) → 0`                                | accept all, no-op              |
 
-Errnos follow POSIX strictly:
+**Address validation (every mmap-family syscall, before any state
+mutation).** Required to close Security finding B2:
 
-- `mmap`: `EINVAL` (`len == 0`, unaligned addr under MAP_FIXED, both/neither
-  of MAP_PRIVATE/MAP_SHARED, unknown bits in flags), `ENOMEM` (no room or
-  RLIMIT_AS), `EBADF`/`EACCES` (deferred — file-backed not yet supported,
-  return `ENOTSUP` for `fd != -1`), `EEXIST` for MAP_FIXED_NOREPLACE.
-- `munmap`/`mprotect`: `EINVAL` (`len == 0`, unaligned addr), `ENOMEM`
-  (range covers unmapped pages — POSIX-conformant strictness).
-- `brk`: returns the *current* break; never sets errno.
+1. `len == 0` → `EINVAL`.
+2. `len` rounded up to a page; if rounding overflows `usize`, `EINVAL`.
+3. `addr` must be canonical (bits 48..63 all equal bit 47); else `EINVAL`.
+4. `addr.checked_add(len_rounded)` must succeed; else `EINVAL`.
+5. `addr + len_rounded <= USER_VA_END` (= `0x0000_8000_0000_0000` minus
+   the per-aspace guard region); else `EINVAL`. This forbids any user-
+   controlled range from touching the kernel half.
+6. `addr` page-alignment: required for `MAP_FIXED`, `munmap`, `mprotect`,
+   `madvise` (else `EINVAL`); for non-FIXED `mmap` `addr` is treated as
+   a hint and rounded down.
+
+Errnos (POSIX-conformant unless explicitly noted as a documented
+deviation):
+
+- `mmap`:
+  - `EINVAL` — failed validation 1–6, both/neither of MAP_PRIVATE/
+    MAP_SHARED, unknown bits in `flags`.
+  - `ENOMEM` — no room for non-FIXED, or `RLIMIT_AS` exceeded, or
+    `VmaTree::insert` returns `AllocError` from the kernel heap.
+  - `EEXIST` — `MAP_FIXED_NOREPLACE` would overlap an existing VMA.
+  - `ENODEV` — `fd != -1` (file-backed not yet supported). This matches
+    Linux's "file type not supported by mmap" semantics and is the
+    POSIX-listed errno (User-Space finding B3); we do not invent
+    `ENOTSUP` here.
+  - `EACCES` — reserved for the future file-backed path.
+
+- `munmap`:
+  - `EINVAL` — failed validation 1–6.
+  - **No `ENOMEM` on holes.** `munmap` over a range that is partly or
+    wholly unmapped returns `0` (POSIX requirement; User-Space finding
+    B1). `glibc`/`musl` `free()` paths depend on this.
+
+- `mprotect`:
+  - `EINVAL` — failed validation 1–6, unknown PROT bits.
+  - `ENOMEM` — only when the request specifies an `addr`+`len` that is
+    not entirely contained in mapped VMAs of *this address space at the
+    page granularity Linux uses* — i.e., a sub-page within the requested
+    range has no VMA. Holes spanning whole VMAs return `ENOMEM`; partial
+    coverage of a single VMA does not. This matches Linux's
+    `mprotect_fixup` failure mode and is the standard POSIX
+    interpretation.
+
+- `brk`:
+  - On failure (request past `brk_max` or allocation failure), returns
+    the **current** (unchanged) break. `glibc`/`musl` `sbrk` detect
+    failure by comparing return value against the prior break (User-
+    Space advisory A3). No errno set.
+
+- `madvise`:
+  - Always returns `0` for valid advice values; `EINVAL` for unknown.
+    `MADV_DONTNEED` on `MAP_PRIVATE | MAP_ANONYMOUS` zeros pages by
+    dropping PTEs and decrementing refcounts (Security advisory A5,
+    User-Space advisory A4) — required because jemalloc/mimalloc rely on
+    it. Other advice is no-op.
+
+**Syscall ABI return convention.** All syscalls return `i64` in `rax`.
+Success is `>= 0` (for `mmap` the new VA, for `brk` the new break, for
+others 0). Failure is `-errno` in the range `-1..=-4095` (Linux
+convention; User-Space advisory A5).
+
+**Syscall numbers** are pinned in this RFC (User-Space advisory A1):
+`mmap=9`, `munmap=11`, `mprotect=10`, `brk=12`, `madvise=28` — chosen to
+match Linux x86-64 numbering so a future `vibix-sys` crate can share
+constants. Implementation issue (#125 successor) freezes the table
+before PID 1 lands.
 
 Supported flags (vibix-init):
 
 ```
 MAP_PRIVATE         0x02
-MAP_SHARED          0x01     // returns ENOTSUP without a backing object
+MAP_SHARED          0x01     // anonymous MAP_SHARED is fully supported
+                             // (shared-memory between fork children).
+                             // file-backed MAP_SHARED returns ENODEV until
+                             // the file-backed VmObject lands.
 MAP_FIXED           0x10
 MAP_FIXED_NOREPLACE 0x100000
 MAP_ANONYMOUS       0x20
@@ -393,8 +587,31 @@ MAP_STACK           0x20000  // no-op marker
 ```
 
 PROT bits: `PROT_NONE=0`, `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
-`PROT_WRITE` without `PROT_READ` is silently upgraded to RW (matches x86
-hardware, where R is not separable).
+`PROT_WRITE` without `PROT_READ` is **accepted as the user's request**
+(stored in `vma.prot_user`) but the PTE is installed with `R|W` because
+x86 cannot separate them. Userspace observability paths (future
+`/proc/self/maps`, `mincore`) report `prot_user`; `mprotect` round-trip
+preserves the original bits. This closes User-Space finding B2: we no
+longer silently mutate the user's request.
+
+`PROT_EXEC` clears the XD bit in the leaf PTE; clearing `PROT_EXEC` sets
+XD. W^X is **not** enforced at the kernel boundary — userspace JITs
+need `RWX` mappings transiently. We will revisit if a hardening RFC
+later adds an opt-in W^X enforcement (User-Space advisory A7).
+
+**MAP_FIXED loader invariant (kernel-initiated mappings).** Any caller
+*inside the kernel* that maps an untrusted byte stream's segment to a
+fixed VA (today: the ring-0 ELF loader, #148) MUST:
+
+1. Use `MAP_FIXED_NOREPLACE`, never bare `MAP_FIXED`.
+2. Reject any segment whose `[p_vaddr, p_vaddr + p_memsz)` is non-
+   canonical, exceeds `USER_VA_END`, overflows, or overlaps the stack-
+   guard region.
+
+This addresses Security finding B4 — the loader cannot be tricked into
+clobbering kernel-half PML4 entries or stack guards via crafted ELFs.
+The check lives in the loader itself; the VM subsystem rejects out-of-
+range addresses unconditionally regardless.
 
 `/proc` and `/sys` layouts: N/A — neither subsystem exists yet.
 
@@ -402,10 +619,13 @@ hardware, where R is not separable).
 
 A user stack is created as a `MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN`
 VMA. On a `#PF` whose `cr2` is below `vma.start` but within
-`stack_guard_gap` (256 pages, matching Linux), the resolver extends `vma.start`
-downward by one page and installs the page. A guard VMA below the stack
-(PROT_NONE, marked `STACK_GUARD`) catches over-runs and converts them to
-SIGSEGV.
+`stack_guard_gap` (256 pages, matching Linux), the resolver extends
+`vma.start` downward by **exactly one page** and installs the page. A
+single fault never extends by more than one page (Security advisory A6) —
+this defeats attacker-controlled multi-page jumps over the guard. After
+each extension we also enforce `RLIMIT_STACK` (today: a fixed 8 MiB
+default; future per-task limit). A guard VMA below the stack (PROT_NONE,
+marked `STACK_GUARD`) catches over-runs and converts them to SIGSEGV.
 
 ### Address-space teardown
 
@@ -428,14 +648,37 @@ frame. The PML4 frame itself is freed last. This addresses #132's leak.
 - **Reserved-bit faults panic**: a `#PF` with RSVD=1 indicates the kernel
   itself wrote a malformed PTE. Continuing risks corrupting another address
   space; we panic with the faulting VA, frame, and PTE word.
-- **Refcount overflow**: 16-bit per-frame refcount caps at 65,535 sharers.
-  The fork path `checked_add(1)` and on overflow falls back to copying the
-  frame eagerly (degenerate but safe). A future widen to `AtomicU32` is
-  trivial; we accept the surface for now.
-- **CoW race**: two CPUs may write-fault the same shared frame
-  simultaneously. Resolution holds `aspace.write()`, which serialises
-  resolution within an address space; cross-address-space CoW state is
-  protected by the per-frame refcount's atomic decrement.
+- **Refcount saturation rollback (Security A4, OS A2).** The fork path
+  uses `fetch_add(1, Relaxed)` and observes the previous value. If the
+  previous value was already `u16::MAX`, we cannot safely share the
+  frame again. The protocol is:
+  1. Walk back the *current VMA's* increments, decrementing every frame
+     we already added a ref to within this VMA.
+  2. If the rollback succeeds, fall back to **eager copy** of the
+     remaining VMA (allocate fresh frames, memcpy via HHDM, install in
+     child without touching parent's refcount). The child's new frames
+     start at refcount 1; the parent's refcounts are unchanged for that
+     VMA's surviving entries.
+  3. If allocation for the eager copy fails, walk back **all** VMAs
+     already processed in this fork (decrementing refcounts and freeing
+     child PML4 entries), then return `ENOMEM`. Fork is all-or-nothing;
+     partial address spaces are never observable.
+
+  Eager copy does *not* require a reverse map: we are inside fork, the
+  child's address space is private and not yet visible to anyone, and
+  we hold the parent's write lock. The "16-bit refcount + saturation
+  fallback" formal invariant is *over-approximation only — refcount is
+  exact or higher, never lower.* A future widen to `AtomicU32` is
+  trivial.
+
+- **CoW race**: two threads of the same process may write-fault the same
+  shared frame simultaneously. Resolution holds `aspace.write()`,
+  which serialises *PTE mutation and refcount inspection within this
+  address space.* Cross-address-space CoW state is protected by the per-
+  frame refcount's atomic increment/decrement plus the
+  release-acquire fence pair documented in `resolve_cow`. The CoW
+  resolver's PTE U/S=1 assertion catches any kernel-mapping leakage
+  before it becomes user-writable (Security finding B5).
 - **Information disclosure via fresh frames**: `AnonObject::fault` zeroes
   the frame *before* installing the PTE. This is a hard invariant — any
   code path that returns a frame to user space without zeroing first is a
@@ -447,7 +690,24 @@ frame. The PML4 frame itself is freed last. This addresses #132's leak.
 - **Stack/heap collision**: `brk_max` is enforced strictly; the stack
   VMA's growth is bounded to never collide with the highest mmap or with
   `brk_max`. A growth attempt that would collide returns SIGSEGV rather
-  than overlapping a user mapping.
+  than overlapping a user mapping. The `brk_max` guard is **non-zero**
+  (default 1 MiB between top of brk and `mmap_base`) so a saturated
+  brk does not strand subsequent mmap allocations (Security advisory A8).
+
+- **`page_refcount` static sizing (Security A3, OS A1).** The array is
+  sized from the same `MAX_PHYS_BYTES` constant the frame allocator
+  uses (`kernel/src/mem/frame.rs`), not from "usable" RAM. MMIO and
+  reserved regions never enter the refcount path: the allocator marks
+  those frames as permanently used in its bitmap and never returns them
+  via `frame_alloc`, so no PTE installed by the VM subsystem can point
+  at one. We assert in `frame_free(f)` that `page_refcount[f]` was
+  exactly 0 before reclaim, catching any underflow at the source.
+
+- **Reserved-bit panic console hygiene (Security A2).** `panic_rsvd_
+  corruption(cr2)` logs only the faulting VA. The PTE word and the
+  physical address it embedded are written to `klog` (kernel-only ring
+  buffer) and never to the boot serial console, which a future userspace
+  may reach.
 - **Speculative-execution side channels**: out of scope. KPTI / Meltdown
   mitigation is filed separately if/when it becomes relevant; vibix is
   bare-metal hobby and the threat model excludes hostile multi-tenant
