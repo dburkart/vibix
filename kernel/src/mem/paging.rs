@@ -380,7 +380,7 @@ pub fn cow_copy_and_remap(
     let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
     // The page must currently be mapped — we're resolving a write
     // protection fault on it. Any other state is a bug in the caller.
-    let (_old_frame, unmap_flush) = mapper
+    let (old_frame, unmap_flush) = mapper
         .unmap(page)
         .expect("cow_copy_and_remap: page not mapped despite write-protection fault");
     if Cr3::read().0 == pml4_frame {
@@ -388,6 +388,11 @@ pub fn cow_copy_and_remap(
     } else {
         unmap_flush.ignore();
     }
+    // Release the PTE's reference to the old frame (it was acquired by
+    // AnonObject::fault via inc_refcount when the page was first mapped).
+    // The AnonObject's cache retains its own reference; this balances
+    // only the now-removed PTE mapping.
+    frame::put(old_frame.start_address().as_u64());
     let flush = unsafe { mapper.map_to(page, new_frame, flags, &mut alloc)? };
     if Cr3::read().0 == pml4_frame {
         flush.flush();
@@ -421,6 +426,31 @@ pub fn unmap_in_pml4(
     // once we have >1 AP online.
     flush.flush();
     Ok(frame)
+}
+
+/// Translate `va` in `pml4_frame` to its backing physical frame and
+/// PTE flags, or `None` if the address is not mapped.
+///
+/// Builds a temporary `OffsetPageTable` over `pml4_frame` via the HHDM
+/// — same pattern as every other `*_in_pml4` helper. Used by
+/// [`crate::mem::addrspace::AddressSpace::fork_address_space`] to walk
+/// present PTEs without unmapping them.
+pub fn translate_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    va: VirtAddr,
+) -> Option<(PhysFrame<Size4KiB>, PageTableFlags)> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before translate_in_pml4");
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    match mapper.translate(va) {
+        TranslateResult::Mapped { frame, flags, .. } => match frame {
+            x86_64::structures::paging::mapper::MappedFrame::Size4KiB(f) => Some((f, flags)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Unmap `page` from `pml4_frame` and return its backing frame to the

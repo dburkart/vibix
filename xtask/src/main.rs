@@ -630,6 +630,7 @@ fn test_all() -> R<()> {
         "task_exit",
         "addrspace",
         "addrspace_drop",
+        "fork_cow",
         "tlb_flusher",
     ] {
         cmd.arg("--test").arg(t);

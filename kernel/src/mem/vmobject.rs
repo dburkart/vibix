@@ -138,10 +138,20 @@ impl VmObject for AnonObject {
         let idx = self.check_bounds(offset)?;
         let mut inner = self.inner.lock();
         if let Some(&frame) = inner.frames.get(&idx) {
+            // Increment for the new PTE mapping. Every installed PTE holds
+            // one reference; the cache entry holds a separate reference.
+            // Balanced by `frame::put` in `AddressSpace::drop` when the
+            // PTE is removed (or `cow_copy_and_remap` when CoW resolves it).
+            #[cfg(target_os = "none")]
+            crate::mem::refcount::inc_refcount(frame);
             return Ok(frame);
         }
         let phys = alloc_zeroed_page()?;
         inner.frames.insert(idx, phys);
+        // `alloc_zeroed_page` sets refcount=1 (the cache's reference).
+        // Increment once more for the PTE mapping being installed by caller.
+        #[cfg(target_os = "none")]
+        crate::mem::refcount::inc_refcount(phys);
         Ok(phys)
     }
 

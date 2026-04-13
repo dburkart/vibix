@@ -193,6 +193,145 @@ impl AddressSpace {
     }
 }
 
+/// Error returned by [`AddressSpace::fork_address_space`].
+#[derive(Debug)]
+pub enum ForkError {
+    /// The frame allocator could not satisfy an intermediate page-table
+    /// allocation needed to build the child's PML4. The child is rolled
+    /// back automatically before this error is returned.
+    OutOfMemory,
+}
+
+/// Clone the address space for a child task (fork CoW).
+///
+/// For each `Share::Private` VMA: walk present PTEs, increment the
+/// frame's refcount, strip `WRITABLE` from both parent and child
+/// PTEs (CoW — the `#PF` handler resolves write faults by copying the
+/// frame), and queue a TLB invalidation for the parent VA. For
+/// `Share::Shared` VMAs: increment refcount and copy PTE verbatim
+/// to the child.
+///
+/// The child inherits the parent's `brk`/`mmap` layout. The caller is
+/// responsible for calling `flusher.finish()` after this returns to
+/// flush stale parent TLB entries.
+///
+/// On `Err(ForkError::OutOfMemory)` the child is dropped cleanly
+/// (its partially-built PTEs are unmapped and frame refcounts are
+/// decremented by `Drop for AddressSpace`) before the error is returned.
+#[cfg(target_os = "none")]
+impl AddressSpace {
+    pub fn fork_address_space(
+        &mut self,
+        flusher: &mut crate::mem::tlb::Flusher,
+    ) -> Result<AddressSpace, ForkError> {
+        use alloc::sync::Arc;
+        use crate::mem::{paging, refcount};
+        use crate::mem::vmatree::{Share, Vma as VmaEntry};
+        use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+
+        // Allocate child PML4 + copy kernel upper half.
+        let mut child = AddressSpace::new_empty();
+        // Inherit brk/mmap layout from parent.
+        child.mmap_base = self.mmap_base;
+        child.brk_start = self.brk_start;
+        child.brk_cur = self.brk_cur;
+        child.brk_max = self.brk_max;
+
+        // Collect VMAs first (avoids borrow conflict when we later
+        // mutate the child and call paging helpers on self.page_table).
+        type VmaSnap = (usize, usize, u32, u64, Share, Arc<dyn crate::mem::vmobject::VmObject>, usize);
+        let vma_snapshot: alloc::vec::Vec<VmaSnap> =
+            self.vmas.iter().map(|v| {
+                (v.start, v.end, v.prot_user, v.prot_pte, v.share, Arc::clone(&v.object), v.object_offset)
+            }).collect();
+
+        for (start, end, prot_user, prot_pte, share, object, object_offset) in &vma_snapshot {
+            let prot_user = *prot_user;
+            let prot_pte = *prot_pte;
+            let share = *share;
+            let start = *start;
+            let end = *end;
+            let object_offset = *object_offset;
+
+            // Insert VMA into child.
+            let child_vma = VmaEntry::new(
+                start, end,
+                prot_user,
+                prot_pte,
+                share,
+                Arc::clone(object),
+                object_offset,
+            );
+            child.vmas.insert(child_vma);
+            child.vm_pages += (end - start) / 4096;
+
+            let mut va = start;
+            while va < end {
+                let page = Page::<Size4KiB>::from_start_address(
+                    x86_64::VirtAddr::new(va as u64),
+                )
+                .expect("vma VA page-aligned");
+
+                if let Some((pte_frame, pte_flags)) =
+                    paging::translate_in_pml4(self.page_table, x86_64::VirtAddr::new(va as u64))
+                {
+                    let phys = pte_frame.start_address().as_u64();
+
+                    match share {
+                        Share::Private => {
+                            // Give child a reference to this frame.
+                            let _prev = refcount::inc_refcount(phys);
+                            // Strip WRITABLE from child PTE.
+                            let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
+                            if let Err(_) = paging::map_existing_in_pml4(
+                                child.page_table,
+                                page,
+                                pte_frame,
+                                ro_flags,
+                            ) {
+                                // Child PTE install failed — drop cleans up.
+                                return Err(ForkError::OutOfMemory);
+                            }
+                            // Strip WRITABLE from parent PTE too.
+                            // Unmap old PTE (puts the PTE-reference), increment
+                            // again for the new read-only parent PTE, then remap.
+                            let _ = paging::unmap_in_pml4(self.page_table, page);
+                            refcount::inc_refcount(phys);
+                            if let Err(_) = paging::map_existing_in_pml4(
+                                self.page_table,
+                                page,
+                                pte_frame,
+                                ro_flags,
+                            ) {
+                                return Err(ForkError::OutOfMemory);
+                            }
+                            flusher.invalidate(x86_64::VirtAddr::new(va as u64));
+                        }
+                        Share::Shared => {
+                            // Shared mapping: child gets same frame + flags.
+                            refcount::inc_refcount(phys);
+                            if let Err(_) = paging::map_existing_in_pml4(
+                                child.page_table,
+                                page,
+                                pte_frame,
+                                pte_flags,
+                            ) {
+                                return Err(ForkError::OutOfMemory);
+                            }
+                        }
+                    }
+                }
+                // Pages not yet faulted in have no PTE; child will demand-fault
+                // them independently.
+
+                va += 4096;
+            }
+        }
+
+        Ok(child)
+    }
+}
+
 /// Reclaim the address space when the last `Arc<RwLock<AddressSpace>>`
 /// is dropped — closes #161 (and the leak documented in #146):
 ///
@@ -228,23 +367,20 @@ impl Drop for AddressSpace {
             while va < vma.end {
                 let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
                     .expect("vma page VA aligned by construction");
-                let obj_offset = (va - vma.start) + vma.object_offset;
                 if let Ok(pte_frame) = paging::unmap_in_pml4(pml4, page) {
-                    let cached = vma.object.frame_at(obj_offset);
-                    if cached != Some(pte_frame.start_address().as_u64()) {
-                        // PTE holds a private CoW copy that is not tracked
-                        // by the VmObject's cache. Free it directly; the
-                        // cached source frame is owned by the VmObject and
-                        // freed when the Arc<dyn VmObject> drops below.
-                        // SAFETY: private copy allocated from the global
-                        // frame allocator by `cow_copy_and_remap`; no other
-                        // PML4 references it at task-reap time.
-                        unsafe {
-                            paging::KernelFrameAllocator.deallocate_frame(pte_frame);
-                        }
+                    // Release this PTE's reference to the frame. Every
+                    // mapped PTE holds one reference (acquired via
+                    // `AnonObject::fault`'s `inc_refcount` or
+                    // `fork_address_space`'s `inc_refcount`); private CoW
+                    // copies have refcount=1 (from `alloc_zeroed_page`) and
+                    // are freed here. Cached frames have their remaining
+                    // cache-reference released by `AnonObject::drop` when
+                    // `self.vmas` drops after this function returns.
+                    // SAFETY: frame was mapped into this PML4 and is now
+                    // exclusively reachable via this drop path.
+                    unsafe {
+                        paging::KernelFrameAllocator.deallocate_frame(pte_frame);
                     }
-                    // cached == Some(pte_frame): frame owned by VmObject;
-                    // freed when Arc<dyn VmObject> drops at end of this fn.
                 }
                 va += 4096;
             }
