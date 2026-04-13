@@ -15,6 +15,7 @@ use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
+use super::tlb::Flusher;
 use super::{paging, FRAME_SIZE};
 use crate::serial_println;
 
@@ -74,11 +75,13 @@ impl GrowingHeap {
         let start = VirtAddr::new((HEAP_BASE + mapped) as u64);
         let frames = (chunk as u64) / FRAME_SIZE;
         let mut grown: usize = 0;
+        let mut flusher = Flusher::new_active();
         for i in 0..frames {
             if paging::map_range(
                 start + i * FRAME_SIZE,
                 1,
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                &mut flusher,
             )
             .is_err()
             {
@@ -86,6 +89,7 @@ impl GrowingHeap {
             }
             grown += FRAME_SIZE as usize;
         }
+        flusher.finish();
         if grown == 0 {
             return false;
         }
@@ -162,12 +166,15 @@ pub fn stats() -> HeapStats {
 /// `paging::init` to have run so `map_range` is live.
 pub fn init() {
     let frames = (INITIAL_HEAP_SIZE as u64) / FRAME_SIZE;
+    let mut flusher = Flusher::new_active();
     paging::map_range(
         VirtAddr::new(HEAP_BASE as u64),
         frames,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        &mut flusher,
     )
     .expect("failed to map initial heap range");
+    flusher.finish();
 
     unsafe {
         ALLOCATOR

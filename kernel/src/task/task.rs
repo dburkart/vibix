@@ -183,12 +183,15 @@ impl Task {
         Page::<Size4KiB>::from_start_address(VirtAddr::new(stack_base as u64))
             .expect("task stack base must be page aligned");
         let stack_page_count = (STACK_SIZE / 4096) as u64;
+        let mut flusher = crate::mem::tlb::Flusher::new_active();
         paging::map_range(
             VirtAddr::new(stack_base as u64),
             stack_page_count,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+            &mut flusher,
         )
         .expect("failed to map task stack");
+        flusher.finish();
 
         // Build the per-task PML4 *after* mapping the stack — the new
         // PML4 snapshots the kernel PML4's upper half, and we want the

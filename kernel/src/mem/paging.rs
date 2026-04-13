@@ -23,6 +23,7 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::frame;
+use super::tlb::Flusher;
 use crate::serial_println;
 
 /// Frame allocator adapter: pulls 4 KiB frames from (and, via
@@ -83,9 +84,13 @@ pub fn with_mapper<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) -> R {
 }
 
 /// Map `page` to a freshly-allocated physical frame with `flags`.
+/// The caller supplies a [`Flusher`]; this function queues `page` on
+/// it but does not `finish` — batch with other mutations where
+/// possible, then `finish` once.
 pub fn map(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
+    flusher: &mut Flusher,
 ) -> Result<PhysFrame<Size4KiB>, MapToError<Size4KiB>> {
     let mut alloc = KernelFrameAllocator;
     let frame = alloc
@@ -93,7 +98,8 @@ pub fn map(
         .ok_or(MapToError::FrameAllocationFailed)?;
     with_mapper(|m| {
         let flush = unsafe { m.map_to(page, frame, flags, &mut alloc)? };
-        flush.flush();
+        flush.ignore();
+        flusher.invalidate(page.start_address());
         Ok(frame)
     })
 }
@@ -103,10 +109,11 @@ pub fn map_range(
     start: VirtAddr,
     count: u64,
     flags: PageTableFlags,
+    flusher: &mut Flusher,
 ) -> Result<(), MapToError<Size4KiB>> {
     for i in 0..count {
         let page = Page::<Size4KiB>::containing_address(start + i * 4096);
-        map(page, flags)?;
+        map(page, flags, flusher)?;
     }
     Ok(())
 }
@@ -123,6 +130,7 @@ pub fn map_phys_into_hhdm(
     phys: u64,
     size: u64,
     flags: PageTableFlags,
+    flusher: &mut Flusher,
 ) -> Result<(), MapToError<Size4KiB>> {
     if size == 0 {
         return Ok(());
@@ -148,7 +156,10 @@ pub fn map_phys_into_hhdm(
             // and firmware-provided ACPI tables the kernel is the sole
             // user and we never hand these pages to the frame allocator.
             match unsafe { m.map_to(page, frame, flags, &mut alloc) } {
-                Ok(flush) => flush.flush(),
+                Ok(flush) => {
+                    flush.ignore();
+                    flusher.invalidate(page.start_address());
+                }
                 // Already mapped via a 4 KiB PTE — no-op.
                 Err(MapToError::PageAlreadyMapped(_)) => {}
                 // A 2 MiB HHDM huge page already covers this address
@@ -179,10 +190,14 @@ pub fn map_phys_into_hhdm(
 /// return it to the global allocator with [`unmap_and_free`], or hold
 /// on to it (e.g. when unmapping a physical region the allocator never
 /// owned, like the IST guard page which lives in `.bss`).
-pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
+pub fn unmap(
+    page: Page<Size4KiB>,
+    flusher: &mut Flusher,
+) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     with_mapper(|m| {
         let (frame, flush) = m.unmap(page)?;
-        flush.flush();
+        flush.ignore();
+        flusher.invalidate(page.start_address());
         Ok(frame)
     })
 }
@@ -190,8 +205,17 @@ pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
 /// Unmap `page` and return its backing frame to the global frame
 /// allocator. Use this for mappings whose frame originally came from
 /// [`map`] / [`map_range`].
-pub fn unmap_and_free(page: Page<Size4KiB>) -> Result<(), UnmapError> {
-    let frame = unmap(page)?;
+pub fn unmap_and_free(page: Page<Size4KiB>, flusher: &mut Flusher) -> Result<(), UnmapError> {
+    let frame = unmap(page, flusher)?;
+    // Local invlpg *before* returning the frame to the allocator. The
+    // caller's Flusher batches with other mutations and finish()
+    // happens later — in the meantime the allocator could hand this
+    // frame to someone else. A stale cached translation for `page`
+    // would then let this CPU read or write another owner's data.
+    // This is a single-CPU flush today; the SMP-shootdown follow-up
+    // will turn it into an IPI. The Flusher still carries the VA
+    // queued, so `finish` re-invalidates harmlessly.
+    x86_64::instructions::tlb::flush(page.start_address());
     // SAFETY: the caller's contract is that `page`'s frame came from
     // the global allocator — `map` is the only supported producer.
     unsafe { KernelFrameAllocator.deallocate_frame(frame) };

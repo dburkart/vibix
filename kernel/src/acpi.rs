@@ -271,12 +271,15 @@ fn checksum(ptr: *const u8, len: usize) -> u8 {
 }
 
 fn map_phys(phys: u64, size: u64) {
+    let mut flusher = crate::mem::tlb::Flusher::new_active();
     paging::map_phys_into_hhdm(
         phys,
         size,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        &mut flusher,
     )
     .expect("failed to map ACPI physical range");
+    flusher.finish();
 }
 
 fn parse_madt(madt: *const SdtHeader) -> AcpiInfo {

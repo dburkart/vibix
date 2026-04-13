@@ -18,6 +18,7 @@ use crate::mem::paging;
 use crate::serial_println;
 
 fn map_mmio(phys: u64, size: u64) {
+    let mut flusher = crate::mem::tlb::Flusher::new_active();
     paging::map_phys_into_hhdm(
         phys,
         size,
@@ -26,8 +27,10 @@ fn map_mmio(phys: u64, size: u64) {
             | PageTableFlags::NO_EXECUTE
             | PageTableFlags::NO_CACHE
             | PageTableFlags::WRITE_THROUGH,
+        &mut flusher,
     )
     .expect("failed to map APIC MMIO");
+    flusher.finish();
 }
 
 // LAPIC register offsets (all MMIO 32-bit, aligned on 16 bytes).
