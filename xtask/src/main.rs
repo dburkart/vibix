@@ -546,6 +546,7 @@ fn test_all() -> R<()> {
         "pci_enum",
         "serial_rx",
         "cow_vma",
+        "task_exit",
     ] {
         cmd.arg("--test").arg(t);
     }

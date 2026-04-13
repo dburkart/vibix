@@ -424,6 +424,135 @@ pub fn current_vma_lookup(
     Some((vma.kind, vma.flags))
 }
 
+/// Terminate the currently-running task. Reclaims the task's mapped
+/// stack pages, VMA-backed frames, and PML4 frame on the next
+/// scheduler tick, then drops the `Box<Task>`.
+///
+/// The actual reclaim runs from [`preempt_tick`] rather than here
+/// because it unmaps the very stack we're executing on — we have to
+/// context-switch away first. The exiting task is parked in
+/// `Scheduler::pending_exit` for the next tick to reap.
+///
+/// The stack VA slot (`NEXT_STACK_VA`'s bump-allocated range) is *not*
+/// reclaimed — that would require a free-list on `NEXT_STACK_VA`
+/// which is out of scope for this pass. The VA is logged as leaked.
+///
+/// # Panics
+/// - No other ready task exists (exiting the last runnable task would
+///   halt the kernel).
+/// - A prior `task::exit` has not yet been reaped. At most one task
+///   may be awaiting reap at a time; with reaping on every tick this
+///   only trips if the scheduler lock is so contended that no tick
+///   ever reaps — i.e. never, in practice.
+pub fn exit() -> ! {
+    interrupts::disable();
+    let (prev_rsp_ptr, next_rsp, next_cr3) = {
+        let mut sched = SCHED.lock();
+        assert!(
+            sched.pending_exit.is_none(),
+            "task::exit: prior exit not yet reaped"
+        );
+        let Some(mut next) = sched.pop_highest() else {
+            panic!("task::exit: no ready task to switch to");
+        };
+        let prev = sched
+            .current
+            .take()
+            .expect("task::exit before task::init");
+        next.state = TaskState::Running;
+        let next_rsp = next.rsp;
+        let next_cr3 = next.cr3.start_address().as_u64();
+        sched.current = Some(next);
+        sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        sched.pending_exit = Some(prev);
+        let prev_ref = sched.pending_exit.as_mut().unwrap();
+        // SAFETY: prev_ref is a stable Box<Task> in pending_exit; the
+        // heap-allocated Task it points at does not move while the
+        // Box lives, and context_switch only writes to this location
+        // once (we never read it back — the task is doomed).
+        let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
+        (prev_rsp_ptr, next_rsp, next_cr3)
+    };
+    // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
+    // a stable heap location, next_cr3 is a valid per-task PML4.
+    unsafe {
+        context_switch(prev_rsp_ptr, next_rsp, next_cr3);
+    }
+    unreachable!("task::exit returned from context_switch");
+}
+
+/// Reclaim the stack pages, VMA-backed frames, and PML4 frame of a
+/// task that called [`exit`]. Called from [`preempt_tick`] on a stack
+/// that is *not* the victim's — the victim already context-switched
+/// away, so unmapping its stack is safe.
+fn reap_pending(victim: alloc::boxed::Box<Task>) {
+    use crate::mem::paging;
+    use crate::mem::vma::VmaKind;
+    use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+    use x86_64::VirtAddr;
+
+    // 1. Unmap + free stack pages. These live in the shared upper-half
+    //    kernel window (L4 entry 416), so a single unmap via the
+    //    active PML4 propagates through aliasing to every PML4.
+    let stack_base = victim.stack_base();
+    if stack_base != 0 {
+        for i in 0..victim.stack_page_count() {
+            let va = stack_base + i * 4096;
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                .expect("stack page VA aligned by construction");
+            let _ = paging::unmap_and_free(page);
+        }
+    }
+
+    // 2. Walk VMAs. For each VA in each VMA, unmap from the victim's
+    //    private PML4. AnonZero: free the frame. Cow: free only when
+    //    the backing frame is not the shared source (the private
+    //    post-write copy).
+    for vma in victim.vmas.iter() {
+        let mut va = vma.start;
+        while va < vma.end {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                .expect("vma page VA aligned by construction");
+            match vma.kind {
+                VmaKind::AnonZero => {
+                    let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
+                }
+                VmaKind::Cow { frame: source } => {
+                    if let Ok(frame) = paging::unmap_in_pml4(victim.cr3, page) {
+                        if frame != source {
+                            // SAFETY: private copy allocated from the
+                            // global allocator by the #PF resolver.
+                            unsafe {
+                                paging::KernelFrameAllocator.deallocate_frame(frame);
+                            }
+                        }
+                    }
+                }
+            }
+            va += 4096;
+        }
+    }
+
+    // 3. Return the PML4 frame itself.
+    // SAFETY: victim is no longer on any CPU; we're running on a
+    //         different CR3 and no other reference to its PML4
+    //         survives — the Box<Task> is about to be dropped.
+    unsafe { paging::free_pml4_frame(victim.cr3) };
+
+    // 4. Log the leaked stack VA slot for diagnostics.
+    if stack_base != 0 {
+        serial_println!(
+            "tasks: reaped task {} (stack VA slot {:#x}..{:#x} leaked)",
+            victim.id,
+            victim.guard_base,
+            victim.guard_base + task::TASK_SLOT_SIZE
+        );
+    }
+
+    // 5. Drop the Box<Task>, returning its heap memory.
+    drop(victim);
+}
+
 /// Called from the timer ISR after `notify_eoi`. Decrements the
 /// current task's slice; if it's exhausted and there's another task
 /// ready, rotates and context-switches. Bails on lock contention so
@@ -442,6 +571,18 @@ pub fn preempt_tick() {
     let Some(mut sched) = SCHED.try_lock() else {
         return;
     };
+
+    // Reap a task that called `task::exit` on a prior tick, before
+    // touching the ready bank — keeps this tick's rotation consistent
+    // and bounds pending_exit to at most one tick of latency.
+    if let Some(victim) = sched.pending_exit.take() {
+        drop(sched);
+        reap_pending(victim);
+        let Some(s) = SCHED.try_lock() else {
+            return;
+        };
+        sched = s;
+    }
 
     // No task::init yet (or a non-task integration test) — nothing to
     // preempt. Forces Lazy init, but that's allocation-free.

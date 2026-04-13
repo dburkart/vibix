@@ -95,6 +95,11 @@ impl VmaList {
         Some(self.entries.swap_remove(idx))
     }
 
+    /// Iterate all entries in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = &Vma> {
+        self.entries.iter()
+    }
+
     /// Duplicate this list for a child address space. Metadata is
     /// cloned verbatim — including any `Cow { frame }` kinds, which
     /// means the child shares the source frames with the parent until

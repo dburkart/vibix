@@ -127,3 +127,7 @@ harness = false
 [[test]]
 name = "cow_vma"
 harness = false
+
+[[test]]
+name = "task_exit"
+harness = false
