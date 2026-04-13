@@ -543,6 +543,7 @@ fn test_all() -> R<()> {
         "sleep",
         "pci_enum",
         "serial_rx",
+        "cow_vma",
     ] {
         cmd.arg("--test").arg(t);
     }

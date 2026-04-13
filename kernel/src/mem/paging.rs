@@ -299,6 +299,91 @@ pub fn map_in_pml4(
     Ok(data_frame)
 }
 
+/// Map an existing physical frame into `pml4_frame` at `page` with
+/// `flags`. Unlike [`map_in_pml4`], does not allocate a new backing
+/// frame — used by the CoW resolver to install the shared source
+/// frame read-only on first touch.
+pub fn map_existing_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), MapToError<Size4KiB>> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before map_existing_in_pml4");
+    let mut alloc = KernelFrameAllocator;
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let flush = unsafe { mapper.map_to(page, frame, flags, &mut alloc)? };
+    if Cr3::read().0 == pml4_frame {
+        flush.flush();
+    } else {
+        flush.ignore();
+    }
+    Ok(())
+}
+
+/// Copy-on-write resolve: `page` is currently mapped read-only to
+/// `source_frame` in `pml4_frame`. Allocate a fresh frame, memcpy the
+/// source into it through the HHDM, unmap the read-only PTE, then
+/// remap the page to the new frame with `flags` (caller supplies the
+/// full flag set — must include `WRITABLE`). Returns the new frame.
+///
+/// The source frame is *not* freed — it may still be aliased by other
+/// PML4s (a child post-fork, or another CoW VMA pointing to the same
+/// frame).
+pub fn cow_copy_and_remap(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    source_frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<PhysFrame<Size4KiB>, MapToError<Size4KiB>> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before cow_copy_and_remap");
+    let mut alloc = KernelFrameAllocator;
+    let new_frame = alloc
+        .allocate_frame()
+        .ok_or(MapToError::FrameAllocationFailed)?;
+    // SAFETY: both frames are in HHDM-covered RAM. `new_frame` was
+    // just allocated for our exclusive use; the source is read-only
+    // shared but we only copy *out* of it.
+    unsafe {
+        let src = (hhdm + source_frame.start_address().as_u64()).as_ptr::<u8>();
+        let dst = (hhdm + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
+        core::ptr::copy_nonoverlapping(src, dst, 4096);
+    }
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    // The page must currently be mapped — we're resolving a write
+    // protection fault on it. Any other state is a bug in the caller.
+    let (_old_frame, unmap_flush) = mapper
+        .unmap(page)
+        .expect("cow_copy_and_remap: page not mapped despite write-protection fault");
+    if Cr3::read().0 == pml4_frame {
+        unmap_flush.flush();
+    } else {
+        unmap_flush.ignore();
+    }
+    let flush = unsafe { mapper.map_to(page, new_frame, flags, &mut alloc)? };
+    if Cr3::read().0 == pml4_frame {
+        flush.flush();
+    } else {
+        flush.ignore();
+    }
+    Ok(new_frame)
+}
+
+/// HHDM offset currently in use. Panics if [`init`] hasn't run.
+/// Exposed for tests that need to poke raw frame contents via the
+/// high half.
+pub fn hhdm_offset() -> VirtAddr {
+    HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before hhdm_offset")
+}
+
 // -- PML4 construction + CR3 swap ---------------------------------------
 
 /// Build a fresh kernel PML4 and switch CR3 to it. Drops Limine's

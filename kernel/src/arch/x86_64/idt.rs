@@ -4,6 +4,7 @@
 
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::arch::x86_64::interrupts::{
@@ -73,31 +74,63 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         }
     }
 
-    // Demand-paging resolver: a not-present fault inside an installed
-    // VMA is satisfied by allocating + zeroing a frame and mapping it
-    // with the VMA's flags. Protection violations (P bit set in the
-    // error code) fall through — those are real access-rights bugs,
-    // not missing-page cases.
-    if !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
-        if let Some((kind, flags)) = crate::task::current_vma_lookup(addr_u64 as usize) {
-            match kind {
-                crate::mem::vma::VmaKind::AnonZero => {
-                    use x86_64::structures::paging::{Page, Size4KiB};
-                    use x86_64::VirtAddr;
-                    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
-                    let active = x86_64::registers::control::Cr3::read().0;
-                    match crate::mem::paging::map_in_pml4(active, page, flags) {
-                        Ok(_) => return,
-                        Err(e) => {
-                            serial_println!(
-                                "#PF demand-page resolve failed addr={:#x}: {:?}",
-                                addr_u64,
-                                e
-                            );
-                        }
-                    }
+    // VMA-backed resolver. Two independent paths:
+    //
+    // * Not-present fault inside an installed VMA → install the page.
+    //   AnonZero: alloc+zero a frame and map it writable per the
+    //   VMA flags. Cow: map the shared source frame read-only (strip
+    //   WRITABLE) so the *next* write takes a protection fault we
+    //   resolve below.
+    //
+    // * Write protection fault on a Cow page → allocate a private
+    //   frame, memcpy the source in, remap writable.
+    //
+    // Any other protection violation (read/exec fault on a present
+    // page, or on a page outside any VMA) falls through to the
+    // generic hang path — those are real access-rights bugs.
+    if let Some((kind, flags)) = crate::task::current_vma_lookup(addr_u64 as usize) {
+        use x86_64::structures::paging::{Page, Size4KiB};
+        use x86_64::VirtAddr;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
+        let active = x86_64::registers::control::Cr3::read().0;
+        let is_write = code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
+        let is_prot = code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+        match (kind, is_prot, is_write) {
+            (crate::mem::vma::VmaKind::AnonZero, false, _) => {
+                match crate::mem::paging::map_in_pml4(active, page, flags) {
+                    Ok(_) => return,
+                    Err(e) => serial_println!(
+                        "#PF anon-zero resolve failed addr={:#x}: {:?}",
+                        addr_u64,
+                        e
+                    ),
                 }
             }
+            (crate::mem::vma::VmaKind::Cow { frame }, false, _) => {
+                // First touch: install the shared source read-only.
+                // Strip WRITABLE so the next write triggers the
+                // protection-fault path below.
+                let ro = flags & !PageTableFlags::WRITABLE;
+                match crate::mem::paging::map_existing_in_pml4(active, page, frame, ro) {
+                    Ok(()) => return,
+                    Err(e) => serial_println!(
+                        "#PF cow map-source failed addr={:#x}: {:?}",
+                        addr_u64,
+                        e
+                    ),
+                }
+            }
+            (crate::mem::vma::VmaKind::Cow { frame }, true, true) => {
+                match crate::mem::paging::cow_copy_and_remap(active, page, frame, flags) {
+                    Ok(_) => return,
+                    Err(e) => serial_println!(
+                        "#PF cow copy-and-remap failed addr={:#x}: {:?}",
+                        addr_u64,
+                        e
+                    ),
+                }
+            }
+            _ => {}
         }
     }
 
