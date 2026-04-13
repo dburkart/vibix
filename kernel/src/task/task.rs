@@ -230,9 +230,15 @@ impl Task {
         }
     }
 
-    /// Number of 4 KiB stack pages owned by this task.
+    /// Number of 4 KiB stack pages owned by this task. Zero for the
+    /// bootstrap task (mirrors `stack_base() == 0`) so cleanup paths
+    /// can loop `0..stack_page_count()` without a separate guard.
     pub fn stack_page_count(&self) -> usize {
-        STACK_SIZE / 4096
+        if self.guard_base == 0 {
+            0
+        } else {
+            STACK_SIZE / 4096
+        }
     }
 
     /// Returns `true` if `addr` falls within this task's guard page.
