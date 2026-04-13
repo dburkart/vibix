@@ -25,6 +25,8 @@ pub mod paging;
 pub mod pat;
 #[cfg(any(target_os = "none", test))]
 pub mod vma;
+#[cfg(any(target_os = "none", test))]
+pub mod vmobject;
 
 #[cfg(any(target_os = "none", test))]
 pub mod addrspace;
