@@ -44,7 +44,10 @@ fn panic(info: &PanicInfo) -> ! {
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
         ("cr4_smep_smap_bits_set", &(cr4_smep_smap_bits_set as fn())),
-        ("copy_rejects_kernel_half", &(copy_rejects_kernel_half as fn())),
+        (
+            "copy_rejects_kernel_half",
+            &(copy_rejects_kernel_half as fn()),
+        ),
         ("copy_rejects_wrap", &(copy_rejects_wrap as fn())),
         ("copy_roundtrip_user", &(copy_roundtrip_user as fn())),
     ];
