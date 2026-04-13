@@ -452,6 +452,19 @@ pub fn exit() -> ! {
             sched.pending_exit.is_none(),
             "task::exit: prior exit not yet reaped"
         );
+        // Exiting the bootstrap task would reap the kernel PML4 and
+        // the inherited boot stack — neither of which we own. Reject
+        // it up-front rather than relying on per-field guards deeper
+        // in the reaper.
+        assert!(
+            sched
+                .current
+                .as_ref()
+                .expect("task::exit before task::init")
+                .id
+                != 0,
+            "task::exit: bootstrap task may not exit"
+        );
         let Some(mut next) = sched.pop_highest() else {
             panic!("task::exit: no ready task to switch to");
         };
