@@ -68,6 +68,10 @@ static STOP_LO: AtomicBool = AtomicBool::new(false);
 fn hi_worker() -> ! {
     HI_HITS.fetch_add(1, Ordering::SeqCst);
     HI_FLAG.store(true, Ordering::SeqCst);
+    // Demote so the driver (priority 19) can resume and observe the
+    // flag. Strict priority scheduling would otherwise starve it —
+    // the one-shot body above already proved the scheduling property.
+    task::set_priority(task::current_id(), 1);
     loop {
         x86_64::instructions::hlt();
     }

@@ -423,18 +423,24 @@ pub fn preempt_tick() {
         let top_ready = sched.highest_ready_priority();
         let current = sched.current.as_mut().unwrap();
         current.slice_remaining_ms = current.slice_remaining_ms.saturating_sub(TICK_MS as u32);
-        // Preempt immediately if something at a strictly higher
-        // priority is ready — don't wait for the current slice to
-        // wind down before handing over.
+        // Preempt immediately if something at strictly higher priority
+        // is ready. Otherwise keep running until the slice expires; when
+        // it does, only rotate if a peer at the same priority is ready
+        // — handing off to a strictly lower-priority task would defeat
+        // the whole point of priorities.
         let higher_ready = top_ready.is_some_and(|p| p > current.priority);
-        if current.slice_remaining_ms > 0 && !higher_ready {
+        let peer_ready = top_ready.is_some_and(|p| p == current.priority);
+        if !higher_ready && (current.slice_remaining_ms > 0 || !peer_ready) {
+            if current.slice_remaining_ms == 0 {
+                current.slice_remaining_ms = DEFAULT_SLICE_MS;
+            }
             return;
         }
     }
 
     let Some(mut next) = sched.pop_highest() else {
-        // Slice expired but nobody else is ready. Reload and keep
-        // running — prevents repeated try_lock churn on every tick.
+        // Shouldn't happen: the guard above already returned when the
+        // ready bank was empty. Reload defensively.
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         return;
     };
