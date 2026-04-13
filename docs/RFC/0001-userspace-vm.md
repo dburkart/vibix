@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Userspace Virtual Memory Subsystem
-status: In Review
+status: Accepted
 created: 2026-04-13
 ---
 
@@ -779,23 +779,32 @@ frame. The PML4 frame itself is freed last. This addresses #132's leak.
 
 ## Open Questions
 
-- **PCID adoption**: when does the cost of full-TLB-flush on context
-  switch start to bite? Likely after we have ≥ 4 long-running user
-  processes. Track as follow-up RFC.
-- **File-backed mappings**: design depends on the VFS layer (no RFC yet).
-  This RFC keeps the `VmObject` trait shape that `FileObject` will fit;
-  no on-disk semantics committed.
-- **Threads / shared address spaces**: the `Arc<AddressSpaceLock>` model
-  supports threads natively, but the syscall API for `clone(CLONE_VM)`
-  is out of scope. Deferred.
-- **Zero-page optimisation**: should `AnonObject::fault` return a single
-  shared zero-frame for read-only faults and only allocate on write?
-  Linux does. Deferred — not a correctness issue, only an RSS/perf one.
-- **Stack guard gap default**: 256 pages is Linux's. Open whether 64
-  pages is sufficient for vibix until we have data on real userspace
-  stack-probe distances.
-- **mlock / mlockall**: deferred. Returning `0` as a no-op is POSIX-
-  conformant for unprivileged callers and we have no swap to defeat.
+All blocking review findings were resolved in defense cycle 1
+(commit `7e550ec`). The following items are intentionally **deferred to
+implementation** — they do not block acceptance and will be revisited as
+the roadmap progresses:
+
+- **PCID adoption** — deferred to implementation. Track as follow-up RFC
+  once context-switch profiling shows full-TLB-flush dominating.
+- **File-backed mappings** — deferred to implementation. The `VmObject`
+  trait shape is committed; the `FileObject` impl awaits the VFS RFC.
+- **Threads / shared address spaces** — deferred. The
+  `Arc<AddressSpaceLock>` model and the lock-by-ascending-pointer
+  invariant are committed; the `clone(CLONE_VM)` syscall awaits the
+  threading RFC.
+- **Zero-page optimisation** — deferred to implementation. Not a
+  correctness issue; an RSS/perf optimisation that can land anytime.
+- **Stack guard gap default** — deferred. Starts at Linux's 256 pages;
+  can be tuned as we collect data.
+- **mlock / mlockall** — deferred. Returning `0` as a no-op is POSIX-
+  conformant and we have no swap to defeat.
+- **PageRefcount false-sharing under SMP** (OS advisory A7) — deferred.
+  Becomes relevant only with SMP fork storms; address when the SMP RFC
+  lands.
+- **Reverse-map (rmap) for refcount-saturation rollback at scale** —
+  deferred. The current eager-copy fallback is correct but O(VMA) on
+  saturation; an rmap would let us walk just the affected frame's PTEs.
+  Not on the P0 path.
 
 ## Implementation Roadmap
 
