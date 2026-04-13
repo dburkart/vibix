@@ -11,11 +11,13 @@ backtraces via an embedded kernel symbol table.
 
 ## Instructions for Humans
 
-vibix is built by an autonomous agent — `/auto-engineer`, a Claude Code
+vibix is built by autonomous agents. The original loop lives in
+`.claude/skills/auto-engineer/SKILL.md` as `/auto-engineer`, a Claude Code
 skill that picks an unblocked GitHub issue, plans the change, implements
-it, opens a PR, chases CI + review-bot feedback, and loops. Your job as a
-human is to file issues and review PRs; the agent handles everything else,
-merges included.
+it, opens a PR, chases CI + review-bot feedback, and loops. Cursor Cloud now
+has a companion skill at `.cursor/skills/cursor-cloud-auto-engineer/SKILL.md`
+invoked as `/cursor-cloud-auto-engineer`, which mirrors the branch-to-PR flow
+but stops at the PR handoff instead of self-merging or self-rescheduling.
 
 To run the loop yourself, you need Docker, a Claude Code login on the host
 (`claude` logged in at least once, so `~/.claude.json` + `~/.claude/`
