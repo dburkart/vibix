@@ -27,3 +27,4 @@ All commands are orchestrated through `cargo xtask`. See `README.md` → "Build 
 - **First build clones Limine:** `cargo xtask iso` (and `run`/`test`/`smoke`) clones the Limine bootloader into `build/limine/` on first invocation and compiles it. This is a one-time ~10s step per fresh workspace.
 - **QEMU runs headlessly in Cloud:** Tests and smoke use `-display none`. For `cargo xtask run` in Cloud, add a `timeout` wrapper or run in a tmux session since the kernel halts in `hlt_loop` forever: `timeout 6 cargo xtask run` or kill the QEMU process manually.
 - **Rust nightly auto-selected:** `rust-toolchain.toml` pins the toolchain; `rustup show` triggers installation if needed.
+- **`gh` CLI available:** Pre-installed and authenticated via `GITHUB_TOKEN`. Use for read-only GitHub queries (PR info, CI logs, etc.). Write operations (creating PRs) should use the `ManagePullRequest` tool instead.
