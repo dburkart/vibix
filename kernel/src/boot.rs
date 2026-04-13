@@ -12,9 +12,9 @@ use limine::BaseRevision;
 
 /// Ask Limine for a 64 KiB bootstrap stack. Comfortable for early init.
 const STACK_SIZE: u64 = 64 * 1024;
-const INTERNAL_HELLO_MODULE: InternalModule =
-    InternalModule::new().with_path(c"/boot/userspace_hello.elf");
-const INTERNAL_HELLO_MODULES: [&InternalModule; 1] = [&INTERNAL_HELLO_MODULE];
+const INTERNAL_INIT_MODULE: InternalModule =
+    InternalModule::new().with_path(c"/boot/userspace_init.elf");
+const INTERNAL_INIT_MODULES: [&InternalModule; 1] = [&INTERNAL_INIT_MODULE];
 
 #[used]
 #[link_section = ".limine_requests"]
@@ -47,7 +47,7 @@ pub static KERNEL_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::n
 #[used]
 #[link_section = ".limine_requests"]
 pub static MODULE_REQUEST: ModuleRequest =
-    ModuleRequest::new().with_internal_modules(&INTERNAL_HELLO_MODULES);
+    ModuleRequest::new().with_internal_modules(&INTERNAL_INIT_MODULES);
 
 #[used]
 #[link_section = ".limine_requests"]

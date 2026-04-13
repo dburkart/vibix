@@ -71,7 +71,8 @@ const SMOKE_MARKERS: &[&str] = &[
     "tasks: scheduler online",
     "userspace module ELF entry=",
     "userspace: loader mapping image",
-    "USRHELLO",
+    "syscall: SYSCALL/SYSRET enabled",
+    "init: hello from pid 1",
 ];
 
 fn main() -> R<()> {
@@ -202,24 +203,24 @@ fn virtio_blk_args(disk: &Path) -> Vec<String> {
     ]
 }
 
-fn userspace_hello_binary() -> PathBuf {
+fn userspace_init_binary() -> PathBuf {
     workspace_root()
         .join("target")
         .join(KERNEL_TARGET)
         .join("debug")
-        .join("userspace_hello")
+        .join("userspace_init")
 }
 
-fn build_userspace_hello() -> R<PathBuf> {
+fn build_userspace_init() -> R<PathBuf> {
     // Setting RUSTFLAGS wholesale overrides the workspace
     // `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
-    // so we must re-supply every flag the kernel target still needs —
-    // only the linker script differs (userspace payload maps at
-    // 0xffffffffc0000000, not the kernel's 0xffffffff80000000).
+    // so we must re-supply every flag the kernel target still needs.
+    // The init binary links at 0x400000 (lower half, user space) and
+    // uses the small code model — no ±2 GiB kernel assumptions.
     let rustflags = [
-        "-C link-arg=-Tuserspace/hello/link.ld",
+        "-C link-arg=-Tuserspace/init/link.ld",
         "-C relocation-model=static",
-        "-C code-model=kernel",
+        "-C code-model=small",
         "-C no-redzone=yes",
         "-C force-frame-pointers=yes",
     ]
@@ -227,12 +228,12 @@ fn build_userspace_hello() -> R<PathBuf> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
         .env("RUSTFLAGS", rustflags)
-        .args(["build", "--package", "userspace_hello"])
+        .args(["build", "--package", "userspace_init"])
         .args(KERNEL_BUILD_STD_ARGS);
     check(cmd.status()?)?;
-    let bin = userspace_hello_binary();
+    let bin = userspace_init_binary();
     if !bin.exists() {
-        return Err(format!("userspace hello binary missing at {}", bin.display()).into());
+        return Err(format!("userspace init binary missing at {}", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
@@ -427,14 +428,14 @@ fn ensure_limine() -> R<PathBuf> {
 /// (so parallel test runs don't stomp each other).
 fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let limine = ensure_limine()?;
-    let userspace_hello = build_userspace_hello()?;
+    let userspace_init = build_userspace_init()?;
     let iso_root = workspace_root().join("build").join(staging);
     let _ = fs::remove_dir_all(&iso_root);
     fs::create_dir_all(iso_root.join("boot/limine"))?;
     fs::create_dir_all(iso_root.join("EFI/BOOT"))?;
 
     fs::copy(kernel, iso_root.join("boot/vibix"))?;
-    fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
+    fs::copy(userspace_init, iso_root.join("boot/userspace_init.elf"))?;
     fs::copy(
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),

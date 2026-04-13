@@ -394,6 +394,23 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
     }
 }
 
+/// Update the current task's saved CR3 frame to `frame`. Call this
+/// before writing a new PML4 to CR3 directly so that subsequent
+/// context switches (which load `task.cr3`) use the new PML4.
+///
+/// Must be called from task context with interrupts enabled (the
+/// scheduler lock is taken briefly to mutate the current task).
+pub fn update_current_cr3(
+    frame: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
+) {
+    let mut sched = SCHED.lock();
+    let current = sched
+        .current
+        .as_mut()
+        .expect("update_current_cr3: no running task");
+    current.cr3 = frame;
+}
+
 /// Install a VMA on the currently-running task. The VMA is resolved
 /// lazily by the `#PF` handler on first touch of each page.
 pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {

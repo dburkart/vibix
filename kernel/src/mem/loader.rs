@@ -20,7 +20,7 @@
 //! read-only → writable → read-only dance.
 
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{Page, Size4KiB};
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::elf;
@@ -35,9 +35,13 @@ pub enum LoadError {
     /// table, non-canonical addresses, entry outside PT_LOAD, etc.).
     NotElf64,
     /// A `PT_LOAD` segment (or the entry) is in the lower half of the
-    /// virtual address space. The loader only installs upper-half
-    /// mappings so they propagate through `new_task_pml4`.
+    /// virtual address space. The kernel-image loader only installs
+    /// upper-half mappings so they propagate through `new_task_pml4`.
     SegmentNotUpperHalf,
+    /// A `PT_LOAD` segment (or the entry) is in the upper half of the
+    /// virtual address space. The user-space loader only accepts lower-half
+    /// addresses so pages go into the process's own PML4.
+    SegmentNotLowerHalf,
     /// A `PT_LOAD` segment's `p_vaddr` isn't 4 KiB-aligned. We only
     /// install 4 KiB PTEs so the caller's linker script has to align
     /// segments to that boundary.
@@ -88,6 +92,118 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     }
 
     Ok(LoadedImage { entry, segments })
+}
+
+/// First canonical upper-half address. Bits [63:47] must all be 1 for
+/// a valid upper-half VA.
+const UPPER_HALF_START: u64 = 0xFFFF_8000_0000_0000;
+
+/// Load `bytes` as a lower-half ELF64 image (entry and all PT_LOAD
+/// segments must be `< UPPER_HALF_START`) into the PML4 rooted at
+/// `pml4`. Returns the entry point and the number of mapped segments.
+///
+/// Unlike [`load`], segments are installed with `USER_ACCESSIBLE` set so
+/// ring-3 code can execute and read/write them. The mapping is installed
+/// only in `pml4` — not in the shared kernel upper-half — so the pages
+/// are exclusive to this process.
+///
+/// # Errors
+///
+/// Returns `LoadError::NotElf64` if parsing fails, and
+/// `LoadError::SegmentNotLowerHalf` if any PT_LOAD or the entry point
+/// is in the upper half.
+pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedImage, LoadError> {
+    let parsed = elf::try_parse_elf64(bytes).ok_or(LoadError::NotElf64)?;
+
+    let entry = parsed.entry();
+    // Reject upper-half entries. Canonical upper-half: bit 63 set.
+    if entry.as_u64() >= UPPER_HALF_START {
+        return Err(LoadError::SegmentNotLowerHalf);
+    }
+
+    let mut segments = 0usize;
+    let mut err: Option<LoadError> = None;
+    for seg in parsed.load_segments() {
+        if let Err(e) = map_user_segment(bytes, seg, pml4) {
+            err = Some(e);
+            break;
+        }
+        segments += 1;
+    }
+    // No Flusher needed here: map_in_pml4 flushes immediately when pml4
+    // is the active PML4, and skips when it is not (we haven't switched
+    // CR3 yet at load time). The CR3 write in init_ring3_entry provides
+    // the definitive TLB flush before entering user code.
+    if let Some(e) = err {
+        return Err(e);
+    }
+
+    Ok(LoadedImage { entry, segments })
+}
+
+fn map_user_segment(
+    bytes: &[u8],
+    seg: elf::LoadSegment,
+    pml4: PhysFrame<Size4KiB>,
+) -> Result<(), LoadError> {
+    if seg.vaddr.as_u64() >= UPPER_HALF_START {
+        return Err(LoadError::SegmentNotLowerHalf);
+    }
+    // Reject segments whose virtual range overflows or crosses the
+    // lower-half ceiling. Without this check, a large `p_memsz` could
+    // push later pages into non-canonical space, panicking in
+    // `VirtAddr::new()` during the mapping loop.
+    if seg
+        .vaddr
+        .as_u64()
+        .checked_add(seg.memsz)
+        .map_or(true, |end| end > UPPER_HALF_START)
+    {
+        return Err(LoadError::SegmentNotLowerHalf);
+    }
+    if seg.vaddr.as_u64() & (PAGE_SIZE - 1) != 0 {
+        return Err(LoadError::SegmentNotPageAligned);
+    }
+
+    let file_end = seg.file_offset + seg.filesz;
+    let src = &bytes[seg.file_offset as usize..file_end as usize];
+
+    let page_count = seg.memsz.div_ceil(PAGE_SIZE);
+    let hhdm = paging::hhdm_offset();
+
+    // Add USER_ACCESSIBLE to every flag set derived from the ELF flags so
+    // ring-3 code can actually reach the pages.
+    let flags = seg.flags | PageTableFlags::USER_ACCESSIBLE;
+
+    for i in 0..page_count {
+        let va = seg.vaddr + i * PAGE_SIZE;
+        let page = Page::<Size4KiB>::containing_address(va);
+        // map_in_pml4 allocates a fresh zeroed frame and installs it in
+        // pml4 (not the global kernel mapper).
+        let frame = paging::map_in_pml4(pml4, page, flags).map_err(LoadError::MapFailed)?;
+
+        // Fill file content through the HHDM window.
+        let dst_base = hhdm + frame.start_address().as_u64();
+        // SAFETY: `frame` was just allocated exclusively for this segment
+        // page, and the HHDM mapping gives us writable access to it.
+        unsafe {
+            // The frame is already zeroed by map_in_pml4, but we still
+            // copy file bytes in to overlay the .bss tail.
+            let offset_in_seg = i * PAGE_SIZE;
+            if offset_in_seg < seg.filesz {
+                let copy_off = offset_in_seg as usize;
+                let remaining = (seg.filesz - offset_in_seg) as usize;
+                let n = remaining.min(PAGE_SIZE as usize);
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(copy_off),
+                    dst_base.as_mut_ptr::<u8>(),
+                    n,
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn map_segment(

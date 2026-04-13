@@ -193,7 +193,7 @@ pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
     let file = resp
         .modules()
         .iter()
-        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_init.elf"))?;
     let base = file.addr();
     let size = file.size() as usize;
     // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
@@ -208,7 +208,7 @@ pub(crate) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     let file = resp
         .modules()
         .iter()
-        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_init.elf"))?;
     let base = file.addr();
     let size = file.size() as usize;
     if size < core::mem::size_of::<Elf64Ehdr>() {

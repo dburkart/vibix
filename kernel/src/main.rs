@@ -10,11 +10,6 @@ use vibix::{exit_qemu, framebuffer, println, serial_println, QemuExitCode};
 /// How many PIT ticks between cursor blink toggles (~500 ms at 100 Hz).
 const CURSOR_BLINK_TICKS: u64 = 50;
 
-/// Entry point of the loaded userspace module, or 0 if no module was
-/// loaded. Set during bootstrap, read by the trampoline task after
-/// task::init().
-static USERSPACE_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 #[no_mangle]
 #[cfg_attr(
     any(feature = "ist-overflow-test", feature = "panic-test"),
@@ -59,15 +54,6 @@ pub extern "C" fn _start() -> ! {
     serial_println!("GDT + IDT loaded");
 
     vibix::mem::init();
-    if let Some((entry, load_segments)) = vibix::mem::userspace_module_elf_summary() {
-        serial_println!(
-            "userspace module ELF entry={:#x} load_segments={}",
-            entry.as_u64(),
-            load_segments
-        );
-    } else {
-        serial_println!("userspace module ELF missing");
-    }
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     match vibix::hpet::init() {
         Ok(()) => {}
@@ -153,30 +139,33 @@ pub extern "C" fn _start() -> ! {
     // see the calibrated clock from their first tick.
     vibix::time::calibrate_tsc();
 
-    // Install the userspace module's PT_LOAD segments into the shared
-    // upper-half of the kernel PML4 *before* task::init — that way
-    // new_task_pml4's upper-half copy propagates the mapping to every
-    // later-spawned task's PML4.
-    if let Some(bytes) = vibix::mem::userspace_module_elf_bytes() {
-        serial_println!("userspace: loader mapping image ({} bytes)", bytes.len());
-        match vibix::mem::loader::load(bytes) {
-            Ok(image) => {
-                serial_println!(
-                    "userspace: loader mapped entry={:#x} segments={}",
-                    image.entry.as_u64(),
-                    image.segments
-                );
-                USERSPACE_ENTRY.store(image.entry.as_u64(), core::sync::atomic::Ordering::Relaxed);
-            }
-            Err(e) => serial_println!("userspace: loader failed: {:?}", e),
-        }
+    // Check for the init module early, before task::init(), so we can
+    // emit the ELF summary log lines that smoke tests assert on.
+    if let Some((entry, load_segments)) = vibix::mem::userspace_module_elf_summary() {
+        serial_println!(
+            "userspace module ELF entry={:#x} load_segments={}",
+            entry.as_u64(),
+            load_segments
+        );
+    } else {
+        serial_println!("userspace module ELF missing");
     }
 
     vibix::task::init();
     vibix::task::spawn(vibix::shell::run);
     vibix::task::spawn(cursor_blink_task);
-    if USERSPACE_ENTRY.load(core::sync::atomic::Ordering::Relaxed) != 0 {
-        vibix::task::spawn(userspace_trampoline);
+
+    // Launch PID 1: load the init ELF into a user-space address space
+    // and spawn a task that drops to ring-3.
+    match vibix::mem::userspace_module_elf_bytes() {
+        Some(bytes) => {
+            serial_println!("userspace: loader mapping image ({} bytes)", bytes.len());
+            vibix::init_process::launch(bytes);
+        }
+        None => {
+            serial_println!("kernel panic: Limine userspace init module missing");
+            panic!("Limine userspace init module missing");
+        }
     }
 
     #[cfg(feature = "bench")]
@@ -196,20 +185,6 @@ pub extern "C" fn _start() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
-}
-
-/// Jump into the previously-loaded userspace ELF entry point. Runs as
-/// a regular scheduler task; the entry is invoked at ring-0 (we don't
-/// have ring-3 yet) using whatever stack the task was handed.
-fn userspace_trampoline() -> ! {
-    let entry = USERSPACE_ENTRY.load(core::sync::atomic::Ordering::Relaxed);
-    serial_println!("userspace: entering payload at {:#x}", entry);
-    // SAFETY: `entry` was produced by the loader from a parsed ELF
-    // `e_entry` and the corresponding page was installed with PRESENT
-    // flags in the shared upper half before task::init(). The payload
-    // is `extern "C" fn() -> !`, matching the type we cast to.
-    let entry_fn: extern "C" fn() -> ! = unsafe { core::mem::transmute(entry as usize) };
-    entry_fn();
 }
 
 /// Blink the framebuffer cursor at approximately 1 Hz (toggle every 500 ms).
