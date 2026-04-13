@@ -62,7 +62,8 @@ impl Flusher {
         self.len += 1;
     }
 
-    /// Number of queued pages (0 while in overflow mode).
+    /// Number of queued pages. Caps at [`INLINE_CAP`] once overflow
+    /// latches — further `invalidate` calls don't increment it.
     pub fn queued(&self) -> usize {
         self.len
     }
