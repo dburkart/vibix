@@ -400,7 +400,9 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
 ///
 /// Must be called from task context with interrupts enabled (the
 /// scheduler lock is taken briefly to mutate the current task).
-pub fn update_current_cr3(frame: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>) {
+pub fn update_current_cr3(
+    frame: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
+) {
     let mut sched = SCHED.lock();
     let current = sched
         .current

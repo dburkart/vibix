@@ -10,7 +10,6 @@ use vibix::{exit_qemu, framebuffer, println, serial_println, QemuExitCode};
 /// How many PIT ticks between cursor blink toggles (~500 ms at 100 Hz).
 const CURSOR_BLINK_TICKS: u64 = 50;
 
-
 #[no_mangle]
 #[cfg_attr(
     any(feature = "ist-overflow-test", feature = "panic-test"),

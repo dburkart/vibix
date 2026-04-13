@@ -70,8 +70,7 @@ pub fn launch(bytes: &[u8]) -> usize {
     );
 
     // 3. Allocate and map the user stack — one page at USER_STACK_PAGE_VA.
-    let stack_page =
-        Page::<Size4KiB>::containing_address(VirtAddr::new(USER_STACK_PAGE_VA));
+    let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(USER_STACK_PAGE_VA));
     paging::map_in_pml4(
         pml4,
         stack_page,
@@ -81,7 +80,11 @@ pub fn launch(bytes: &[u8]) -> usize {
             | PageTableFlags::NO_EXECUTE,
     )
     .expect("init: user stack page allocation failed");
-    serial_println!("init: user stack at virt={:#x} top={:#x}", USER_STACK_PAGE_VA, USER_STACK_TOP);
+    serial_println!(
+        "init: user stack at virt={:#x} top={:#x}",
+        USER_STACK_PAGE_VA,
+        USER_STACK_TOP
+    );
 
     // 4. Publish entry + PML4 for the spawned task to read.
     INIT_ENTRY.store(image.entry.as_u64(), Ordering::Release);
@@ -140,7 +143,11 @@ fn init_ring3_entry() -> ! {
     // kernel stack, and SYSCALL_KERNEL_RSP for the syscall path.
     syscall::setup_ring3_stacks();
 
-    serial_println!("init: entering ring-3 entry={:#x} stack={:#x}", entry, USER_STACK_TOP);
+    serial_println!(
+        "init: entering ring-3 entry={:#x} stack={:#x}",
+        entry,
+        USER_STACK_TOP
+    );
 
     // Drop to ring-3. Never returns.
     unsafe { syscall::jump_to_ring3(entry, USER_STACK_TOP) }

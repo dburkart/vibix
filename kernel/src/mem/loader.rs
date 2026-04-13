@@ -112,10 +112,7 @@ const UPPER_HALF_START: u64 = 0xFFFF_8000_0000_0000;
 /// Returns `LoadError::NotElf64` if parsing fails, and
 /// `LoadError::SegmentNotLowerHalf` if any PT_LOAD or the entry point
 /// is in the upper half.
-pub fn load_user_elf(
-    bytes: &[u8],
-    pml4: PhysFrame<Size4KiB>,
-) -> Result<LoadedImage, LoadError> {
+pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedImage, LoadError> {
     let parsed = elf::try_parse_elf64(bytes).ok_or(LoadError::NotElf64)?;
 
     let entry = parsed.entry();

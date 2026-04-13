@@ -42,8 +42,7 @@ fn run_tests() {
 }
 
 fn load_user_elf_maps_lower_half_segments() {
-    let bytes =
-        vibix::mem::userspace_module_elf_bytes().expect("init module bytes missing");
+    let bytes = vibix::mem::userspace_module_elf_bytes().expect("init module bytes missing");
     // Allocate a fresh per-process PML4 for the test.
     let pml4 = vibix::mem::paging::new_task_pml4();
     let image = vibix::mem::loader::load_user_elf(bytes, pml4)
@@ -75,7 +74,7 @@ fn load_user_elf_rejects_upper_half() {
     bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     bytes[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
     bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
-    // Upper-half entry (bit 63 set, canonical kernel address).
+                                                        // Upper-half entry (bit 63 set, canonical kernel address).
     bytes[24..32].copy_from_slice(&0xffff_ffff_c000_0080u64.to_le_bytes());
     bytes[32..40].copy_from_slice(&(EHDR as u64).to_le_bytes()); // e_phoff
     bytes[52..54].copy_from_slice(&(EHDR as u16).to_le_bytes()); // e_ehsize
@@ -91,7 +90,10 @@ fn load_user_elf_rejects_upper_half() {
     let pml4 = vibix::mem::paging::new_task_pml4();
     let result = vibix::mem::loader::load_user_elf(&bytes, pml4);
     assert!(
-        matches!(result, Err(vibix::mem::loader::LoadError::SegmentNotLowerHalf)),
+        matches!(
+            result,
+            Err(vibix::mem::loader::LoadError::SegmentNotLowerHalf)
+        ),
         "expected SegmentNotLowerHalf, got {:?}",
         result
     );
