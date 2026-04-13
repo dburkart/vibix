@@ -17,6 +17,9 @@ pub mod mem;
 
 #[cfg(target_os = "none")]
 pub mod acpi;
+
+#[cfg(all(target_os = "none", feature = "bench"))]
+pub mod bench;
 #[cfg(target_os = "none")]
 pub mod arch;
 #[cfg(target_os = "none")]

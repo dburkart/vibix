@@ -125,6 +125,9 @@ pub extern "C" fn _start() -> ! {
     vibix::task::spawn(vibix::shell::run);
     vibix::task::spawn(cursor_blink_task);
 
+    #[cfg(feature = "bench")]
+    vibix::task::spawn(vibix::bench::run_all);
+
     // Bootstrap task becomes the idle loop. `hlt` with IRQs on parks
     // the CPU until the next interrupt; the PIT `preempt_tick` then
     // rotates us to any other ready task (shell, cursor_blink).

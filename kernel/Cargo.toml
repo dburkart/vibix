@@ -35,6 +35,10 @@ panic-test = []
 # of letting it silently corrupt .bss. Manual verification only —
 # successful overflow is indistinguishable from other crashes in CI.
 ist-overflow-test = []
+# Enable the in-kernel microbenchmark harness. Adds two rdtsc + an atomic
+# store to the timer ISR and spawns a bench task at boot that prints a
+# summary table over serial. Off by default so normal boots stay quiet.
+bench = []
 
 [[test]]
 name = "basic_boot"
