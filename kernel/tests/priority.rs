@@ -121,6 +121,11 @@ fn high_priority_runs_before_low() {
         1,
         "hi_worker's one-shot body ran the wrong number of times"
     );
+    assert_eq!(
+        LO_HITS.load(Ordering::SeqCst),
+        0,
+        "lo_spinner ran before hi_worker finished its one-shot body"
+    );
     STOP_LO.store(true, Ordering::SeqCst);
 
     // Let the spinner wind down before the next test reuses statics.
