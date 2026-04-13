@@ -501,6 +501,7 @@ fn test_all() -> R<()> {
         "backtrace",
         "page_fault",
         "blocking_sync",
+        "shell_smoke",
     ] {
         cmd.arg("--test").arg(t);
     }

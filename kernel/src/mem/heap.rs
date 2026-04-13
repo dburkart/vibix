@@ -133,6 +133,31 @@ pub fn mapped_size() -> usize {
     ALLOCATOR.mapped_size()
 }
 
+/// Snapshot of heap occupancy. `used + free == mapped_size()`.
+pub struct HeapStats {
+    pub used: usize,
+    pub free: usize,
+    pub mapped: usize,
+}
+
+/// Read a consistent snapshot of the heap. Briefly locks the inner
+/// allocator — do not call from allocation-sensitive paths.
+///
+/// `mapped` is derived from `used + free` inside the same lock scope so
+/// it can't disagree with the other two fields. Reading `mapped` from
+/// the separate `AtomicUsize` would race with `grow_locked`, which
+/// releases the inner lock between `extend()` and the atomic bump.
+pub fn stats() -> HeapStats {
+    let h = ALLOCATOR.inner.lock();
+    let used = h.used();
+    let free = h.free();
+    HeapStats {
+        used,
+        free,
+        mapped: used + free,
+    }
+}
+
 /// Map the initial slab and hand it to the inner heap. Requires
 /// `paging::init` to have run so `map_range` is live.
 pub fn init() {
