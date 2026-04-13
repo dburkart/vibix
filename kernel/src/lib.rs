@@ -30,6 +30,8 @@ pub mod bench;
 #[cfg(target_os = "none")]
 pub mod boot;
 #[cfg(target_os = "none")]
+pub mod init_process;
+#[cfg(target_os = "none")]
 pub mod framebuffer;
 #[cfg(any(test, target_os = "none"))]
 pub mod hpet;

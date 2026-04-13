@@ -1,4 +1,4 @@
-//! Integration test: module request delivers the hello ELF and parser
+//! Integration test: module request delivers the init ELF and parser
 //! exposes entry point + load segments.
 
 #![no_std]
@@ -37,7 +37,7 @@ fn run_tests() {
 
 fn userspace_module_elf_present_and_parsed() {
     let (entry, segs) =
-        vibix::mem::userspace_module_elf_summary().expect("userspace hello module missing");
+        vibix::mem::userspace_module_elf_summary().expect("userspace init module missing");
     assert!(entry.as_u64() > 0, "module entry must be non-zero");
     assert!(segs > 0, "module must contain at least one PT_LOAD segment");
     serial_println!(

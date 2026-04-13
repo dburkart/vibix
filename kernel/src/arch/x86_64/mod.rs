@@ -6,6 +6,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod ist_guard;
 pub mod pic;
+pub mod syscall;
 
 /// Bring up arch-specific interrupt plumbing that doesn't depend on
 /// the kernel mapper. Interrupts stay disabled throughout.
@@ -17,6 +18,9 @@ pub fn init() {
     fpu::init();
     gdt::init();
     idt::init();
+    // SYSCALL/SYSRET MSR setup. Runs after GDT (segment selectors must
+    // be live) and before any ring-3 entry.
+    syscall::init();
     // Remap + mask the 8259 before touching ACPI/APIC. Leaving it in
     // its reset state would fire legacy IRQs into CPU exception
     // vectors as soon as we `sti`.
