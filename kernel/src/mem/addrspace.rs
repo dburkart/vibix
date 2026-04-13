@@ -70,6 +70,13 @@ pub struct AddressSpace {
     /// been faulted in. Bumped by `insert`, decremented by
     /// `unmap_range`.
     pub(crate) vm_pages: usize,
+
+    /// `true` for the bootstrap task's address space, whose `page_table`
+    /// is the live kernel PML4. `Drop` skips reclaim entirely in that
+    /// case — freeing the kernel PML4 (or walking its lower half, which
+    /// is empty anyway) would brick the system. All other constructors
+    /// set this to `false`.
+    pub(crate) bootstrap: bool,
 }
 
 impl AddressSpace {
@@ -93,6 +100,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            bootstrap: true,
         }
     }
 
@@ -121,6 +129,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            bootstrap: false,
         }
     }
 
@@ -137,6 +146,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            bootstrap: false,
         }
     }
 
@@ -199,6 +209,78 @@ impl AddressSpace {
     #[allow(dead_code)] // consumed by #156 (VmaTree::insert) and the mmap syscall
     pub(crate) fn vma_in_user_range(vma: &Vma) -> bool {
         (vma.end as u64) <= USER_VA_END
+    }
+}
+
+/// Reclaim the address space when the last `Arc<RwLock<AddressSpace>>`
+/// is dropped — closes #161 (and the leak documented in #146):
+///
+/// 1. Walk every VMA, unmap each page from this PML4, free the leaf
+///    frame (`AnonZero` always; `Cow` only when the mapped frame is the
+///    private post-write copy, never the shared source).
+/// 2. Free every intermediate L3/L2/L1 page-table frame in the user
+///    half via [`paging::free_user_page_tables`].
+/// 3. Free the PML4 frame itself.
+///
+/// The bootstrap task's address space is exempt: its `page_table` is
+/// the live kernel PML4 and its lower half is empty.
+///
+/// Runs from whatever context drops the last `Arc` — today that's the
+/// `preempt_tick` reaper (timer ISR, IRQs masked). The reclaim path is
+/// lock-free apart from the `HHDM_OFFSET` mutex, which is set once at
+/// boot and only briefly read here, so it cannot deadlock the ISR.
+///
+/// TODO(#159 follow-up): once the legacy `VmaKind::AnonZero`/`Cow`
+/// reclaim is replaced by `VmObject::release` + `PageRefcount` book-
+/// keeping, add `debug_assert_eq!(self.rss_pages, 0)` after the VMA
+/// pass to catch refcount leaks.
+#[cfg(target_os = "none")]
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        if self.bootstrap {
+            return;
+        }
+
+        use crate::mem::paging;
+        use crate::mem::vma::VmaKind;
+        use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+
+        let pml4 = self.page_table;
+
+        for vma in self.vmas.values() {
+            let mut va = vma.start;
+            while va < vma.end {
+                let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                    .expect("vma page VA aligned by construction");
+                match vma.kind {
+                    VmaKind::AnonZero => {
+                        let _ = paging::unmap_and_free_in_pml4(pml4, page);
+                    }
+                    VmaKind::Cow { frame: source } => {
+                        if let Ok(frame) = paging::unmap_in_pml4(pml4, page) {
+                            if frame != source {
+                                // SAFETY: private CoW copy allocated from the
+                                // global allocator by the #PF resolver; no
+                                // other PML4 references it.
+                                unsafe {
+                                    paging::KernelFrameAllocator.deallocate_frame(frame);
+                                }
+                            }
+                        }
+                    }
+                }
+                va += 4096;
+            }
+        }
+
+        // SAFETY: this PML4 is no longer the active CR3 on any CPU
+        // (the reaper switched away before dropping the Box<Task>),
+        // every leaf VMA frame has just been unmapped above, and no
+        // outstanding `&mut` references to its tables exist.
+        unsafe {
+            paging::free_user_page_tables(pml4);
+            paging::free_pml4_frame(pml4);
+        }
     }
 }
 
