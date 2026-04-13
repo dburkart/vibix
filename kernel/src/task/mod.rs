@@ -539,7 +539,7 @@ pub fn exit() -> ! {
 /// away, so unmapping its stack is safe.
 fn reap_pending(victim: alloc::boxed::Box<Task>) {
     use crate::mem::paging;
-    use x86_64::structures::paging::{Page, Size4KiB};
+    use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
     use x86_64::VirtAddr;
 
     // 1. Unmap + free stack pages. Stack pages live in the shared
@@ -563,11 +563,14 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     }
 
     // 2. Walk VMAs: unmap each page from the victim's private PML4.
-    //    Frame reclaim is handled by `AnonObject::drop` when the last
-    //    `Arc<dyn VmObject>` is released below — we must not also free
-    //    them here or we get double-frees. Pages that were never faulted
-    //    in have no PTE; `unmap_in_pml4` returns an error, which we
-    //    silently discard.
+    //    Source frames are owned by the VmObject and freed by its Drop
+    //    when the Arc refcount reaches zero below. However, a
+    //    write-protection (CoW) fault allocates a *private copy* frame
+    //    via `cow_copy_and_remap`; that frame is stored in the PTE but
+    //    never added to the VmObject's cache (the cache retains the
+    //    original source frame). We detect private copies by comparing
+    //    the PTE frame against `VmObject::frame_at`: if they differ the
+    //    PTE holds a private copy that we must free here.
     //
     //    `reap_pending` runs from the timer ISR with IRQs masked, so a
     //    blocking `read()` would deadlock the moment the address space is
@@ -584,9 +587,21 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
         while va < vma.end {
             let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
                 .expect("vma page VA aligned by construction");
-            // Just unmap the PTE; the backing frame is owned by the
-            // VmObject and will be freed when the Arc drops.
-            let _ = paging::unmap_in_pml4(victim.cr3, page);
+            if let Ok(pte_frame) = paging::unmap_in_pml4(victim.cr3, page) {
+                let obj_offset = (va - vma.start) + vma.object_offset;
+                let cached = vma.object.frame_at(obj_offset);
+                if cached != Some(pte_frame.start_address().as_u64()) {
+                    // PTE holds a private CoW copy (or a frame from a
+                    // future non-caching VmObject). Free it now; the
+                    // object's Drop handles its own cached frames.
+                    // SAFETY: private copy allocated from the global frame
+                    // allocator by `cow_copy_and_remap`; exclusive owner.
+                    unsafe { paging::KernelFrameAllocator.deallocate_frame(pte_frame) }
+                }
+                // If cached == Some(pte_frame): the VmObject owns this
+                // frame; its Drop (via AnonObject::drop → frame::put)
+                // will free it — no action needed here.
+            }
             va += 4096;
         }
     }
@@ -596,7 +611,7 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     // point the Arc<RwLock<AddressSpace>> reaches refcount 0, the
     // AddressSpace is released, its VmaTree drops, each
     // Arc<dyn VmObject> drops, and AnonObject::drop frees every
-    // cached frame via frame::put.
+    // cached (source) frame via frame::put.
 
     // 3. Return the PML4 frame itself.
     // SAFETY: victim is no longer on any CPU; we're running on a
