@@ -455,10 +455,7 @@ pub fn exit() -> ! {
         let Some(mut next) = sched.pop_highest() else {
             panic!("task::exit: no ready task to switch to");
         };
-        let prev = sched
-            .current
-            .take()
-            .expect("task::exit before task::init");
+        let prev = sched.current.take().expect("task::exit before task::init");
         next.state = TaskState::Running;
         let next_rsp = next.rsp;
         let next_cr3 = next.cr3.start_address().as_u64();
