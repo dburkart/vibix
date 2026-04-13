@@ -138,11 +138,17 @@ impl<T> Sender<T> {
     pub fn send(&self, val: T) -> Result<(), T> {
         let mut slot = Some(val);
         loop {
-            if self.shared.receiver_closed.load(Ordering::Acquire) {
-                return Err(slot.take().expect("send slot populated"));
-            }
+            // The closed-check + push MUST happen under one `buf`
+            // lock acquisition — symmetric to the recv-side drain
+            // check. Otherwise: sender loads `receiver_closed =
+            // false`, receiver drops (setting the flag), sender
+            // acquires buf, pushes, returns Ok with the item
+            // stranded (no live receiver will ever pop it).
             {
                 let mut inner = self.shared.buf.lock();
+                if self.shared.receiver_closed.load(Ordering::Acquire) {
+                    return Err(slot.take().expect("send slot populated"));
+                }
                 if inner.queue.len() < inner.capacity {
                     inner
                         .queue
@@ -170,10 +176,11 @@ impl<T> Sender<T> {
     /// queue is at capacity and [`TrySendError::Closed`] when the
     /// receiver has been dropped.
     pub fn try_send(&self, val: T) -> Result<(), TrySendError<T>> {
+        let mut inner = self.shared.buf.lock();
+        // Closed-check under the buf lock (see `send` for the race).
         if self.shared.receiver_closed.load(Ordering::Acquire) {
             return Err(TrySendError::Closed(val));
         }
-        let mut inner = self.shared.buf.lock();
         if inner.queue.len() < inner.capacity {
             inner.queue.push_back(val);
             drop(inner);

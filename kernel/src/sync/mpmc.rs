@@ -179,12 +179,17 @@ impl<T> Sender<T> {
     pub fn send(&self, val: T) -> Result<(), T> {
         let mut slot = Some(val);
         loop {
-            // Fast path: check closed, then try to push.
-            if self.shared.receiver_count.load(Ordering::Acquire) == 0 {
-                return Err(slot.take().expect("send slot populated"));
-            }
+            // Close check + push must happen under one `buf` lock
+            // acquisition — symmetric to the drain-first check in
+            // `Receiver::recv`. Otherwise: sender loads
+            // `receiver_count = 1`, the last receiver drops (count
+            // →0), sender acquires buf and pushes, returns Ok with
+            // the item stranded (no live receiver will ever pop).
             {
                 let mut inner = self.shared.buf.lock();
+                if self.shared.receiver_count.load(Ordering::Acquire) == 0 {
+                    return Err(slot.take().expect("send slot populated"));
+                }
                 if inner.queue.len() < inner.capacity {
                     inner
                         .queue
@@ -212,10 +217,11 @@ impl<T> Sender<T> {
     /// Non-blocking send. Returns a [`TrySendError`] that
     /// distinguishes "full right now" from "channel closed".
     pub fn try_send(&self, val: T) -> Result<(), TrySendError<T>> {
+        let mut inner = self.shared.buf.lock();
+        // Closed-check under the buf lock (see `send` for the race).
         if self.shared.receiver_count.load(Ordering::Acquire) == 0 {
             return Err(TrySendError::Closed(val));
         }
-        let mut inner = self.shared.buf.lock();
         if inner.queue.len() < inner.capacity {
             inner.queue.push_back(val);
             drop(inner);
