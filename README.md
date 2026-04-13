@@ -8,42 +8,41 @@ interrupts discovered via ACPI, runs preemptively-scheduled kernel tasks
 with blocking synchronisation primitives, and emits symbolicated panic
 backtraces via an embedded kernel symbol table.
 
-## Status
+## Instructions for Humans
 
-Milestones complete:
+vibix is built by an autonomous agent — `/auto-engineer`, a Claude Code
+skill that picks an unblocked GitHub issue, plans the change, implements
+it, opens a PR, chases CI + review-bot feedback, and loops. Your job as a
+human is to file issues, review PRs, and merge. The agent does the rest.
 
-- **M1 — hello-kernel:** Limine boot (BIOS + UEFI), COM1 serial,
-  framebuffer text console (font8x8), GDT/TSS + `#DF` IST, IDT for
-  `#DE`/`#UD`/`#GP`/`#PF`/`#DF`.
-- **M2 — memory + testing:** bitmap frame allocator over Limine's USABLE
-  map (with frame deallocation), `linked_list_allocator`-backed
-  `#[global_allocator]` (1 MiB initial heap, auto-growing via paging),
-  three-layer automated testing story (see below).
-- **M3 — interrupts:** 8259 PIC remapped to 0x20/0x28, PIT at 100 Hz
-  driving `time::uptime_ms()`, PS/2 keyboard ISR feeding a ring buffer
-  decoded by `pc-keyboard` on the consumer side. Keystrokes in QEMU echo
-  over serial.
-- **M4 — paging:** tight-flags kernel paging (RO `.rodata`, RX `.text`,
-  RW `.data`/`.bss`), HHDM mapped with 2 MiB pages, heap region extended
-  on demand via `paging::map_range`, framebuffer mapped Write-Combining
-  via PAT, unmapped guard page below `#DF` IST stack, atomic CR3 switch to
-  a kernel-owned PML4 (Limine's original tree is no longer used after init).
-- **M5 — tasks:** preemptive round-robin scheduler driven by the PIT
-  (10 ms slices); each task gets its own kernel stack; context switch in
-  hand-written assembly (RSP save/restore); bootstrap task wraps the main
-  thread. Blocking primitives (`BlockingMutex`, `WaitQueue`, SPSC channel)
-  live in `kernel::sync` and park tasks via the scheduler's parked-task
-  side-table.
-- **M6 — APIC:** ACPI RSDP → XSDT/RSDT → MADT parser; LAPIC + IOAPIC
-  discovered; legacy IRQ0 (timer) and IRQ1 (keyboard) routed through IOAPIC;
-  8259 PIC disabled; BSP LAPIC brought online.
-- **M7 — diagnostics:** frame-pointer-based stack unwinder
-  (`-Cforce-frame-pointers=yes`), post-link embedded kernel symbol table
-  (256 KiB `.rodata` reservation patched by xtask), symbolicated panic
-  backtraces emitted to serial, structured klog ring (64 KiB, leveled,
-  dumped on panic).
+To run the loop yourself, you need Docker, a Claude Code login on the host
+(`claude` logged in at least once, so `~/.claude.json` + `~/.claude/`
+exist), and a GitHub token with repo write access.
 
-Out of scope for now: SMP / AP bring-up, userspace, task priorities, tickless idle.
+```sh
+# one-time: add yourself to the docker group so the wrapper doesn't need sudo
+sudo usermod -aG docker "$USER" && newgrp docker
+
+# each run
+export GITHUB_TOKEN=ghp_...
+./scripts/auto-engineer.sh
+```
+
+The wrapper builds a container image (first run ~5–10 min) that bundles
+every build/test dep — Rust nightly, `qemu-system-x86_64`, `xorriso`,
+`gh`, and Claude Code itself — then runs `claude --dangerously-skip-permissions`
+against a fresh clone inside the container. Your host `~/.claude` auth is
+bind-mounted in, so the container talks to Anthropic as you.
+
+Under the hood:
+
+- **`Dockerfile`** — Ubuntu 24.04 base, dep install, rustup pre-warm.
+- **`scripts/docker-entrypoint.sh`** — clones the repo, wires up `gh` auth,
+  execs `claude`.
+- **`scripts/auto-engineer.sh`** — host wrapper: sources `.env`, builds the
+  image, and runs the container with the right mounts + SELinux handling.
+
+Ctrl-C at any time to stop the loop.
 
 ## Requirements
 
