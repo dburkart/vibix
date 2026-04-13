@@ -50,6 +50,11 @@ fn wait_for_ready(counter: &AtomicUsize, expected: usize, deadline_ticks: usize)
         }
         x86_64::instructions::hlt();
     }
+    // One last read after the final `hlt`: if a worker bumped the counter
+    // during that sleep, we shouldn't panic spuriously.
+    if counter.load(Ordering::SeqCst) >= expected {
+        return;
+    }
     panic!(
         "workers didn't reach the park point in time: ready={}/{}",
         counter.load(Ordering::SeqCst),
