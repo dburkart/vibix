@@ -59,6 +59,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "acpi: MADT parsed",
     "apic: BSP online",
     "ioapic: initialized",
+    "serial: rx irq enabled",
     "timer: 100 Hz",
     "rtc:",
     "vibix online.",
@@ -541,6 +542,7 @@ fn test_all() -> R<()> {
         "userspace_module",
         "sleep",
         "pci_enum",
+        "serial_rx",
     ] {
         cmd.arg("--test").arg(t);
     }

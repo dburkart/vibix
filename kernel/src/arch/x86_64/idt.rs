@@ -6,7 +6,9 @@ use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX;
-use crate::arch::x86_64::interrupts::{keyboard_interrupt, timer_interrupt, InterruptIndex};
+use crate::arch::x86_64::interrupts::{
+    keyboard_interrupt, serial_interrupt, timer_interrupt, InterruptIndex,
+};
 use crate::serial_println;
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
@@ -23,6 +25,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt);
+    idt[InterruptIndex::Serial.as_u8()].set_handler_fn(serial_interrupt);
     idt
 });
 

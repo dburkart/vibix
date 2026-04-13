@@ -119,3 +119,7 @@ harness = false
 [[test]]
 name = "pci_enum"
 harness = false
+
+[[test]]
+name = "serial_rx"
+harness = false
