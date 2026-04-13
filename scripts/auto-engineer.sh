@@ -50,7 +50,7 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Di
 fi
 
 docker run --rm -it \
-    "${docker_sec_opts[@]}" \
+    ${docker_sec_opts[@]+"${docker_sec_opts[@]}"} \
     -v "$HOME/.claude:/home/agent/.claude" \
     -v "$HOME/.claude.json:/home/agent/.claude.json" \
     -e GITHUB_TOKEN \
