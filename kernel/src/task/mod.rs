@@ -51,6 +51,7 @@ use scheduler::Scheduler;
 use switch::context_switch;
 use task::{Task, TaskState};
 
+use crate::arch::x86_64::fpu;
 use crate::serial_println;
 use crate::time::TICK_MS;
 
@@ -490,6 +491,10 @@ pub fn preempt_tick() {
     let prev_prio = prev.priority;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+    // Grab a raw pointer to the incoming task's FPU area while we
+    // still hold the mutable borrow; we'll dereference it after the
+    // lock is dropped.
+    let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
     sched.push_ready(prev);
     // The push above put `prev` at the back of its priority's queue;
     // retrieve the pointer through the bank to keep the Box-stability
@@ -500,18 +505,22 @@ pub fn preempt_tick() {
         .and_then(|q| q.back_mut())
         .expect("just pushed");
     let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
+    let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
     drop(sched);
 
-    // SAFETY: `prev_rsp_ptr` points at the `rsp` field of a Box<Task>
-    // in the ready queue. The Box indirection pins the Task's address
-    // — a VecDeque reallocation would move the Box, not the heap-
-    // allocated Task it points at — so the pointer stays valid even
-    // though the VecDeque could mutate from under us. IRQs are already
+    // SAFETY: `prev_rsp_ptr` / `prev_fpu_ptr` / `next_fpu_ptr` point
+    // into heap-allocated `FpuArea` / `usize` fields behind Box<Task>
+    // values in the scheduler — the Box indirection pins those
+    // allocations across VecDeque or BTreeMap rebalances (rebalancing
+    // moves the Box, not the heap-allocated Task). IRQs are already
     // masked inside the ISR, so no other scheduler path can race us
     // between lock drop and the context switch. `next_cr3` is a valid
     // PML4 whose upper half mirrors the kernel PML4 (by construction
-    // in `Task::new` / `Task::bootstrap`).
+    // in `Task::new` / `Task::bootstrap`). `fpu::init()` ran during
+    // `arch::init`, so fxsave64/fxrstor64 are legal on this CPU.
     unsafe {
+        fpu::save(&mut *prev_fpu_ptr);
+        fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 }
@@ -552,7 +561,7 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, next_rsp, next_cr3) = {
+    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -589,6 +598,7 @@ pub fn block_current() {
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
         sched.parked.insert(prev_id, prev);
 
         let prev_ref = sched
@@ -596,20 +606,24 @@ pub fn block_current() {
             .get_mut(&prev_id)
             .expect("just inserted into parked");
         // SAFETY: `prev_ref` is `&mut Box<Task>`; the Box heap-allocates
-        // the Task, so `&mut prev_ref.rsp` points at stable memory that
-        // survives any BTreeMap rebalance (rebalancing moves the Box,
-        // not the heap-allocated Task it points at). Same invariant as
-        // preempt_tick's ready-queue push.
+        // the Task, so `&mut prev_ref.rsp` / `&mut *prev_ref.fpu` point
+        // at stable memory that survives any BTreeMap rebalance
+        // (rebalancing moves the Box, not the heap-allocated Task it
+        // points at). Same invariant as preempt_tick's ready-queue push.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
+        let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
 
-        (prev_rsp_ptr, next_rsp, next_cr3)
+        (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3)
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
-    // incoming task can re-enter the scheduler, and prev_rsp_ptr
-    // targets stable heap memory (see the insert comment above).
-    // `next_cr3` is a valid per-task PML4 (see preempt_tick).
+    // incoming task can re-enter the scheduler, and prev_rsp_ptr /
+    // prev_fpu_ptr / next_fpu_ptr target stable heap memory (see the
+    // insert comment above). `next_cr3` is a valid per-task PML4 (see
+    // preempt_tick). `fpu::init()` ran during `arch::init`.
     unsafe {
+        fpu::save(&mut *prev_fpu_ptr);
+        fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 
