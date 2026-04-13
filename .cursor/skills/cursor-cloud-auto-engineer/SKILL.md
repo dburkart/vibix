@@ -16,6 +16,7 @@ Read these shared playbooks first:
 - `docs/agent-playbooks/build-run.md`
 - `docs/agent-playbooks/testing.md`
 - `docs/agent-playbooks/pr-review.md`
+- `docs/agent-playbooks/prioritization.md`
 
 This is the Cursor Cloud companion to `.claude/skills/auto-engineer/SKILL.md`. Keep the same
 core loop — pick work, plan, implement, validate, push, and open a PR — but adapt it to Cursor
@@ -64,8 +65,11 @@ gh issue list --search 'no:assignee' --state open \
 ```
 
 Filter out issues labeled `blocked`, `needs-discussion`, `question`, or `wontfix`, plus issues
-whose body clearly references an unresolved dependency. Prefer the lowest-numbered
-`enhancement`/`milestone-*`, then `bug`, then the next remaining issue.
+whose body clearly references an unresolved dependency. Apply the pick-order policy from
+`docs/agent-playbooks/prioritization.md`: sort `priority:P0` → `P1` → `P2` → `P3`, preferring
+`track:userspace` / `track:filesystem` / `track:terminal` / `track:posix` in that order within a
+priority bucket, and only fall back to lowest-numbered first inside a (priority, track) bucket.
+Issues missing a `priority:*` label rank after `priority:P3`.
 
 Cursor Cloud's `gh` access is read-only in this repo, so do not try to assign the issue. If
 issue assignment matters, note that limitation in the final handoff or PR body.
