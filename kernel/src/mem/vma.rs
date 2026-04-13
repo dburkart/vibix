@@ -12,7 +12,6 @@
 //!   the page writable. The source frame is never freed by the CoW
 //!   resolver — other PML4s (post-`clone_for_fork`) may still alias it.
 
-use alloc::vec::Vec;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
 
 /// Kind of backing a VMA describes.
@@ -53,66 +52,5 @@ impl Vma {
 
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.start && addr < self.end
-    }
-}
-
-/// Per-task list of VMAs. Small and linear — we expect a handful of
-/// regions per task, not thousands. Lookup is O(n).
-#[derive(Default)]
-pub struct VmaList {
-    entries: Vec<Vma>,
-}
-
-impl VmaList {
-    pub const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Insert `vma` if it doesn't overlap anything already present.
-    /// Panics on overlap — overlapping VMAs are a programmer error,
-    /// not a runtime condition to recover from.
-    pub fn insert(&mut self, vma: Vma) {
-        for existing in &self.entries {
-            let overlap = vma.start < existing.end && existing.start < vma.end;
-            assert!(!overlap, "VMA overlaps existing range");
-        }
-        self.entries.push(vma);
-    }
-
-    /// Find the VMA containing `addr`, if any.
-    pub fn find(&self, addr: usize) -> Option<Vma> {
-        self.entries.iter().copied().find(|v| v.contains(addr))
-    }
-
-    /// Remove the VMA whose `start` matches exactly and return it.
-    /// Keyed on `start` (not an arbitrary inclusion address) so
-    /// `munmap`-style callers must name the region they installed —
-    /// partial-range unmap is out of scope here.
-    pub fn remove(&mut self, start: usize) -> Option<Vma> {
-        let idx = self.entries.iter().position(|v| v.start == start)?;
-        Some(self.entries.swap_remove(idx))
-    }
-
-    /// Iterate all entries in insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.entries.iter()
-    }
-
-    /// Duplicate this list for a child address space. Metadata is
-    /// cloned verbatim — including any `Cow { frame }` kinds, which
-    /// means the child shares the source frames with the parent until
-    /// a write fault in either address space diverges them.
-    ///
-    /// Callers that fork mapped `AnonZero` pages should convert them
-    /// to `Cow` *before* calling this — `AnonZero` carries no frame,
-    /// so copying it verbatim leaves the child with no visibility into
-    /// whatever frames the parent's page-table already backs the
-    /// region with.
-    pub fn clone_for_fork(&self) -> VmaList {
-        VmaList {
-            entries: self.entries.clone(),
-        }
     }
 }
