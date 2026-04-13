@@ -2,8 +2,12 @@ name: Issue Backfill
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */8 * * *'
   workflow_dispatch: {}
+
+concurrency:
+  group: issue-backfill
+  cancel-in-progress: true
 
 jobs:
   backfill:
@@ -21,7 +25,7 @@ jobs:
         with:
           fetch-depth: 50   # enough history to see recent momentum
 
-      - name: Run Claude Code — propose 5 next issues
+      - name: Run Claude Code — propose up to 5 next issues
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -36,12 +40,14 @@ jobs:
             "Bash(find:*)"
             "Bash(cat:*)"
             "Bash(ls:*)"
+            "Bash(grep:*)"
+            "Bash(head:*)"
             "Bash(gh issue list:*)"
             "Bash(gh issue create:*)"
           prompt: |
             You are a technical project manager for the vibix kernel — a hobby OS kernel written in Rust.
 
-            Your job: propose and file exactly 5 GitHub issues that represent the most valuable
+            Your job: propose and file up to 5 GitHub issues that represent the most valuable
             near-term work, based on recent project momentum and what is already tracked.
 
             ## Step 1 — understand recent progress
@@ -80,7 +86,7 @@ jobs:
 
             Avoid filing anything that duplicates an open issue (check titles and bodies carefully).
 
-            ## Step 4 — file exactly 5 issues
+            ## Step 4 — file up to 5 issues
 
             For each issue run:
             ```
