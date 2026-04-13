@@ -182,6 +182,14 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "bench")]
     vibix::task::spawn(vibix::bench::run_all);
 
+    // ASCII art banner — shown once all subsystems and tasks are up.
+    println!("");
+    println!(r" __   _____ ____  _____  __");
+    println!(r" \ \ / /_ _| __ )|_ _\ \/ /");
+    println!(r"  \ V / | ||  _ \ | | >  < ");
+    println!(r"   \_/ |___|____/|___|/_/\_\");
+    println!("");
+
     // Bootstrap task becomes the idle loop. `hlt` with IRQs on parks
     // the CPU until the next interrupt; the PIT `preempt_tick` then
     // rotates us to any other ready task (shell, cursor_blink).
