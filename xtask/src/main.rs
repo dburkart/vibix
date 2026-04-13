@@ -159,9 +159,22 @@ fn test_disk_path() -> PathBuf {
 /// already present and the right size, we leave it alone.
 fn ensure_test_disk() -> R<PathBuf> {
     let path = test_disk_path();
+    // Rebuild if absent, wrong size, or the magic prefix doesn't match.
+    // Size alone isn't a strong enough check — an old disk image of the
+    // right length but stale contents would silently fail the smoke
+    // marker assertion, which is noisier to diagnose than a fresh write.
     let needs_write = match fs::metadata(&path) {
-        Ok(m) => m.len() != TEST_DISK_SIZE,
-        Err(_) => true,
+        Ok(m) if m.len() == TEST_DISK_SIZE => {
+            let mut head = vec![0u8; TEST_DISK_MAGIC.len()];
+            match fs::File::open(&path).and_then(|mut f| {
+                use std::io::Read as _;
+                f.read_exact(&mut head)
+            }) {
+                Ok(()) => head != TEST_DISK_MAGIC,
+                Err(_) => true,
+            }
+        }
+        _ => true,
     };
     if needs_write {
         if let Some(parent) = path.parent() {

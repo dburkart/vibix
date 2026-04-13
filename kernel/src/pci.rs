@@ -276,12 +276,14 @@ mod target {
     /// (config offset 0x04). Required before the device is allowed to
     /// DMA driver-managed memory.
     pub fn enable_bus_master(addr: Address) {
-        // SAFETY: the Command/Status dword at 0x04 is a well-known
-        // config-space slot; we only OR in bit 2 without clobbering the
-        // status half.
+        // The high 16 bits of this dword are the Status register, which
+        // is write-1-to-clear: writing back any bit currently set would
+        // ack-and-clear it. Mask to just the Command half (low 16) before
+        // ORing in bit 2.
         unsafe {
             let dw = config_read32(addr, 0x04);
-            config_write32(addr, 0x04, dw | 0x0000_0004);
+            let command = (dw & 0x0000_FFFF) | 0x0000_0004;
+            config_write32(addr, 0x04, command);
         }
     }
 

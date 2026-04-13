@@ -13,9 +13,14 @@
 //! - Polling — no interrupt handler. The completion path spins on the
 //!   used-ring index with a bounded retry budget.
 //! - Read-only (`VIRTIO_BLK_T_IN`).
-//! - Queue size is taken from whatever the device reports. The queue is
-//!   a single heap allocation with page-size alignment so the physical
-//!   base fits the legacy `QUEUE_ADDR` register (a PFN).
+//! - Queue size is taken from whatever the device reports, capped at
+//!   [`QUEUE_MAX`] so the whole virtqueue fits in a statically-reserved
+//!   `#[repr(align(4096))]` region inside the kernel image. Limine loads
+//!   kernel segments into physically contiguous frames, which satisfies
+//!   the virtio legacy requirement that the queue be physically
+//!   contiguous (spec 0.9.5 §2.3). We verify the contiguity at init time
+//!   with `paging::translate` across each page and fail bring-up if the
+//!   mapping is not contiguous.
 //!
 //! References:
 //! - Virtio 1.0 spec §5.2 (block device).
@@ -28,6 +33,8 @@ use super::SECTOR_SIZE;
 
 #[cfg(target_os = "none")]
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+#[cfg(target_os = "none")]
+use core::cell::UnsafeCell;
 #[cfg(target_os = "none")]
 use core::mem::size_of;
 #[cfg(target_os = "none")]
@@ -99,6 +106,37 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 #[cfg(target_os = "none")]
 const POLL_BUDGET: u32 = 10_000_000;
 
+/// Largest queue size we're willing to drive. `queue_layout(256)` =
+/// 10248 bytes → fits in 3 pages. QEMU defaults virtio-blk to 256, so
+/// anything smaller here would force bring-up to fail rather than cap
+/// silently — legacy QUEUE_SIZE is read-only, we can't request less.
+#[cfg(target_os = "none")]
+const QUEUE_MAX: u16 = 256;
+#[cfg(target_os = "none")]
+const QUEUE_STORAGE_BYTES: usize = 4096 * 3;
+/// Minimum queue size we can drive. The submit path writes three
+/// consecutive descriptor slots computed as `slot`, `slot+1`, `slot+2`
+/// (mod qsz); with qsz < 3 those wrap and collide.
+#[cfg(target_os = "none")]
+const QUEUE_MIN: u16 = 3;
+
+/// Page-aligned storage for the single virtqueue. Lives in the kernel
+/// image's `.bss`, which Limine places into physically contiguous frames
+/// — the virtio legacy PFN in `QUEUE_ADDR` requires that. We verify the
+/// contiguity at init (see `verify_contig`).
+#[cfg(target_os = "none")]
+#[repr(C, align(4096))]
+struct QueueStorage(UnsafeCell<[u8; QUEUE_STORAGE_BYTES]>);
+
+// SAFETY: the only access is behind the DEVICE mutex (bring-up writes
+// QUEUE_ADDR once, submit_and_wait accesses descriptors while holding
+// the DEVICE lock). No concurrent CPU access occurs.
+#[cfg(target_os = "none")]
+unsafe impl Sync for QueueStorage {}
+
+#[cfg(target_os = "none")]
+static QUEUE_STORAGE: QueueStorage = QueueStorage(UnsafeCell::new([0u8; QUEUE_STORAGE_BYTES]));
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtqDesc {
@@ -164,7 +202,6 @@ struct BlkDevice {
     queue_pa: u64,
     layout: QueueLayout,
     queue_base: *mut u8,
-    queue_alloc_layout: Layout,
     /// Our running `avail.idx` — incremented for each submission.
     avail_idx: u16,
     /// Last `used.idx` we observed; completions advance it.
@@ -229,7 +266,9 @@ pub fn init() {
 #[allow(dead_code)] // payloads are surfaced via {:?} in the init error log
 enum BringUpError {
     ZeroQueueSize,
+    QueueTooSmall(u16),
     QueueTooLarge(u16),
+    QueueNotContiguous,
     FeaturesNotOk,
 }
 
@@ -271,27 +310,35 @@ fn bring_up(dev: &pci::Device, io_base: u16) -> Result<BlkDevice, BringUpError> 
             write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
             return Err(BringUpError::ZeroQueueSize);
         }
-        if queue_size > 256 {
-            // Cap to keep the allocation small; spec allows the driver
-            // to request a smaller queue by writing QUEUE_SIZE, but in
-            // legacy it's ROM on QEMU — easier to refuse oversized queues
-            // outright than silently half-initialize.
+        if queue_size < QUEUE_MIN {
+            // submit_and_wait writes three consecutive descriptors mod
+            // qsz; qsz<3 aliases them onto the same slot.
+            write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
+            return Err(BringUpError::QueueTooSmall(queue_size));
+        }
+        if queue_size > QUEUE_MAX {
+            // Refuse rather than half-initialize — the static queue
+            // storage is sized for QUEUE_MAX.
             write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
             return Err(BringUpError::QueueTooLarge(queue_size));
         }
 
         let layout = queue_layout(queue_size);
-        let alloc_layout =
-            Layout::from_size_align(layout.total, 4096).expect("virtio_blk: bad queue layout");
-        let queue_base = alloc_zeroed(alloc_layout);
-        if queue_base.is_null() {
-            write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
-            panic!("virtio_blk: queue allocation failed");
-        }
+        debug_assert!(layout.total <= QUEUE_STORAGE_BYTES);
+        let queue_base = QUEUE_STORAGE.0.get() as *mut u8;
+        // Zero the full region — the static is zero-initialized at boot,
+        // but being defensive here costs nothing and keeps the invariant
+        // obvious if a future caller ever re-enters bring_up.
+        ptr::write_bytes(queue_base, 0, QUEUE_STORAGE_BYTES);
+
         let queue_pa = paging::translate(x86_64::VirtAddr::new(queue_base as u64))
             .expect("virtio_blk: queue not mapped")
             .as_u64();
         debug_assert_eq!(queue_pa & 0xFFF, 0, "queue must be page-aligned");
+        if !queue_phys_contiguous(queue_base, layout.total, queue_pa) {
+            write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
+            return Err(BringUpError::QueueNotContiguous);
+        }
 
         // Legacy QUEUE_ADDR is a PFN (phys >> 12).
         write32(io_base, REG_QUEUE_ADDR, (queue_pa >> 12) as u32);
@@ -309,11 +356,31 @@ fn bring_up(dev: &pci::Device, io_base: u16) -> Result<BlkDevice, BringUpError> 
             queue_pa,
             layout,
             queue_base,
-            queue_alloc_layout: alloc_layout,
             avail_idx: 0,
             last_used_idx: 0,
         })
     }
+}
+
+/// Walk each 4 KiB page of `[base, base+len)` and assert that successive
+/// pages map to successive physical frames starting from `base_pa`.
+/// Legacy virtio-blk's QUEUE_ADDR is a single PFN and the device
+/// interprets the whole queue as contiguous physical memory.
+#[cfg(target_os = "none")]
+unsafe fn queue_phys_contiguous(base: *const u8, len: usize, base_pa: u64) -> bool {
+    let mut off = 4096usize;
+    while off < len {
+        let va = x86_64::VirtAddr::new(base as u64 + off as u64);
+        let pa = match paging::translate(va) {
+            Some(p) => p.as_u64(),
+            None => return false,
+        };
+        if pa != base_pa + off as u64 {
+            return false;
+        }
+        off += 4096;
+    }
+    true
 }
 
 #[cfg(target_os = "none")]
@@ -321,11 +388,19 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
         return Err(BlkError::BadAlign);
     }
+    // Single-page bounce buffer: guarantees the data descriptor covers
+    // one physically-contiguous frame regardless of the caller's buffer
+    // alignment. Capping at one page keeps this step-1 driver simple;
+    // multi-page transfers can split into per-page descriptors later.
+    if buf.len() > 4096 {
+        return Err(BlkError::BadAlign);
+    }
     let mut guard = DEVICE.lock();
     let dev = guard.as_mut().ok_or(BlkError::NotInitialized)?;
 
-    // Per-request scratch: header + status byte, sitting in the heap
-    // (HHDM-backed, so translate works identically to the queue).
+    // Per-request scratch: header + status byte + page-aligned data
+    // bounce buffer, sitting in the heap (HHDM-backed, so translate
+    // works identically to the queue).
     let header = VirtioBlkReqHeader {
         ty: VIRTIO_BLK_T_IN,
         reserved: 0,
@@ -333,10 +408,12 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     };
     let header_layout = Layout::from_size_align(size_of::<VirtioBlkReqHeader>(), 8).unwrap();
     let status_layout = Layout::from_size_align(1, 1).unwrap();
-    // SAFETY: both layouts are valid and non-zero-sized.
+    let data_layout = Layout::from_size_align(4096, 4096).unwrap();
+    // SAFETY: all layouts are valid and non-zero-sized.
     let header_ptr = unsafe { alloc_zeroed(header_layout) } as *mut VirtioBlkReqHeader;
     let status_ptr = unsafe { alloc_zeroed(status_layout) };
-    assert!(!header_ptr.is_null() && !status_ptr.is_null());
+    let data_ptr = unsafe { alloc_zeroed(data_layout) };
+    assert!(!header_ptr.is_null() && !status_ptr.is_null() && !data_ptr.is_null());
     // SAFETY: just allocated, exclusive.
     unsafe {
         ptr::write(header_ptr, header);
@@ -345,25 +422,41 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     let header_pa = paging::translate(x86_64::VirtAddr::new(header_ptr as u64))
         .expect("virtio_blk: header not mapped")
         .as_u64();
-    let buf_pa = paging::translate(x86_64::VirtAddr::new(buf.as_mut_ptr() as u64))
-        .expect("virtio_blk: buffer not mapped")
+    let data_pa = paging::translate(x86_64::VirtAddr::new(data_ptr as u64))
+        .expect("virtio_blk: data not mapped")
         .as_u64();
     let status_pa = paging::translate(x86_64::VirtAddr::new(status_ptr as u64))
         .expect("virtio_blk: status not mapped")
         .as_u64();
 
-    let result = unsafe { submit_and_wait(dev, header_pa, buf_pa, buf.len() as u32, status_pa) };
-    // SAFETY: these allocations are no longer referenced by the device
-    // once submit_and_wait has seen the used-ring entry (or timed out).
-    // On timeout we deliberately leak rather than risk the device
-    // scribbling into freed memory.
-    if result.is_ok() {
-        unsafe {
-            dealloc(header_ptr as *mut u8, header_layout);
-            dealloc(status_ptr, status_layout);
+    let result = unsafe { submit_and_wait(dev, header_pa, data_pa, buf.len() as u32, status_pa) };
+    // The device is only still looking at our buffers if submit_and_wait
+    // timed out — on any completed status (Ok or DeviceError) it's safe
+    // to free. Timeout deliberately leaks to avoid freeing memory the
+    // device may still DMA into.
+    match result {
+        Ok(()) => {
+            // SAFETY: data_ptr points to a live 4 KiB allocation.
+            unsafe {
+                ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), buf.len());
+            }
+            unsafe {
+                dealloc(header_ptr as *mut u8, header_layout);
+                dealloc(status_ptr, status_layout);
+                dealloc(data_ptr, data_layout);
+            }
+            Ok(())
+        }
+        Err(BlkError::Timeout) => Err(BlkError::Timeout),
+        Err(e) => {
+            unsafe {
+                dealloc(header_ptr as *mut u8, header_layout);
+                dealloc(status_ptr, status_layout);
+                dealloc(data_ptr, data_layout);
+            }
+            Err(e)
         }
     }
-    result
 }
 
 #[cfg(target_os = "none")]
