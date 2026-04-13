@@ -91,6 +91,12 @@ pub fn init() {
     unsafe {
         Cr0::update(|f| {
             f.remove(Cr0Flags::EMULATE_COPROCESSOR);
+            // Clear TS so `fxsave64` / `fxrstor64` / `ldmxcsr` below
+            // (and every subsequent context-switch save/restore) don't
+            // take `#NM` if the bootloader or firmware left TS set.
+            // We eager-save; there's no lazy-FPU state machine that
+            // wants TS asserted.
+            f.remove(Cr0Flags::TASK_SWITCHED);
             f.insert(Cr0Flags::MONITOR_COPROCESSOR);
             f.insert(Cr0Flags::NUMERIC_ERROR);
         });
