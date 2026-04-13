@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 limine = "0.5"
-spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "lazy"] }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "lazy", "rwlock"] }
 x86_64 = "0.15"
 uart_16550 = "0.3"
 font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
@@ -138,4 +138,8 @@ harness = false
 
 [[test]]
 name = "task_exit"
+harness = false
+
+[[test]]
+name = "addrspace"
 harness = false

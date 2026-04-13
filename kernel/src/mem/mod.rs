@@ -22,8 +22,11 @@ pub mod loader;
 pub mod paging;
 #[cfg(target_os = "none")]
 pub mod pat;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 pub mod vma;
+
+#[cfg(any(target_os = "none", test))]
+pub mod addrspace;
 
 #[cfg(target_os = "none")]
 use spin::Once;
