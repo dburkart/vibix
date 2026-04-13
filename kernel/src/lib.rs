@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod cpu;
 pub mod input;
 pub mod klog;
 pub mod mem;

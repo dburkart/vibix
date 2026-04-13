@@ -49,6 +49,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "vibix booting",
     "memory map:",
     "hhdm offset:",
+    "cpu: ",
     "GDT + IDT loaded",
     "heap: 1024 KiB",
     "paging: mapper online",
