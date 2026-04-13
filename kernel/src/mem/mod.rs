@@ -23,6 +23,12 @@ pub mod pat;
 #[cfg(target_os = "none")]
 pub mod vma;
 
+#[cfg(target_os = "none")]
+use spin::Once;
+
+#[cfg(target_os = "none")]
+static USERSPACE_MODULE_ELF_SUMMARY: Once<Option<(x86_64::VirtAddr, usize)>> = Once::new();
+
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;
 
@@ -59,6 +65,10 @@ pub fn init() {
         .expect("Limine HHDM response missing");
     paging::init(x86_64::VirtAddr::new(hhdm.offset()));
 
+    // Snapshot Limine module metadata before reclaiming BOOTLOADER_RECLAIMABLE
+    // memory; the response structs themselves live there.
+    USERSPACE_MODULE_ELF_SUMMARY.call_once(elf::first_loaded_module_elf_summary);
+
     heap::init();
     crate::arch::x86_64::ist_guard::install();
 
@@ -77,5 +87,5 @@ pub fn init() {
 /// userspace module delivered by Limine, if present and well-formed.
 #[cfg(target_os = "none")]
 pub fn userspace_module_elf_summary() -> Option<(x86_64::VirtAddr, usize)> {
-    elf::first_loaded_module_elf_summary()
+    USERSPACE_MODULE_ELF_SUMMARY.get().copied().flatten()
 }

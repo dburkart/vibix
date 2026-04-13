@@ -16,6 +16,10 @@ const PF_W: u32 = 1 << 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 
+#[cfg(target_os = "none")]
+static CACHED_MODULE_ELF_SUMMARY: spin::mutex::Mutex<Option<(VirtAddr, usize)>> =
+    spin::mutex::Mutex::new(None);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64Ehdr {
@@ -158,10 +162,21 @@ pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     if size < core::mem::size_of::<Elf64Ehdr>() {
         return None;
     }
-    // SAFETY: Limine keeps module file bytes resident for kernel use.
+    // SAFETY: Limine's module bytes are readable while its response
+    // metadata is still live (before reclaim_bootloader_memory()).
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(base, size) };
     let parsed = try_parse_elf64(bytes)?;
     Some((parsed.entry(), parsed.load_segments().count()))
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn snapshot_module_elf_summary_before_reclaim() {
+    *CACHED_MODULE_ELF_SUMMARY.lock() = first_loaded_module_elf_summary();
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn cached_module_elf_summary() -> Option<(VirtAddr, usize)> {
+    *CACHED_MODULE_ELF_SUMMARY.lock()
 }
 
 pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
