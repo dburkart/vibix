@@ -5,19 +5,16 @@
 //! against an `AddressSpace`; the `#PF` resolver walks it to decide how to
 //! back a faulting address.
 //!
-//! This is the skeleton introduced by RFC 0001. Richer facilities (VMA
-//! split/merge, the `VmObject` trait, the rewritten fault resolver, task
-//! integration, reclaim-on-drop) land in their own follow-up issues
-//! (#155..#161). What lives here today: the struct, kernel-half PML4 copy,
-//! the IRQ-safety contract on the lock, and the `find(addr)` lookup that
-//! every later caller will build on.
-
-use alloc::collections::BTreeMap;
+//! Richer facilities (the `VmObject` trait, the rewritten fault resolver,
+//! reclaim-on-drop) were wired up in issues #155..#159. `AddressSpace` now
+//! owns a `VmaTree` whose entries carry `Arc<dyn VmObject>` backing objects;
+//! the `#PF` resolver calls `VmObject::fault` to obtain physical frames on
+//! first touch.
 
 use spin::RwLock;
 use x86_64::VirtAddr;
 
-use crate::mem::vma::Vma;
+use crate::mem::vmatree::{Vma, VmaTree};
 
 /// First address **above** the userspace canonical lower half. The legal
 /// user VA range is `[0, USER_VA_END)`; a `len`-rounded mapping that ends
@@ -34,10 +31,9 @@ pub const DEFAULT_BRK_GUARD: u64 = 1 * 1024 * 1024;
 /// Per-process address space.
 ///
 /// All fields are `pub(crate)` rather than `pub` so later issues can
-/// evolve the representation (e.g. swap the VMA `BTreeMap` for a richer
-/// `VmaTree`, promote `brk_start`/`brk_cur` into a dedicated struct)
-/// without breaking every downstream user.
-#[allow(dead_code)] // fields consumed by follow-up issues #155..#161
+/// evolve the representation (e.g. promote `brk_start`/`brk_cur` into a
+/// dedicated struct) without breaking every downstream user.
+#[allow(dead_code)] // rss_pages / vm_pages consumed by future syscall accounting
 pub struct AddressSpace {
     /// Physical frame backing this address space's PML4. The lower half
     /// (entries `0..256`) is user-owned; the upper half (entries
@@ -47,11 +43,10 @@ pub struct AddressSpace {
     pub(crate) page_table:
         x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
 
-    /// Sorted interval map of user VMAs keyed by `start`. Half-open
-    /// `[start, end)` intervals that never overlap (enforced by the
-    /// insertion path once #156 lands; for now this map is empty on
-    /// construction and read-only via [`AddressSpace::find`]).
-    pub(crate) vmas: BTreeMap<usize, Vma>,
+    /// Sorted, non-overlapping interval tree of user VMAs. Each entry
+    /// carries an `Arc<dyn VmObject>` whose `fault` method the `#PF`
+    /// resolver calls on first touch to obtain a physical frame.
+    pub(crate) vmas: VmaTree,
 
     /// First valid user VA for the initial `mmap` hint floor. Callers
     /// that place fixed mappings may go below this.
@@ -86,7 +81,7 @@ impl AddressSpace {
         let brk_start = mmap_base;
         Self {
             page_table,
-            vmas: BTreeMap::new(),
+            vmas: VmaTree::new(),
             mmap_base,
             brk_start,
             brk_cur: brk_start,
@@ -114,7 +109,7 @@ impl AddressSpace {
         let brk_start = mmap_base;
         Self {
             page_table,
-            vmas: BTreeMap::new(),
+            vmas: VmaTree::new(),
             mmap_base,
             brk_start,
             brk_cur: brk_start,
@@ -130,7 +125,7 @@ impl AddressSpace {
     #[cfg(test)]
     pub(crate) fn new_for_test(mmap_base: u64) -> Self {
         Self {
-            vmas: BTreeMap::new(),
+            vmas: VmaTree::new(),
             mmap_base: VirtAddr::new(mmap_base),
             brk_start: VirtAddr::new(mmap_base),
             brk_cur: VirtAddr::new(mmap_base),
@@ -150,53 +145,39 @@ impl AddressSpace {
         self.page_table
     }
 
-    /// Insert `vma`, panicking if it overlaps any existing entry.
-    /// Overlapping VMAs are a programmer error, not a runtime
-    /// condition to recover from. O(log n) lookup of the candidate
-    /// neighbours via `BTreeMap::range`.
+    /// Insert `vma` into the VMA tree, merging with adjacent neighbours
+    /// where possible. Panics if `vma` overlaps any existing entry —
+    /// overlapping VMAs are a programmer error.
     pub fn insert(&mut self, vma: Vma) {
-        // Predecessor whose start < vma.end could still overlap if its
-        // end > vma.start.
-        if let Some((_, prev)) = self.vmas.range(..vma.start).next_back() {
-            assert!(prev.end <= vma.start, "VMA overlaps existing range");
-        }
-        if let Some((_, next)) = self.vmas.range(vma.start..).next() {
-            assert!(vma.end <= next.start, "VMA overlaps existing range");
-        }
         let pages = (vma.end - vma.start) / 4096;
-        self.vmas.insert(vma.start, vma);
+        self.vmas.insert(vma);
         self.vm_pages += pages;
     }
 
     /// Iterate VMAs in ascending start-address order.
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.vmas.values()
+        self.vmas.iter()
     }
 
     /// Remove the VMA whose `start` matches exactly. Keyed on `start`
     /// (not an arbitrary inclusion address) so callers must name the
-    /// region they installed — partial-range unmap is a separate
-    /// concern (#160).
+    /// region they installed — partial-range unmap uses
+    /// `VmaTree::unmap_range` directly.
     pub fn remove(&mut self, start: usize) -> Option<Vma> {
-        let removed = self.vmas.remove(&start)?;
+        let removed = self.vmas.remove_exact(start)?;
         self.vm_pages -= (removed.end - removed.start) / 4096;
         Some(removed)
     }
 
-    /// Find the VMA containing `addr`, if any. Uses a `BTreeMap::range`
-    /// walk backward from `addr` — O(log n) — so this is the intended
-    /// hot-path lookup for the page-fault resolver.
+    /// Find the VMA containing `addr`, if any. O(log n) via the
+    /// underlying `VmaTree`.
     pub fn find(&self, addr: usize) -> Option<&Vma> {
-        self.vmas
-            .range(..=addr)
-            .next_back()
-            .map(|(_, v)| v)
-            .filter(|v| addr < v.end)
+        self.vmas.find(addr)
     }
 
     /// Returns `true` if `vma` lies entirely inside the userspace
     /// canonical lower half and does not cross [`USER_VA_END`].
-    #[allow(dead_code)] // consumed by #156 (VmaTree::insert) and the mmap syscall
+    #[allow(dead_code)] // consumed by the mmap syscall
     pub(crate) fn vma_in_user_range(vma: &Vma) -> bool {
         (vma.end as u64) <= USER_VA_END
     }
@@ -259,11 +240,14 @@ fn debug_assert_task_ctx() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem::vma::{Vma, VmaKind};
-    use x86_64::structures::paging::PageTableFlags;
+    use alloc::sync::Arc;
+    use crate::mem::vmatree::{Share, Vma};
+    use crate::mem::vmobject::AnonObject;
 
     fn anon(start: usize, end: usize) -> Vma {
-        Vma::new(start, end, VmaKind::AnonZero, PageTableFlags::PRESENT)
+        let pages = (end - start) / 4096;
+        Vma::new(start, end, 0x3 /* PROT_READ|WRITE */, 0, Share::Private,
+                 AnonObject::new(Some(pages)), 0)
     }
 
     #[test]
@@ -276,7 +260,7 @@ mod tests {
     fn find_hits_exact_start() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma.start, vma);
+        aspace.vmas.insert(vma);
         let hit = aspace.find(0x1_0000).expect("start is inclusive");
         assert_eq!(hit.start, 0x1_0000);
     }
@@ -285,7 +269,7 @@ mod tests {
     fn find_hits_interior() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x3_0000);
-        aspace.vmas.insert(vma.start, vma);
+        aspace.vmas.insert(vma);
         let hit = aspace.find(0x2_5000).expect("addr is inside the vma");
         assert_eq!(hit.start, 0x1_0000);
         assert_eq!(hit.end, 0x3_0000);
@@ -296,7 +280,7 @@ mod tests {
         // `end` is exclusive — the very last byte is in, the end address is out.
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma.start, vma);
+        aspace.vmas.insert(vma);
         assert!(aspace.find(0x2_0000).is_none());
         assert!(aspace.find(0x1_ffff).is_some());
     }
@@ -305,17 +289,18 @@ mod tests {
     fn find_misses_before_start() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma.start, vma);
+        aspace.vmas.insert(vma);
         assert!(aspace.find(0x0fff).is_none());
     }
 
     #[test]
     fn find_picks_the_right_neighbor_with_a_gap() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
+        // Use distinct Arc objects so VmaTree does not merge them.
         let a = anon(0x1_0000, 0x2_0000);
         let b = anon(0x5_0000, 0x6_0000);
-        aspace.vmas.insert(a.start, a);
-        aspace.vmas.insert(b.start, b);
+        aspace.vmas.insert(a);
+        aspace.vmas.insert(b);
         // In the gap: predecessor is A, but addr >= A.end → miss.
         assert!(aspace.find(0x3_0000).is_none());
         // Inside B.
@@ -324,19 +309,18 @@ mod tests {
 
     #[test]
     fn user_va_range_guard_rejects_kernel_half() {
+        let obj: Arc<dyn crate::mem::vmobject::VmObject> = AnonObject::new(Some(1));
         let kernel_half = Vma::new(
             USER_VA_END as usize,
             (USER_VA_END as usize) + 0x1000,
-            VmaKind::AnonZero,
-            PageTableFlags::PRESENT,
+            0, 0, Share::Private, Arc::clone(&obj), 0,
         );
         assert!(!AddressSpace::vma_in_user_range(&kernel_half));
 
         let high_user = Vma::new(
             (USER_VA_END as usize) - 0x2000,
             USER_VA_END as usize,
-            VmaKind::AnonZero,
-            PageTableFlags::PRESENT,
+            0, 0, Share::Private, obj, 0,
         );
         assert!(AddressSpace::vma_in_user_range(&high_user));
     }

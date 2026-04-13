@@ -377,6 +377,13 @@ impl VmaTree {
         self.map.insert(right.start, right);
     }
 
+    /// Remove the VMA whose `start` matches exactly. Returns the VMA
+    /// if found. Unlike [`unmap_range`], this is an exact-match remove
+    /// that does not split bordering VMAs.
+    pub fn remove_exact(&mut self, start: usize) -> Option<Vma> {
+        self.map.remove(&start)
+    }
+
     fn assert_no_overlap(&self, start: usize, end: usize) {
         if let Some((_, left)) = self.map.range(..start).next_back() {
             assert!(

@@ -412,8 +412,9 @@ pub fn update_current_cr3(
 }
 
 /// Install a VMA on the currently-running task. The VMA is resolved
-/// lazily by the `#PF` handler on first touch of each page.
-pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
+/// lazily by the `#PF` handler on first touch of each page via
+/// [`VmObject::fault`].
+pub fn install_vma_on_current(vma: crate::mem::vmatree::Vma) {
     let aspace = {
         let sched = SCHED.lock();
         let current = sched
@@ -425,8 +426,9 @@ pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
     aspace.write().insert(vma);
 }
 
-/// Consult the current task's VMA list for `addr`. Returns the VMA's
-/// backing kind and the flags the `#PF` resolver should apply.
+/// Consult the current task's address space for `addr`. Returns the
+/// VMA's backing object, the page-aligned byte offset into that object,
+/// the cached PTE flags, and the sharing discipline.
 ///
 /// Returns `None` if the scheduler lock is contended — the `#PF`
 /// handler treats that as "not a demand-page fault" and falls through
@@ -436,8 +438,10 @@ pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
 pub fn current_vma_lookup(
     addr: usize,
 ) -> Option<(
-    crate::mem::vma::VmaKind,
-    x86_64::structures::paging::PageTableFlags,
+    alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
+    usize,
+    crate::mem::vmatree::ProtPte,
+    crate::mem::vmatree::Share,
 )> {
     let aspace = {
         let sched = SCHED.try_lock()?;
@@ -452,7 +456,9 @@ pub fn current_vma_lookup(
     // demand fault" contract.
     let guard = aspace.try_write()?;
     let vma = guard.find(addr)?;
-    Some((vma.kind, vma.flags))
+    let page_aligned = addr & !(4096 - 1);
+    let offset = page_aligned - vma.start + vma.object_offset;
+    Some((alloc::sync::Arc::clone(&vma.object), offset, vma.prot_pte, vma.share))
 }
 
 /// Terminate the currently-running task. Reclaims the task's mapped
@@ -528,8 +534,7 @@ pub fn exit() -> ! {
 /// away, so unmapping its stack is safe.
 fn reap_pending(victim: alloc::boxed::Box<Task>) {
     use crate::mem::paging;
-    use crate::mem::vma::VmaKind;
-    use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+    use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
     // 1. Unmap + free stack pages. Stack pages live in the shared
@@ -537,7 +542,7 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     //    that entry is aliased into every per-task PML4, so unmapping
     //    via the victim's PML4 propagates to every PML4.
     //
-    //    We deliberately route through `unmap_in_pml4` (temporary
+    //    We deliberately route through `unmap_and_free_in_pml4` (temporary
     //    mapper) rather than `unmap_and_free` (global `MAPPER` lock):
     //    `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
     //    interrupted task held `MAPPER`, spinning on it here would
@@ -552,17 +557,19 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
         }
     }
 
-    // 2. Walk VMAs. For each VA in each VMA, unmap from the victim's
-    //    private PML4. AnonZero: free the frame. Cow: free only when
-    //    the backing frame is not the shared source (the private
-    //    post-write copy).
-    // `reap_pending` runs from the timer ISR with IRQs masked, so a
-    // blocking `read()` would deadlock the moment the address space is
-    // contended. Today every task owns its address space outright (no
-    // CLONE_VM), so the lock is uncontended at reap time — `try_read`
-    // succeeds. The `expect` will fire loudly the first time a future
-    // refactor introduces shared address spaces; better a panic with
-    // a clear message than a silent ISR hang.
+    // 2. Walk VMAs: unmap each page from the victim's private PML4.
+    //    Frame reclaim is handled by `AnonObject::drop` when the last
+    //    `Arc<dyn VmObject>` is released below — we must not also free
+    //    them here or we get double-frees. Pages that were never faulted
+    //    in have no PTE; `unmap_in_pml4` returns an error, which we
+    //    silently discard.
+    //
+    //    `reap_pending` runs from the timer ISR with IRQs masked, so a
+    //    blocking `read()` would deadlock the moment the address space is
+    //    contended. Today every task owns its address space outright (no
+    //    CLONE_VM), so the lock is uncontended at reap time — `try_read`
+    //    succeeds. The `expect` will fire loudly the first time a future
+    //    refactor introduces shared address spaces.
     let aspace = victim
         .address_space
         .try_read()
@@ -572,26 +579,19 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
         while va < vma.end {
             let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
                 .expect("vma page VA aligned by construction");
-            match vma.kind {
-                VmaKind::AnonZero => {
-                    let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
-                }
-                VmaKind::Cow { frame: source } => {
-                    if let Ok(frame) = paging::unmap_in_pml4(victim.cr3, page) {
-                        if frame != source {
-                            // SAFETY: private copy allocated from the
-                            // global allocator by the #PF resolver.
-                            unsafe {
-                                paging::KernelFrameAllocator.deallocate_frame(frame);
-                            }
-                        }
-                    }
-                }
-            }
+            // Just unmap the PTE; the backing frame is owned by the
+            // VmObject and will be freed when the Arc drops.
+            let _ = paging::unmap_in_pml4(victim.cr3, page);
             va += 4096;
         }
     }
     drop(aspace);
+    // Releasing the read guard does not drop the AddressSpace; that
+    // happens when `victim` (the Box<Task>) is dropped below. At that
+    // point the Arc<RwLock<AddressSpace>> reaches refcount 0, the
+    // AddressSpace is released, its VmaTree drops, each
+    // Arc<dyn VmObject> drops, and AnonObject::drop frees every
+    // cached frame via frame::put.
 
     // 3. Return the PML4 frame itself.
     // SAFETY: victim is no longer on any CPU; we're running on a
