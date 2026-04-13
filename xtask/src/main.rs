@@ -60,6 +60,8 @@ const SMOKE_MARKERS: &[&str] = &[
     "apic: BSP online",
     "ioapic: initialized",
     "serial: rx irq enabled",
+    "hpet: initialized",
+    "hpet: periodic timer armed",
     "timer: 100 Hz",
     "rtc:",
     "vibix online.",
