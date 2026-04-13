@@ -11,6 +11,7 @@
 //!    the kernel can own its own `map`/`unmap`/`translate` API.
 
 pub mod frame;
+pub mod refcount;
 
 #[cfg(any(target_os = "none", test))]
 pub(crate) mod elf;
