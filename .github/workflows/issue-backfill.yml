@@ -43,12 +43,27 @@ jobs:
             "Bash(grep:*)"
             "Bash(head:*)"
             "Bash(gh issue list:*)"
-            "Bash(gh issue create:*)"
+            "Skill(file-issue)"
           prompt: |
             You are a technical project manager for the vibix kernel — a hobby OS kernel written in Rust.
 
             Your job: propose and file up to 5 GitHub issues that represent the most valuable
-            near-term work, based on recent project momentum and what is already tracked.
+            near-term work, based on recent project momentum and what is already tracked. The
+            north star is the minimal useful kernel defined in the prioritization playbook —
+            getting to PID 1 loading a real userspace program from the ramdisk — so favor gaps
+            that advance that goal over unrelated polish.
+
+            ## Step 0 — read the prioritization playbook
+
+            Read `docs/agent-playbooks/prioritization.md` end-to-end. It defines:
+
+            - The `priority:P0..P3` / `area:*` / `track:*` label taxonomy.
+            - The current P0 critical path to PID 1.
+            - The triage rules every new issue must follow.
+
+            Every issue you file in this run must land with the correct labels applied on
+            creation. Un-labeled issues pollute the auto-engineer candidate set and defeat the
+            whole point of triage.
 
             ## Step 1 — understand recent progress
 
@@ -73,6 +88,9 @@ jobs:
             gh issue list --state open --limit 100 --json number,title,labels,body
             ```
 
+            Pay attention to existing labels — the triaged backlog is your map of what's
+            already covered and where the gaps are.
+
             ## Step 3 — identify gaps
 
             Cross-reference what was recently merged with what is already filed.
@@ -86,33 +104,28 @@ jobs:
 
             Avoid filing anything that duplicates an open issue (check titles and bodies carefully).
 
-            ## Step 4 — file up to 5 issues
+            ## Step 4 — file up to 5 issues via the `file-issue` skill
 
-            For each issue run:
-            ```
-            gh issue create --title "<title>" --body "<body>"
-            ```
+            For each gap, invoke the `file-issue` skill (`/file-issue`). The skill handles
+            dedupe, enforces the label taxonomy from `docs/agent-playbooks/prioritization.md`,
+            and writes the canonical body template. Do **not** call `gh issue create` or
+            `mcp__github__issue_write` directly — go through the skill so every filed issue
+            is triaged on creation.
 
-            Each issue body must follow this template:
+            Feed the skill, per issue:
 
-            ```
-            ## Motivation
-            <1-3 sentences: why this matters and what it unblocks>
-
-            ## Work
-            - [ ] <concrete sub-task 1>
-            - [ ] <concrete sub-task 2>
-            - [ ] ...
-
-            ## Context
-            <relevant commit hashes, file paths, or existing issue numbers that informed this>
-            ```
+            - A concise imperative title (≤ 72 chars, no emoji).
+            - A 1–3 sentence motivation: why this matters and what it unblocks.
+            - Concrete work items, naming files / structs / functions where known.
+            - Context: commit SHAs, file paths, and existing issue numbers that informed
+              the gap.
 
             Guidelines:
-            - Titles should be concise imperative phrases (≤ 72 chars), no emoji.
-            - Prefer specificity over vagueness — name files, structs, and functions where known.
+            - Prefer specificity over vagueness.
             - Cover a spread of concerns (correctness, performance, testing, docs, next subsystem).
+            - Weight your picks toward P0 / P1 work that advances the minimal useful kernel.
             - Do NOT create duplicate issues. If you cannot find 5 distinct gaps, file fewer.
 
-            After filing all issues, print a one-line summary of each issue number and title
-            so it appears in the workflow log.
+            After filing all issues, print a one-line summary of each issue number, title,
+            and the priority/area/track labels the skill applied so it appears in the
+            workflow log.

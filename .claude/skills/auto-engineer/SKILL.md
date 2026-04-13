@@ -11,6 +11,7 @@ Read these shared playbooks first:
 - `docs/agent-playbooks/build-run.md`
 - `docs/agent-playbooks/testing.md`
 - `docs/agent-playbooks/pr-review.md`
+- `docs/agent-playbooks/prioritization.md`
 
 Closes the full SDLC loop without prompting the user between steps. Each invocation runs **one cycle** (pick → plan → implement → PR → wait → merge), then reschedules itself via `ScheduleWakeup` with prompt `/auto-engineer` for the next cycle. Stops cleanly when it runs out of work or hits something it can't safely resolve.
 
@@ -32,6 +33,10 @@ The iteration counter is carried in the wake-up prompt itself as `/auto-engineer
 
 ### 1. Pick an unblocked issue
 
+The picking rules live in `docs/agent-playbooks/prioritization.md` — this step is the
+mechanical implementation of that policy. The north star is the minimal useful kernel:
+work P0s first, then P1s, and so on.
+
 ```sh
 gh issue list --search 'no:assignee' --state open \
   --json number,title,labels,body,assignees
@@ -41,10 +46,19 @@ Filter out:
 - Issues labeled `blocked`, `needs-discussion`, `question`, `wontfix`.
 - Issues whose body references an unresolved dependency (e.g. "blocked on #NN" where #NN is still open).
 
-Sort preference:
-1. Lowest-numbered issue labeled `enhancement` or `milestone-*`.
-2. Otherwise lowest-numbered `bug`.
-3. Otherwise lowest-numbered remaining issue.
+Sort preference (apply in order — do **not** fall back to "oldest first" until you have
+exhausted the priority ordering):
+
+1. `priority:P0` before `priority:P1` before `priority:P2` before `priority:P3`. Issues with
+   no `priority:*` label rank **after** `priority:P3` — they are un-triaged.
+2. Within a priority bucket, prefer `track:userspace`, then `track:filesystem`, then
+   `track:terminal`, then `track:posix`, then untracked.
+3. Within a (priority, track) bucket, lowest-numbered first.
+
+If the top candidate's prerequisites are still open, skip it and try the next one rather
+than starting work that cannot land. If a candidate is un-triaged (no `priority:*` label),
+prefer triaging it via the `file-issue` skill's label rules before working it — don't mine
+the un-triaged tail for "easy" work and bypass the priority queue.
 
 If the candidate list is empty → **stop** (see Stopping below) with message *"no unblocked issues — auto-engineer idle."*
 
@@ -145,17 +159,16 @@ Before reloading the next issue, scan for work that surfaced during this cycle b
 - Build/test warnings observed during step 4 that weren't blocking but deserve follow-up.
 - Anything the sub-agent's plan (step 2) explicitly listed as "out of scope" or "risks."
 
-For each distinct follow-up, before filing, **dedupe against existing issues**:
+For each distinct follow-up, **invoke the `file-issue` skill** — do not call
+`mcp__github__issue_write` directly. The `file-issue` skill handles dedupe against existing
+issues, enforces the label taxonomy from `docs/agent-playbooks/prioritization.md`, and
+produces a body in the canonical template. Feed it:
 
-```sh
-gh issue list --state open --search '<keywords>' --json number,title
-```
-
-If no match, file via `mcp__github__create_issue` per the `sdlc` "capture out-of-scope ideas" rule:
-- Specific title.
-- Body explaining *what* and *why* with enough context to act on cold in a week.
-- Reference the merged PR (`discovered while merging #<PR>`).
-- Labels that fit (`bug`, `enhancement`, `tech-debt`, `milestone-N`).
+- A specific title.
+- A 1–3 sentence motivation, including `discovered while merging #<PR>` so the origin is
+  recoverable later.
+- Concrete work items.
+- Context (file paths, commit SHAs, related issue numbers).
 
 If nothing worth filing, skip silently. **Do not file speculative or "nice-to-have" issues** — only things with concrete motivation. Over-filing clutters the backlog and degrades the `no:assignee` candidate set that step 1 depends on.
 

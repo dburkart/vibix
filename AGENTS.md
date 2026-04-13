@@ -11,6 +11,7 @@ Read these repo-level playbooks before acting in the corresponding area:
 - `docs/agent-playbooks/testing.md` for host, QEMU, and smoke testing
 - `docs/agent-playbooks/sdlc.md` for branch, commit, push, and PR policy
 - `docs/agent-playbooks/pr-review.md` for CI readiness and review classification
+- `docs/agent-playbooks/prioritization.md` for issue labels, triage rules, and pick-order policy
 
 ## Cursor Cloud runtime notes
 
