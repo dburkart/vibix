@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+#[cfg(any(test, target_os = "none"))]
+pub mod block;
 pub mod cpu;
 pub mod input;
 pub mod klog;

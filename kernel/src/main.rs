@@ -70,6 +70,14 @@ pub extern "C" fn _start() -> ! {
     }
     vibix::time::init();
     vibix::pci::scan();
+    vibix::block::init();
+    if vibix::block::ready() {
+        let mut sector = [0u8; vibix::block::SECTOR_SIZE];
+        match vibix::block::read(0, &mut sector) {
+            Ok(()) => serial_println!("block: lba0[0..16]={:02x?}", &sector[..16]),
+            Err(e) => serial_println!("block: lba0 read failed: {:?}", e),
+        }
+    }
 
     // Console init must come after mem::init() — the character grid and
     // scrollback buffer are heap-allocated inside Console::new().

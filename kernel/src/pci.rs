@@ -256,6 +256,37 @@ mod target {
         value
     }
 
+    /// Write a 32-bit word to the PCI config space at `addr + offset`.
+    /// Same locking contract as [`config_read32`].
+    ///
+    /// # Safety
+    /// Issues raw OUT to 0xCF8/0xCFC. Caller is responsible for the
+    /// semantic validity of writes (e.g. enabling bus mastering).
+    pub unsafe fn config_write32(addr: Address, offset: u8, value: u32) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let _guard = CFG_LOCK.lock();
+            let mut a: Port<u32> = Port::new(CONFIG_ADDRESS);
+            let mut d: Port<u32> = Port::new(CONFIG_DATA);
+            a.write(addr.config_dword(offset));
+            d.write(value);
+        });
+    }
+
+    /// Set the `Bus Master` bit (bit 2) in the device's Command register
+    /// (config offset 0x04). Required before the device is allowed to
+    /// DMA driver-managed memory.
+    pub fn enable_bus_master(addr: Address) {
+        // The high 16 bits of this dword are the Status register, which
+        // is write-1-to-clear: writing back any bit currently set would
+        // ack-and-clear it. Mask to just the Command half (low 16) before
+        // ORing in bit 2.
+        unsafe {
+            let dw = config_read32(addr, 0x04);
+            let command = (dw & 0x0000_FFFF) | 0x0000_0004;
+            config_write32(addr, 0x04, command);
+        }
+    }
+
     fn read_device(addr: Address) -> Option<Device> {
         // SAFETY: see config_read32 — the fixed hardware interface.
         let dw0 = unsafe { config_read32(addr, 0x00) };
@@ -329,7 +360,7 @@ mod target {
 }
 
 #[cfg(target_os = "none")]
-pub use target::{config_read32, scan};
+pub use target::{config_read32, config_write32, enable_bus_master, scan};
 
 // -- host unit tests ----------------------------------------------------
 
