@@ -33,31 +33,30 @@ fn panic(info: &PanicInfo) -> ! {
     test_panic_handler(info)
 }
 
-/// Park the driver on `hlt` until `counter` reaches `expected`, so wake-side
-/// tests fire their wake only after every worker has reached its blocking
-/// call. Each worker bumps its own slot in `counter` immediately before the
-/// blocking op (`recv`, `send`, `wait_while`); without this, the driver's
-/// wake can race the worker into the fast-path `wake_pending` bail and never
-/// actually exercise the parked-wake branch.
+/// Park the driver on `hlt` until `parked()` reports that `expected`
+/// waiters have actually enqueued themselves on the primitive under
+/// test. Queried directly against the primitive (`WaitQueue`, channel
+/// endpoint), so the driver observes the real parked state instead of
+/// a pre-call readiness flag — this closes the race where a worker
+/// bumps a readiness counter, gets preempted before the blocking call,
+/// and the driver's wake hits `wake_pending` instead of the parked-wake
+/// branch the test exists to exercise.
 ///
-/// Panics if the workers don't all arrive within `deadline_ticks` hlt cycles
-/// — a real bug (worker wedged or scheduler not advancing), not the
-/// previous "probably long enough" heuristic.
-fn wait_for_ready(counter: &AtomicUsize, expected: usize, deadline_ticks: usize) {
+/// Panics if the waiters haven't all parked within `deadline_ticks`
+/// hlt cycles — a real bug (worker wedged or scheduler not advancing).
+fn wait_for_parked<F: Fn() -> usize>(parked: F, expected: usize, deadline_ticks: usize) {
     for _ in 0..deadline_ticks {
-        if counter.load(Ordering::SeqCst) >= expected {
+        if parked() >= expected {
             return;
         }
         x86_64::instructions::hlt();
     }
-    // One last read after the final `hlt`: if a worker bumped the counter
-    // during that sleep, we shouldn't panic spuriously.
-    if counter.load(Ordering::SeqCst) >= expected {
+    if parked() >= expected {
         return;
     }
     panic!(
-        "workers didn't reach the park point in time: ready={}/{}",
-        counter.load(Ordering::SeqCst),
+        "waiters didn't park in time: parked={}/{}",
+        parked(),
         expected
     );
 }
@@ -249,10 +248,8 @@ fn mutex_contention() {
 static WQ: WaitQueue = WaitQueue::new();
 static WQ_FLAG: AtomicUsize = AtomicUsize::new(0);
 static WQ_WOKEN: AtomicUsize = AtomicUsize::new(0);
-static WQ_READY: AtomicUsize = AtomicUsize::new(0);
 
 fn wq_waiter() -> ! {
-    WQ_READY.fetch_add(1, Ordering::SeqCst);
     WQ.wait_while(|| WQ_FLAG.load(Ordering::SeqCst) == 0);
     WQ_WOKEN.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -263,15 +260,14 @@ fn wq_waiter() -> ! {
 fn waitqueue_notify_all() {
     WQ_FLAG.store(0, Ordering::SeqCst);
     WQ_WOKEN.store(0, Ordering::SeqCst);
-    WQ_READY.store(0, Ordering::SeqCst);
 
     task::spawn(wq_waiter);
     task::spawn(wq_waiter);
 
-    // Wait until both waiters have run up to their wait_while call.
+    // Wait until both waiters have actually enqueued themselves on WQ.
     // Deadline is generous (~2 s) — hitting it means a worker
     // wedged, not just "slower than expected".
-    wait_for_ready(&WQ_READY, 2, 200);
+    wait_for_parked(|| WQ.waiter_count(), 2, 200);
     // Nobody should be "woken" yet: flag is still 0.
     assert_eq!(
         WQ_WOKEN.load(Ordering::SeqCst),
@@ -303,14 +299,12 @@ fn waitqueue_notify_all() {
 
 static SPSC_CLOSE_RX: SpinMutex<Option<spsc::Receiver<u32>>> = SpinMutex::new(None);
 static SPSC_CLOSE_RX_SAW_NONE: AtomicUsize = AtomicUsize::new(0);
-static SPSC_CLOSE_RX_READY: AtomicUsize = AtomicUsize::new(0);
 
 fn spsc_close_rx_worker() -> ! {
     let rx = SPSC_CLOSE_RX
         .lock()
         .take()
         .expect("spsc_close_rx_worker: receiver not set");
-    SPSC_CLOSE_RX_READY.fetch_add(1, Ordering::SeqCst);
     if rx.recv().is_none() {
         SPSC_CLOSE_RX_SAW_NONE.fetch_add(1, Ordering::SeqCst);
     }
@@ -323,12 +317,11 @@ fn spsc_close_wakes_receiver() {
     let (tx, rx) = spsc::channel::<u32>(4);
     *SPSC_CLOSE_RX.lock() = Some(rx);
     SPSC_CLOSE_RX_SAW_NONE.store(0, Ordering::SeqCst);
-    SPSC_CLOSE_RX_READY.store(0, Ordering::SeqCst);
 
     task::spawn(spsc_close_rx_worker);
 
-    // Wait until the worker has reached its recv call.
-    wait_for_ready(&SPSC_CLOSE_RX_READY, 1, 200);
+    // Wait until the worker has actually parked inside `recv`.
+    wait_for_parked(|| tx.receivers_parked(), 1, 200);
 
     // Drop the sender. This must wake the parked receiver.
     drop(tx);
@@ -353,7 +346,6 @@ fn spsc_close_wakes_receiver() {
 
 static SPSC_CLOSE_TX: SpinMutex<Option<spsc::Sender<u32>>> = SpinMutex::new(None);
 static SPSC_CLOSE_TX_SAW_ERR: AtomicUsize = AtomicUsize::new(0);
-static SPSC_CLOSE_TX_READY: AtomicUsize = AtomicUsize::new(0);
 
 fn spsc_close_tx_worker() -> ! {
     let tx = SPSC_CLOSE_TX
@@ -361,7 +353,6 @@ fn spsc_close_tx_worker() -> ! {
         .take()
         .expect("spsc_close_tx_worker: sender not set");
     // Channel already has one item buffered; this send parks.
-    SPSC_CLOSE_TX_READY.fetch_add(1, Ordering::SeqCst);
     if tx.send(2).is_err() {
         SPSC_CLOSE_TX_SAW_ERR.fetch_add(1, Ordering::SeqCst);
     }
@@ -375,11 +366,10 @@ fn spsc_close_wakes_sender() {
     tx.send(1).expect("prefill send");
     *SPSC_CLOSE_TX.lock() = Some(tx);
     SPSC_CLOSE_TX_SAW_ERR.store(0, Ordering::SeqCst);
-    SPSC_CLOSE_TX_READY.store(0, Ordering::SeqCst);
 
     task::spawn(spsc_close_tx_worker);
 
-    wait_for_ready(&SPSC_CLOSE_TX_READY, 1, 200);
+    wait_for_parked(|| rx.senders_parked(), 1, 200);
 
     drop(rx);
 
@@ -660,11 +650,9 @@ fn mpmc_many_to_many() {
 static MPMC_CLOSE_RX_A: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
 static MPMC_CLOSE_RX_B: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
 static MPMC_CLOSE_RX_WOKEN: AtomicUsize = AtomicUsize::new(0);
-static MPMC_CLOSE_RX_READY: AtomicUsize = AtomicUsize::new(0);
 
 fn mpmc_close_rx_a() -> ! {
     let rx = MPMC_CLOSE_RX_A.lock().take().expect("close rx A");
-    MPMC_CLOSE_RX_READY.fetch_add(1, Ordering::SeqCst);
     if rx.recv().is_none() {
         MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
     }
@@ -675,7 +663,6 @@ fn mpmc_close_rx_a() -> ! {
 
 fn mpmc_close_rx_b() -> ! {
     let rx = MPMC_CLOSE_RX_B.lock().take().expect("close rx B");
-    MPMC_CLOSE_RX_READY.fetch_add(1, Ordering::SeqCst);
     if rx.recv().is_none() {
         MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
     }
@@ -689,12 +676,11 @@ fn mpmc_close_wakes_receivers() {
     *MPMC_CLOSE_RX_A.lock() = Some(rx.clone());
     *MPMC_CLOSE_RX_B.lock() = Some(rx);
     MPMC_CLOSE_RX_WOKEN.store(0, Ordering::SeqCst);
-    MPMC_CLOSE_RX_READY.store(0, Ordering::SeqCst);
 
     task::spawn(mpmc_close_rx_a);
     task::spawn(mpmc_close_rx_b);
 
-    wait_for_ready(&MPMC_CLOSE_RX_READY, 2, 200);
+    wait_for_parked(|| tx.receivers_parked(), 2, 200);
 
     // Drop the sole sender; both parked receivers must wake.
     drop(tx);
@@ -721,11 +707,9 @@ fn mpmc_close_wakes_receivers() {
 static MPMC_CLOSE_TX_A: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
 static MPMC_CLOSE_TX_B: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
 static MPMC_CLOSE_TX_ERRS: AtomicUsize = AtomicUsize::new(0);
-static MPMC_CLOSE_TX_READY: AtomicUsize = AtomicUsize::new(0);
 
 fn mpmc_close_tx_a() -> ! {
     let tx = MPMC_CLOSE_TX_A.lock().take().expect("close tx A");
-    MPMC_CLOSE_TX_READY.fetch_add(1, Ordering::SeqCst);
     if tx.send(2).is_err() {
         MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
     }
@@ -736,7 +720,6 @@ fn mpmc_close_tx_a() -> ! {
 
 fn mpmc_close_tx_b() -> ! {
     let tx = MPMC_CLOSE_TX_B.lock().take().expect("close tx B");
-    MPMC_CLOSE_TX_READY.fetch_add(1, Ordering::SeqCst);
     if tx.send(3).is_err() {
         MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
     }
@@ -751,12 +734,11 @@ fn mpmc_close_wakes_senders() {
     *MPMC_CLOSE_TX_A.lock() = Some(tx.clone());
     *MPMC_CLOSE_TX_B.lock() = Some(tx);
     MPMC_CLOSE_TX_ERRS.store(0, Ordering::SeqCst);
-    MPMC_CLOSE_TX_READY.store(0, Ordering::SeqCst);
 
     task::spawn(mpmc_close_tx_a);
     task::spawn(mpmc_close_tx_b);
 
-    wait_for_ready(&MPMC_CLOSE_TX_READY, 2, 200);
+    wait_for_parked(|| rx.senders_parked(), 2, 200);
 
     // Drop the sole receiver; both parked senders must wake.
     drop(rx);

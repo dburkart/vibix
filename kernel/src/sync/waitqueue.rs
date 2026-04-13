@@ -104,6 +104,18 @@ impl WaitQueue {
         }
     }
 
+    /// Number of tasks currently enqueued on this waitqueue.
+    ///
+    /// Intended for test-harness synchronisation: a driver can spin on
+    /// `waiter_count() >= N` to confirm that N workers have actually
+    /// parked before firing a wake, closing the gap between a worker's
+    /// pre-call readiness signal and its real enqueue inside
+    /// `wait_while`. Not appropriate for production logic — the count
+    /// can change the instant it's returned.
+    pub fn waiter_count(&self) -> usize {
+        self.inner.lock().len()
+    }
+
     /// Wake every currently-registered waiter.
     pub fn notify_all(&self) {
         loop {
