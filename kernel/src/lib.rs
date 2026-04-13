@@ -29,7 +29,7 @@ pub mod bench;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod framebuffer;
-#[cfg(target_os = "none")]
+#[cfg(any(test, target_os = "none"))]
 pub mod hpet;
 #[cfg(target_os = "none")]
 pub mod ksymtab;

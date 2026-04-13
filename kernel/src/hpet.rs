@@ -11,14 +11,20 @@
 //! only one ever drives it per boot.
 //!
 //! Reference: IA-PC HPET Specification Rev 1.0a, sections 2.3 / 2.4.
+#[cfg(target_os = "none")]
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(target_os = "none")]
 use x86_64::structures::paging::PageTableFlags;
 
+#[cfg(target_os = "none")]
 use crate::acpi::{self, SdtHeader};
+#[cfg(target_os = "none")]
 use crate::mem::paging;
+#[cfg(target_os = "none")]
 use crate::serial_println;
+#[cfg(target_os = "none")]
 use crate::time::TICK_HZ;
 
 /// MMIO register offsets (bytes) within the HPET block.
@@ -41,6 +47,7 @@ const TN_VAL_SET: u64 = 1 << 6;
 /// HPET description table. The ACPI-provided address structure is
 /// inlined rather than carved out as a GAS since we only use the
 /// address + address_space_id fields.
+#[cfg(target_os = "none")]
 #[repr(C, packed)]
 struct HpetTable {
     header: SdtHeader,
@@ -83,18 +90,23 @@ pub fn active() -> bool {
 
 /// Discover, map, and start the HPET. On `Err`, callers should fall
 /// back to the PIT path; [`active`] will remain `false`.
+#[cfg(target_os = "none")]
 pub fn init() -> Result<(), HpetError> {
     let table_ptr = acpi::find_sdt(b"HPET").ok_or(HpetError::TableMissing)?;
     let hhdm = acpi::hhdm_offset().ok_or(HpetError::HhdmMissing)?;
 
     // The find_sdt helper already checked the header + checksum, so we
-    // can safely project through HpetTable here.
-    let table = unsafe { &*(table_ptr as *const HpetTable) };
-    let address_space_id = table.address_space_id;
+    // read through addr_of! to avoid forming a reference to an
+    // unaligned field — `#[repr(C, packed)]` disables alignment
+    // guarantees, so plain field access is UB even on x86_64 where
+    // the load itself would succeed.
+    let table = table_ptr as *const HpetTable;
+    let address_space_id =
+        unsafe { ptr::addr_of!((*table).address_space_id).read_unaligned() };
     if address_space_id != 0 {
         return Err(HpetError::UnsupportedAddressSpace(address_space_id));
     }
-    let base_phys = table.base_address;
+    let base_phys = unsafe { ptr::addr_of!((*table).base_address).read_unaligned() };
 
     // The register block is 1024 bytes per spec; one page covers it.
     paging::map_phys_into_hhdm(
@@ -177,10 +189,12 @@ pub fn init() -> Result<(), HpetError> {
     Ok(())
 }
 
+#[cfg(target_os = "none")]
 unsafe fn read64(base: *mut u8, offset: usize) -> u64 {
     ptr::read_volatile(base.add(offset) as *const u64)
 }
 
+#[cfg(target_os = "none")]
 unsafe fn write64(base: *mut u8, offset: usize, value: u64) {
     ptr::write_volatile(base.add(offset) as *mut u64, value);
 }
@@ -213,8 +227,8 @@ mod tests {
     #[test]
     fn handles_smaller_period() {
         // Real hardware sometimes reports ~14.3 MHz (≈69841 fs).
-        // 100 Hz → 10 ms = 10^13 fs → ~143_218_250 ticks.
+        // 100 Hz → 10 ms = 10^13 fs / 69841 ≈ 143_182_371 ticks.
         let t = ticks_for_hz(69_841, 100);
-        assert!((143_200_000..=143_300_000).contains(&t), "got {t}");
+        assert!((143_100_000..=143_300_000).contains(&t), "got {t}");
     }
 }
