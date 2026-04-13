@@ -1,7 +1,7 @@
 //! Integration test: legacy PCI bus-0 enumeration finds the devices
 //! QEMU's `q35`/`pc-i440fx` machines always expose.
 //!
-//! The test is tolerant to QEMU's machine-type default (pc-i440fx in
+//! The test is tolerant to QEMU's machine-type variations (q35 in
 //! `xtask test`) — it only asserts devices that are guaranteed by
 //! *both* machine types: the host bridge, the ISA bridge, an IDE
 //! controller, and a VGA class device.

@@ -231,9 +231,14 @@ mod target {
     /// hardware interface — the unsafety is entirely about holding the
     /// `CFG_LOCK` for the two-step transaction, which this function does.
     pub unsafe fn config_read32(addr: Address, offset: u8) -> u32 {
-        let _guard = CFG_LOCK.lock();
         let mut value: u32 = 0;
+        // Suppress IRQs *before* acquiring CFG_LOCK. Acquiring the lock
+        // first leaves a window where a timer tick can preempt the
+        // holder; on a single CPU the preempted task can never run
+        // again, and any other task calling config_read32 would spin on
+        // the lock forever.
         x86_64::instructions::interrupts::without_interrupts(|| {
+            let _guard = CFG_LOCK.lock();
             let mut a: Port<u32> = Port::new(CONFIG_ADDRESS);
             let mut d: Port<u32> = Port::new(CONFIG_DATA);
             a.write(addr.config_dword(offset));
