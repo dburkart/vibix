@@ -163,7 +163,9 @@ impl AddressSpace {
         if let Some((_, next)) = self.vmas.range(vma.start..).next() {
             assert!(vma.end <= next.start, "VMA overlaps existing range");
         }
+        let pages = (vma.end - vma.start) / 4096;
         self.vmas.insert(vma.start, vma);
+        self.vm_pages += pages;
     }
 
     /// Iterate VMAs in ascending start-address order.
@@ -176,7 +178,9 @@ impl AddressSpace {
     /// region they installed — partial-range unmap is a separate
     /// concern (#160).
     pub fn remove(&mut self, start: usize) -> Option<Vma> {
-        self.vmas.remove(&start)
+        let removed = self.vmas.remove(&start)?;
+        self.vm_pages -= (removed.end - removed.start) / 4096;
+        Some(removed)
     }
 
     /// Find the VMA containing `addr`, if any. Uses a `BTreeMap::range`
