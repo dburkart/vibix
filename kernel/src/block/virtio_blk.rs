@@ -86,8 +86,6 @@ const STATUS_DRIVER: u8 = 2;
 #[cfg(target_os = "none")]
 const STATUS_DRIVER_OK: u8 = 4;
 #[cfg(target_os = "none")]
-const STATUS_FEATURES_OK: u8 = 8;
-#[cfg(target_os = "none")]
 const STATUS_FAILED: u8 = 128;
 
 /// `type` values in the block request header.
@@ -170,10 +168,12 @@ pub struct QueueLayout {
 pub const fn queue_layout(size: u16) -> QueueLayout {
     let sz = size as usize;
     let desc_bytes = 16 * sz;
+    // avail: flags(u16) + idx(u16) + ring(u16 * size) + used_event(u16)
     let avail_bytes = 6 + 2 * sz;
     let avail_end = desc_bytes + avail_bytes;
     let used_off = (avail_end + 4095) & !4095;
-    let used_bytes = 8 + 8 * sz;
+    // used: flags(u16) + idx(u16) + ring(u32+u32 * size) + avail_event(u16)
+    let used_bytes = 6 + 8 * sz;
     QueueLayout {
         desc_off: 0,
         avail_off: desc_bytes,
@@ -269,7 +269,6 @@ enum BringUpError {
     QueueTooSmall(u16),
     QueueTooLarge(u16),
     QueueNotContiguous,
-    FeaturesNotOk,
 }
 
 #[cfg(target_os = "none")]
@@ -289,19 +288,13 @@ fn bring_up(dev: &pci::Device, io_base: u16) -> Result<BlkDevice, BringUpError> 
             REG_DEVICE_STATUS,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER,
         );
-        // Feature negotiation: accept nothing (step 1).
+        // Feature negotiation: accept nothing (step 1). Legacy virtio
+        // (0.9.5) has no FEATURES_OK bit — that's a v1.0 addition. We
+        // write GUEST_FEATURES and move on; the transitional device
+        // accepts an empty feature set unconditionally.
         let host = read32(io_base, REG_HOST_FEATURES) as u64;
         let guest = negotiate(host);
         write32(io_base, REG_GUEST_FEATURES, guest as u32);
-        write8(
-            io_base,
-            REG_DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
-        );
-        if read8(io_base, REG_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
-            write8(io_base, REG_DEVICE_STATUS, STATUS_FAILED);
-            return Err(BringUpError::FeaturesNotOk);
-        }
 
         // Select queue 0 ("requestq").
         write16(io_base, REG_QUEUE_SELECT, 0);
@@ -347,7 +340,7 @@ fn bring_up(dev: &pci::Device, io_base: u16) -> Result<BlkDevice, BringUpError> 
         write8(
             io_base,
             REG_DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK,
         );
 
         Ok(BlkDevice {
@@ -540,11 +533,6 @@ unsafe fn submit_and_wait(
 }
 
 #[cfg(target_os = "none")]
-unsafe fn read8(base: u16, reg: u16) -> u8 {
-    let mut p: Port<u8> = Port::new(base + reg);
-    p.read()
-}
-#[cfg(target_os = "none")]
 unsafe fn read16(base: u16, reg: u16) -> u16 {
     let mut p: Port<u16> = Port::new(base + reg);
     p.read()
@@ -582,8 +570,8 @@ mod tests {
         // avail = 6 + 2*64 = 134 bytes; ends at 1024 + 134 = 1158 → next
         // 4 KiB boundary is 4096.
         assert_eq!(l.used_off, 4096);
-        // used = 8 + 8*64 = 520 bytes.
-        assert_eq!(l.total, 4096 + 520);
+        // used = 6 + 8*64 = 518 bytes.
+        assert_eq!(l.total, 4096 + 518);
     }
 
     #[test]
@@ -592,8 +580,8 @@ mod tests {
         assert_eq!(l.avail_off, 16 * 256);
         // 16*256 = 4096; avail = 6 + 512 = 518; avail_end = 4614 → 8192.
         assert_eq!(l.used_off, 8192);
-        // used = 8 + 8*256 = 2056.
-        assert_eq!(l.total, 8192 + 2056);
+        // used = 6 + 8*256 = 2054.
+        assert_eq!(l.total, 8192 + 2054);
     }
 
     #[test]
