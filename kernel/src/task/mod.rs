@@ -84,38 +84,42 @@ pub struct TaskInfo {
     pub state: TaskStateView,
 }
 
-impl TaskInfo {
-    pub fn is_current(&self) -> bool {
-        self.state == TaskStateView::Running
-    }
-}
-
 /// Invoke `f` once per live task: current first, then ready queue in
-/// FIFO order, then parked (blocked) tasks in id order. Holds the
-/// scheduler lock for the duration, so `f` must not call back into
-/// `task::*`.
+/// FIFO order, then parked (blocked) tasks in id order. Snapshots the
+/// scheduler under lock and drops it before invoking `f`, so the
+/// callback is free to touch any other subsystem (including serial I/O
+/// and other `task::*` calls).
 pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
-    let sched = SCHED.lock();
-    if let Some(cur) = sched.current.as_ref() {
-        f(TaskInfo {
-            id: cur.id,
-            slice_remaining_ms: cur.slice_remaining_ms,
-            state: TaskStateView::Running,
-        });
-    }
-    for t in sched.ready.iter() {
-        f(TaskInfo {
-            id: t.id,
-            slice_remaining_ms: t.slice_remaining_ms,
-            state: TaskStateView::Ready,
-        });
-    }
-    for t in sched.parked.values() {
-        f(TaskInfo {
-            id: t.id,
-            slice_remaining_ms: t.slice_remaining_ms,
-            state: TaskStateView::Blocked,
-        });
+    let snapshot: alloc::vec::Vec<TaskInfo> = {
+        let sched = SCHED.lock();
+        let mut out = alloc::vec::Vec::with_capacity(
+            sched.current.is_some() as usize + sched.ready.len() + sched.parked.len(),
+        );
+        if let Some(cur) = sched.current.as_ref() {
+            out.push(TaskInfo {
+                id: cur.id,
+                slice_remaining_ms: cur.slice_remaining_ms,
+                state: TaskStateView::Running,
+            });
+        }
+        for t in sched.ready.iter() {
+            out.push(TaskInfo {
+                id: t.id,
+                slice_remaining_ms: t.slice_remaining_ms,
+                state: TaskStateView::Ready,
+            });
+        }
+        for t in sched.parked.values() {
+            out.push(TaskInfo {
+                id: t.id,
+                slice_remaining_ms: t.slice_remaining_ms,
+                state: TaskStateView::Blocked,
+            });
+        }
+        out
+    };
+    for info in snapshot {
+        f(info);
     }
 }
 

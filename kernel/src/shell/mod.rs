@@ -121,15 +121,7 @@ fn cmd_mem() {
 }
 
 fn cmd_tasks() {
-    // Collect the snapshot before any serial I/O: `for_each_task` holds
-    // the scheduler lock for the duration of its closure, so printing
-    // inside it would both lengthen the critical section and invite
-    // lock-ordering trouble if the serial path ever grows dependencies
-    // on the scheduler.
-    let mut tasks: alloc::vec::Vec<task::TaskInfo> = alloc::vec::Vec::new();
-    task::for_each_task(|t| tasks.push(t));
-
-    for t in tasks {
+    task::for_each_task(|t| {
         let tag = match t.state {
             TaskStateView::Running => "[run]",
             TaskStateView::Ready => "[rdy]",
@@ -141,5 +133,5 @@ fn cmd_tasks() {
             tag,
             t.slice_remaining_ms,
         );
-    }
+    });
 }
