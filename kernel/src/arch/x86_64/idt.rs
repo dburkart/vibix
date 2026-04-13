@@ -166,10 +166,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                 Ok(phys) => {
                     let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
                         .expect("#PF: VmObject returned unaligned phys");
-                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
+                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags)
+                    {
                         Ok(()) => return,
                         Err(e) => {
-                            serial_println!("#PF demand map failed addr={:#x}: {:?}", addr_u64, e)
+                            // map_existing_in_pml4 failed (OOM allocating page-table
+                            // frames). AnonObject::fault already called inc_refcount
+                            // for the PTE we won't install; roll it back so the
+                            // refcount stays balanced and AddressSpace::drop does not
+                            // see a phantom PTE reference.
+                            #[cfg(target_os = "none")]
+                            crate::mem::refcount::dec_refcount(phys);
+                            serial_println!(
+                                "#PF demand map failed addr={:#x}: {:?}",
+                                addr_u64,
+                                e
+                            )
                         }
                     }
                 }
@@ -180,25 +192,25 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         } else if is_write && pte_flags.contains(PageTableFlags::WRITABLE) {
             // Write-protection fault on a CoW-eligible page: the VMA
             // wants WRITABLE but the PTE was installed read-only by the
-            // fork path. Fetch the source frame and make a private copy.
-            match object.fault(offset, Access::Read) {
-                Ok(phys) => {
-                    let source = PhysFrame::from_start_address(PhysAddr::new(phys))
-                        .expect("#PF: VmObject returned unaligned phys for CoW source");
-                    match crate::mem::paging::cow_copy_and_remap(active, page, source, pte_flags) {
-                        Ok(_) => return,
-                        Err(e) => serial_println!(
-                            "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
-                            addr_u64,
-                            e
-                        ),
-                    }
+            // fork path. Look up the source frame via frame_at (no
+            // PTE-refcount side-effect — fault() would inc_refcount for a
+            // frame that never gets a new PTE installed for it here).
+            if let Some(phys) = object.frame_at(offset) {
+                let source = PhysFrame::from_start_address(PhysAddr::new(phys))
+                    .expect("#PF: frame_at returned unaligned phys for CoW source");
+                match crate::mem::paging::cow_copy_and_remap(active, page, source, pte_flags) {
+                    Ok(_) => return,
+                    Err(e) => serial_println!(
+                        "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
+                        addr_u64,
+                        e
+                    ),
                 }
-                Err(e) => serial_println!(
-                    "#PF CoW VmObject::fault failed addr={:#x}: {:?}",
-                    addr_u64,
-                    e
-                ),
+            } else {
+                serial_println!(
+                    "#PF CoW: no cached frame for addr={:#x} (VmObject has no frame_at)",
+                    addr_u64
+                );
             }
         }
     }

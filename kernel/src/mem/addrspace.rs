@@ -297,23 +297,28 @@ impl AddressSpace {
 
                     match share {
                         Share::Private => {
-                            // Give child a reference to this frame.
-                            let _prev = refcount::inc_refcount(phys);
-                            // Strip WRITABLE from child PTE.
                             let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
+                            // Acquire child PTE reference.
+                            refcount::inc_refcount(phys);
                             if let Err(_) = paging::map_existing_in_pml4(
                                 child.page_table,
                                 page,
                                 pte_frame,
                                 ro_flags,
                             ) {
-                                // Child PTE install failed — drop cleans up.
+                                // Roll back the child PTE increment.
+                                refcount::dec_refcount(phys);
                                 return Err(ForkError::OutOfMemory);
                             }
-                            // Strip WRITABLE from parent PTE too.
-                            // Unmap old PTE (puts the PTE-reference), increment
-                            // again for the new read-only parent PTE, then remap.
+                            // W-strip parent PTE: unmap (old PTE reference now
+                            // floating), release the old reference, then acquire
+                            // a fresh reference for the new read-only parent PTE.
                             let _ = paging::unmap_in_pml4(self.page_table, page);
+                            // Release the old parent PTE's reference that was
+                            // acquired by AnonObject::fault when the page was
+                            // first demand-faulted.
+                            crate::mem::frame::put(phys);
+                            // Acquire reference for the new parent PTE.
                             refcount::inc_refcount(phys);
                             if let Err(_) = paging::map_existing_in_pml4(
                                 self.page_table,
@@ -321,6 +326,8 @@ impl AddressSpace {
                                 pte_frame,
                                 ro_flags,
                             ) {
+                                // Roll back the new parent PTE increment.
+                                refcount::dec_refcount(phys);
                                 return Err(ForkError::OutOfMemory);
                             }
                             flusher.invalidate(x86_64::VirtAddr::new(va as u64));
@@ -334,6 +341,7 @@ impl AddressSpace {
                                 pte_frame,
                                 pte_flags,
                             ) {
+                                refcount::dec_refcount(phys);
                                 return Err(ForkError::OutOfMemory);
                             }
                         }
