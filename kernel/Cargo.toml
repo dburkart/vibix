@@ -107,3 +107,7 @@ harness = false
 [[test]]
 name = "demand_paging"
 harness = false
+
+[[test]]
+name = "userspace_module"
+harness = false

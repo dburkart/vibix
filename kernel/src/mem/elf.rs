@@ -17,6 +17,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Ehdr {
     e_ident: [u8; 16],
     e_type: u16,
@@ -35,6 +36,7 @@ struct Elf64Ehdr {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Elf64Phdr {
     p_type: u32,
     p_flags: u32,
@@ -56,6 +58,67 @@ pub(super) struct LoadSegment {
     pub flags: PageTableFlags,
 }
 
+/// Parsed ELF64 image metadata for segment walking.
+#[derive(Clone, Copy)]
+pub(super) struct ParsedElf<'a> {
+    ehdr: Elf64Ehdr,
+    phdr_bytes: &'a [u8],
+    phnum: usize,
+}
+
+pub(super) struct LoadSegmentIter<'a> {
+    phdr_bytes: &'a [u8],
+    phnum: usize,
+    idx: usize,
+}
+
+impl<'a> Iterator for LoadSegmentIter<'a> {
+    type Item = LoadSegment;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.phnum {
+            let off = self.idx * core::mem::size_of::<Elf64Phdr>();
+            self.idx += 1;
+            // SAFETY: `phdr_bytes` was bounds-checked to hold exactly
+            // `phnum` contiguous `Elf64Phdr` records. Unaligned reads
+            // are intentional because ELF headers are byte-packed.
+            let ph = unsafe {
+                core::ptr::read_unaligned(self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>())
+            };
+            if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+                continue;
+            }
+            let mut flags = PageTableFlags::PRESENT;
+            if ph.p_flags & PF_W != 0 {
+                flags |= PageTableFlags::WRITABLE;
+            }
+            if ph.p_flags & PF_X == 0 {
+                flags |= PageTableFlags::NO_EXECUTE;
+            }
+            return Some(LoadSegment {
+                vaddr: VirtAddr::new(ph.p_vaddr),
+                memsz: ph.p_memsz,
+                flags,
+            });
+        }
+        None
+    }
+}
+
+impl<'a> ParsedElf<'a> {
+    pub(super) fn load_segments(self) -> LoadSegmentIter<'a> {
+        LoadSegmentIter {
+            phdr_bytes: self.phdr_bytes,
+            phnum: self.phnum,
+            idx: 0,
+        }
+    }
+
+    pub(super) fn entry(&self) -> VirtAddr {
+        VirtAddr::new(self.ehdr.e_entry)
+    }
+}
+
 /// Iterate `PT_LOAD` segments of the running kernel's ELF image,
 /// reachable through Limine's `ExecutableFileRequest`.
 ///
@@ -63,6 +126,7 @@ pub(super) struct LoadSegment {
 /// the ELF magic is wrong, or the class isn't 64-bit — any of those
 /// would mean the bootloader handed us something we can't reason
 /// about, and limping on would only corrupt page tables.
+#[cfg(target_os = "none")]
 pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
     let resp = crate::boot::KERNEL_FILE_REQUEST
         .get_response()
@@ -78,7 +142,37 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
     // SAFETY: Limine guarantees the file bytes live at this address
     // for the lifetime of the kernel (BOOTLOADER_RECLAIMABLE-adjacent
     // but held through `EXECUTABLE_AND_MODULES`). We only read.
-    let ehdr: &Elf64Ehdr = unsafe { &*(base as *const Elf64Ehdr) };
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(base, size) };
+    parse_elf64(bytes).load_segments()
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+    let base = file.addr();
+    let size = file.size() as usize;
+    if size < core::mem::size_of::<Elf64Ehdr>() {
+        return None;
+    }
+    // SAFETY: Limine keeps module file bytes resident for kernel use.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(base, size) };
+    let parsed = parse_elf64(bytes);
+    Some((parsed.entry(), parsed.load_segments().count()))
+}
+
+pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
+    assert!(
+        bytes.len() >= core::mem::size_of::<Elf64Ehdr>(),
+        "kernel ELF too small for Ehdr"
+    );
+
+    // SAFETY: length checked above and we use `read_unaligned` so no
+    // alignment assumptions are required for the input slice.
+    let ehdr = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Elf64Ehdr>()) };
     assert_eq!(ehdr.e_ident[..4], ELF_MAGIC, "kernel ELF bad magic");
     assert_eq!(ehdr.e_ident[4], ELFCLASS64, "kernel ELF not ELFCLASS64");
     assert_eq!(
@@ -92,35 +186,94 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
     let phsz = ehdr.e_phentsize as usize;
     let phdr_table_end = phnum
         .checked_mul(phsz)
-        .and_then(|bytes| phoff.checked_add(bytes))
+        .and_then(|n| phoff.checked_add(n))
         .expect("kernel ELF phdr table size overflow");
-    assert!(phdr_table_end <= size, "kernel ELF phdr table out of range");
-
-    // SAFETY: bounds checked above; the slice covers only phdrs, and
-    // the alignment assertion guarantees the cast-to-reference is
-    // sound even on toolchains that place `e_phoff` oddly.
-    let phdr_ptr = unsafe { base.add(phoff) } as *const Elf64Phdr;
     assert!(
-        phdr_ptr.align_offset(core::mem::align_of::<Elf64Phdr>()) == 0,
-        "kernel ELF phdr table misaligned"
+        phdr_table_end <= bytes.len(),
+        "kernel ELF phdr table out of range"
     );
-    let phdrs: &[Elf64Phdr] = unsafe { core::slice::from_raw_parts(phdr_ptr, phnum) };
 
-    phdrs.iter().filter_map(|ph| {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            return None;
-        }
-        let mut flags = PageTableFlags::PRESENT;
-        if ph.p_flags & PF_W != 0 {
-            flags |= PageTableFlags::WRITABLE;
-        }
-        if ph.p_flags & PF_X == 0 {
-            flags |= PageTableFlags::NO_EXECUTE;
-        }
-        Some(LoadSegment {
-            vaddr: VirtAddr::new(ph.p_vaddr),
-            memsz: ph.p_memsz,
-            flags,
-        })
-    })
+    ParsedElf {
+        ehdr,
+        phdr_bytes: &bytes[phoff..phdr_table_end],
+        phnum,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_elf64;
+    use x86_64::structures::paging::PageTableFlags;
+
+    const EHDR_SIZE: usize = 64;
+    const PHDR_SIZE: usize = 56;
+
+    fn put16(buf: &mut [u8], off: usize, v: u16) {
+        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn sample_elf_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; EHDR_SIZE + (2 * PHDR_SIZE)];
+        bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // little-endian
+        bytes[6] = 1; // ELF v1
+        put16(&mut bytes, 16, 2); // ET_EXEC
+        put16(&mut bytes, 18, 0x3e); // x86_64
+        put32(&mut bytes, 20, 1); // EV_CURRENT
+        put64(&mut bytes, 24, 0x400080); // entry
+        put64(&mut bytes, 32, EHDR_SIZE as u64); // e_phoff
+        put16(&mut bytes, 52, EHDR_SIZE as u16); // e_ehsize
+        put16(&mut bytes, 54, PHDR_SIZE as u16); // e_phentsize
+        put16(&mut bytes, 56, 2); // e_phnum
+
+        // phdr 0: RX text-like
+        let p0 = EHDR_SIZE;
+        put32(&mut bytes, p0, 1); // PT_LOAD
+        put32(&mut bytes, p0 + 4, 1); // PF_X
+        put64(&mut bytes, p0 + 16, 0x400000); // p_vaddr
+        put64(&mut bytes, p0 + 40, 0x2000); // p_memsz
+
+        // phdr 1: RW data-like
+        let p1 = EHDR_SIZE + PHDR_SIZE;
+        put32(&mut bytes, p1, 1); // PT_LOAD
+        put32(&mut bytes, p1 + 4, 2); // PF_W
+        put64(&mut bytes, p1 + 16, 0x402000); // p_vaddr
+        put64(&mut bytes, p1 + 40, 0x1000); // p_memsz
+
+        bytes
+    }
+
+    #[test]
+    fn parses_entry_and_segment_flags() {
+        let bytes = sample_elf_bytes();
+        let parsed = parse_elf64(&bytes);
+        assert_eq!(parsed.entry().as_u64(), 0x400080);
+        let segs: Vec<_> = parsed.load_segments().collect();
+        assert_eq!(segs.len(), 2);
+
+        assert_eq!(segs[0].vaddr.as_u64(), 0x400000);
+        assert_eq!(segs[0].memsz, 0x2000);
+        assert!(!segs[0].flags.contains(PageTableFlags::WRITABLE));
+        assert!(!segs[0].flags.contains(PageTableFlags::NO_EXECUTE));
+
+        assert_eq!(segs[1].vaddr.as_u64(), 0x402000);
+        assert_eq!(segs[1].memsz, 0x1000);
+        assert!(segs[1].flags.contains(PageTableFlags::WRITABLE));
+        assert!(segs[1].flags.contains(PageTableFlags::NO_EXECUTE));
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel ELF bad magic")]
+    fn rejects_bad_magic() {
+        let mut bytes = sample_elf_bytes();
+        bytes[0] = 0;
+        let _ = parse_elf64(&bytes);
+    }
 }

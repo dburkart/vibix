@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "xtask"]
+members = ["kernel", "xtask", "userspace/hello"]
 resolver = "2"
 
 [workspace.package]

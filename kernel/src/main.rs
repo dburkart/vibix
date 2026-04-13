@@ -54,6 +54,15 @@ pub extern "C" fn _start() -> ! {
     serial_println!("GDT + IDT loaded");
 
     vibix::mem::init();
+    if let Some((entry, load_segments)) = vibix::mem::userspace_module_elf_summary() {
+        serial_println!(
+            "userspace module ELF entry={:#x} load_segments={}",
+            entry.as_u64(),
+            load_segments
+        );
+    } else {
+        serial_println!("userspace module ELF missing");
+    }
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     vibix::time::init();
 

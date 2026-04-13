@@ -2,14 +2,19 @@
 //! sections so the Limine bootloader can find and fill them in before we
 //! take control.
 
+use limine::modules::InternalModule;
 use limine::request::{
     ExecutableAddressRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
+    MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest,
+    StackSizeRequest,
 };
 use limine::BaseRevision;
 
 /// Ask Limine for a 64 KiB bootstrap stack. Comfortable for early init.
 const STACK_SIZE: u64 = 64 * 1024;
+const INTERNAL_HELLO_MODULE: InternalModule =
+    InternalModule::new().with_path(c"/boot/userspace_hello.elf");
+const INTERNAL_HELLO_MODULES: [&InternalModule; 1] = [&INTERNAL_HELLO_MODULE];
 
 #[used]
 #[link_section = ".limine_requests"]
@@ -38,6 +43,11 @@ pub static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressR
 #[used]
 #[link_section = ".limine_requests"]
 pub static KERNEL_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static MODULE_REQUEST: ModuleRequest =
+    ModuleRequest::new().with_internal_modules(&INTERNAL_HELLO_MODULES);
 
 #[used]
 #[link_section = ".limine_requests"]

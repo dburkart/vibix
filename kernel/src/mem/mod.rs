@@ -12,7 +12,7 @@
 
 pub mod frame;
 
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 mod elf;
 #[cfg(target_os = "none")]
 pub mod heap;
@@ -71,4 +71,11 @@ pub fn init() {
     // and all BOOTLOADER_RECLAIMABLE regions now that we no longer need
     // the bootloader's page-table tree or its data structures.
     paging::reclaim_bootloader_memory();
+}
+
+/// Return the parsed entry point and loadable-segment count for the first
+/// userspace module delivered by Limine, if present and well-formed.
+#[cfg(target_os = "none")]
+pub fn userspace_module_elf_summary() -> Option<(x86_64::VirtAddr, usize)> {
+    elf::first_loaded_module_elf_summary()
 }
