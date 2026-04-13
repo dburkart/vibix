@@ -81,7 +81,11 @@ pub fn enable_smep_smap() {
 #[inline(always)]
 unsafe fn stac() {
     if SMAP_ON.load(Ordering::Relaxed) {
-        core::arch::asm!("stac", options(nomem, nostack));
+        // `nostack` only — omitting `nomem` makes this a compiler memory
+        // barrier so LLVM cannot hoist volatile loads/stores (in the
+        // copy_*_user callers) past this instruction and out of the
+        // STAC/CLAC bracket.
+        core::arch::asm!("stac", options(nostack));
     }
 }
 
@@ -89,7 +93,10 @@ unsafe fn stac() {
 #[inline(always)]
 unsafe fn clac() {
     if SMAP_ON.load(Ordering::Relaxed) {
-        core::arch::asm!("clac", options(nomem, nostack));
+        // Same reasoning as `stac`: no `nomem` so this acts as a compiler
+        // memory barrier, preventing the volatile accesses from sinking
+        // past the bracket.
+        core::arch::asm!("clac", options(nostack));
     }
 }
 
