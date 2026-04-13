@@ -375,6 +375,57 @@ pub fn cow_copy_and_remap(
     Ok(new_frame)
 }
 
+/// Unmap `page` from `pml4_frame` and return its backing frame. Unlike
+/// [`unmap`], scopes to a specific PML4 — the reaper path in
+/// `task::exit` uses this to clean up a dead task's private mappings
+/// while running on a different (live) PML4.
+pub fn unmap_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+) -> Result<PhysFrame<Size4KiB>, UnmapError> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before unmap_in_pml4");
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let (frame, flush) = mapper.unmap(page)?;
+    // Always flush this CPU's TLB for `page`. `Cr3::read().0 ==
+    // pml4_frame` isn't sufficient: upper-half L3 subtrees are aliased
+    // into every PML4 (shared kernel window), so an unmap performed
+    // through the victim PML4 invalidates entries that the active CR3's
+    // TLB may have cached. Leaving them behind lets freed frames be
+    // reallocated while stale translations still point at them.
+    // `invlpg` is a single-CPU op; multi-CPU shootdown is a follow-up
+    // once we have >1 AP online.
+    flush.flush();
+    Ok(frame)
+}
+
+/// Unmap `page` from `pml4_frame` and return its backing frame to the
+/// global allocator. Mirrors [`unmap_and_free`] for the
+/// arbitrary-PML4 case.
+pub fn unmap_and_free_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+) -> Result<(), UnmapError> {
+    let frame = unmap_in_pml4(pml4_frame, page)?;
+    // SAFETY: caller asserts the frame came from the global allocator.
+    unsafe { KernelFrameAllocator.deallocate_frame(frame) };
+    Ok(())
+}
+
+/// Return `pml4_frame` to the global frame allocator.
+///
+/// # Safety
+/// The caller must guarantee that no CPU is using `pml4_frame` as its
+/// active page table and that no outstanding reference (PTE alias,
+/// OffsetPageTable, cached `&mut PageTable`) still exists. Kernel
+/// upper-half entries reference shared L3 tables owned by the kernel
+/// PML4 — freeing this L4 frame does not affect them.
+pub unsafe fn free_pml4_frame(pml4_frame: PhysFrame<Size4KiB>) {
+    KernelFrameAllocator.deallocate_frame(pml4_frame);
+}
+
 /// HHDM offset currently in use. Panics if [`init`] hasn't run.
 /// Exposed for tests that need to poke raw frame contents via the
 /// high half.

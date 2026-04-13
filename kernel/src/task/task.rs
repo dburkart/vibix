@@ -234,6 +234,27 @@ impl Task {
         }
     }
 
+    /// Base VA of the mapped stack pages (guard page excluded). Zero
+    /// for the bootstrap task, which has no separate stack allocation.
+    pub fn stack_base(&self) -> usize {
+        if self.guard_base == 0 {
+            0
+        } else {
+            self.guard_base + GUARD_SIZE
+        }
+    }
+
+    /// Number of 4 KiB stack pages owned by this task. Zero for the
+    /// bootstrap task (mirrors `stack_base() == 0`) so cleanup paths
+    /// can loop `0..stack_page_count()` without a separate guard.
+    pub fn stack_page_count(&self) -> usize {
+        if self.guard_base == 0 {
+            0
+        } else {
+            STACK_SIZE / 4096
+        }
+    }
+
     /// Returns `true` if `addr` falls within this task's guard page.
     ///
     /// Always returns `false` for the bootstrap task (`guard_base == 0`).

@@ -135,3 +135,7 @@ harness = false
 [[test]]
 name = "fpu_context_switch"
 harness = false
+
+[[test]]
+name = "task_exit"
+harness = false
