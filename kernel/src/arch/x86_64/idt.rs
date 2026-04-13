@@ -70,6 +70,34 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         }
     }
 
+    // Demand-paging resolver: a not-present fault inside an installed
+    // VMA is satisfied by allocating + zeroing a frame and mapping it
+    // with the VMA's flags. Protection violations (P bit set in the
+    // error code) fall through — those are real access-rights bugs,
+    // not missing-page cases.
+    if !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+        if let Some((kind, flags)) = crate::task::current_vma_lookup(addr_u64 as usize) {
+            match kind {
+                crate::mem::vma::VmaKind::AnonZero => {
+                    use x86_64::structures::paging::{Page, Size4KiB};
+                    use x86_64::VirtAddr;
+                    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
+                    let active = x86_64::registers::control::Cr3::read().0;
+                    match crate::mem::paging::map_in_pml4(active, page, flags) {
+                        Ok(_) => return,
+                        Err(e) => {
+                            serial_println!(
+                                "#PF demand-page resolve failed addr={:#x}: {:?}",
+                                addr_u64,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Check whether the fault address lands inside a kernel task's guard
     // page — if so, this is a stack overflow, not a generic fault.
     if let Some(task_id) = crate::task::find_stack_overflow(addr_u64 as usize) {

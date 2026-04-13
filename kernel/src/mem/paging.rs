@@ -265,6 +265,40 @@ pub fn new_task_pml4() -> PhysFrame<Size4KiB> {
     new_frame
 }
 
+/// Map `page` to a freshly-allocated zeroed frame in the PML4 rooted
+/// at `pml4_frame`, with `flags`. Intended for the `#PF` demand-paging
+/// resolver: the handler runs in the faulting task's address space, so
+/// it passes `Cr3::read().0` for `pml4_frame`.
+///
+/// Flushes the TLB entry for `page` if `pml4_frame` is the currently
+/// active PML4; otherwise the new mapping only becomes visible when a
+/// later CR3 load installs this PML4 (at which point the load flushes
+/// non-global TLB entries implicitly).
+pub fn map_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<PhysFrame<Size4KiB>, MapToError<Size4KiB>> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before map_in_pml4");
+    let mut alloc = KernelFrameAllocator;
+    // SAFETY: just-allocated frame, zeroed through HHDM, exclusive.
+    let data_frame = unsafe { alloc_zeroed_frame(hhdm) };
+    // SAFETY: `pml4_frame` is a valid page-table frame and `hhdm` is
+    // the live HHDM offset. The temporary OffsetPageTable only lives
+    // for this call; no aliasing handle to the same PML4 escapes.
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    let flush = unsafe { mapper.map_to(page, data_frame, flags, &mut alloc)? };
+    if Cr3::read().0 == pml4_frame {
+        flush.flush();
+    } else {
+        flush.ignore();
+    }
+    Ok(data_frame)
+}
+
 // -- PML4 construction + CR3 swap ---------------------------------------
 
 /// Build a fresh kernel PML4 and switch CR3 to it. Drops Limine's

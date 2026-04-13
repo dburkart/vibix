@@ -103,3 +103,7 @@ harness = false
 [[test]]
 name = "per_task_cr3"
 harness = false
+
+[[test]]
+name = "demand_paging"
+harness = false
