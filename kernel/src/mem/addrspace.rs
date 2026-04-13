@@ -224,9 +224,9 @@ impl AddressSpace {
         &mut self,
         flusher: &mut crate::mem::tlb::Flusher,
     ) -> Result<AddressSpace, ForkError> {
-        use alloc::sync::Arc;
-        use crate::mem::{paging, refcount};
         use crate::mem::vmatree::{Share, Vma as VmaEntry};
+        use crate::mem::{paging, refcount};
+        use alloc::sync::Arc;
         use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 
         // Allocate child PML4 + copy kernel upper half.
@@ -239,11 +239,30 @@ impl AddressSpace {
 
         // Collect VMAs first (avoids borrow conflict when we later
         // mutate the child and call paging helpers on self.page_table).
-        type VmaSnap = (usize, usize, u32, u64, Share, Arc<dyn crate::mem::vmobject::VmObject>, usize);
-        let vma_snapshot: alloc::vec::Vec<VmaSnap> =
-            self.vmas.iter().map(|v| {
-                (v.start, v.end, v.prot_user, v.prot_pte, v.share, Arc::clone(&v.object), v.object_offset)
-            }).collect();
+        type VmaSnap = (
+            usize,
+            usize,
+            u32,
+            u64,
+            Share,
+            Arc<dyn crate::mem::vmobject::VmObject>,
+            usize,
+        );
+        let vma_snapshot: alloc::vec::Vec<VmaSnap> = self
+            .vmas
+            .iter()
+            .map(|v| {
+                (
+                    v.start,
+                    v.end,
+                    v.prot_user,
+                    v.prot_pte,
+                    v.share,
+                    Arc::clone(&v.object),
+                    v.object_offset,
+                )
+            })
+            .collect();
 
         for (start, end, prot_user, prot_pte, share, object, object_offset) in &vma_snapshot {
             let prot_user = *prot_user;
@@ -255,7 +274,8 @@ impl AddressSpace {
 
             // Insert VMA into child.
             let child_vma = VmaEntry::new(
-                start, end,
+                start,
+                end,
                 prot_user,
                 prot_pte,
                 share,
@@ -267,10 +287,8 @@ impl AddressSpace {
 
             let mut va = start;
             while va < end {
-                let page = Page::<Size4KiB>::from_start_address(
-                    x86_64::VirtAddr::new(va as u64),
-                )
-                .expect("vma VA page-aligned");
+                let page = Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(va as u64))
+                    .expect("vma VA page-aligned");
 
                 if let Some((pte_frame, pte_flags)) =
                     paging::translate_in_pml4(self.page_table, x86_64::VirtAddr::new(va as u64))

@@ -45,8 +45,14 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("fork_cow_vma_tree_is_cloned", &(fork_cow_vma_tree_is_cloned as fn())),
-        ("fork_cow_parent_write_diverges", &(fork_cow_parent_write_diverges as fn())),
+        (
+            "fork_cow_vma_tree_is_cloned",
+            &(fork_cow_vma_tree_is_cloned as fn()),
+        ),
+        (
+            "fork_cow_parent_write_diverges",
+            &(fork_cow_parent_write_diverges as fn()),
+        ),
         ("fork_cow_no_frame_leak", &(fork_cow_no_frame_leak as fn())),
     ];
     serial_println!("running {} tests", tests.len());
@@ -150,7 +156,9 @@ fn fork_cow_no_frame_leak() {
     for _ in 0..2 {
         let mut parent = make_parent_aspace();
         let mut flusher = Flusher::new_active();
-        let child = parent.fork_address_space(&mut flusher).expect("fork failed");
+        let child = parent
+            .fork_address_space(&mut flusher)
+            .expect("fork failed");
         flusher.finish();
         drop(parent);
         drop(child);
@@ -161,7 +169,9 @@ fn fork_cow_no_frame_leak() {
     for _ in 0..8 {
         let mut parent = make_parent_aspace();
         let mut flusher = Flusher::new_active();
-        let child = parent.fork_address_space(&mut flusher).expect("fork failed");
+        let child = parent
+            .fork_address_space(&mut flusher)
+            .expect("fork failed");
         flusher.finish();
         drop(parent);
         drop(child);
