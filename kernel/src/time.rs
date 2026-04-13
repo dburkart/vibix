@@ -235,11 +235,9 @@ fn read_cmos(register: u8) -> u8 {
     unsafe {
         let mut index = Port::<u8>::new(0x70);
         let mut data = Port::<u8>::new(0x71);
-        let previous = index.read();
-        let nmi_mask = previous & CMOS_NMI_MASK;
-        index.write(nmi_mask | register);
+        index.write(CMOS_NMI_MASK | register);
         let value = data.read();
-        index.write(previous);
+        index.write(register);
         value
     }
 }
