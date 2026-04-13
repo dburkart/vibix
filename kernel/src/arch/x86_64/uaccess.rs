@@ -21,10 +21,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
 use crate::cpu::{self, Feature};
-
-/// First canonical upper-half address. Any user pointer at or above this
-/// is a kernel address and must be rejected.
-pub const USER_VA_END: u64 = 0x0000_8000_0000_0000;
+// Single source of truth for the lower/upper canonical-half boundary.
+// Re-exported so callers in this module can use the short name.
+pub use crate::mem::addrspace::USER_VA_END;
 
 /// Cached so `stac`/`clac` can skip the SMAP ops on CPUs that don't
 /// implement them (e.g. `qemu64` without `-cpu max`).
@@ -82,7 +81,7 @@ pub fn enable_smep_smap() {
 #[inline(always)]
 unsafe fn stac() {
     if SMAP_ON.load(Ordering::Relaxed) {
-        core::arch::asm!("stac", options(nomem, preserves_flags));
+        core::arch::asm!("stac", options(nomem, nostack));
     }
 }
 
@@ -90,19 +89,22 @@ unsafe fn stac() {
 #[inline(always)]
 unsafe fn clac() {
     if SMAP_ON.load(Ordering::Relaxed) {
-        core::arch::asm!("clac", options(nomem, preserves_flags));
+        core::arch::asm!("clac", options(nomem, nostack));
     }
 }
 
 /// Validate `[uva, uva + len)` lies entirely within the lower canonical
 /// half. Returns `Efault` on overflow or kernel-half overlap.
+///
+/// Exposed so syscall handlers can reject a bad range up front before
+/// any observable side effect (e.g. emitting bytes to the UART).
 #[inline]
-fn check_range(uva: u64, len: usize) -> Result<(), Efault> {
+pub fn check_user_range(uva: usize, len: usize) -> Result<(), Efault> {
     if len == 0 {
         return Ok(());
     }
-    let end = uva.checked_add(len as u64).ok_or(Efault)?;
-    if uva >= USER_VA_END || end > USER_VA_END {
+    let end = (uva as u64).checked_add(len as u64).ok_or(Efault)?;
+    if uva as u64 >= USER_VA_END || end > USER_VA_END {
         return Err(Efault);
     }
     Ok(())
@@ -121,7 +123,7 @@ fn check_range(uva: u64, len: usize) -> Result<(), Efault> {
 /// per-CPU AC bit; a context switch clobbers it). Syscalls already
 /// run with IF=0 via the SFMASK we install.
 pub unsafe fn copy_from_user(dst: &mut [u8], src_uva: usize) -> Result<(), Efault> {
-    check_range(src_uva as u64, dst.len())?;
+    check_user_range(src_uva, dst.len())?;
     let src = src_uva as *const u8;
     stac();
     for i in 0..dst.len() {
@@ -137,7 +139,7 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src_uva: usize) -> Result<(), Efaul
 /// Same constraints as `copy_from_user` but the user range must be
 /// mapped writable.
 pub unsafe fn copy_to_user(dst_uva: usize, src: &[u8]) -> Result<(), Efault> {
-    check_range(dst_uva as u64, src.len())?;
+    check_user_range(dst_uva, src.len())?;
     let dst = dst_uva as *mut u8;
     stac();
     for i in 0..src.len() {

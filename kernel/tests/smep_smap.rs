@@ -96,20 +96,26 @@ fn copy_roundtrip_user() {
     const BASE: usize = 0x0000_3000_0010_0000;
     const PAGES: usize = 2;
 
+    // USER_ACCESSIBLE is load-bearing here: without it the pages are
+    // mapped supervisor-only (U/S=0), SMAP wouldn't block ring-0 access,
+    // and the copy_*_user helpers would appear to work even if their
+    // STAC/CLAC bracket were broken. With U/S=1 the round-trip only
+    // succeeds when SMAP is actually toggled inside the helpers.
     task::install_vma_on_current(Vma::new(
         BASE,
         BASE + PAGES * 4096,
         VmaKind::AnonZero,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE,
     ));
 
-    // Fault each page in by touching it. We're still running in ring-0
-    // and this task's PML4 — this is a demand-paging trigger, not a
-    // user-pointer-from-kernel access.
-    for i in 0..PAGES {
-        unsafe { core::ptr::write_volatile((BASE + i * 4096) as *mut u8, 0) };
-    }
-
+    // No explicit warm-up touch: with USER_ACCESSIBLE mappings a ring-0
+    // write without `stac` would itself trip SMAP. Let `copy_to_user`
+    // drive demand paging under its own STAC bracket — the fault
+    // handler's CLAC keeps the resolver running with SMAP live, and the
+    // IRET retry completes inside the bracket.
     let payload: [u8; 16] = *b"smep_smap_rtrip!";
     let mut readback = [0u8; 16];
     unsafe {
