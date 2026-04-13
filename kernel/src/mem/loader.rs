@@ -29,11 +29,18 @@ const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadError {
+    /// `bytes` failed ELF64 parsing (bad magic, wrong class, bad phdr
+    /// table, non-canonical addresses, entry outside PT_LOAD, etc.).
     NotElf64,
-    NonCanonicalEntry,
+    /// A `PT_LOAD` segment (or the entry) is in the lower half of the
+    /// virtual address space. The loader only installs upper-half
+    /// mappings so they propagate through `new_task_pml4`.
     SegmentNotUpperHalf,
+    /// A `PT_LOAD` segment's `p_vaddr` isn't 4 KiB-aligned. We only
+    /// install 4 KiB PTEs so the caller's linker script has to align
+    /// segments to that boundary.
     SegmentNotPageAligned,
-    SegmentFileTooShort,
+    /// Frame allocation or page-table install failed mid-segment.
     MapFailed,
 }
 
@@ -75,13 +82,10 @@ fn map_segment(bytes: &[u8], seg: elf::LoadSegment) -> Result<(), LoadError> {
         return Err(LoadError::SegmentNotPageAligned);
     }
 
-    let file_end = seg
-        .file_offset
-        .checked_add(seg.filesz)
-        .ok_or(LoadError::SegmentFileTooShort)?;
-    if (file_end as usize) > bytes.len() {
-        return Err(LoadError::SegmentFileTooShort);
-    }
+    // The parser already rejects PT_LOAD segments where
+    // `p_offset + p_filesz` overflows or exceeds the image, so this
+    // slice is just a sanity restatement of that invariant.
+    let file_end = seg.file_offset + seg.filesz;
     let src = &bytes[seg.file_offset as usize..file_end as usize];
 
     let page_count = seg.memsz.div_ceil(PAGE_SIZE);

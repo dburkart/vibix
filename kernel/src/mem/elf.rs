@@ -78,6 +78,11 @@ enum ElfParseError {
     PhdrTableOutOfRange,
     NonCanonicalEntry,
     NonCanonicalLoadVaddr,
+    LoadFileszExceedsMemsz,
+    LoadFileRangeOverflow,
+    LoadFileRangeOutOfRange,
+    LoadVaddrRangeOverflow,
+    EntryOutsideLoadSegment,
 }
 
 impl ElfParseError {
@@ -91,6 +96,11 @@ impl ElfParseError {
             Self::PhdrTableOutOfRange => "ELF phdr table out of range",
             Self::NonCanonicalEntry => "ELF entry address is non-canonical",
             Self::NonCanonicalLoadVaddr => "ELF PT_LOAD virtual address is non-canonical",
+            Self::LoadFileszExceedsMemsz => "ELF PT_LOAD p_filesz exceeds p_memsz",
+            Self::LoadFileRangeOverflow => "ELF PT_LOAD file range arithmetic overflow",
+            Self::LoadFileRangeOutOfRange => "ELF PT_LOAD file range exceeds image bounds",
+            Self::LoadVaddrRangeOverflow => "ELF PT_LOAD virtual range arithmetic overflow",
+            Self::EntryOutsideLoadSegment => "ELF entry address not covered by any PT_LOAD",
         }
     }
 }
@@ -251,14 +261,38 @@ fn parse_elf64_inner(bytes: &[u8]) -> Result<ParsedElf<'_>, ElfParseError> {
         return Err(ElfParseError::NonCanonicalEntry);
     }
 
+    let mut entry_covered = false;
     for i in 0..phnum {
         let off = phoff + i * phsz;
         // SAFETY: `phdr_table_end` bounds-check above guarantees every
         // header read in this loop stays within `bytes`.
         let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
-        if ph.p_type == PT_LOAD && ph.p_memsz != 0 && VirtAddr::try_new(ph.p_vaddr).is_err() {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        if VirtAddr::try_new(ph.p_vaddr).is_err() {
             return Err(ElfParseError::NonCanonicalLoadVaddr);
         }
+        if ph.p_filesz > ph.p_memsz {
+            return Err(ElfParseError::LoadFileszExceedsMemsz);
+        }
+        let file_end = ph
+            .p_offset
+            .checked_add(ph.p_filesz)
+            .ok_or(ElfParseError::LoadFileRangeOverflow)?;
+        if file_end > bytes.len() as u64 {
+            return Err(ElfParseError::LoadFileRangeOutOfRange);
+        }
+        let vaddr_end = ph
+            .p_vaddr
+            .checked_add(ph.p_memsz)
+            .ok_or(ElfParseError::LoadVaddrRangeOverflow)?;
+        if ehdr.e_entry >= ph.p_vaddr && ehdr.e_entry < vaddr_end {
+            entry_covered = true;
+        }
+    }
+    if !entry_covered {
+        return Err(ElfParseError::EntryOutsideLoadSegment);
     }
 
     Ok(ParsedElf {
