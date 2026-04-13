@@ -8,6 +8,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// PIT oscillator frequency, in Hz. Divisor = this / desired Hz.
+#[cfg(target_os = "none")]
 const PIT_FREQ_HZ: u32 = 1_193_182;
 /// Desired tick rate. 100 Hz → 10 ms per tick — coarse, but cheap and
 /// plenty for a toy kernel.
@@ -47,19 +48,30 @@ struct RawRtc {
     status_b: u8,
 }
 
+#[cfg(target_os = "none")]
 const CMOS_SECONDS: u8 = 0x00;
+#[cfg(target_os = "none")]
 const CMOS_MINUTES: u8 = 0x02;
+#[cfg(target_os = "none")]
 const CMOS_HOURS: u8 = 0x04;
+#[cfg(target_os = "none")]
 const CMOS_DAY: u8 = 0x07;
+#[cfg(target_os = "none")]
 const CMOS_MONTH: u8 = 0x08;
+#[cfg(target_os = "none")]
 const CMOS_YEAR: u8 = 0x09;
+#[cfg(target_os = "none")]
 const CMOS_STATUS_A: u8 = 0x0A;
+#[cfg(target_os = "none")]
 const CMOS_STATUS_B: u8 = 0x0B;
+#[cfg(target_os = "none")]
 const RTC_UPDATE_IN_PROGRESS: u8 = 0x80;
 const RTC_BINARY_MODE: u8 = 0x04;
 const RTC_24_HOUR_MODE: u8 = 0x02;
 const RTC_PM_BIT: u8 = 0x80;
+#[cfg(target_os = "none")]
 const RTC_MAX_READY_POLLS: usize = 1_000_000;
+#[cfg(target_os = "none")]
 const RTC_SNAPSHOT_RETRIES: usize = 4;
 
 /// Program PIT channel 0 in rate-generator mode at `TICK_HZ` and log a
