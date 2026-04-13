@@ -26,8 +26,8 @@ pub struct Features {
     leaf7_ecx: u32, // reserved for future features
     #[allow(dead_code)]
     leaf7_edx: u32, // reserved for future features
-    ext_edx: u32,   // leaf 0x8000_0001 EDX
-    ext_ecx: u32,   // leaf 0x8000_0001 ECX
+    ext_edx: u32, // leaf 0x8000_0001 EDX
+    ext_ecx: u32, // leaf 0x8000_0001 ECX
 }
 
 impl Features {
@@ -155,9 +155,7 @@ pub fn init() {
         (0u32, 0u32)
     };
 
-    let features = Features::from_raw(
-        l1.edx, l1.ecx, l7_ebx, l7_ecx, l7_edx, lext_edx, lext_ecx,
-    );
+    let features = Features::from_raw(l1.edx, l1.ecx, l7_ebx, l7_ecx, l7_edx, lext_edx, lext_ecx);
     FEATURES.call_once(|| features);
 
     // Print a single boot-time line listing every detected feature.
@@ -220,13 +218,13 @@ mod tests {
         // Ext EDX:    RDTSCP (27)
         // Ext ECX:    LZCNT (5)
         let f = Features::from_raw(
-            (1 << 16) | (1 << 25) | (1 << 26),                          // leaf1_edx
+            (1 << 16) | (1 << 25) | (1 << 26), // leaf1_edx
             (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 28), // leaf1_ecx
-            (1 << 0) | (1 << 5) | (1 << 7) | (1 << 20),                 // leaf7_ebx
-            0,                                                            // leaf7_ecx
-            0,                                                            // leaf7_edx
-            1 << 27,                                                      // ext_edx
-            1 << 5,                                                       // ext_ecx
+            (1 << 0) | (1 << 5) | (1 << 7) | (1 << 20), // leaf7_ebx
+            0,                                 // leaf7_ecx
+            0,                                 // leaf7_edx
+            1 << 27,                           // ext_edx
+            1 << 5,                            // ext_ecx
         );
 
         assert!(f.has(Feature::Sse));
