@@ -510,6 +510,7 @@ fn test_all() -> R<()> {
         "shell_smoke",
         "priority",
         "per_task_cr3",
+        "demand_paging",
     ] {
         cmd.arg("--test").arg(t);
     }
