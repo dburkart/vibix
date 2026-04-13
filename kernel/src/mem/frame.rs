@@ -256,6 +256,10 @@ pub fn alloc() -> Option<u64> {
 #[cfg(target_os = "none")]
 pub fn free(phys: u64) {
     super::refcount::assert_zero_for_free(phys);
+    // Pair the `Release` the caller's `dec_refcount` issued with an
+    // `Acquire` before reclaim, so whoever the allocator hands this
+    // frame to next observes every write from the prior owner.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
     global().lock().deallocate_frame(phys);
 }
 

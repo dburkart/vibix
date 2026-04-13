@@ -45,9 +45,16 @@ fn index_of(phys: u64) -> usize {
 // --- Pure helpers over an explicit slice, host-testable. ---------------
 
 /// Borrow the refcount slot for `phys` from `slots`. `phys` must be
-/// frame-aligned and `< MAX_PHYS_BYTES`.
+/// frame-aligned, `< MAX_PHYS_BYTES`, and within the slice's own bounds
+/// (so host tests against a tiny table still produce a refcount-specific
+/// panic message instead of a generic slice OOB).
 pub fn page_refcount_in(slots: &[AtomicU16], phys: u64) -> &AtomicU16 {
-    &slots[index_of(phys)]
+    let idx = index_of(phys);
+    assert!(
+        idx < slots.len(),
+        "refcount: {phys:#x} is outside the provided refcount table",
+    );
+    &slots[idx]
 }
 
 /// Saturating fetch-add of 1. Returns the previous value. Once a slot
