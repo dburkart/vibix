@@ -115,3 +115,7 @@ harness = false
 [[test]]
 name = "sleep"
 harness = false
+
+[[test]]
+name = "pci_enum"
+harness = false

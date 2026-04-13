@@ -15,6 +15,8 @@ pub mod cpu;
 pub mod input;
 pub mod klog;
 pub mod mem;
+#[cfg(any(test, target_os = "none"))]
+pub mod pci;
 
 #[cfg(target_os = "none")]
 pub mod acpi;

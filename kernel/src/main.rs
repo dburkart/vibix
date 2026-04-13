@@ -65,6 +65,7 @@ pub extern "C" fn _start() -> ! {
     }
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     vibix::time::init();
+    vibix::pci::scan();
 
     // Console init must come after mem::init() — the character grid and
     // scrollback buffer are heap-allocated inside Console::new().

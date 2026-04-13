@@ -540,6 +540,7 @@ fn test_all() -> R<()> {
         "demand_paging",
         "userspace_module",
         "sleep",
+        "pci_enum",
     ] {
         cmd.arg("--test").arg(t);
     }

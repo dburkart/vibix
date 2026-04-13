@@ -15,7 +15,7 @@ use pc_keyboard::DecodedKey;
 
 use crate::mem::{frame, heap, FRAME_SIZE};
 use crate::task::TaskStateView;
-use crate::{input, serial_print, serial_println, task, time};
+use crate::{input, pci, serial_print, serial_println, task, time};
 
 /// Flipped to `true` the first time the shell's `run` enters its main
 /// loop. Integration tests poll this to confirm the shell actually
@@ -84,6 +84,7 @@ fn dispatch(line: &str) {
         "time" => cmd_time(),
         "mem" => cmd_mem(),
         "tasks" => cmd_tasks(),
+        "pci" => cmd_pci(),
         "echo" => serial_println!("{}", rest),
         "panic" => panic!("shell: panic builtin invoked"),
         _ => serial_println!("unknown command: {} (try `help`)", cmd),
@@ -97,6 +98,7 @@ fn cmd_help() {
     serial_println!("  time            seconds since boot, ms precision");
     serial_println!("  mem             heap + free-frame counters");
     serial_println!("  tasks           live task ids and remaining slices");
+    serial_println!("  pci             enumerated PCI devices on bus 0");
     serial_println!("  echo <args>     echo the rest of the line");
     serial_println!("  panic           trigger a kernel panic (test aid)");
 }
@@ -127,6 +129,52 @@ fn cmd_mem() {
         free,
         (free as u64 * FRAME_SIZE) / 1024,
     );
+}
+
+fn cmd_pci() {
+    let n = pci::device_count();
+    if n == 0 {
+        serial_println!("pci: no devices enumerated (scan not yet run?)");
+        return;
+    }
+    serial_println!("pci: {} device(s) on bus 0", n);
+    for d in pci::devices() {
+        serial_println!(
+            "  {:02x}:{:02x}.{:x}  {:04x}:{:04x}  class {:02x}:{:02x} pi={:02x}  {}",
+            d.addr.bus,
+            d.addr.device,
+            d.addr.function,
+            d.vendor_id,
+            d.device_id,
+            d.class,
+            d.subclass,
+            d.prog_if,
+            d.class_name(),
+        );
+        // Walk BARs skipping the high-dword slot that follows a 64-bit
+        // memory BAR — that slot holds raw upper address bits, not a
+        // self-describing BAR, and calling is_io/is_64bit/addr on it
+        // produces nonsense (e.g. a set low bit would mislabel it as io).
+        let mut i = 0;
+        while i < d.bars.len() {
+            let bar = d.bars[i];
+            if bar.is_empty() {
+                i += 1;
+                continue;
+            }
+            if bar.is_io() {
+                serial_println!("     bar{}: {:#010x} (io)", i, bar.addr());
+                i += 1;
+            } else if bar.is_64bit() && i + 1 < d.bars.len() {
+                let full = bar.addr64(d.bars[i + 1]);
+                serial_println!("     bar{}: {:#018x} (mem64)", i, full);
+                i += 2;
+            } else {
+                serial_println!("     bar{}: {:#010x} (mem32)", i, bar.addr());
+                i += 1;
+            }
+        }
+    }
 }
 
 fn cmd_tasks() {
