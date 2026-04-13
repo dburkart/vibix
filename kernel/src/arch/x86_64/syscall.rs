@@ -59,8 +59,7 @@ const EFER_SCE: u64 = 1 << 0;
 /// DF (bit 10) — direction: clear so string instructions run forward
 /// NT (bit 14) — nested task: should never be set in 64-bit mode, clear defensively
 /// AC (bit 18) — alignment check: clear to avoid spurious faults in handler
-const RFLAGS_SYSCALL_MASK: u64 =
-    (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
+const RFLAGS_SYSCALL_MASK: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
 
 /// Dedicated kernel stack for ring-3 privilege changes: IRQs/exceptions
 /// (via TSS.rsp[0]) and SYSCALL (via SYSCALL_KERNEL_RSP below).
