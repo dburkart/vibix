@@ -113,6 +113,10 @@ name = "userspace_module"
 harness = false
 
 [[test]]
+name = "userspace_loader"
+harness = false
+
+[[test]]
 name = "sleep"
 harness = false
 
@@ -126,6 +130,10 @@ harness = false
 
 [[test]]
 name = "cow_vma"
+harness = false
+
+[[test]]
+name = "fpu_context_switch"
 harness = false
 
 [[test]]

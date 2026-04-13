@@ -52,15 +52,17 @@ struct Elf64Phdr {
 /// wants it: a virtual range plus the `PageTableFlags` derived from
 /// `p_flags` (`PF_W` → `WRITABLE`, no `PF_X` → `NO_EXECUTE`).
 #[derive(Clone, Copy)]
-pub(super) struct LoadSegment {
+pub(crate) struct LoadSegment {
     pub vaddr: VirtAddr,
     pub memsz: u64,
+    pub filesz: u64,
+    pub file_offset: u64,
     pub flags: PageTableFlags,
 }
 
 /// Parsed ELF64 image metadata for segment walking.
 #[derive(Clone, Copy)]
-pub(super) struct ParsedElf<'a> {
+pub(crate) struct ParsedElf<'a> {
     ehdr: Elf64Ehdr,
     phdr_bytes: &'a [u8],
     phnum: usize,
@@ -76,6 +78,11 @@ enum ElfParseError {
     PhdrTableOutOfRange,
     NonCanonicalEntry,
     NonCanonicalLoadVaddr,
+    LoadFileszExceedsMemsz,
+    LoadFileRangeOverflow,
+    LoadFileRangeOutOfRange,
+    LoadVaddrRangeOverflow,
+    EntryOutsideLoadSegment,
 }
 
 impl ElfParseError {
@@ -89,11 +96,16 @@ impl ElfParseError {
             Self::PhdrTableOutOfRange => "ELF phdr table out of range",
             Self::NonCanonicalEntry => "ELF entry address is non-canonical",
             Self::NonCanonicalLoadVaddr => "ELF PT_LOAD virtual address is non-canonical",
+            Self::LoadFileszExceedsMemsz => "ELF PT_LOAD p_filesz exceeds p_memsz",
+            Self::LoadFileRangeOverflow => "ELF PT_LOAD file range arithmetic overflow",
+            Self::LoadFileRangeOutOfRange => "ELF PT_LOAD file range exceeds image bounds",
+            Self::LoadVaddrRangeOverflow => "ELF PT_LOAD virtual range arithmetic overflow",
+            Self::EntryOutsideLoadSegment => "ELF entry address not covered by any PT_LOAD",
         }
     }
 }
 
-pub(super) struct LoadSegmentIter<'a> {
+pub(crate) struct LoadSegmentIter<'a> {
     phdr_bytes: &'a [u8],
     phnum: usize,
     idx: usize,
@@ -125,6 +137,8 @@ impl<'a> Iterator for LoadSegmentIter<'a> {
             return Some(LoadSegment {
                 vaddr: VirtAddr::new(ph.p_vaddr),
                 memsz: ph.p_memsz,
+                filesz: ph.p_filesz,
+                file_offset: ph.p_offset,
                 flags,
             });
         }
@@ -133,7 +147,7 @@ impl<'a> Iterator for LoadSegmentIter<'a> {
 }
 
 impl<'a> ParsedElf<'a> {
-    pub(super) fn load_segments(self) -> LoadSegmentIter<'a> {
+    pub(crate) fn load_segments(self) -> LoadSegmentIter<'a> {
         LoadSegmentIter {
             phdr_bytes: self.phdr_bytes,
             phnum: self.phnum,
@@ -141,7 +155,7 @@ impl<'a> ParsedElf<'a> {
         }
     }
 
-    pub(super) fn entry(&self) -> VirtAddr {
+    pub(crate) fn entry(&self) -> VirtAddr {
         VirtAddr::new(self.ehdr.e_entry)
     }
 }
@@ -174,7 +188,22 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
 }
 
 #[cfg(target_os = "none")]
-pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
+pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+    let base = file.addr();
+    let size = file.size() as usize;
+    // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
+    // memory, which is preserved across `reclaim_bootloader_memory()`.
+    // The slice stays valid for the rest of the kernel's lifetime.
+    Some(unsafe { core::slice::from_raw_parts(base, size) })
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     let resp = crate::boot::MODULE_REQUEST.get_response()?;
     let file = resp
         .modules()
@@ -192,11 +221,11 @@ pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     Some((parsed.entry(), parsed.load_segments().count()))
 }
 
-pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
+pub(crate) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
     parse_elf64_inner(bytes).ok()
 }
 
-pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
+pub(crate) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
     parse_elf64_inner(bytes).unwrap_or_else(|err| panic!("{}", err.message()))
 }
 
@@ -232,14 +261,38 @@ fn parse_elf64_inner(bytes: &[u8]) -> Result<ParsedElf<'_>, ElfParseError> {
         return Err(ElfParseError::NonCanonicalEntry);
     }
 
+    let mut entry_covered = false;
     for i in 0..phnum {
         let off = phoff + i * phsz;
         // SAFETY: `phdr_table_end` bounds-check above guarantees every
         // header read in this loop stays within `bytes`.
         let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
-        if ph.p_type == PT_LOAD && ph.p_memsz != 0 && VirtAddr::try_new(ph.p_vaddr).is_err() {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        if VirtAddr::try_new(ph.p_vaddr).is_err() {
             return Err(ElfParseError::NonCanonicalLoadVaddr);
         }
+        if ph.p_filesz > ph.p_memsz {
+            return Err(ElfParseError::LoadFileszExceedsMemsz);
+        }
+        let file_end = ph
+            .p_offset
+            .checked_add(ph.p_filesz)
+            .ok_or(ElfParseError::LoadFileRangeOverflow)?;
+        if file_end > bytes.len() as u64 {
+            return Err(ElfParseError::LoadFileRangeOutOfRange);
+        }
+        let vaddr_end = ph
+            .p_vaddr
+            .checked_add(ph.p_memsz)
+            .ok_or(ElfParseError::LoadVaddrRangeOverflow)?;
+        if ehdr.e_entry >= ph.p_vaddr && ehdr.e_entry < vaddr_end {
+            entry_covered = true;
+        }
+    }
+    if !entry_covered {
+        return Err(ElfParseError::EntryOutsideLoadSegment);
     }
 
     Ok(ParsedElf {
@@ -354,5 +407,51 @@ mod tests {
         let mut bytes = sample_elf_bytes();
         put64(&mut bytes, 24, 0x0001_0000_0000_0000);
         let _ = parse_elf64(&bytes);
+    }
+
+    #[test]
+    fn try_parse_rejects_filesz_exceeds_memsz() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        put64(&mut bytes, p0 + 32, 0x3000); // p_filesz > p_memsz (0x2000)
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_file_range_overflow() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        put64(&mut bytes, p0 + 8, u64::MAX); // p_offset
+        put64(&mut bytes, p0 + 32, 1); // p_filesz (memsz already 0x2000)
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_file_range_out_of_range() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        let len = bytes.len() as u64;
+        put64(&mut bytes, p0 + 8, len); // p_offset at end
+        put64(&mut bytes, p0 + 32, 1); // p_filesz=1 pushes past image
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_vaddr_range_overflow() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        // Canonical upper-half vaddr close to u64::MAX so p_vaddr+p_memsz wraps.
+        put64(&mut bytes, p0 + 16, 0xFFFF_FFFF_FFFF_F000);
+        put64(&mut bytes, p0 + 40, 0x2000); // p_memsz → overflow
+                                            // Move entry into p1's range so coverage doesn't mask the overflow.
+        put64(&mut bytes, 24, 0x402000);
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_entry_outside_load_segments() {
+        let mut bytes = sample_elf_bytes();
+        put64(&mut bytes, 24, 0x500000); // entry outside both PT_LOADs
+        assert!(try_parse_elf64(&bytes).is_none());
     }
 }

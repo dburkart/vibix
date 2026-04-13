@@ -64,10 +64,14 @@ const SMOKE_MARKERS: &[&str] = &[
     "hpet: periodic timer armed",
     "timer: 100 Hz",
     "rtc:",
+    "block: virtio-blk ready",
+    "block: lba0[0..16]=[56, 49, 42, 49, 58, 42, 4c, 4b, 30",
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
     "userspace module ELF entry=",
+    "userspace: loader mapping image",
+    "USRHELLO",
 ];
 
 fn main() -> R<()> {
@@ -142,6 +146,62 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Magic bytes at LBA 0 of the test disk. The kernel's smoke-path
+/// readback logs the first 16 bytes, which `SMOKE_MARKERS` assert on.
+const TEST_DISK_MAGIC: &[u8] = b"VIBIXBLK0";
+/// 1 MiB scratch disk — enough for any step-1 smoke test; the file is
+/// regenerated if absent or the wrong size so it's safe to `rm -rf`.
+const TEST_DISK_SIZE: u64 = 1024 * 1024;
+
+fn test_disk_path() -> PathBuf {
+    workspace_root().join("target").join("test-disk.img")
+}
+
+/// Create or refresh the test disk image. Idempotent: if the file is
+/// already present and the right size, we leave it alone.
+fn ensure_test_disk() -> R<PathBuf> {
+    let path = test_disk_path();
+    // Rebuild if absent, wrong size, or the magic prefix doesn't match.
+    // Size alone isn't a strong enough check — an old disk image of the
+    // right length but stale contents would silently fail the smoke
+    // marker assertion, which is noisier to diagnose than a fresh write.
+    let needs_write = match fs::metadata(&path) {
+        Ok(m) if m.len() == TEST_DISK_SIZE => {
+            let mut head = vec![0u8; TEST_DISK_MAGIC.len()];
+            match fs::File::open(&path).and_then(|mut f| {
+                use std::io::Read as _;
+                f.read_exact(&mut head)
+            }) {
+                Ok(()) => head != TEST_DISK_MAGIC,
+                Err(_) => true,
+            }
+        }
+        _ => true,
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut data = vec![0u8; TEST_DISK_SIZE as usize];
+        data[..TEST_DISK_MAGIC.len()].copy_from_slice(TEST_DISK_MAGIC);
+        fs::write(&path, &data)?;
+    }
+    Ok(path)
+}
+
+/// QEMU args attaching the generated test disk as legacy virtio-blk.
+/// `disable-modern=on,disable-legacy=off` pins the transport so the
+/// step-1 legacy-only driver actually matches the device.
+fn virtio_blk_args(disk: &Path) -> Vec<String> {
+    let drive = format!("file={},if=none,id=vd0,format=raw", disk.display());
+    vec![
+        "-drive".to_string(),
+        drive,
+        "-device".to_string(),
+        "virtio-blk-pci,drive=vd0,disable-modern=on,disable-legacy=off".to_string(),
+    ]
+}
+
 fn userspace_hello_binary() -> PathBuf {
     workspace_root()
         .join("target")
@@ -151,8 +211,22 @@ fn userspace_hello_binary() -> PathBuf {
 }
 
 fn build_userspace_hello() -> R<PathBuf> {
+    // Setting RUSTFLAGS wholesale overrides the workspace
+    // `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
+    // so we must re-supply every flag the kernel target still needs —
+    // only the linker script differs (userspace payload maps at
+    // 0xffffffffc0000000, not the kernel's 0xffffffff80000000).
+    let rustflags = [
+        "-C link-arg=-Tuserspace/hello/link.ld",
+        "-C relocation-model=static",
+        "-C code-model=kernel",
+        "-C no-redzone=yes",
+        "-C force-frame-pointers=yes",
+    ]
+    .join(" ");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
         .args(["build", "--package", "userspace_hello"])
         .args(KERNEL_BUILD_STD_ARGS);
     check(cmd.status()?)?;
@@ -425,6 +499,7 @@ fn iso(opts: &BuildOpts) -> R<PathBuf> {
 
 fn run(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
+    let disk = ensure_test_disk()?;
     let status = Command::new("qemu-system-x86_64")
         .args([
             "-M",
@@ -438,6 +513,7 @@ fn run(opts: &BuildOpts) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .status()?;
@@ -467,6 +543,7 @@ fn test_runner(kernel: &Path) -> R<()> {
     eprintln!("▶ {}", name);
     // Note: no `-no-shutdown` here — it would prevent `isa-debug-exit`
     // from actually terminating QEMU, defeating the exit-code protocol.
+    let disk = ensure_test_disk()?;
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M",
@@ -481,6 +558,7 @@ fn test_runner(kernel: &Path) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .stdout(Stdio::inherit())
@@ -542,10 +620,12 @@ fn test_all() -> R<()> {
         "per_task_cr3",
         "demand_paging",
         "userspace_module",
+        "userspace_loader",
         "sleep",
         "pci_enum",
         "serial_rx",
         "cow_vma",
+        "fpu_context_switch",
         "task_exit",
     ] {
         cmd.arg("--test").arg(t);
@@ -557,6 +637,7 @@ fn test_all() -> R<()> {
 
 fn smoke(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
+    let disk = ensure_test_disk()?;
 
     // We run QEMU with serial to stdio, capture output, then kill after
     // a short delay — the kernel halts in hlt_loop forever.
@@ -575,6 +656,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .stdout(Stdio::piped())

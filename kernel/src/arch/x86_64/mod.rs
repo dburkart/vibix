@@ -1,5 +1,6 @@
 pub mod apic;
 pub mod backtrace;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
@@ -11,6 +12,9 @@ pub mod pic;
 pub fn init() {
     // Feature detection first — everything below may query cpu::has().
     crate::cpu::init();
+    // FPU init needs CR0/CR4 writes but no heap, so it fits here —
+    // ahead of task::init() which spawns the first saving task.
+    fpu::init();
     gdt::init();
     idt::init();
     // Remap + mask the 8259 before touching ACPI/APIC. Leaving it in
