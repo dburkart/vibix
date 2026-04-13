@@ -25,6 +25,7 @@ use x86_64::VirtAddr;
 
 use crate::mem::paging;
 
+use super::priority::{AFFINITY_ALL, DEFAULT_PRIORITY};
 use super::switch::task_entry_trampoline;
 use super::DEFAULT_SLICE_MS;
 
@@ -88,6 +89,15 @@ pub(super) struct Task {
     /// guards against the "wake before park" lost-wakeup race in
     /// [`crate::sync::WaitQueue::wait_while`].
     pub wake_pending: AtomicBool,
+    /// Effective scheduling priority in `0..=MAX_PRIORITY`. Higher
+    /// values preempt lower ones. See [`super::priority`] for the
+    /// priority/nice mapping.
+    pub priority: u8,
+    /// Bitmask of CPUs this task is allowed to run on (bit `n` set =
+    /// allowed on CPU `n`). Stored-but-unenforced on the single-CPU
+    /// kernel; exists so affinity APIs keep a stable shape once SMP
+    /// lands.
+    pub affinity: u64,
 }
 
 impl Task {
@@ -102,11 +112,16 @@ impl Task {
             slice_remaining_ms: DEFAULT_SLICE_MS,
             state: TaskState::Running,
             wake_pending: AtomicBool::new(false),
+            priority: DEFAULT_PRIORITY,
+            affinity: AFFINITY_ALL,
         }
     }
 
-    /// Allocate a guard-paged stack and prime it so the first switch into
-    /// this task runs `entry` via the trampoline.
+    /// Allocate a guard-paged stack and prime it so the first switch
+    /// into this task runs `entry` via the trampoline at the given
+    /// scheduling priority. Affinity defaults to [`AFFINITY_ALL`];
+    /// callers that care about pinning call [`super::set_affinity`]
+    /// after spawning.
     ///
     /// VA layout (low → high):
     /// ```text
@@ -120,7 +135,7 @@ impl Task {
     ///   r15=0  r14=0  r13=0  r12=entry  rbp=0  rbx=0  ret=trampoline  <top>
     ///   ^ saved rsp (initial)
     /// ```
-    pub fn new(entry: fn() -> !) -> Self {
+    pub fn new_with_priority(entry: fn() -> !, priority: u8) -> Self {
         // Bump-allocate a fresh VA slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
         let guard_base = slot_va;
@@ -170,6 +185,8 @@ impl Task {
             slice_remaining_ms: DEFAULT_SLICE_MS,
             state: TaskState::Ready,
             wake_pending: AtomicBool::new(false),
+            priority: super::priority::clamp_priority(priority),
+            affinity: AFFINITY_ALL,
         }
     }
 

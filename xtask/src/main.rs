@@ -508,6 +508,7 @@ fn test_all() -> R<()> {
         "page_fault",
         "blocking_sync",
         "shell_smoke",
+        "priority",
     ] {
         cmd.arg("--test").arg(t);
     }

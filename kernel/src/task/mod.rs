@@ -20,13 +20,19 @@
 //!
 //! ## What's *not* here (yet)
 //!
-//! - Priorities, per-CPU queues, tickless idle.
+//! - Per-CPU queues, tickless idle.
 //! - Per-task address spaces.
+//! - Priority inheritance on blocking primitives (tracked for a later
+//!   pass alongside the sleeping-mutex work).
+//!
+//! Scheduling priorities and UNIX-style nice values are live (see
+//! [`priority`] and [`spawn_with_priority`] / [`set_priority`]).
 //!
 //! Blocking primitives (mutex-that-sleeps, channels, waitqueues) live
 //! in [`crate::sync`] and are built on top of [`block_current`] and
 //! [`wake`] below.
 
+pub mod priority;
 mod scheduler;
 mod switch;
 mod task;
@@ -35,6 +41,11 @@ use alloc::boxed::Box;
 use core::sync::atomic::Ordering;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
+
+pub use priority::{
+    clamp_priority, nice_from_priority, priority_from_nice, AFFINITY_ALL, DEFAULT_PRIORITY,
+    MAX_PRIORITY, NICE_MAX, NICE_MIN,
+};
 
 use scheduler::Scheduler;
 use switch::context_switch;
@@ -59,11 +70,229 @@ pub fn init() {
     serial_println!("tasks: scheduler online");
 }
 
-/// Queue a new task running `entry`. The task starts at the back of
-/// the ready queue and will run when scheduling reaches it.
+/// Queue a new task running `entry` at [`DEFAULT_PRIORITY`]. The task
+/// starts at the back of its priority's ready FIFO and will run when
+/// scheduling reaches it.
 pub fn spawn(entry: fn() -> !) {
+    spawn_with_priority(entry, DEFAULT_PRIORITY);
+}
+
+/// Like [`spawn`] but starts the task at a caller-chosen priority.
+/// Values above [`MAX_PRIORITY`] are clamped.
+pub fn spawn_with_priority(entry: fn() -> !, priority: u8) {
+    let task = Box::new(Task::new_with_priority(entry, priority));
+    let new_prio = task.priority;
     let mut sched = SCHED.lock();
-    sched.ready.push_back(Box::new(Task::new(entry)));
+    sched.push_ready(task);
+    maybe_preempt_current_for_priority(&mut sched, new_prio);
+}
+
+/// Like [`spawn_with_priority`] but accepts a UNIX-style nice value
+/// (`-20..=19`). Wrapper for API ergonomics — mapping lives in
+/// [`priority_from_nice`].
+pub fn spawn_with_nice(entry: fn() -> !, nice: i8) {
+    spawn_with_priority(entry, priority_from_nice(nice));
+}
+
+/// Update the priority of task `id` in place. Takes effect on the next
+/// scheduling decision: if the task is currently ready it moves to the
+/// correct priority bucket; if it is running and its priority dropped
+/// below another ready task, the current slice is ended so the higher-
+/// priority task preempts at the next tick.
+///
+/// Returns `true` if a task with `id` was found, `false` otherwise.
+pub fn set_priority(id: usize, priority: u8) -> bool {
+    let priority = clamp_priority(priority);
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let mut sched = SCHED.lock();
+
+    let found = apply_priority(&mut sched, id, priority);
+    if found {
+        // If a ready task now outranks the running one, shorten its slice
+        // so the next tick swaps it out.
+        preempt_if_higher_ready(&mut sched);
+    }
+
+    drop(sched);
+    if was_on {
+        interrupts::enable();
+    }
+    found
+}
+
+/// Like [`set_priority`] but with a nice-value argument. Returns
+/// whether a task with `id` was found.
+pub fn set_nice(id: usize, nice: i8) -> bool {
+    set_priority(id, priority_from_nice(nice))
+}
+
+/// Adjust task `id`'s nice value by `delta`, clamped to the legal
+/// range. Returns the resulting nice value, or `None` if the id is
+/// unknown.
+pub fn adjust_nice(id: usize, delta: i8) -> Option<i8> {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let mut sched = SCHED.lock();
+
+    let current_prio = find_priority(&sched, id);
+    let result = current_prio.map(|prio| {
+        let current_nice = nice_from_priority(prio);
+        let new_nice =
+            (current_nice as i16 + delta as i16).clamp(NICE_MIN as i16, NICE_MAX as i16) as i8;
+        let new_prio = priority_from_nice(new_nice);
+        apply_priority(&mut sched, id, new_prio);
+        new_nice
+    });
+
+    if result.is_some() {
+        preempt_if_higher_ready(&mut sched);
+    }
+
+    drop(sched);
+    if was_on {
+        interrupts::enable();
+    }
+    result
+}
+
+/// Set the CPU affinity mask of task `id`. Bit `n` set means the task
+/// may run on CPU `n`. On the single-CPU kernel the mask is stored but
+/// not enforced. Returns `true` if the id was found.
+///
+/// A mask of `0` is rejected (a task must be runnable somewhere) and
+/// returns `false` without modifying the task.
+pub fn set_affinity(id: usize, mask: u64) -> bool {
+    if mask == 0 {
+        return false;
+    }
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let mut sched = SCHED.lock();
+
+    let mut found = false;
+    if let Some(cur) = sched.current.as_mut() {
+        if cur.id == id {
+            cur.affinity = mask;
+            found = true;
+        }
+    }
+    if !found {
+        'outer: for queue in sched.ready.values_mut() {
+            for task in queue.iter_mut() {
+                if task.id == id {
+                    task.affinity = mask;
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if !found {
+        if let Some(task) = sched.parked.get_mut(&id) {
+            task.affinity = mask;
+            found = true;
+        }
+    }
+
+    drop(sched);
+    if was_on {
+        interrupts::enable();
+    }
+    found
+}
+
+/// Return the current scheduling priority of the currently-running
+/// task. Useful for callers that want to spawn a helper at the same
+/// or adjusted priority.
+pub fn current_priority() -> u8 {
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .map(|t| t.priority)
+        .unwrap_or(DEFAULT_PRIORITY)
+}
+
+fn find_priority(sched: &Scheduler, id: usize) -> Option<u8> {
+    if let Some(cur) = sched.current.as_ref() {
+        if cur.id == id {
+            return Some(cur.priority);
+        }
+    }
+    for queue in sched.ready.values() {
+        for task in queue.iter() {
+            if task.id == id {
+                return Some(task.priority);
+            }
+        }
+    }
+    sched.parked.get(&id).map(|t| t.priority)
+}
+
+/// Mutate the stored priority of task `id` across current/ready/parked
+/// and re-bucket if it's in the ready bank. Returns `true` on hit.
+fn apply_priority(sched: &mut Scheduler, id: usize, new_priority: u8) -> bool {
+    if let Some(cur) = sched.current.as_mut() {
+        if cur.id == id {
+            cur.priority = new_priority;
+            return true;
+        }
+    }
+
+    // Search ready queues; if found, remove and re-bucket at new priority.
+    let mut moved: Option<Box<Task>> = None;
+    let mut drop_key: Option<u8> = None;
+    for (&prio, queue) in sched.ready.iter_mut() {
+        if let Some(pos) = queue.iter().position(|t| t.id == id) {
+            let mut task = queue.remove(pos).expect("position just confirmed");
+            task.priority = new_priority;
+            if queue.is_empty() {
+                drop_key = Some(prio);
+            }
+            moved = Some(task);
+            break;
+        }
+    }
+    if let Some(k) = drop_key {
+        sched.ready.remove(&k);
+    }
+    if let Some(task) = moved {
+        sched.push_ready(task);
+        return true;
+    }
+
+    if let Some(task) = sched.parked.get_mut(&id) {
+        task.priority = new_priority;
+        return true;
+    }
+
+    false
+}
+
+/// If a ready task at `new_prio` outranks the currently-running task,
+/// end the current slice so the PIT tick preempts promptly. Must be
+/// called with the scheduler lock held.
+fn maybe_preempt_current_for_priority(sched: &mut Scheduler, new_prio: u8) {
+    let Some(cur) = sched.current.as_mut() else {
+        return;
+    };
+    if new_prio > cur.priority {
+        cur.slice_remaining_ms = 0;
+    }
+}
+
+/// Query the ready bank and shorten the current slice to zero if any
+/// ready task outranks the running one. Must be called with the
+/// scheduler lock held.
+fn preempt_if_higher_ready(sched: &mut Scheduler) {
+    let Some(cur) = sched.current.as_ref() else {
+        return;
+    };
+    let cur_prio = cur.priority;
+    if sched.highest_ready_priority().is_some_and(|p| p > cur_prio) {
+        sched.current.as_mut().unwrap().slice_remaining_ms = 0;
+    }
 }
 
 /// Public view of a task's scheduling state, used by [`TaskInfo`].
@@ -82,6 +311,12 @@ pub struct TaskInfo {
     pub id: usize,
     pub slice_remaining_ms: u32,
     pub state: TaskStateView,
+    /// Effective priority (`0..=MAX_PRIORITY`). Higher values preempt.
+    pub priority: u8,
+    /// UNIX-style nice value (`-20..=19`). Derived from `priority`.
+    pub nice: i8,
+    /// CPU affinity mask (bit `n` = allowed on CPU `n`).
+    pub affinity: u64,
 }
 
 /// Invoke `f` once per live task: current first, then ready queue in
@@ -93,20 +328,26 @@ pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
     let snapshot: alloc::vec::Vec<TaskInfo> = {
         let sched = SCHED.lock();
         let mut out = alloc::vec::Vec::with_capacity(
-            sched.current.is_some() as usize + sched.ready.len() + sched.parked.len(),
+            sched.current.is_some() as usize + sched.ready_count() + sched.parked.len(),
         );
         if let Some(cur) = sched.current.as_ref() {
             out.push(TaskInfo {
                 id: cur.id,
                 slice_remaining_ms: cur.slice_remaining_ms,
                 state: TaskStateView::Running,
+                priority: cur.priority,
+                nice: nice_from_priority(cur.priority),
+                affinity: cur.affinity,
             });
         }
-        for t in sched.ready.iter() {
+        for t in sched.iter_ready() {
             out.push(TaskInfo {
                 id: t.id,
                 slice_remaining_ms: t.slice_remaining_ms,
                 state: TaskStateView::Ready,
+                priority: t.priority,
+                nice: nice_from_priority(t.priority),
+                affinity: t.affinity,
             });
         }
         for t in sched.parked.values() {
@@ -114,6 +355,9 @@ pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
                 id: t.id,
                 slice_remaining_ms: t.slice_remaining_ms,
                 state: TaskStateView::Blocked,
+                priority: t.priority,
+                nice: nice_from_priority(t.priority),
+                affinity: t.affinity,
             });
         }
         out
@@ -175,16 +419,27 @@ pub fn preempt_tick() {
     }
 
     {
+        let top_ready = sched.highest_ready_priority();
         let current = sched.current.as_mut().unwrap();
         current.slice_remaining_ms = current.slice_remaining_ms.saturating_sub(TICK_MS as u32);
-        if current.slice_remaining_ms > 0 {
+        // Preempt immediately if something at strictly higher priority
+        // is ready. Otherwise keep running until the slice expires; when
+        // it does, only rotate if a peer at the same priority is ready
+        // — handing off to a strictly lower-priority task would defeat
+        // the whole point of priorities.
+        let higher_ready = top_ready.is_some_and(|p| p > current.priority);
+        let peer_ready = top_ready.is_some_and(|p| p == current.priority);
+        if !higher_ready && (current.slice_remaining_ms > 0 || !peer_ready) {
+            if current.slice_remaining_ms == 0 {
+                current.slice_remaining_ms = DEFAULT_SLICE_MS;
+            }
             return;
         }
     }
 
-    let Some(mut next) = sched.ready.pop_front() else {
-        // Slice expired but nobody else is ready. Reload and keep
-        // running — prevents repeated try_lock churn on every tick.
+    let Some(mut next) = sched.pop_highest() else {
+        // Shouldn't happen: the guard above already returned when the
+        // ready bank was empty. Reload defensively.
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         return;
     };
@@ -193,10 +448,18 @@ pub fn preempt_tick() {
     prev.state = TaskState::Ready;
     next.state = TaskState::Running;
     let next_rsp = next.rsp;
+    let prev_prio = prev.priority;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
-    sched.ready.push_back(prev);
-    let prev_ref = sched.ready.back_mut().expect("just pushed");
+    sched.push_ready(prev);
+    // The push above put `prev` at the back of its priority's queue;
+    // retrieve the pointer through the bank to keep the Box-stability
+    // invariant.
+    let prev_ref = sched
+        .ready
+        .get_mut(&prev_prio)
+        .and_then(|q| q.back_mut())
+        .expect("just pushed");
     let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
     drop(sched);
 
@@ -274,7 +537,7 @@ pub fn block_current() {
             return;
         }
 
-        let Some(mut next) = sched.ready.pop_front() else {
+        let Some(mut next) = sched.pop_highest() else {
             panic!("task::block_current: no ready task to switch to");
         };
         let mut prev = sched.current.take().unwrap();
@@ -336,7 +599,11 @@ pub fn wake(id: usize) {
     if let Some(mut task) = sched.parked.remove(&id) {
         task.state = TaskState::Ready;
         task.slice_remaining_ms = DEFAULT_SLICE_MS;
-        sched.ready.push_back(task);
+        let prio = task.priority;
+        sched.push_ready(task);
+        // If the newly-ready task outranks the current one, cut the
+        // current slice short so the next tick rotates it in.
+        maybe_preempt_current_for_priority(&mut sched, prio);
         drop(sched);
         if was_on {
             interrupts::enable();
@@ -357,15 +624,20 @@ pub fn wake(id: usize) {
             return;
         }
     }
-    for task in sched.ready.iter() {
+    let ready_hit = sched.iter_ready().any(|task| {
         if task.id == id {
             task.wake_pending.store(true, Ordering::Release);
-            drop(sched);
-            if was_on {
-                interrupts::enable();
-            }
-            return;
+            true
+        } else {
+            false
         }
+    });
+    if ready_hit {
+        drop(sched);
+        if was_on {
+            interrupts::enable();
+        }
+        return;
     }
 
     // Unknown id — drop the wake on the floor. Tasks don't exit yet so

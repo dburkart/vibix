@@ -128,10 +128,12 @@ fn cmd_tasks() {
             TaskStateView::Blocked => "[blk]",
         };
         serial_println!(
-            "  task {:>3} {} slice={} ms",
+            "  task {:>3} {} slice={} ms prio={} nice={}",
             t.id,
             tag,
             t.slice_remaining_ms,
+            t.priority,
+            t.nice,
         );
     });
 }
