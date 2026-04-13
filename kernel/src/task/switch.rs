@@ -5,7 +5,8 @@
 //! (`rbx`, `rbp`, `r12`-`r15`) plus `rsp` of the outgoing task, then
 //! loads the incoming task's state symmetrically. That's the entire
 //! saved context — caller-saved registers belong to whichever function
-//! called `yield_now()` and Rust/LLVM handle them for us.
+//! called into the scheduler (`preempt_tick` or `block_current`) and
+//! Rust/LLVM handle them for us.
 //!
 //! A new task's stack is primed so that the first `context_switch`
 //! into it returns into `task_entry_trampoline`, which reads the entry
@@ -59,8 +60,7 @@ task_entry_trampoline:
     // task entered for the first time from the preempt ISR (which
     // runs with IF=0 under an interrupt gate) still receives future
     // timer IRQs and can itself be preempted. `sti` when IF is
-    // already set is a no-op, so the cooperative-yield path is
-    // unaffected.
+    // already set is a no-op.
     sti
     call r12
     ud2

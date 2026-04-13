@@ -4,9 +4,9 @@ A hobby x86_64 kernel, vibe-coded in Rust. Boots under the Limine boot
 protocol, prints to serial + a framebuffer console, installs a full GDT/TSS +
 IDT with CPU exception handlers, manages physical memory with a bitmap frame
 allocator, owns a growing kernel heap backed by custom paging, drives APIC
-interrupts discovered via ACPI, runs cooperative + preemptively-scheduled
-kernel tasks, and emits symbolicated panic backtraces via an embedded kernel
-symbol table.
+interrupts discovered via ACPI, runs preemptively-scheduled kernel tasks
+with blocking synchronisation primitives, and emits symbolicated panic
+backtraces via an embedded kernel symbol table.
 
 ## Status
 
@@ -28,10 +28,12 @@ Milestones complete:
   on demand via `paging::map_range`, framebuffer mapped Write-Combining
   via PAT, unmapped guard page below `#DF` IST stack, atomic CR3 switch to
   a kernel-owned PML4 (Limine's original tree is no longer used after init).
-- **M5 — tasks:** cooperative round-robin scheduler + PIT-driven preemption
+- **M5 — tasks:** preemptive round-robin scheduler driven by the PIT
   (10 ms slices); each task gets its own kernel stack; context switch in
   hand-written assembly (RSP save/restore); bootstrap task wraps the main
-  thread.
+  thread. Blocking primitives (`BlockingMutex`, `WaitQueue`, SPSC channel)
+  live in `kernel::sync` and park tasks via the scheduler's parked-task
+  side-table.
 - **M6 — APIC:** ACPI RSDP → XSDT/RSDT → MADT parser; LAPIC + IOAPIC
   discovered; legacy IRQ0 (timer) and IRQ1 (keyboard) routed through IOAPIC;
   8259 PIC disabled; BSP LAPIC brought online.
@@ -41,8 +43,7 @@ Milestones complete:
   backtraces emitted to serial, structured klog ring (64 KiB, leveled,
   dumped on panic).
 
-Out of scope for now: SMP / AP bring-up, preemptive userspace, blocking
-primitives, task priorities, tickless idle.
+Out of scope for now: SMP / AP bring-up, userspace, task priorities, tickless idle.
 
 ## Requirements
 
@@ -91,7 +92,7 @@ Three layers, all driven by xtask:
 
    Current integration tests: `basic_boot`, `heap_alloc`, `heap_grow`,
    `should_panic`, `timer_tick`, `paging`, `pml4_switch`, `page_fault`,
-   `tasks`, `preempt`, `apic_online`, `backtrace`.
+   `tasks`, `preempt`, `blocking_sync`, `apic_online`, `backtrace`.
 3. **End-to-end smoke** (`cargo xtask smoke`) — boots the normal kernel,
    captures serial output, and asserts on a fixed list of markers:
    `vibix booting`, `memory map:`, `hhdm offset:`, `GDT + IDT loaded`,
@@ -138,7 +139,7 @@ kernel/              # the kernel crate (lib + thin bin)
       task.rs        # per-task kernel stack + saved register context
       scheduler.rs   # round-robin ready queue
       switch.rs      # hand-written context-switch assembly
-  tests/             # one no_std kernel binary per file (12 total)
+  tests/             # one no_std kernel binary per file (13 total)
     basic_boot.rs
     heap_alloc.rs
     heap_grow.rs
@@ -149,6 +150,7 @@ kernel/              # the kernel crate (lib + thin bin)
     page_fault.rs
     tasks.rs
     preempt.rs
+    blocking_sync.rs
     apic_online.rs
     backtrace.rs
 xtask/               # build/iso/run/test/smoke/lint orchestrator

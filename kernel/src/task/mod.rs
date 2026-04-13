@@ -1,10 +1,15 @@
-//! Round-robin kernel tasks, cooperative + PIT-driven preemption.
+//! Round-robin kernel tasks, preemptively scheduled off the PIT tick.
 //!
-//! Tasks can hand control back explicitly with [`yield_now`], and the
-//! timer ISR calls [`preempt_tick`] every PIT interrupt to rotate tasks
-//! that never yield. Each task owns a guard-paged kernel stack and a
-//! saved register context; the hand-written switch in [`switch`] is the
-//! one place that touches `rsp`.
+//! The timer ISR calls [`preempt_tick`] every PIT interrupt; once the
+//! running task's time slice is exhausted, the scheduler rotates to
+//! the next task in the ready queue. Tasks that want to block on a
+//! condition call [`block_current`] (via [`crate::sync`]); tasks that
+//! have nothing to do halt and let the next timer IRQ either resume
+//! them or switch to something else.
+//!
+//! Each task owns a guard-paged kernel stack and a saved register
+//! context; the hand-written switch in [`switch`] is the one place
+//! that touches `rsp`.
 //!
 //! ## Ordering
 //!
@@ -45,7 +50,7 @@ pub(crate) const DEFAULT_SLICE_MS: u32 = 10;
 static SCHED: Lazy<Mutex<Scheduler>> = Lazy::new(|| Mutex::new(Scheduler::new()));
 
 /// Install the bootstrap task wrapping the currently-running thread.
-/// Must be called exactly once, before any [`spawn`] or [`yield_now`].
+/// Must be called exactly once, before any [`spawn`].
 pub fn init() {
     let mut sched = SCHED.lock();
     assert!(sched.current.is_none(), "task::init called twice");
@@ -59,63 +64,6 @@ pub fn init() {
 pub fn spawn(entry: fn() -> !) {
     let mut sched = SCHED.lock();
     sched.ready.push_back(Box::new(Task::new(entry)));
-}
-
-/// Yield the CPU to the next runnable task. If no other task is
-/// ready, returns immediately. Safe to call from any task (including
-/// the bootstrap task after [`init`]).
-pub fn yield_now() {
-    // Mask IRQs across the lock + switch so the timer ISR's preempt
-    // path can't mutate the ready queue between our lock drop and the
-    // context_switch (which would invalidate `prev_rsp_ptr`). `was_on`
-    // lives on this task's stack — when we're eventually switched back
-    // in, it'll be restored and we re-enable iff this task was running
-    // with IRQs on. Tasks first entered via the trampoline always come
-    // back here with IRQs on, regardless of our caller's state.
-    let was_on = interrupts::are_enabled();
-    interrupts::disable();
-
-    // Carve out the switch parameters under the lock, then drop the
-    // lock BEFORE the context switch. Holding it across would
-    // deadlock the incoming task's own call to `yield_now`.
-    let (prev_rsp_ptr, next_rsp) = {
-        let mut sched = SCHED.lock();
-        let Some(mut next) = sched.ready.pop_front() else {
-            if was_on {
-                interrupts::enable();
-            }
-            return;
-        };
-        let mut prev = sched.current.take().expect("yield_now before task::init");
-
-        prev.state = TaskState::Ready;
-        next.state = TaskState::Running;
-        let next_rsp = next.rsp;
-        sched.current = Some(next);
-        sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
-        sched.ready.push_back(prev);
-        let prev_ref = sched.ready.back_mut().expect("just pushed");
-        let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
-
-        (prev_rsp_ptr, next_rsp)
-    };
-
-    // SAFETY: `prev_rsp_ptr` points at the `rsp` field of a Box<Task>
-    // in the ready queue. The Box indirection pins the Task's address
-    // — a VecDeque reallocation would move the Box, not the Task
-    // itself — so the pointer stays valid even if an IRQ fires before
-    // `context_switch` reaches its write. The Task can't be dropped
-    // until someone re-acquires SCHED and pops it, which can't happen
-    // between this lock drop and that write on a single CPU. We've
-    // also masked IRQs for the duration, so the preempt tick can't
-    // fire and re-enter the scheduler while the switch is in flight.
-    unsafe {
-        context_switch(prev_rsp_ptr, next_rsp);
-    }
-
-    if was_on {
-        interrupts::enable();
-    }
 }
 
 /// Check whether `addr` falls within any live kernel task's guard page.
@@ -148,15 +96,17 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
 /// current task's slice; if it's exhausted and there's another task
 /// ready, rotates and context-switches. Bails on lock contention so
 /// the ISR never blocks on a task that's in the middle of its own
-/// cooperative switch.
+/// [`block_current`] switch.
 ///
 /// Runs with IRQs masked (interrupt gate). The switched-in task
-/// resumes either via IRET (if it was last preempted) or through
-/// `yield_now`'s tail (if it was last suspended cooperatively) — both
-/// paths restore a correct IF on return to task code.
+/// resumes either via IRET (if it was last preempted at tick time)
+/// or through [`block_current`]'s tail (if it was last suspended on
+/// a waitqueue); both paths restore a correct IF on return to task
+/// code.
 pub fn preempt_tick() {
-    // `try_lock` + bail: yield_now (or another preempt tick mid-switch)
-    // may already hold SCHED. We'll get another tick in 10 ms.
+    // `try_lock` + bail: block_current (or another preempt tick
+    // mid-switch) may already hold SCHED. We'll get another tick in
+    // 10 ms.
     let Some(mut sched) = SCHED.try_lock() else {
         return;
     };
@@ -193,10 +143,13 @@ pub fn preempt_tick() {
     let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
     drop(sched);
 
-    // SAFETY: same invariant as `yield_now` — `prev_rsp_ptr` stays
-    // valid because Box pins the Task's address, and IRQs are masked
-    // inside the ISR so no other scheduler path can race us between
-    // lock drop and the context switch.
+    // SAFETY: `prev_rsp_ptr` points at the `rsp` field of a Box<Task>
+    // in the ready queue. The Box indirection pins the Task's address
+    // — a VecDeque reallocation would move the Box, not the heap-
+    // allocated Task it points at — so the pointer stays valid even
+    // though the VecDeque could mutate from under us. IRQs are already
+    // masked inside the ISR, so no other scheduler path can race us
+    // between lock drop and the context switch.
     unsafe {
         context_switch(prev_rsp_ptr, next_rsp);
     }
@@ -284,15 +237,15 @@ pub fn block_current() {
         // the Task, so `&mut prev_ref.rsp` points at stable memory that
         // survives any BTreeMap rebalance (rebalancing moves the Box,
         // not the heap-allocated Task it points at). Same invariant as
-        // yield_now's ready-queue push.
+        // preempt_tick's ready-queue push.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
 
         (prev_rsp_ptr, next_rsp)
     };
 
-    // SAFETY: same switch invariant as yield_now — IRQs are masked,
-    // the SCHED lock is dropped so the incoming task can re-enter the
-    // scheduler, and prev_rsp_ptr targets stable heap memory.
+    // SAFETY: IRQs are masked, the SCHED lock is dropped so the
+    // incoming task can re-enter the scheduler, and prev_rsp_ptr
+    // targets stable heap memory (see the insert comment above).
     unsafe {
         context_switch(prev_rsp_ptr, next_rsp);
     }

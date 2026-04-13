@@ -1,8 +1,11 @@
 //! Round-robin scheduler state. Holds the currently-running task, a
 //! FIFO ready queue, and a side-table of blocked (parked) tasks.
-//! Rescheduling happens from either `yield_now()` (cooperative) or
-//! `preempt_tick()` (PIT ISR); `yield_now` masks IRQs across the
-//! lock/switch window so the two paths can't race on the queue.
+//!
+//! Rescheduling happens from either `preempt_tick()` (PIT ISR, on
+//! slice exhaustion) or `block_current()` (task voluntarily parking
+//! on a waitqueue). Both paths lock the scheduler, update the queues,
+//! then drop the lock before `context_switch` to avoid deadlocking
+//! the incoming task's own scheduler entry.
 //!
 //! Blocked tasks are parked in `parked` (keyed by task id) and are
 //! invisible to the round-robin rotation. `task::wake(id)` migrates

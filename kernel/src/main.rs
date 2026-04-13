@@ -126,7 +126,9 @@ pub extern "C" fn _start() -> ! {
     vibix::task::spawn(cursor_blink_task);
 
     loop {
-        vibix::task::yield_now();
+        // `read_key` itself blocks on `hlt` until a scancode arrives;
+        // the PIT preempt tick can switch us out of that wait to any
+        // other ready task.
         match vibix::input::read_key() {
             pc_keyboard::DecodedKey::Unicode(c) => serial_print!("{}", c),
             pc_keyboard::DecodedKey::RawKey(key) => serial_print!("[{:?}]", key),
@@ -135,9 +137,11 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn idle_task() -> ! {
+    // `hlt` with IRQs on parks the CPU until the next interrupt, at
+    // which point `preempt_tick` may rotate us out. No explicit yield
+    // needed.
     loop {
         x86_64::instructions::hlt();
-        vibix::task::yield_now();
     }
 }
 
@@ -146,7 +150,9 @@ fn cursor_blink_task() -> ! {
     let mut next = vibix::time::ticks() + CURSOR_BLINK_TICKS;
     loop {
         while vibix::time::ticks() < next {
-            vibix::task::yield_now();
+            // Wake on the next timer tick, recheck. Preemption
+            // rotates other tasks in and out while we sleep.
+            x86_64::instructions::hlt();
         }
         next = next.wrapping_add(CURSOR_BLINK_TICKS);
         vibix::framebuffer::toggle_cursor();

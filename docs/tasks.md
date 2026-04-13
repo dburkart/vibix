@@ -1,20 +1,25 @@
 # Task Subsystem
 
-**Sources:** `kernel/src/task/`
-- `mod.rs` — public API, `init`, `spawn`, `yield_now`, `preempt_tick`
-- `task.rs` — `Task` struct: kernel stack allocation, saved register context
-- `scheduler.rs` — `Scheduler`: current task + FIFO ready queue
-- `switch.rs` — `context_switch` in hand-written assembly
+**Sources:** `kernel/src/task/`, `kernel/src/sync/`
+- `task/mod.rs` — public API, `init`, `spawn`, `preempt_tick`, `block_current`, `wake`
+- `task/task.rs` — `Task` struct: kernel stack allocation, saved register context, scheduling state
+- `task/scheduler.rs` — `Scheduler`: current task + FIFO ready queue + parked-task side-table
+- `task/switch.rs` — `context_switch` in hand-written assembly
+- `sync/` — blocking primitives (mutex, waitqueue, SPSC channel) built on `block_current` / `wake`
 
 ## Overview
 
-The task subsystem implements cooperative and preemptive kernel-mode
-multitasking. Tasks are kernel threads — they share the kernel address space
-and run entirely in ring 0. Each task has its own kernel stack and a saved
-register context that `context_switch` restores on re-entry.
+The task subsystem implements preemptive kernel-mode multitasking. Tasks
+are kernel threads — they share the kernel address space and run entirely
+in ring 0. Each task has its own kernel stack and a saved register context
+that `context_switch` restores on re-entry.
 
-There is no userspace, no per-task address space, and no blocking primitives.
-Cooperative code yields explicitly; the PIT timer drives preemption.
+There is no userspace and no per-task address space. Tasks that need to
+wait on a condition block via `sync::WaitQueue` / `sync::BlockingMutex` /
+`sync::spsc::channel`, which park the task on the scheduler's `parked`
+side-table until a wake arrives. Tasks that simply want to idle call
+`hlt` with IRQs enabled; the PIT preempt tick rotates them out when
+anyone else has work.
 
 ## Design
 
@@ -23,6 +28,7 @@ Cooperative code yields explicitly; the PIT timer drives preemption.
 A single `Lazy<Mutex<Scheduler>>` holds:
 - `current: Option<Box<Task>>` — the running task, `None` before `task::init`.
 - `ready: VecDeque<Box<Task>>` — FIFO queue of ready-to-run tasks.
+- `parked: BTreeMap<usize, Box<Task>>` — blocked tasks keyed by task id, invisible to the round-robin rotation until `wake(id)` migrates them back to `ready`.
 
 ### Task Struct
 
@@ -31,6 +37,8 @@ Each `Task` contains:
 - An unmapped guard page at the base of the stack.
 - `rsp: usize` — the saved stack pointer, updated by `context_switch`.
 - `slice_remaining_ms: u32` — remaining preemption budget in milliseconds.
+- `state: TaskState` — `Running` / `Ready` / `Blocked`, maintained by the scheduler transitions.
+- `wake_pending: AtomicBool` — cure for the wake-before-park race: set by `wake(id)` if the target task is still Running or Ready, consumed by the next `block_current`.
 
 Stacks are carved from a dedicated virtual address range
 (`TASK_STACKS_VA_BASE`), one slot per task. Each slot is
@@ -62,33 +70,53 @@ first run.
 5. Returns — which enters the new task at its saved return address.
 
 For a brand-new task this return address is the trampoline; for a previously
-preempted or yielded task it is the instruction after the call to
-`context_switch` inside `yield_now` or `preempt_tick`.
+preempted or parked task it is the instruction after the call to
+`context_switch` inside `preempt_tick` or `block_current`.
 
 ## Public API
 
 ### `task::init()`
 
-Wraps the current thread as the bootstrap task. Must be called once, after
-`mem::init()` (stacks are mapped via `paging::map_range`) and after interrupts are enabled (so
-preemption ticks can arrive).
+Wraps the current thread as the bootstrap task. Must be called once after
+`mem::init()` (stacks are mapped via `paging::map_range`). Safe to run
+either before or after interrupts are enabled: `preempt_tick` short-
+circuits on `sched.current.is_none()`, so a stray PIT tick that arrives
+before the bootstrap task exists simply returns. Integration tests
+initialize tasks first and then enable IRQs; `main.rs` does the reverse
+for historical reasons and both work.
 
 ### `task::spawn(entry: fn() -> !)`
 
 Allocates a new task and appends it to the ready queue. The task does not run
 until the scheduler reaches it.
 
-### `task::yield_now()`
+### `task::block_current()`
 
-The cooperative yield point:
-1. Disable IRQs to prevent the timer ISR from re-entering the scheduler.
-2. Under the `SCHED` lock, pop the next task from `ready`, move `current` to
-   the back of `ready`, make the popped task `current`.
-3. Release the lock, then call `context_switch`.
-4. Restore the IRQ state of the caller on return.
+Park the current task until a matching `wake(id)` fires. Used exclusively
+by the `sync` primitives; callers register themselves with a wakeup source
+(e.g. push their id onto a `WaitQueue`) before calling.
 
-If `ready` is empty, `yield_now` returns immediately (the running task keeps
-the CPU).
+1. Disable IRQs.
+2. Under the `SCHED` lock, check the task's `wake_pending` flag. If set,
+   clear it and return without parking — this closes the wake-before-park
+   race.
+3. Otherwise, pop the next task from `ready`, move `current` into
+   `parked` keyed by its id, make the popped task `current`.
+4. Release the lock, then call `context_switch`.
+5. Restore the IRQ state of the caller on return.
+
+Panics if `ready` is empty — blocking the sole runnable task would halt
+the kernel. Integration tests always keep the bootstrap task alive.
+
+### `task::wake(id)`
+
+Transition a parked task back to `ready`, or — if the target is still
+Running or Ready — set its `wake_pending` flag so its next
+`block_current` returns immediately. Task-context only: acquires the
+same `SCHED` lock that `preempt_tick` takes with `try_lock`, so calling
+from an ISR risks deadlock. If an IRQ needs to wake a task, defer
+through a lock-free queue drained by a kernel task (see
+`kernel/src/input.rs` for the pattern).
 
 ### `task::preempt_tick()`
 
@@ -117,5 +145,5 @@ from the `#PF` and `#DF` exception handlers.
 
 - Single-CPU only; no SMP or per-CPU runqueues.
 - No task priorities — pure round-robin.
-- No blocking primitives — sleeping tasks must poll and yield.
 - No per-task address spaces — all tasks share the kernel PML4.
+- No task exit — spawned tasks must park on `hlt` forever once done.
