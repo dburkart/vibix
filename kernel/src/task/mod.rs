@@ -414,7 +414,10 @@ pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
 /// normally the lock is free at fault time.
 pub fn current_vma_lookup(
     addr: usize,
-) -> Option<(crate::mem::vma::VmaKind, x86_64::structures::paging::PageTableFlags)> {
+) -> Option<(
+    crate::mem::vma::VmaKind,
+    x86_64::structures::paging::PageTableFlags,
+)> {
     let sched = SCHED.try_lock()?;
     let current = sched.current.as_ref()?;
     let vma = current.vmas.find(addr)?;
