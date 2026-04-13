@@ -397,12 +397,15 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
 /// Install a VMA on the currently-running task. The VMA is resolved
 /// lazily by the `#PF` handler on first touch of each page.
 pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
-    let mut sched = SCHED.lock();
-    let current = sched
-        .current
-        .as_mut()
-        .expect("install_vma_on_current: no running task");
-    current.vmas.insert(vma);
+    let aspace = {
+        let sched = SCHED.lock();
+        let current = sched
+            .current
+            .as_ref()
+            .expect("install_vma_on_current: no running task");
+        current.address_space.clone()
+    };
+    aspace.write().insert(vma);
 }
 
 /// Consult the current task's VMA list for `addr`. Returns the VMA's
@@ -419,9 +422,19 @@ pub fn current_vma_lookup(
     crate::mem::vma::VmaKind,
     x86_64::structures::paging::PageTableFlags,
 )> {
-    let sched = SCHED.try_lock()?;
-    let current = sched.current.as_ref()?;
-    let vma = current.vmas.find(addr)?;
+    let aspace = {
+        let sched = SCHED.try_lock()?;
+        let current = sched.current.as_ref()?;
+        current.address_space.clone()
+    };
+    // Take the write lock even for a read: the resolver in `idt.rs`
+    // mutates page-table state under this guarantee, and once SMP and
+    // CoW refcount fast-paths land we need exclusive access to the
+    // address space across the whole fault to keep the rc==1 check
+    // race-free. `try_write` keeps the existing "contention → not a
+    // demand fault" contract.
+    let guard = aspace.try_write()?;
+    let vma = guard.find(addr)?;
     Some((vma.kind, vma.flags))
 }
 
@@ -526,7 +539,18 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     //    private PML4. AnonZero: free the frame. Cow: free only when
     //    the backing frame is not the shared source (the private
     //    post-write copy).
-    for vma in victim.vmas.iter() {
+    // `reap_pending` runs from the timer ISR with IRQs masked, so a
+    // blocking `read()` would deadlock the moment the address space is
+    // contended. Today every task owns its address space outright (no
+    // CLONE_VM), so the lock is uncontended at reap time — `try_read`
+    // succeeds. The `expect` will fire loudly the first time a future
+    // refactor introduces shared address spaces; better a panic with
+    // a clear message than a silent ISR hang.
+    let aspace = victim
+        .address_space
+        .try_read()
+        .expect("reap_pending: address-space lock contended in ISR");
+    for vma in aspace.iter() {
         let mut va = vma.start;
         while va < vma.end {
             let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
@@ -550,6 +574,7 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
             va += 4096;
         }
     }
+    drop(aspace);
 
     // 3. Return the PML4 frame itself.
     // SAFETY: victim is no longer on any CPU; we're running on a

@@ -108,12 +108,15 @@ fn cow_read_then_write_diverges() {
 }
 
 fn vma_list_remove_roundtrip() {
-    // Covers VmaList::remove in isolation via the VMA installed by
-    // the previous test — proves `find` → `remove` → `find` returns
-    // None for that start, without disturbing other regions.
-    use vibix::mem::vma::VmaList;
+    // Covers AddressSpace::remove in isolation: proves
+    // `find` → `remove` → `find` returns None for that start,
+    // without disturbing other regions.
+    use vibix::mem::addrspace::AddressSpace;
 
-    let mut list = VmaList::new();
+    // SAFETY: smoke test running in a freshly-`init`-ed kernel; new_empty
+    // allocates a PML4 from the live frame allocator. We do not switch
+    // CR3 to it, so no aliasing concerns.
+    let mut aspace = AddressSpace::new_empty();
     let a = Vma::new(
         0x1000,
         0x2000,
@@ -126,22 +129,18 @@ fn vma_list_remove_roundtrip() {
         VmaKind::AnonZero,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
     );
-    list.insert(a);
-    list.insert(b);
-    assert!(list.find(0x1000).is_some());
-    assert!(list.find(0x3000).is_some());
+    aspace.insert(a);
+    aspace.insert(b);
+    assert!(aspace.find(0x1000).is_some());
+    assert!(aspace.find(0x3000).is_some());
 
-    let removed = list.remove(0x1000).expect("remove returned None");
+    let removed = aspace.remove(0x1000).expect("remove returned None");
     assert_eq!(removed.start, 0x1000);
-    assert!(list.find(0x1000).is_none(), "removed VMA still findable");
-    assert!(list.find(0x3000).is_some(), "sibling VMA lost to remove");
+    assert!(aspace.find(0x1000).is_none(), "removed VMA still findable");
+    assert!(aspace.find(0x3000).is_some(), "sibling VMA lost to remove");
 
     assert!(
-        list.remove(0x9000).is_none(),
+        aspace.remove(0x9000).is_none(),
         "remove of absent start must be None"
     );
-
-    // clone_for_fork preserves entries.
-    let child = list.clone_for_fork();
-    assert!(child.find(0x3000).is_some(), "fork clone lost an entry");
 }

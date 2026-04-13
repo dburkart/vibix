@@ -73,6 +73,29 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    /// Build an `AddressSpace` for the bootstrap task: wraps the
+    /// already-running kernel PML4 instead of allocating a new one. The
+    /// bootstrap task inherits the kernel mappings as-is and never
+    /// installs user VMAs, so the fields beyond `page_table` get the
+    /// same defaults as [`new_empty`].
+    #[cfg(target_os = "none")]
+    pub fn for_bootstrap(
+        page_table: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
+    ) -> Self {
+        let mmap_base = VirtAddr::new(0x0000_0000_4000_0000);
+        let brk_start = mmap_base;
+        Self {
+            page_table,
+            vmas: BTreeMap::new(),
+            mmap_base,
+            brk_start,
+            brk_cur: brk_start,
+            brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
+            rss_pages: 0,
+            vm_pages: 0,
+        }
+    }
+
     /// Build an empty address space: fresh PML4 with the canonical
     /// kernel upper half copied in, no VMAs, `brk` window pinned at
     /// `mmap_base` until a loader picks a real heap start.
@@ -125,6 +148,39 @@ impl AddressSpace {
         &self,
     ) -> x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB> {
         self.page_table
+    }
+
+    /// Insert `vma`, panicking if it overlaps any existing entry.
+    /// Overlapping VMAs are a programmer error, not a runtime
+    /// condition to recover from. O(log n) lookup of the candidate
+    /// neighbours via `BTreeMap::range`.
+    pub fn insert(&mut self, vma: Vma) {
+        // Predecessor whose start < vma.end could still overlap if its
+        // end > vma.start.
+        if let Some((_, prev)) = self.vmas.range(..vma.start).next_back() {
+            assert!(prev.end <= vma.start, "VMA overlaps existing range");
+        }
+        if let Some((_, next)) = self.vmas.range(vma.start..).next() {
+            assert!(vma.end <= next.start, "VMA overlaps existing range");
+        }
+        let pages = (vma.end - vma.start) / 4096;
+        self.vmas.insert(vma.start, vma);
+        self.vm_pages += pages;
+    }
+
+    /// Iterate VMAs in ascending start-address order.
+    pub fn iter(&self) -> impl Iterator<Item = &Vma> {
+        self.vmas.values()
+    }
+
+    /// Remove the VMA whose `start` matches exactly. Keyed on `start`
+    /// (not an arbitrary inclusion address) so callers must name the
+    /// region they installed — partial-range unmap is a separate
+    /// concern (#160).
+    pub fn remove(&mut self, start: usize) -> Option<Vma> {
+        let removed = self.vmas.remove(&start)?;
+        self.vm_pages -= (removed.end - removed.start) / 4096;
+        Some(removed)
     }
 
     /// Find the VMA containing `addr`, if any. Uses a `BTreeMap::range`
