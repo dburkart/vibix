@@ -501,16 +501,23 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
     use x86_64::VirtAddr;
 
-    // 1. Unmap + free stack pages. These live in the shared upper-half
-    //    kernel window (L4 entry 416), so a single unmap via the
-    //    active PML4 propagates through aliasing to every PML4.
+    // 1. Unmap + free stack pages. Stack pages live in the shared
+    //    upper-half kernel window (L4 entry 416) — the L3 subtree under
+    //    that entry is aliased into every per-task PML4, so unmapping
+    //    via the victim's PML4 propagates to every PML4.
+    //
+    //    We deliberately route through `unmap_in_pml4` (temporary
+    //    mapper) rather than `unmap_and_free` (global `MAPPER` lock):
+    //    `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
+    //    interrupted task held `MAPPER`, spinning on it here would
+    //    deadlock with IRQs masked.
     let stack_base = victim.stack_base();
     if stack_base != 0 {
         for i in 0..victim.stack_page_count() {
             let va = stack_base + i * 4096;
             let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
                 .expect("stack page VA aligned by construction");
-            let _ = paging::unmap_and_free(page);
+            let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
         }
     }
 
