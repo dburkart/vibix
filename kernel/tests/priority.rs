@@ -132,15 +132,25 @@ fn idle_forever() -> ! {
 }
 
 fn nice_sets_visible_priority() {
-    // nice=10 maps to priority 10; nice=-5 maps to priority 25. The
-    // task list must reflect both mappings. Doesn't depend on the
-    // spawned tasks running — a lower-priority task would starve
-    // against the default-priority driver and that's the point.
+    // With DEFAULT_PRIORITY=19, nice=10 maps to priority 9 and
+    // nice=-5 maps to priority 24. The task list must reflect both
+    // mappings. Doesn't depend on the spawned tasks running — a
+    // lower-priority task would starve against the default-priority
+    // driver and that's the point.
     task::spawn_with_nice(idle_forever, 10);
     task::spawn_with_nice(idle_forever, -5);
 
-    assert_eq!(task::priority_from_nice(10), 10);
-    assert_eq!(task::priority_from_nice(-5), 25);
+    let lo_prio = task::priority_from_nice(10);
+    let hi_prio = task::priority_from_nice(-5);
+    // Round-trip across the full legal nice range.
+    for nice in task::NICE_MIN..=task::NICE_MAX {
+        let p = task::priority_from_nice(nice);
+        assert!(p <= task::MAX_PRIORITY);
+        assert_eq!(task::nice_from_priority(p), nice);
+    }
+    // Edge cases: nice extremes must not saturate before mapping.
+    assert_eq!(task::priority_from_nice(task::NICE_MIN), task::MAX_PRIORITY);
+    assert_eq!(task::priority_from_nice(task::NICE_MAX), 0);
 
     let mut saw_low = false;
     let mut saw_high = false;
@@ -148,10 +158,10 @@ fn nice_sets_visible_priority() {
         assert!(info.priority <= task::MAX_PRIORITY);
         assert!(info.nice >= task::NICE_MIN && info.nice <= task::NICE_MAX);
         assert_eq!(task::nice_from_priority(info.priority), info.nice);
-        if info.nice == 10 && info.priority == 10 {
+        if info.nice == 10 && info.priority == lo_prio {
             saw_low = true;
         }
-        if info.nice == -5 && info.priority == 25 {
+        if info.nice == -5 && info.priority == hi_prio {
             saw_high = true;
         }
     });
@@ -203,10 +213,10 @@ fn set_priority_round_trip() {
 
     assert!(!task::set_priority(usize::MAX, 10), "accepted unknown id");
 
-    // adjust_nice on the target: priority 30 -> nice -10. Bump by +3
-    // → nice -7 → priority 27.
+    // adjust_nice on the target: priority 30 -> nice -11 (with
+    // DEFAULT_PRIORITY=19). Bump by +3 → nice -8 → priority 27.
     let new_nice = task::adjust_nice(target_id, 3);
-    assert_eq!(new_nice, Some(-7));
+    assert_eq!(new_nice, Some(-8));
     let mut adjusted_prio = None;
     task::for_each_task(|info| {
         if info.id == target_id {

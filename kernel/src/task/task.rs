@@ -117,8 +117,11 @@ impl Task {
         }
     }
 
-    /// Allocate a guard-paged stack and prime it so the first switch into
-    /// this task runs `entry` via the trampoline.
+    /// Allocate a guard-paged stack and prime it so the first switch
+    /// into this task runs `entry` via the trampoline at the given
+    /// scheduling priority. Affinity defaults to [`AFFINITY_ALL`];
+    /// callers that care about pinning call [`super::set_affinity`]
+    /// after spawning.
     ///
     /// VA layout (low → high):
     /// ```text
@@ -132,11 +135,6 @@ impl Task {
     ///   r15=0  r14=0  r13=0  r12=entry  rbp=0  rbx=0  ret=trampoline  <top>
     ///   ^ saved rsp (initial)
     /// ```
-    /// Allocate a guard-paged stack and prime it so the first switch
-    /// into this task runs `entry` via the trampoline at the given
-    /// scheduling priority. Affinity defaults to [`AFFINITY_ALL`];
-    /// callers that care about pinning call [`super::set_affinity`]
-    /// after spawning.
     pub fn new_with_priority(entry: fn() -> !, priority: u8) -> Self {
         // Bump-allocate a fresh VA slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);

@@ -16,7 +16,12 @@ pub const MAX_PRIORITY: u8 = 39;
 
 /// Priority assigned to tasks spawned without an explicit priority.
 /// Corresponds to nice 0.
-pub const DEFAULT_PRIORITY: u8 = 20;
+///
+/// Set so the full nice range (`-20..=19`) round-trips through
+/// `priority_from_nice` / `nice_from_priority` without saturating at
+/// [`MAX_PRIORITY`]: nice = -20 maps to priority 39, nice = 19 maps to
+/// priority 0.
+pub const DEFAULT_PRIORITY: u8 = 19;
 
 /// Number of distinct priority levels (0..=MAX_PRIORITY).
 pub const NUM_PRIORITIES: usize = MAX_PRIORITY as usize + 1;
@@ -40,7 +45,8 @@ pub const fn priority_from_nice(nice: i8) -> u8 {
     } else {
         nice
     };
-    // nice -20 → 39, nice 0 → 20 (DEFAULT_PRIORITY), nice 19 → 1.
+    // nice -20 → 39 (MAX_PRIORITY), nice 0 → 19 (DEFAULT_PRIORITY),
+    // nice 19 → 0.
     (DEFAULT_PRIORITY as i16 - clamped as i16) as u8
 }
 
