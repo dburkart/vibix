@@ -100,7 +100,9 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // faults fall through to the existing hang-with-diagnostic path).
     let err_raw = code.bits();
     let cpl = (frame.code_segment.0 & 0b11) as u8;
-    let rflags_ac = frame.cpu_flags.contains(x86_64::registers::rflags::RFlags::ALIGNMENT_CHECK);
+    let rflags_ac = frame
+        .cpu_flags
+        .contains(x86_64::registers::rflags::RFlags::ALIGNMENT_CHECK);
 
     if crate::mem::pf::is_smap_violation(cpl, err_raw, rflags_ac) {
         panic_smap_violation(addr_u64);
