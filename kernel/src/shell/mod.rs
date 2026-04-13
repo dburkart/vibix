@@ -38,7 +38,9 @@ pub fn run() -> ! {
         match input::try_read_key() {
             Some(DecodedKey::Unicode('\r')) | Some(DecodedKey::Unicode('\n')) => {
                 serial_print!("\r\n");
-                dispatch(line.trim());
+                // Only strip leading whitespace so `echo` can round-trip
+                // user-entered trailing spaces.
+                dispatch(line.trim_start());
                 line.clear();
                 prompt();
             }
@@ -72,7 +74,7 @@ fn dispatch(line: &str) {
         return;
     }
     let (cmd, rest) = match line.split_once(' ') {
-        Some((c, r)) => (c, r.trim_start()),
+        Some((c, r)) => (c, r),
         None => (line, ""),
     };
     match cmd {
@@ -118,12 +120,20 @@ fn cmd_mem() {
 }
 
 fn cmd_tasks() {
-    task::for_each_task(|t| {
+    // Collect the snapshot before any serial I/O: `for_each_task` holds
+    // the scheduler lock for the duration of its closure, so printing
+    // inside it would both lengthen the critical section and invite
+    // lock-ordering trouble if the serial path ever grows dependencies
+    // on the scheduler.
+    let mut tasks: alloc::vec::Vec<task::TaskInfo> = alloc::vec::Vec::new();
+    task::for_each_task(|t| tasks.push(t));
+
+    for t in tasks {
         serial_println!(
             "  task {:>3} {} slice={} ms",
             t.id,
             if t.is_current { "[run]" } else { "[rdy]" },
             t.slice_remaining_ms,
         );
-    });
+    }
 }
