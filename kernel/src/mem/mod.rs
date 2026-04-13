@@ -32,6 +32,9 @@ pub mod vmatree;
 pub mod vmobject;
 
 #[cfg(any(target_os = "none", test))]
+pub mod pf;
+
+#[cfg(any(target_os = "none", test))]
 pub mod addrspace;
 
 #[cfg(target_os = "none")]

@@ -40,6 +40,25 @@ fn hang() -> ! {
     }
 }
 
+/// RFC 0001 Security A2: an SMAP violation is a kernel bug that could
+/// be weaponised by an attacker-controlled user page, so the diagnostic
+/// carries the faulting VA only — never PTE contents or frame physaddrs.
+#[inline(never)]
+fn panic_smap_violation(addr: u64) -> ! {
+    serial_println!("EXCEPTION: #PF SMAP violation addr={:#x}", addr);
+    hang();
+}
+
+/// RFC 0001 Security A2: a reserved-bit fault means the page-table
+/// walker saw a PTE with bits set that the current MAXPHYADDR /
+/// paging mode reserves — always a kernel-side corruption. Log the
+/// VA only; the PTE word must not reach any user-reachable sink.
+#[inline(never)]
+fn panic_rsvd_corruption(addr: u64) -> ! {
+    serial_println!("EXCEPTION: #PF RSVD corruption addr={:#x}", addr);
+    hang();
+}
+
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: #DE (divide error)\n{:#?}", frame);
     hang();
@@ -72,6 +91,42 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
             );
             exit_qemu(QemuExitCode::Failure);
         }
+    }
+
+    // RFC 0001 dispatch gates. Order is load-bearing: SMAP before any
+    // decision that might trust user state; RSVD before canonical
+    // because a corrupt walk could spoof a "bad address" signal; the
+    // canonical/USER_VA_END check gates user faults only (pure kernel
+    // faults fall through to the existing hang-with-diagnostic path).
+    let err_raw = code.bits();
+    let cpl = (frame.code_segment.0 & 0b11) as u8;
+    let rflags_ac = frame
+        .cpu_flags
+        .contains(x86_64::registers::rflags::RFlags::ALIGNMENT_CHECK);
+
+    if crate::mem::pf::is_smap_violation(cpl, err_raw, rflags_ac) {
+        panic_smap_violation(addr_u64);
+    }
+
+    // Pure kernel faults (CPL=0, supervisor page) fall through to the
+    // existing handler chain below. Nothing to do here beyond the
+    // explicit no-op — the comment documents the RFC's step 2.
+
+    if crate::mem::pf::is_rsvd_fault(err_raw) {
+        panic_rsvd_corruption(addr_u64);
+    }
+
+    // Step 4: canonical / USER_VA_END check for user-mode faults. A
+    // user fault whose cr2 lands in the kernel half (or non-canonical
+    // region) is a SIGSEGV/MAPERR; we don't have signal delivery yet
+    // so log and hang with the RFC-mandated marker.
+    if cpl != 0 && !crate::mem::pf::is_user_va(addr_u64) {
+        serial_println!(
+            "EXCEPTION: #PF user addr={:#x} outside USER_VA_END (MAPERR) code={:?}",
+            addr_u64,
+            code,
+        );
+        hang();
     }
 
     // VMA-backed resolver. Two independent paths:
