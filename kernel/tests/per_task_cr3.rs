@@ -37,7 +37,10 @@ fn panic(info: &PanicInfo) -> ! {
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
         ("distinct_pml4_per_task", &(distinct_pml4_per_task as fn())),
-        ("kernel_upper_half_shared", &(kernel_upper_half_shared as fn())),
+        (
+            "kernel_upper_half_shared",
+            &(kernel_upper_half_shared as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
