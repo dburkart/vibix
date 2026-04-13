@@ -92,17 +92,29 @@ struct Rsdp {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct SdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oem_id: [u8; 6],
-    oem_table_id: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_revision: u32,
+pub struct SdtHeader {
+    pub signature: [u8; 4],
+    pub length: u32,
+    pub revision: u8,
+    pub checksum: u8,
+    pub oem_id: [u8; 6],
+    pub oem_table_id: [u8; 8],
+    pub oem_revision: u32,
+    pub creator_id: u32,
+    pub creator_revision: u32,
 }
+
+/// Cached pointer to the root table (XSDT or RSDT) plus the HHDM base.
+/// Populated by [`init`] so follow-on callers (e.g. the HPET driver)
+/// can re-walk the root looking for additional SDTs without having to
+/// re-parse the RSDP.
+struct RootTable {
+    root_phys: u64,
+    hhdm_offset: u64,
+    is_xsdt: bool,
+}
+
+static ROOT: Once<RootTable> = Once::new();
 
 const MADT_PROCESSOR_LAPIC: u8 = 0;
 const MADT_IOAPIC: u8 = 1;
@@ -143,12 +155,19 @@ pub fn init(rsdp_phys: usize, hhdm_offset: u64) {
     let xsdt_phys = rsdp.xsdt_address;
     let rsdt_phys = rsdp.rsdt_address;
 
-    let madt_ptr = if rsdp.revision >= 2 && xsdt_phys != 0 {
-        find_madt_xsdt(xsdt_phys, hhdm_offset)
+    let (root_phys, is_xsdt) = if rsdp.revision >= 2 && xsdt_phys != 0 {
+        (xsdt_phys, true)
     } else {
-        find_madt_rsdt(rsdt_phys as u64, hhdm_offset)
-    }
-    .expect("MADT not found in ACPI tables");
+        (rsdt_phys as u64, false)
+    };
+    ROOT.call_once(|| RootTable {
+        root_phys,
+        hhdm_offset,
+        is_xsdt,
+    });
+
+    let madt_ptr = find_sdt_in_root(root_phys, hhdm_offset, is_xsdt, b"APIC")
+        .expect("MADT not found in ACPI tables");
 
     let info = parse_madt(madt_ptr);
     serial_println!(
@@ -159,6 +178,65 @@ pub fn init(rsdp_phys: usize, hhdm_offset: u64) {
         info.lapic_phys
     );
     INFO.call_once(|| info);
+}
+
+/// Look up a non-MADT SDT by its 4-byte signature in the previously
+/// walked root table. Returns a pointer to the full SDT (including its
+/// header); callers cast to their own `#[repr(C, packed)]` layout.
+/// Returns `None` if [`init`] hasn't run yet or the signature is
+/// absent.
+pub fn find_sdt(signature: &[u8; 4]) -> Option<*const SdtHeader> {
+    let root = ROOT.get()?;
+    find_sdt_in_root(root.root_phys, root.hhdm_offset, root.is_xsdt, signature)
+}
+
+/// HHDM offset recorded during [`init`]. Used by drivers that map
+/// additional MMIO regions once ACPI discovery has completed.
+pub fn hhdm_offset() -> Option<u64> {
+    ROOT.get().map(|r| r.hhdm_offset)
+}
+
+fn find_sdt_in_root(
+    root_phys: u64,
+    hhdm: u64,
+    is_xsdt: bool,
+    signature: &[u8; 4],
+) -> Option<*const SdtHeader> {
+    if is_xsdt {
+        find_by_sig_xsdt(root_phys, hhdm, signature)
+    } else {
+        find_by_sig_rsdt(root_phys, hhdm, signature)
+    }
+}
+
+fn find_by_sig_xsdt(xsdt_phys: u64, hhdm: u64, signature: &[u8; 4]) -> Option<*const SdtHeader> {
+    let header = read_sdt(xsdt_phys, hhdm);
+    let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
+    let count = entries_bytes / 8;
+    let entries_ptr = (xsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u64;
+    for i in 0..count {
+        let phys = unsafe { entries_ptr.add(i).read_unaligned() };
+        let sdt = read_sdt(phys, hhdm);
+        if &sdt.signature == signature {
+            return Some(sdt as *const _);
+        }
+    }
+    None
+}
+
+fn find_by_sig_rsdt(rsdt_phys: u64, hhdm: u64, signature: &[u8; 4]) -> Option<*const SdtHeader> {
+    let header = read_sdt(rsdt_phys, hhdm);
+    let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
+    let count = entries_bytes / 4;
+    let entries_ptr = (rsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u32;
+    for i in 0..count {
+        let phys = unsafe { entries_ptr.add(i).read_unaligned() } as u64;
+        let sdt = read_sdt(phys, hhdm);
+        if &sdt.signature == signature {
+            return Some(sdt as *const _);
+        }
+    }
+    None
 }
 
 fn read_sdt(phys: u64, hhdm: u64) -> &'static SdtHeader {
@@ -190,36 +268,6 @@ fn checksum(ptr: *const u8, len: usize) -> u8 {
         sum = sum.wrapping_add(unsafe { *ptr.add(i) });
     }
     sum
-}
-
-fn find_madt_xsdt(xsdt_phys: u64, hhdm: u64) -> Option<*const SdtHeader> {
-    let header = read_sdt(xsdt_phys, hhdm);
-    let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
-    let count = entries_bytes / 8;
-    let entries_ptr = (xsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u64;
-    for i in 0..count {
-        let phys = unsafe { entries_ptr.add(i).read_unaligned() };
-        let sdt = read_sdt(phys, hhdm);
-        if &sdt.signature == b"APIC" {
-            return Some(sdt as *const _);
-        }
-    }
-    None
-}
-
-fn find_madt_rsdt(rsdt_phys: u64, hhdm: u64) -> Option<*const SdtHeader> {
-    let header = read_sdt(rsdt_phys, hhdm);
-    let entries_bytes = header.length as usize - mem::size_of::<SdtHeader>();
-    let count = entries_bytes / 4;
-    let entries_ptr = (rsdt_phys + hhdm + mem::size_of::<SdtHeader>() as u64) as *const u32;
-    for i in 0..count {
-        let phys = unsafe { entries_ptr.add(i).read_unaligned() } as u64;
-        let sdt = read_sdt(phys, hhdm);
-        if &sdt.signature == b"APIC" {
-            return Some(sdt as *const _);
-        }
-    }
-    None
 }
 
 fn map_phys(phys: u64, size: u64) {
