@@ -412,8 +412,9 @@ pub fn update_current_cr3(
 }
 
 /// Install a VMA on the currently-running task. The VMA is resolved
-/// lazily by the `#PF` handler on first touch of each page.
-pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
+/// lazily by the `#PF` handler on first touch of each page via
+/// [`VmObject::fault`].
+pub fn install_vma_on_current(vma: crate::mem::vmatree::Vma) {
     let aspace = {
         let sched = SCHED.lock();
         let current = sched
@@ -425,8 +426,9 @@ pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
     aspace.write().insert(vma);
 }
 
-/// Consult the current task's VMA list for `addr`. Returns the VMA's
-/// backing kind and the flags the `#PF` resolver should apply.
+/// Consult the current task's address space for `addr`. Returns the
+/// VMA's backing object, the page-aligned byte offset into that object,
+/// the cached PTE flags, and the sharing discipline.
 ///
 /// Returns `None` if the scheduler lock is contended — the `#PF`
 /// handler treats that as "not a demand-page fault" and falls through
@@ -436,8 +438,10 @@ pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
 pub fn current_vma_lookup(
     addr: usize,
 ) -> Option<(
-    crate::mem::vma::VmaKind,
-    x86_64::structures::paging::PageTableFlags,
+    alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
+    usize,
+    crate::mem::vmatree::ProtPte,
+    crate::mem::vmatree::Share,
 )> {
     let aspace = {
         let sched = SCHED.try_lock()?;
@@ -452,7 +456,14 @@ pub fn current_vma_lookup(
     // demand fault" contract.
     let guard = aspace.try_write()?;
     let vma = guard.find(addr)?;
-    Some((vma.kind, vma.flags))
+    let page_aligned = addr & !(4096 - 1);
+    let offset = page_aligned - vma.start + vma.object_offset;
+    Some((
+        alloc::sync::Arc::clone(&vma.object),
+        offset,
+        vma.prot_pte,
+        vma.share,
+    ))
 }
 
 /// Terminate the currently-running task. Reclaims the task's mapped
@@ -541,10 +552,11 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     // that entry is aliased into every per-task PML4, so unmapping via
     // the victim's PML4 propagates to every PML4.
     //
-    // We deliberately route through `unmap_in_pml4` (temporary mapper)
-    // rather than `unmap_and_free` (global `MAPPER` lock): `reap_pending`
-    // runs inside `preempt_tick`, a timer ISR. If the interrupted task
-    // held `MAPPER`, spinning on it here would deadlock with IRQs masked.
+    // We deliberately route through `unmap_and_free_in_pml4` (temporary
+    // mapper) rather than `unmap_and_free` (global `MAPPER` lock):
+    // `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
+    // interrupted task held `MAPPER`, spinning on it here would
+    // deadlock with IRQs masked.
     let stack_base = victim.stack_base();
     if stack_base != 0 {
         for i in 0..victim.stack_page_count() {
@@ -565,7 +577,8 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
 
     // Drop the Box<Task>. The Arc<RwLock<AddressSpace>> goes with it;
     // when the strong count reaches zero, `Drop for AddressSpace`
-    // walks the VMAs, frees every leaf frame, frees the user-half
+    // walks the VMAs, frees every leaf frame (detecting and freeing
+    // private CoW copies via VmObject::frame_at), frees the user-half
     // intermediate page tables, and frees the PML4 itself.
     drop(victim);
 }

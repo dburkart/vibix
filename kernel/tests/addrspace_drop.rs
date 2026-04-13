@@ -17,7 +17,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use vibix::mem::frame;
-use vibix::mem::vma::{Vma, VmaKind};
+use vibix::mem::vmatree::{Share, Vma};
+use vibix::mem::vmobject::AnonObject;
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
@@ -61,11 +62,16 @@ const WORKER_VMA_PAGES: usize = 8;
 static WORKER_DONE: AtomicUsize = AtomicUsize::new(0);
 
 fn worker() -> ! {
+    let prot_pte =
+        (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE).bits();
     task::install_vma_on_current(Vma::new(
         WORKER_VMA_BASE,
         WORKER_VMA_BASE + WORKER_VMA_PAGES * 4096,
-        VmaKind::AnonZero,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        0x3, // PROT_READ | PROT_WRITE
+        prot_pte,
+        Share::Private,
+        AnonObject::new(Some(WORKER_VMA_PAGES)),
+        0,
     ));
 
     // Touch every page so the resolver installs a leaf frame for each.

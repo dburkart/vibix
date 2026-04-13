@@ -129,61 +129,77 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         hang();
     }
 
-    // VMA-backed resolver. Two independent paths:
+    // VMA-backed resolver. Two paths:
     //
-    // * Not-present fault inside an installed VMA → install the page.
-    //   AnonZero: alloc+zero a frame and map it writable per the
-    //   VMA flags. Cow: map the shared source frame read-only (strip
-    //   WRITABLE) so the *next* write takes a protection fault we
-    //   resolve below.
+    // * Not-present fault inside an installed VMA → call VmObject::fault
+    //   to obtain the backing physical frame (allocating lazily if
+    //   needed), then map it with the VMA's cached PTE flags.
     //
-    // * Write protection fault on a Cow page → allocate a private
-    //   frame, memcpy the source in, remap writable.
+    // * Write-protection fault on a Private + WRITABLE page → the page
+    //   was previously installed read-only (CoW first-touch, set by the
+    //   fork path). Fetch the source frame from the VmObject, copy it
+    //   into a fresh private frame, and remap writable.
     //
-    // Any other protection violation (read/exec fault on a present
-    // page, or on a page outside any VMA) falls through to the
-    // generic hang path — those are real access-rights bugs.
-    if let Some((kind, flags)) = crate::task::current_vma_lookup(addr_u64 as usize) {
-        use x86_64::structures::paging::{Page, Size4KiB};
-        use x86_64::VirtAddr;
+    // Any other protection violation falls through to the generic hang
+    // path — those are real access-rights bugs.
+    if let Some((object, offset, prot_pte, _share)) =
+        crate::task::current_vma_lookup(addr_u64 as usize)
+    {
+        use crate::mem::vmobject::Access;
+        use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+        use x86_64::{PhysAddr, VirtAddr};
+
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
         let active = x86_64::registers::control::Cr3::read().0;
         let is_write = code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_prot = code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
-        match (kind, is_prot, is_write) {
-            (crate::mem::vma::VmaKind::AnonZero, false, _) => {
-                match crate::mem::paging::map_in_pml4(active, page, flags) {
-                    Ok(_) => return,
-                    Err(e) => serial_println!(
-                        "#PF anon-zero resolve failed addr={:#x}: {:?}",
-                        addr_u64,
-                        e
-                    ),
-                }
-            }
-            (crate::mem::vma::VmaKind::Cow { frame }, false, _) => {
-                // First touch: install the shared source read-only.
-                // Strip WRITABLE so the next write triggers the
-                // protection-fault path below.
-                let ro = flags & !PageTableFlags::WRITABLE;
-                match crate::mem::paging::map_existing_in_pml4(active, page, frame, ro) {
-                    Ok(()) => return,
-                    Err(e) => {
-                        serial_println!("#PF cow map-source failed addr={:#x}: {:?}", addr_u64, e)
+        let pte_flags = PageTableFlags::from_bits_truncate(prot_pte);
+
+        if !is_prot {
+            // Not-present fault: ask the VmObject for the backing frame.
+            let access = if is_write {
+                Access::Write
+            } else {
+                Access::Read
+            };
+            match object.fault(offset, access) {
+                Ok(phys) => {
+                    let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
+                        .expect("#PF: VmObject returned unaligned phys");
+                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
+                        Ok(()) => return,
+                        Err(e) => {
+                            serial_println!("#PF demand map failed addr={:#x}: {:?}", addr_u64, e)
+                        }
                     }
                 }
-            }
-            (crate::mem::vma::VmaKind::Cow { frame }, true, true) => {
-                match crate::mem::paging::cow_copy_and_remap(active, page, frame, flags) {
-                    Ok(_) => return,
-                    Err(e) => serial_println!(
-                        "#PF cow copy-and-remap failed addr={:#x}: {:?}",
-                        addr_u64,
-                        e
-                    ),
+                Err(e) => {
+                    serial_println!("#PF VmObject::fault failed addr={:#x}: {:?}", addr_u64, e)
                 }
             }
-            _ => {}
+        } else if is_write && pte_flags.contains(PageTableFlags::WRITABLE) {
+            // Write-protection fault on a CoW-eligible page: the VMA
+            // wants WRITABLE but the PTE was installed read-only by the
+            // fork path. Fetch the source frame and make a private copy.
+            match object.fault(offset, Access::Read) {
+                Ok(phys) => {
+                    let source = PhysFrame::from_start_address(PhysAddr::new(phys))
+                        .expect("#PF: VmObject returned unaligned phys for CoW source");
+                    match crate::mem::paging::cow_copy_and_remap(active, page, source, pte_flags) {
+                        Ok(_) => return,
+                        Err(e) => serial_println!(
+                            "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
+                            addr_u64,
+                            e
+                        ),
+                    }
+                }
+                Err(e) => serial_println!(
+                    "#PF CoW VmObject::fault failed addr={:#x}: {:?}",
+                    addr_u64,
+                    e
+                ),
+            }
         }
     }
 

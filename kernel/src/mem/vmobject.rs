@@ -59,6 +59,23 @@ pub trait VmObject: Send + Sync {
     /// Number of pages this object covers. `None` for unbounded
     /// (heap-style) objects.
     fn len_pages(&self) -> Option<usize>;
+
+    /// Return the cached physical address for `offset` without allocating,
+    /// or `None` if the page has not been faulted in yet.
+    ///
+    /// Used by `reap_pending` to detect private CoW copies: after
+    /// `cow_copy_and_remap` the PTE holds a new private frame that is
+    /// *not* in this object's cache (the cache still maps the offset to
+    /// the original source frame). When the PTE frame differs from this
+    /// return value, `reap_pending` frees it directly; the cached source
+    /// frame is freed later by [`Drop`]. Implementations that do not
+    /// cache frames (future file-backed objects) return `None`, which
+    /// triggers the same "free the PTE frame directly" path — safe because
+    /// those objects never own the frame in the first place.
+    fn frame_at(&self, offset: usize) -> Option<u64> {
+        let _ = offset;
+        None
+    }
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is
@@ -130,6 +147,11 @@ impl VmObject for AnonObject {
 
     fn len_pages(&self) -> Option<usize> {
         self.len_pages
+    }
+
+    fn frame_at(&self, offset: usize) -> Option<u64> {
+        let idx = offset / (crate::mem::FRAME_SIZE as usize);
+        self.inner.lock().frames.get(&idx).copied()
     }
 }
 

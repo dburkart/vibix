@@ -25,8 +25,6 @@ pub mod paging;
 #[cfg(target_os = "none")]
 pub mod pat;
 #[cfg(any(target_os = "none", test))]
-pub mod vma;
-#[cfg(any(target_os = "none", test))]
 pub mod vmatree;
 #[cfg(any(target_os = "none", test))]
 pub mod vmobject;
