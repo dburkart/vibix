@@ -11,7 +11,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex as SpinMutex;
-use vibix::sync::spsc;
+use vibix::sync::{mpmc, spsc};
 use vibix::sync::{BlockingMutex, WaitQueue};
 use vibix::{
     exit_qemu, serial_println, task,
@@ -38,6 +38,24 @@ fn run_tests() {
         ("channel_ping_pong", &(channel_ping_pong as fn())),
         ("mutex_contention", &(mutex_contention as fn())),
         ("waitqueue_notify_all", &(waitqueue_notify_all as fn())),
+        (
+            "spsc_close_wakes_receiver",
+            &(spsc_close_wakes_receiver as fn()),
+        ),
+        (
+            "spsc_close_wakes_sender",
+            &(spsc_close_wakes_sender as fn()),
+        ),
+        ("mpmc_many_to_one", &(mpmc_many_to_one as fn())),
+        ("mpmc_many_to_many", &(mpmc_many_to_many as fn())),
+        (
+            "mpmc_close_wakes_receivers",
+            &(mpmc_close_wakes_receivers as fn()),
+        ),
+        (
+            "mpmc_close_wakes_senders",
+            &(mpmc_close_wakes_senders as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -69,7 +87,7 @@ const CH_N: u32 = 60;
 fn ch_producer() -> ! {
     let tx = CH_TX.lock().take().expect("producer: CH_TX not set");
     for i in 0..CH_N {
-        tx.send(i);
+        tx.send(i).expect("producer: send returned Err");
     }
     CH_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -80,7 +98,7 @@ fn ch_producer() -> ! {
 fn ch_consumer() -> ! {
     let rx = CH_RX.lock().take().expect("consumer: CH_RX not set");
     for _ in 0..CH_N {
-        let v = rx.recv();
+        let v = rx.recv().expect("consumer: recv returned None");
         CH_SUM.fetch_add(v as usize, Ordering::SeqCst);
     }
     CH_CONS_DONE.fetch_add(1, Ordering::SeqCst);
@@ -245,5 +263,464 @@ fn waitqueue_notify_all() {
         WQ_WOKEN.load(Ordering::SeqCst),
         2,
         "notify_all didn't wake both waiters"
+    );
+}
+
+// --- spsc_close_wakes_receiver --------------------------------------
+//
+// A receiver parks on an empty SPSC channel. The driver drops the
+// sender; the receiver must wake and observe `None` from `recv`.
+
+static SPSC_CLOSE_RX: SpinMutex<Option<spsc::Receiver<u32>>> = SpinMutex::new(None);
+static SPSC_CLOSE_RX_SAW_NONE: AtomicUsize = AtomicUsize::new(0);
+
+fn spsc_close_rx_worker() -> ! {
+    let rx = SPSC_CLOSE_RX
+        .lock()
+        .take()
+        .expect("spsc_close_rx_worker: receiver not set");
+    if rx.recv().is_none() {
+        SPSC_CLOSE_RX_SAW_NONE.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn spsc_close_wakes_receiver() {
+    let (tx, rx) = spsc::channel::<u32>(4);
+    *SPSC_CLOSE_RX.lock() = Some(rx);
+    SPSC_CLOSE_RX_SAW_NONE.store(0, Ordering::SeqCst);
+
+    task::spawn(spsc_close_rx_worker);
+
+    // Let the worker reach its park. ~200 ms wall time is plenty.
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
+    }
+
+    // Drop the sender. This must wake the parked receiver.
+    drop(tx);
+
+    for _ in 0..1_000 {
+        if SPSC_CLOSE_RX_SAW_NONE.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SPSC_CLOSE_RX_SAW_NONE.load(Ordering::SeqCst),
+        1,
+        "receiver didn't observe None after sender dropped"
+    );
+}
+
+// --- spsc_close_wakes_sender ----------------------------------------
+//
+// A sender fills a capacity-1 channel and then parks on `send`. The
+// driver drops the receiver; the sender must wake and observe `Err`.
+
+static SPSC_CLOSE_TX: SpinMutex<Option<spsc::Sender<u32>>> = SpinMutex::new(None);
+static SPSC_CLOSE_TX_SAW_ERR: AtomicUsize = AtomicUsize::new(0);
+
+fn spsc_close_tx_worker() -> ! {
+    let tx = SPSC_CLOSE_TX
+        .lock()
+        .take()
+        .expect("spsc_close_tx_worker: sender not set");
+    // Channel already has one item buffered; this send parks.
+    if tx.send(2).is_err() {
+        SPSC_CLOSE_TX_SAW_ERR.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn spsc_close_wakes_sender() {
+    let (tx, rx) = spsc::channel::<u32>(1);
+    tx.send(1).expect("prefill send");
+    *SPSC_CLOSE_TX.lock() = Some(tx);
+    SPSC_CLOSE_TX_SAW_ERR.store(0, Ordering::SeqCst);
+
+    task::spawn(spsc_close_tx_worker);
+
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
+    }
+
+    drop(rx);
+
+    for _ in 0..1_000 {
+        if SPSC_CLOSE_TX_SAW_ERR.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SPSC_CLOSE_TX_SAW_ERR.load(Ordering::SeqCst),
+        1,
+        "sender didn't observe Err after receiver dropped"
+    );
+}
+
+// --- mpmc_many_to_one -----------------------------------------------
+//
+// Three producer tasks each push a disjoint range; one consumer
+// drains all 3*M items and checksums. Exercises `Sender: Clone` and
+// the Mutex-protected queue under fan-in contention.
+
+static MPMC_M2O_TX: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_M2O_RX: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
+static MPMC_M2O_SUM: AtomicUsize = AtomicUsize::new(0);
+static MPMC_M2O_PROD_DONE: AtomicUsize = AtomicUsize::new(0);
+static MPMC_M2O_CONS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+const MPMC_M2O_PRODUCERS: u32 = 3;
+const MPMC_M2O_PER_PROD: u32 = 20;
+
+// One of three static slots each producer claims on entry. Mirrors
+// the CH_TX pattern but with per-producer handoff to avoid racing on
+// a single mutex for the take.
+static MPMC_M2O_TX_A: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_M2O_TX_B: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_M2O_TX_C: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+
+fn mpmc_m2o_prod_a() -> ! {
+    let tx = MPMC_M2O_TX_A.lock().take().expect("m2o prod A: tx not set");
+    for i in 0..MPMC_M2O_PER_PROD {
+        tx.send(i).expect("m2o prod A: send failed");
+    }
+    MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_m2o_prod_b() -> ! {
+    let tx = MPMC_M2O_TX_B.lock().take().expect("m2o prod B: tx not set");
+    for i in 0..MPMC_M2O_PER_PROD {
+        tx.send(100 + i).expect("m2o prod B: send failed");
+    }
+    MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_m2o_prod_c() -> ! {
+    let tx = MPMC_M2O_TX_C.lock().take().expect("m2o prod C: tx not set");
+    for i in 0..MPMC_M2O_PER_PROD {
+        tx.send(1000 + i).expect("m2o prod C: send failed");
+    }
+    MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_m2o_cons() -> ! {
+    let rx = MPMC_M2O_RX.lock().take().expect("m2o cons: rx not set");
+    let total = MPMC_M2O_PRODUCERS * MPMC_M2O_PER_PROD;
+    for _ in 0..total {
+        let v = rx.recv().expect("m2o cons: recv returned None");
+        MPMC_M2O_SUM.fetch_add(v as usize, Ordering::SeqCst);
+    }
+    MPMC_M2O_CONS_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_many_to_one() {
+    let (tx, rx) = mpmc::channel::<u32>(4);
+    *MPMC_M2O_TX_A.lock() = Some(tx.clone());
+    *MPMC_M2O_TX_B.lock() = Some(tx.clone());
+    *MPMC_M2O_TX_C.lock() = Some(tx.clone());
+    // Retain the original in TX so the driver can observe the close
+    // path via `drop` after cloning to the three workers, but we
+    // don't need it after this point; drop it immediately so the
+    // channel closes once the workers finish.
+    *MPMC_M2O_TX.lock() = Some(tx);
+    MPMC_M2O_TX.lock().take();
+
+    *MPMC_M2O_RX.lock() = Some(rx);
+    MPMC_M2O_SUM.store(0, Ordering::SeqCst);
+    MPMC_M2O_PROD_DONE.store(0, Ordering::SeqCst);
+    MPMC_M2O_CONS_DONE.store(0, Ordering::SeqCst);
+
+    task::spawn(mpmc_m2o_prod_a);
+    task::spawn(mpmc_m2o_prod_b);
+    task::spawn(mpmc_m2o_prod_c);
+    task::spawn(mpmc_m2o_cons);
+
+    for _ in 0..5_000 {
+        if MPMC_M2O_PROD_DONE.load(Ordering::SeqCst) == MPMC_M2O_PRODUCERS as usize
+            && MPMC_M2O_CONS_DONE.load(Ordering::SeqCst) == 1
+        {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+
+    assert_eq!(
+        MPMC_M2O_PROD_DONE.load(Ordering::SeqCst),
+        MPMC_M2O_PRODUCERS as usize,
+        "not all producers finished"
+    );
+    assert_eq!(
+        MPMC_M2O_CONS_DONE.load(Ordering::SeqCst),
+        1,
+        "consumer didn't finish"
+    );
+    let expected: usize = (0..MPMC_M2O_PER_PROD).map(|i| i as usize).sum::<usize>()
+        + (0..MPMC_M2O_PER_PROD)
+            .map(|i| (100 + i) as usize)
+            .sum::<usize>()
+        + (0..MPMC_M2O_PER_PROD)
+            .map(|i| (1000 + i) as usize)
+            .sum::<usize>();
+    assert_eq!(
+        MPMC_M2O_SUM.load(Ordering::SeqCst),
+        expected,
+        "checksum mismatch — fan-in dropped or duplicated items"
+    );
+}
+
+// --- mpmc_many_to_many ----------------------------------------------
+//
+// Two producers and two consumers share a channel. The aggregate sum
+// across both consumers must equal the expected total.
+
+static MPMC_M2M_TX_A: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_M2M_TX_B: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_M2M_RX_A: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
+static MPMC_M2M_RX_B: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
+static MPMC_M2M_SUM: AtomicUsize = AtomicUsize::new(0);
+static MPMC_M2M_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+static MPMC_M2M_PROD_DONE: AtomicUsize = AtomicUsize::new(0);
+static MPMC_M2M_CONS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+const MPMC_M2M_PER_PROD: u32 = 20;
+const MPMC_M2M_TOTAL: usize = 2 * MPMC_M2M_PER_PROD as usize;
+
+fn mpmc_m2m_prod_a() -> ! {
+    let tx = MPMC_M2M_TX_A.lock().take().expect("m2m prod A: tx");
+    for i in 0..MPMC_M2M_PER_PROD {
+        tx.send(i).expect("m2m prod A: send");
+    }
+    MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_m2m_prod_b() -> ! {
+    let tx = MPMC_M2M_TX_B.lock().take().expect("m2m prod B: tx");
+    for i in 0..MPMC_M2M_PER_PROD {
+        tx.send(500 + i).expect("m2m prod B: send");
+    }
+    MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+// Each consumer drains until `recv` returns None (channel closed
+// after both senders drop). They cooperatively share the total.
+fn mpmc_m2m_cons_a() -> ! {
+    let rx = MPMC_M2M_RX_A.lock().take().expect("m2m cons A: rx");
+    while let Some(v) = rx.recv() {
+        MPMC_M2M_SUM.fetch_add(v as usize, Ordering::SeqCst);
+        MPMC_M2M_RECEIVED.fetch_add(1, Ordering::SeqCst);
+    }
+    MPMC_M2M_CONS_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_m2m_cons_b() -> ! {
+    let rx = MPMC_M2M_RX_B.lock().take().expect("m2m cons B: rx");
+    while let Some(v) = rx.recv() {
+        MPMC_M2M_SUM.fetch_add(v as usize, Ordering::SeqCst);
+        MPMC_M2M_RECEIVED.fetch_add(1, Ordering::SeqCst);
+    }
+    MPMC_M2M_CONS_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_many_to_many() {
+    let (tx, rx) = mpmc::channel::<u32>(4);
+    *MPMC_M2M_TX_A.lock() = Some(tx.clone());
+    *MPMC_M2M_TX_B.lock() = Some(tx.clone());
+    // The driver's original `tx` drops at end of scope (immediately
+    // below) — only the two cloned handles held by the producer
+    // tasks keep the channel open.
+    drop(tx);
+    *MPMC_M2M_RX_A.lock() = Some(rx.clone());
+    *MPMC_M2M_RX_B.lock() = Some(rx);
+    MPMC_M2M_SUM.store(0, Ordering::SeqCst);
+    MPMC_M2M_RECEIVED.store(0, Ordering::SeqCst);
+    MPMC_M2M_PROD_DONE.store(0, Ordering::SeqCst);
+    MPMC_M2M_CONS_DONE.store(0, Ordering::SeqCst);
+
+    task::spawn(mpmc_m2m_prod_a);
+    task::spawn(mpmc_m2m_prod_b);
+    task::spawn(mpmc_m2m_cons_a);
+    task::spawn(mpmc_m2m_cons_b);
+
+    for _ in 0..5_000 {
+        if MPMC_M2M_PROD_DONE.load(Ordering::SeqCst) == 2
+            && MPMC_M2M_CONS_DONE.load(Ordering::SeqCst) == 2
+        {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+
+    assert_eq!(
+        MPMC_M2M_PROD_DONE.load(Ordering::SeqCst),
+        2,
+        "not all producers finished"
+    );
+    assert_eq!(
+        MPMC_M2M_CONS_DONE.load(Ordering::SeqCst),
+        2,
+        "consumers didn't observe channel close"
+    );
+    assert_eq!(
+        MPMC_M2M_RECEIVED.load(Ordering::SeqCst),
+        MPMC_M2M_TOTAL,
+        "total item count mismatch across consumers"
+    );
+    let expected: usize = (0..MPMC_M2M_PER_PROD).map(|i| i as usize).sum::<usize>()
+        + (0..MPMC_M2M_PER_PROD)
+            .map(|i| (500 + i) as usize)
+            .sum::<usize>();
+    assert_eq!(
+        MPMC_M2M_SUM.load(Ordering::SeqCst),
+        expected,
+        "checksum mismatch — m2m dropped or duplicated items"
+    );
+}
+
+// --- mpmc_close_wakes_receivers -------------------------------------
+//
+// Two receivers park on an empty channel. The driver drops the
+// sender; both receivers must wake and observe `None`.
+
+static MPMC_CLOSE_RX_A: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
+static MPMC_CLOSE_RX_B: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
+static MPMC_CLOSE_RX_WOKEN: AtomicUsize = AtomicUsize::new(0);
+
+fn mpmc_close_rx_a() -> ! {
+    let rx = MPMC_CLOSE_RX_A.lock().take().expect("close rx A");
+    if rx.recv().is_none() {
+        MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_close_rx_b() -> ! {
+    let rx = MPMC_CLOSE_RX_B.lock().take().expect("close rx B");
+    if rx.recv().is_none() {
+        MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_close_wakes_receivers() {
+    let (tx, rx) = mpmc::channel::<u32>(4);
+    *MPMC_CLOSE_RX_A.lock() = Some(rx.clone());
+    *MPMC_CLOSE_RX_B.lock() = Some(rx);
+    MPMC_CLOSE_RX_WOKEN.store(0, Ordering::SeqCst);
+
+    task::spawn(mpmc_close_rx_a);
+    task::spawn(mpmc_close_rx_b);
+
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
+    }
+
+    // Drop the sole sender; both parked receivers must wake.
+    drop(tx);
+
+    for _ in 0..1_000 {
+        if MPMC_CLOSE_RX_WOKEN.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        MPMC_CLOSE_RX_WOKEN.load(Ordering::SeqCst),
+        2,
+        "receivers didn't both wake on last-sender drop"
+    );
+}
+
+// --- mpmc_close_wakes_senders ---------------------------------------
+//
+// Channel of capacity 1 is prefilled; two senders each park on
+// `send`. The driver drops the sole receiver; both senders must
+// wake and observe `Err`.
+
+static MPMC_CLOSE_TX_A: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_CLOSE_TX_B: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
+static MPMC_CLOSE_TX_ERRS: AtomicUsize = AtomicUsize::new(0);
+
+fn mpmc_close_tx_a() -> ! {
+    let tx = MPMC_CLOSE_TX_A.lock().take().expect("close tx A");
+    if tx.send(2).is_err() {
+        MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_close_tx_b() -> ! {
+    let tx = MPMC_CLOSE_TX_B.lock().take().expect("close tx B");
+    if tx.send(3).is_err() {
+        MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn mpmc_close_wakes_senders() {
+    let (tx, rx) = mpmc::channel::<u32>(1);
+    tx.send(1).expect("prefill send");
+    *MPMC_CLOSE_TX_A.lock() = Some(tx.clone());
+    *MPMC_CLOSE_TX_B.lock() = Some(tx);
+    MPMC_CLOSE_TX_ERRS.store(0, Ordering::SeqCst);
+
+    task::spawn(mpmc_close_tx_a);
+    task::spawn(mpmc_close_tx_b);
+
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
+    }
+
+    // Drop the sole receiver; both parked senders must wake.
+    drop(rx);
+
+    for _ in 0..1_000 {
+        if MPMC_CLOSE_TX_ERRS.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        MPMC_CLOSE_TX_ERRS.load(Ordering::SeqCst),
+        2,
+        "senders didn't both wake with Err on last-receiver drop"
     );
 }

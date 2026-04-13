@@ -5,7 +5,7 @@
 - `task/task.rs` — `Task` struct: kernel stack allocation, saved register context, scheduling state
 - `task/scheduler.rs` — `Scheduler`: current task + FIFO ready queue + parked-task side-table
 - `task/switch.rs` — `context_switch` in hand-written assembly
-- `sync/` — blocking primitives (mutex, waitqueue, SPSC channel) built on `block_current` / `wake`
+- `sync/` — blocking primitives (mutex, waitqueue, SPSC + MPMC channels) built on `block_current` / `wake`
 
 ## Overview
 
@@ -16,7 +16,7 @@ that `context_switch` restores on re-entry.
 
 There is no userspace and no per-task address space. Tasks that need to
 wait on a condition block via `sync::WaitQueue` / `sync::BlockingMutex` /
-`sync::spsc::channel`, which park the task on the scheduler's `parked`
+`sync::spsc::channel` / `sync::mpmc::channel`, which park the task on the scheduler's `parked`
 side-table until a wake arrives. Tasks that simply want to idle call
 `hlt` with IRQs enabled; the PIT preempt tick rotates them out when
 anyone else has work.

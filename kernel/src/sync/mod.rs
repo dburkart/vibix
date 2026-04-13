@@ -18,8 +18,17 @@
 //!   the condition depends on. Both of the other primitives are built
 //!   on this.
 //! - [`spsc`] — single-producer / single-consumer bounded channel.
-//!   The simplest message-passing shape; MPSC/MPMC variants can be
-//!   added as follow-ups once the SPSC case has baked in-tree.
+//!   The simplest message-passing shape; reach for this when each
+//!   side has exactly one endpoint.
+//! - [`mpmc`] — multi-producer / multi-consumer bounded channel.
+//!   Same shape as `spsc` but both endpoints are `Clone`; pay the
+//!   extra endpoint-count bookkeeping when you need fan-in or
+//!   fan-out.
+//!
+//! Both channel variants observe the close / hang-up protocol:
+//! dropping the last sender wakes parked receivers (which drain,
+//! then see `None`); dropping the last receiver wakes parked
+//! senders (which see `Err(val)`).
 //!
 //! ## Task-context only
 //!
@@ -46,6 +55,7 @@
 //! Nothing acquires `WaitQueue.inner` while already holding a data
 //! lock or `SCHED`, so the graph is a DAG.
 
+pub mod mpmc;
 pub mod mutex;
 pub mod spsc;
 pub mod waitqueue;
