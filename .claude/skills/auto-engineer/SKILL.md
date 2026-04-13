@@ -23,11 +23,26 @@ This skill is a deliberate override of the project's default "don't merge your o
 - User types `/auto-engineer` (optionally with `#NN` to scope to a single issue for one cycle, no reschedule).
 - This skill re-invokes itself at the end of each successful cycle via `ScheduleWakeup`.
 
+## Entry flags and phase state
+
+All persistent state lives in the wakeup prompt — `/compact` can summarize away conversation state, so nothing important should rely on being in context.
+
+Parse these flags on every entry before doing any work:
+
+| Flag | Meaning |
+|---|---|
+| `--iteration N` | Current cycle number (1-indexed). Absent → treat as 1. |
+| `--phase wait` | Re-entry into the PR-wait poll loop (jump to step 6b). Requires `--pr`. |
+| `--pr M` | PR number being waited on (only meaningful with `--phase wait`). |
+| `#NN` | Scope to a single issue for one cycle, then stop without rescheduling. |
+
+A bare `/auto-engineer` is iteration 1, phase "pick".
+
 ## Iteration budget
 
 **Soft cap: 8 iterations per user-initiated run.** After the 8th merged PR, stop and wait for the user to restart. Prevents runaway loops.
 
-The iteration counter is carried in the wake-up prompt itself as `/auto-engineer --iteration N` (1-indexed). A bare `/auto-engineer` invocation is iteration 1. This is deliberate: `/compact` can summarize away conversation state, so the count must live in the re-entry prompt, not in context. On entry, parse `--iteration N` out of the invocation; if absent, treat as 1.
+The `--iteration N` flag is what enforces the cap across `/compact` boundaries — always carry it in every `ScheduleWakeup` call.
 
 ## Cycle
 
@@ -107,28 +122,88 @@ Per `docs/agent-playbooks/sdlc.md`:
 - **Always include `Closes #<N>`** on its own line near the top of the PR body (where `<N>` is the issue picked in step 1). Without it, the squash-merge in step 7 won't auto-close the issue, the assignment persists, and step 1's `no:assignee` candidate set stays polluted on the next cycle.
 - Record the PR number and URL for the rest of the cycle.
 
-### 6. Wait for PR, respond to feedback
+### 6. Wait for CI and review
 
-Invoke the `wait-for-pr` skill. It handles:
-- CI polling with cache-friendly `ScheduleWakeup` cadence.
-- Review-bot timing (30-min bot window).
-- Auto-fix for fmt / clippy failures.
+Auto-engineer owns the PR-wait loop directly — do **not** delegate to the `wait-for-pr`
+skill. Delegating would hand off the `ScheduleWakeup` thread and there would be no path back
+into this skill when CI finishes.
 
-The classification of actionable bugs, in-scope nits, and out-of-scope nits comes from
-`docs/agent-playbooks/pr-review.md`; this skill only owns the Claude-native loop around that
-policy.
+The `wait-for-pr` skill is for manual invocations only.
 
-When `wait-for-pr` returns a summary:
+#### 6a. First poll tick (immediately after opening the PR)
+
+Record the PR open time. Run one poll tick (step 6b below), then either proceed or sleep.
+
+#### 6b. Poll tick (re-entry via `--phase wait --pr M`)
+
+1. Check CI state:
+   ```sh
+   gh pr checks <M> --json name,state,bucket,link
+   ```
+2. Count review-bot activity:
+   ```sh
+   gh api "repos/{owner}/{repo}/issues/<M>/comments" \
+     --jq '[.[] | select(.user.login | test("coderabbitai|greptile|github-advanced-security"))] | length'
+   ```
+   Also fetch formal reviews via `mcp__github__get_pull_request_reviews`.
+
+3. Evaluate "done" criteria (from `docs/agent-playbooks/pr-review.md`):
+   - Every check is in a terminal state (`success`, `failure`, `skipped`, `cancelled`,
+     `neutral`, `timed_out`, `stale`) — nothing `in_progress`, `queued`, or `pending`.
+   - At least one review-bot comment exists **or** 30 minutes have elapsed since PR opened.
+
+4. **If done**: proceed to step 6c.
+
+5. **If not done**: schedule the next poll tick and end the turn — do not proceed further.
+   ```
+   ScheduleWakeup(
+     delaySeconds=<cadence>,
+     prompt="/auto-engineer --iteration N --phase wait --pr M",
+     reason="auto-engineer: waiting on CI/review for PR #M (iteration N)"
+   )
+   ```
+   Cadence (same as wait-for-pr playbook):
+   | Elapsed since PR opened | delaySeconds |
+   |---|---|
+   | 0–10 min | 120 |
+   | 10–30 min | 180 |
+   | 30 min+ (bots only) | 1200 |
+   Never use 300 s — it's a cache-miss with no payoff.
+
+   If any check is `action_required` → **stop** instead (human must approve).
+
+#### 6c. Review-response
+
+Carry a `--fix-round R` counter (default 0) forward in the wakeup prompt when looping back
+here. **Max 2 fix rounds** — if `R == 2` and findings remain, stop.
+
+**Auto-fix CI failures** (before classifying review findings):
+
+| Failed check pattern | Fix command | Canonical commit subject |
+|---|---|---|
+| `fmt` / `rustfmt` / `format` | `cargo fmt --all` | `fix: apply rustfmt` |
+| `clippy` / `lint` | `cargo clippy --fix --allow-dirty --allow-staged && cargo fmt --all` | `fix: address clippy lints` |
+
+Before applying: check `git log origin/<base>..HEAD --format='%s'` — if the canonical subject
+is already there and the check still failed, do not re-apply. Flag as "auto-fix already
+attempted, did not resolve" and stop.
+
+After applying a fix: commit with the canonical subject + `Co-Authored-By:` trailer, `git push`,
+then schedule another poll tick:
+```
+ScheduleWakeup(
+  prompt="/auto-engineer --iteration N --phase wait --pr M --fix-round R",
+  ...
+)
+```
+
+**Classify review findings** using `docs/agent-playbooks/pr-review.md`:
 
 - **All green, no actionable findings** → proceed to merge (step 7).
-- **Actionable bugs or non-fmt/clippy CI failures** → auto-engineer handles them:
-  1. Read each finding.
-  2. Apply fixes as follow-up commits (never amend, never force-push).
-  3. `git push`.
-  4. Re-enter `wait-for-pr`.
-- **Cycle counter: max 2 review-response passes.** If the 3rd `wait-for-pr` return still has actionable findings → **stop** and let the user take over.
-
-For out-of-scope nits: reply on the PR with "deferred to #<issue-or-future-work>" via `mcp__github__add_issue_comment`, open the follow-up issue if one doesn't exist, then proceed.
+- **Actionable bugs** → apply follow-up commits (never amend), `git push`, then reschedule
+  another poll tick with `--fix-round R+1`.
+- **Out-of-scope nits** → reply on the PR via `mcp__github__add_issue_comment` ("deferred to
+  future work"), open a follow-up issue via the `file-issue` skill, then proceed to merge.
 
 ### 7. Merge
 
@@ -201,7 +276,7 @@ If iteration budget not exhausted and no stop condition tripped:
      reason="auto-engineer: next cycle (iteration N+1 of 8)"
    )
    ```
-   The `--iteration` flag is what enforces the 8-cycle cap across `/compact` boundaries — don't omit it.
+   The `--iteration` flag is what enforces the 8-cycle cap across `/compact` boundaries — don't omit it. Never carry `--phase`, `--pr`, or `--fix-round` into a fresh cycle; those are intra-cycle state that resets each iteration.
 3. End the turn. The next wake-up re-enters this skill from step 1.
 
 ## Stopping
@@ -216,7 +291,7 @@ Stop conditions:
 
 - No unblocked issues remain.
 - 3 consecutive build/test fix attempts failed.
-- 3 `wait-for-pr` returns still showed actionable findings (2 response cycles exhausted).
+- `--fix-round` reached 2 and actionable findings remain (2 response cycles exhausted).
 - Any check in `action_required` state (needs human approval).
 - Any security / advisory finding from `github-advanced-security[bot]`.
 - Merge conflict against `main` that isn't cleanly resolvable by `git pull --rebase`.
@@ -228,7 +303,8 @@ Stop conditions:
 - Force-push, rebase pushed branches, or rewrite reviewed commits.
 - Edit `main` directly.
 - Merge without green CI.
-- Skip `wait-for-pr` — even when CI "looks fast", review bots post on their own schedule.
+- Delegate the PR-wait loop to the `wait-for-pr` skill — it would steal the `ScheduleWakeup` thread. Use the embedded poll loop in step 6 instead.
 - Continue past 8 iterations without a fresh user invocation.
-- Auto-fix test or build logic inside `wait-for-pr`'s auto-fix slot (fmt and clippy only there; real fixes belong in step 6's response pass).
+- Auto-fix test or build logic in step 6c (fmt and clippy only; real fixes are follow-up commits).
 - Close an issue manually — let the squash-merge do it via the PR body's `Closes #N`.
+- Ask the user for input — **never use `AskUserQuestion` or pause for a response**. If information is missing, make the most defensible choice and continue; if a stop condition applies, stop and report but do not ask.

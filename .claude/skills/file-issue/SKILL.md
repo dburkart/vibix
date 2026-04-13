@@ -36,7 +36,7 @@ context:
 - **context** — relevant commit SHAs, file paths, existing issue numbers, or the PR that
   surfaced the follow-up.
 
-If any of those are missing and cannot be reasonably inferred, ask the user before filing.
+If any of those are missing and **cannot be reasonably inferred**, skip the issue silently — do not ask the user. This skill may be called from auto-engineer or other agents where user interaction is not available; asking would block the loop.
 
 ## Cycle
 
