@@ -13,7 +13,8 @@ backtraces via an embedded kernel symbol table.
 vibix is built by an autonomous agent — `/auto-engineer`, a Claude Code
 skill that picks an unblocked GitHub issue, plans the change, implements
 it, opens a PR, chases CI + review-bot feedback, and loops. Your job as a
-human is to file issues, review PRs, and merge. The agent does the rest.
+human is to file issues and review PRs; the agent handles everything else,
+merges included.
 
 To run the loop yourself, you need Docker, a Claude Code login on the host
 (`claude` logged in at least once, so `~/.claude.json` + `~/.claude/`

@@ -25,4 +25,4 @@ if [ "$#" -eq 0 ]; then
     set -- /auto-engineer
 fi
 
-exec claude --dangerously-skip-permissions "$*"
+exec claude --dangerously-skip-permissions "$@"
