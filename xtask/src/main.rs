@@ -64,6 +64,8 @@ const SMOKE_MARKERS: &[&str] = &[
     "hpet: periodic timer armed",
     "timer: 100 Hz",
     "rtc:",
+    "block: virtio-blk ready",
+    "block: lba0[0..16]=[56, 49, 42, 49, 58, 42, 4c, 4b, 30",
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
@@ -140,6 +142,49 @@ fn workspace_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+/// Magic bytes at LBA 0 of the test disk. The kernel's smoke-path
+/// readback logs the first 16 bytes, which `SMOKE_MARKERS` assert on.
+const TEST_DISK_MAGIC: &[u8] = b"VIBIXBLK0";
+/// 1 MiB scratch disk — enough for any step-1 smoke test; the file is
+/// regenerated if absent or the wrong size so it's safe to `rm -rf`.
+const TEST_DISK_SIZE: u64 = 1024 * 1024;
+
+fn test_disk_path() -> PathBuf {
+    workspace_root().join("target").join("test-disk.img")
+}
+
+/// Create or refresh the test disk image. Idempotent: if the file is
+/// already present and the right size, we leave it alone.
+fn ensure_test_disk() -> R<PathBuf> {
+    let path = test_disk_path();
+    let needs_write = match fs::metadata(&path) {
+        Ok(m) => m.len() != TEST_DISK_SIZE,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut data = vec![0u8; TEST_DISK_SIZE as usize];
+        data[..TEST_DISK_MAGIC.len()].copy_from_slice(TEST_DISK_MAGIC);
+        fs::write(&path, &data)?;
+    }
+    Ok(path)
+}
+
+/// QEMU args attaching the generated test disk as legacy virtio-blk.
+/// `disable-modern=on,disable-legacy=off` pins the transport so the
+/// step-1 legacy-only driver actually matches the device.
+fn virtio_blk_args(disk: &Path) -> Vec<String> {
+    let drive = format!("file={},if=none,id=vd0,format=raw", disk.display());
+    vec![
+        "-drive".to_string(),
+        drive,
+        "-device".to_string(),
+        "virtio-blk-pci,drive=vd0,disable-modern=on,disable-legacy=off".to_string(),
+    ]
 }
 
 fn userspace_hello_binary() -> PathBuf {
@@ -425,6 +470,7 @@ fn iso(opts: &BuildOpts) -> R<PathBuf> {
 
 fn run(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
+    let disk = ensure_test_disk()?;
     let status = Command::new("qemu-system-x86_64")
         .args([
             "-M",
@@ -438,6 +484,7 @@ fn run(opts: &BuildOpts) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .status()?;
@@ -467,6 +514,7 @@ fn test_runner(kernel: &Path) -> R<()> {
     eprintln!("▶ {}", name);
     // Note: no `-no-shutdown` here — it would prevent `isa-debug-exit`
     // from actually terminating QEMU, defeating the exit-code protocol.
+    let disk = ensure_test_disk()?;
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M",
@@ -481,6 +529,7 @@ fn test_runner(kernel: &Path) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .stdout(Stdio::inherit())
@@ -556,6 +605,7 @@ fn test_all() -> R<()> {
 
 fn smoke(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
+    let disk = ensure_test_disk()?;
 
     // We run QEMU with serial to stdio, capture output, then kill after
     // a short delay — the kernel halts in hlt_loop forever.
@@ -574,6 +624,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
         .stdout(Stdio::piped())
