@@ -111,14 +111,7 @@ pub fn set_priority(id: usize, priority: u8) -> bool {
     if found {
         // If a ready task now outranks the running one, shorten its slice
         // so the next tick swaps it out.
-        if let Some(cur) = sched.current.as_ref() {
-            let cur_prio = cur.priority;
-            if let Some(top_ready) = sched.highest_ready_priority() {
-                if top_ready > cur_prio {
-                    sched.current.as_mut().unwrap().slice_remaining_ms = 0;
-                }
-            }
-        }
+        preempt_if_higher_ready(&mut sched);
     }
 
     drop(sched);
@@ -153,14 +146,7 @@ pub fn adjust_nice(id: usize, delta: i8) -> Option<i8> {
     });
 
     if result.is_some() {
-        if let Some(cur) = sched.current.as_ref() {
-            let cur_prio = cur.priority;
-            if let Some(top_ready) = sched.highest_ready_priority() {
-                if top_ready > cur_prio {
-                    sched.current.as_mut().unwrap().slice_remaining_ms = 0;
-                }
-            }
-        }
+        preempt_if_higher_ready(&mut sched);
     }
 
     drop(sched);
@@ -293,6 +279,22 @@ fn maybe_preempt_current_for_priority(sched: &mut Scheduler, new_prio: u8) {
     };
     if new_prio > cur.priority {
         cur.slice_remaining_ms = 0;
+    }
+}
+
+/// Query the ready bank and shorten the current slice to zero if any
+/// ready task outranks the running one. Must be called with the
+/// scheduler lock held.
+fn preempt_if_higher_ready(sched: &mut Scheduler) {
+    let Some(cur) = sched.current.as_ref() else {
+        return;
+    };
+    let cur_prio = cur.priority;
+    if sched
+        .highest_ready_priority()
+        .is_some_and(|p| p > cur_prio)
+    {
+        sched.current.as_mut().unwrap().slice_remaining_ms = 0;
     }
 }
 
