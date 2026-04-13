@@ -44,9 +44,8 @@ pub struct AddressSpace {
     /// `256..512`) is a verbatim copy of the canonical kernel PML4
     /// installed at construction.
     #[cfg(target_os = "none")]
-    pub(crate) page_table: x86_64::structures::paging::PhysFrame<
-        x86_64::structures::paging::Size4KiB,
-    >,
+    pub(crate) page_table:
+        x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
 
     /// Sorted interval map of user VMAs keyed by `start`. Half-open
     /// `[start, end)` intervals that never overlap (enforced by the
