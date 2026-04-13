@@ -59,16 +59,16 @@ pub trait VmObject: Send + Sync {
     /// Number of pages this object covers. `None` for unbounded
     /// (heap-style) objects.
     fn len_pages(&self) -> Option<usize>;
+}
 
-    /// Clone this object for `fork`. The default is `Arc::clone` —
-    /// callers share backing frames via the page-refcount mechanism,
-    /// and CoW is resolved at the PTE layer, not here.
-    fn clone_for_fork(self: Arc<Self>) -> Arc<dyn VmObject>
-    where
-        Self: Sized + 'static,
-    {
-        self
-    }
+/// Clone a `VmObject` trait-object for `fork`. The default behavior is
+/// `Arc::clone` — child and parent share backing frames via the
+/// page-refcount mechanism, and CoW is resolved at the PTE layer, not
+/// here. A concrete `VmObject` that needs a deep clone on fork (future
+/// writable shared-memory segments, for example) can expose its own
+/// type-specific helper and upcast to `Arc<dyn VmObject>`.
+pub fn clone_for_fork(obj: &Arc<dyn VmObject>) -> Arc<dyn VmObject> {
+    Arc::clone(obj)
 }
 
 /// Zero-fill anonymous object.
@@ -177,9 +177,8 @@ fn alloc_zeroed_page() -> Result<u64, VmFault> {
 
 #[cfg(not(target_os = "none"))]
 fn release_frame(_phys: u64) {
-    // Host tests that install synthetic frames via
-    // `AnonObject::insert_for_test` are responsible for clearing the map
-    // before drop.
+    #[cfg(test)]
+    tests::HOST_RELEASE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -190,18 +189,18 @@ impl AnonObject {
     pub(crate) fn insert_for_test(&self, idx: usize, phys: u64) {
         self.inner.lock().frames.insert(idx, phys);
     }
-
-    /// Test-only: clear the cache without dropping any frames. Called
-    /// by host tests before `drop` so the stub `release_frame` doesn't
-    /// need to know how to account for synthetic frames.
-    pub(crate) fn forget_all_for_test(&self) {
-        self.inner.lock().frames.clear();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Incremented by the host stub of [`release_frame`] each time `Drop`
+    /// calls it. Tests that exercise reclamation sample the counter
+    /// before and after dropping the object to confirm `Drop` actually
+    /// walked the cache.
+    pub(super) static HOST_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn cached_fault_returns_same_frame() {
@@ -212,7 +211,6 @@ mod tests {
         // Second lookup returns the same cached frame.
         let p2 = obj.fault(3 * 4096, Access::Write).unwrap();
         assert_eq!(p2, 0x1234_5000);
-        obj.forget_all_for_test();
     }
 
     #[test]
@@ -231,7 +229,6 @@ mod tests {
         obj.insert_for_test(3, 0xdead_0000);
         let p = obj.fault(3 * 4096, Access::Read).unwrap();
         assert_eq!(p, 0xdead_0000);
-        obj.forget_all_for_test();
     }
 
     #[test]
@@ -240,7 +237,6 @@ mod tests {
         obj.insert_for_test(1_000_000, 0xabcd_0000);
         let p = obj.fault(1_000_000 * 4096, Access::Read).unwrap();
         assert_eq!(p, 0xabcd_0000);
-        obj.forget_all_for_test();
     }
 
     #[test]
@@ -258,13 +254,33 @@ mod tests {
 
     #[test]
     fn clone_for_fork_shares_cache() {
-        // Arc-clone is the default; the forked object sees the same
-        // cached frames as the parent until the CoW path diverges them
-        // at the PTE layer.
-        let obj = AnonObject::new(Some(4));
-        obj.insert_for_test(0, 0x4000);
-        let forked = obj.clone().clone_for_fork();
+        // Arc-clone is the default for fork; the forked object sees the
+        // same cached frames as the parent until the CoW path diverges
+        // them at the PTE layer.
+        let obj: Arc<dyn VmObject> = AnonObject::new(Some(4));
+        // Downcast-free seed via the concrete type.
+        let anon = AnonObject::new(Some(4));
+        anon.insert_for_test(0, 0x4000);
+        let parent: Arc<dyn VmObject> = anon;
+        let forked = clone_for_fork(&parent);
         assert_eq!(forked.fault(0, Access::Read).unwrap(), 0x4000);
-        obj.forget_all_for_test();
+        // `obj` is kept live so an unused-Arc-drop doesn't race the
+        // assert above.
+        drop(obj);
+    }
+
+    #[test]
+    fn drop_releases_every_cached_frame() {
+        // Seed three cached frames, drop the object, confirm
+        // `release_frame` was invoked once per frame.
+        let before = HOST_RELEASE_COUNT.load(Ordering::Relaxed);
+        {
+            let obj = AnonObject::new(Some(8));
+            obj.insert_for_test(0, 0x1000);
+            obj.insert_for_test(1, 0x2000);
+            obj.insert_for_test(5, 0x5000);
+        }
+        let after = HOST_RELEASE_COUNT.load(Ordering::Relaxed);
+        assert_eq!(after - before, 3);
     }
 }
