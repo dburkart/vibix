@@ -13,9 +13,11 @@
 pub mod frame;
 
 #[cfg(any(target_os = "none", test))]
-mod elf;
+pub(crate) mod elf;
 #[cfg(target_os = "none")]
 pub mod heap;
+#[cfg(target_os = "none")]
+pub mod loader;
 #[cfg(target_os = "none")]
 pub mod paging;
 #[cfg(target_os = "none")]
@@ -28,6 +30,9 @@ use spin::Once;
 
 #[cfg(target_os = "none")]
 static USERSPACE_MODULE_ELF_SUMMARY: Once<Option<(x86_64::VirtAddr, usize)>> = Once::new();
+
+#[cfg(target_os = "none")]
+static USERSPACE_MODULE_ELF_BYTES: Once<Option<&'static [u8]>> = Once::new();
 
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;
@@ -67,6 +72,11 @@ pub fn init() {
 
     // Snapshot Limine module metadata before reclaiming BOOTLOADER_RECLAIMABLE
     // memory; the response structs themselves live there.
+    // Snapshot both the parsed summary and the raw file slice before
+    // BOOTLOADER_RECLAIMABLE is released. The bytes themselves live in
+    // EXECUTABLE_AND_MODULES (preserved) so the &'static slice stays
+    // valid after reclaim; only Limine's response structs go away.
+    USERSPACE_MODULE_ELF_BYTES.call_once(elf::first_loaded_module_bytes);
     USERSPACE_MODULE_ELF_SUMMARY.call_once(elf::first_loaded_module_elf_summary);
 
     heap::init();
@@ -88,4 +98,11 @@ pub fn init() {
 #[cfg(target_os = "none")]
 pub fn userspace_module_elf_summary() -> Option<(x86_64::VirtAddr, usize)> {
     USERSPACE_MODULE_ELF_SUMMARY.get().copied().flatten()
+}
+
+/// Raw bytes of the first Limine-delivered userspace module ELF file,
+/// snapshotted during `init()` before BOOTLOADER_RECLAIMABLE is freed.
+#[cfg(target_os = "none")]
+pub fn userspace_module_elf_bytes() -> Option<&'static [u8]> {
+    USERSPACE_MODULE_ELF_BYTES.get().copied().flatten()
 }

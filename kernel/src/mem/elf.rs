@@ -52,15 +52,17 @@ struct Elf64Phdr {
 /// wants it: a virtual range plus the `PageTableFlags` derived from
 /// `p_flags` (`PF_W` → `WRITABLE`, no `PF_X` → `NO_EXECUTE`).
 #[derive(Clone, Copy)]
-pub(super) struct LoadSegment {
+pub(crate) struct LoadSegment {
     pub vaddr: VirtAddr,
     pub memsz: u64,
+    pub filesz: u64,
+    pub file_offset: u64,
     pub flags: PageTableFlags,
 }
 
 /// Parsed ELF64 image metadata for segment walking.
 #[derive(Clone, Copy)]
-pub(super) struct ParsedElf<'a> {
+pub(crate) struct ParsedElf<'a> {
     ehdr: Elf64Ehdr,
     phdr_bytes: &'a [u8],
     phnum: usize,
@@ -93,7 +95,7 @@ impl ElfParseError {
     }
 }
 
-pub(super) struct LoadSegmentIter<'a> {
+pub(crate) struct LoadSegmentIter<'a> {
     phdr_bytes: &'a [u8],
     phnum: usize,
     idx: usize,
@@ -125,6 +127,8 @@ impl<'a> Iterator for LoadSegmentIter<'a> {
             return Some(LoadSegment {
                 vaddr: VirtAddr::new(ph.p_vaddr),
                 memsz: ph.p_memsz,
+                filesz: ph.p_filesz,
+                file_offset: ph.p_offset,
                 flags,
             });
         }
@@ -133,7 +137,7 @@ impl<'a> Iterator for LoadSegmentIter<'a> {
 }
 
 impl<'a> ParsedElf<'a> {
-    pub(super) fn load_segments(self) -> LoadSegmentIter<'a> {
+    pub(crate) fn load_segments(self) -> LoadSegmentIter<'a> {
         LoadSegmentIter {
             phdr_bytes: self.phdr_bytes,
             phnum: self.phnum,
@@ -141,7 +145,7 @@ impl<'a> ParsedElf<'a> {
         }
     }
 
-    pub(super) fn entry(&self) -> VirtAddr {
+    pub(crate) fn entry(&self) -> VirtAddr {
         VirtAddr::new(self.ehdr.e_entry)
     }
 }
@@ -174,7 +178,22 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
 }
 
 #[cfg(target_os = "none")]
-pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
+pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+    let base = file.addr();
+    let size = file.size() as usize;
+    // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
+    // memory, which is preserved across `reclaim_bootloader_memory()`.
+    // The slice stays valid for the rest of the kernel's lifetime.
+    Some(unsafe { core::slice::from_raw_parts(base, size) })
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     let resp = crate::boot::MODULE_REQUEST.get_response()?;
     let file = resp
         .modules()
@@ -192,11 +211,11 @@ pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     Some((parsed.entry(), parsed.load_segments().count()))
 }
 
-pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
+pub(crate) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
     parse_elf64_inner(bytes).ok()
 }
 
-pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
+pub(crate) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
     parse_elf64_inner(bytes).unwrap_or_else(|err| panic!("{}", err.message()))
 }
 
