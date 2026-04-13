@@ -1,24 +1,22 @@
 # vibix
 *Pronounced VIBE-IX*
 
-A hobby x86_64 kernel, vibe-coded in Rust. Boots under the Limine boot
-protocol, prints to serial + a framebuffer console, installs a full GDT/TSS +
-IDT with CPU exception handlers, manages physical memory with a bitmap frame
-allocator, owns a growing kernel heap backed by custom paging, drives APIC
-interrupts discovered via ACPI, runs preemptively-scheduled kernel tasks
-with blocking synchronisation primitives, and emits symbolicated panic
-backtraces via an embedded kernel symbol table.
+An experiment in autonomous software engineering: can AI agents, given a
+backlog of issues and a set of tools, build a real kernel from scratch? vibix
+is that kernel — written in Rust, running on x86_64, built almost entirely by
+Claude and Cursor agents looping through plan → implement → PR → review →
+merge. The long-term goal is a full operating system. The immediate goal is
+to see how far autonomous agents can get before the wheels fall off.
 
 ## Instructions for Humans
 
-vibix is built by autonomous agents. The original loop lives in
-`.claude/skills/auto-engineer/SKILL.md` as `/auto-engineer`, a Claude Code
-skill that picks an unblocked GitHub issue, plans the change, implements
-it, opens a PR, chases CI + review-bot feedback, and loops. Cursor Cloud now
-has a companion skill at `.cursor/skills/cursor-cloud-auto-engineer/SKILL.md`
-invoked as `/cursor-cloud-auto-engineer`, which mirrors the branch-to-PR flow,
-polls review and CI status for up to 15 minutes per review round, and still
-stops short of cross-turn self-rescheduling or self-merging.
+### `/auto-engineer` — the implementation loop
+
+The primary build driver. Defined in `.claude/skills/auto-engineer/SKILL.md`,
+it picks an unblocked GitHub issue, plans the change, implements it, opens a
+PR, chases CI + review-bot feedback until green, and loops. A companion skill
+at `.cursor/skills/cursor-cloud-auto-engineer/SKILL.md` mirrors the same flow
+for Cursor Cloud.
 
 To run the loop yourself, you need Docker, a Claude Code login on the host
 (`claude` logged in at least once, so `~/.claude.json` + `~/.claude/`
@@ -33,11 +31,11 @@ export GITHUB_TOKEN=ghp_...
 ./scripts/auto-engineer.sh
 ```
 
-The wrapper builds a container image (first run ~5–10 min) that bundles
-every build/test dep — Rust nightly, `qemu-system-x86_64`, `xorriso`,
-`gh`, and Claude Code itself — then runs `claude --dangerously-skip-permissions`
-against a fresh clone inside the container. Your host `~/.claude` auth is
-bind-mounted in, so the container talks to Anthropic as you.
+The wrapper builds a container image (first run ~5–10 min) that bundles every
+build/test dep — Rust nightly, `qemu-system-x86_64`, `xorriso`, `gh`, and
+Claude Code itself — then runs `claude --dangerously-skip-permissions` against
+a fresh clone inside the container. Your host `~/.claude` auth is bind-mounted
+in, so the container talks to Anthropic as you.
 
 Under the hood:
 
@@ -48,6 +46,35 @@ Under the hood:
   image, and runs the container with the right mounts + SELinux handling.
 
 Ctrl-C at any time to stop the loop.
+
+### `/os-researcher` — design before implementation
+
+Before a non-trivial subsystem gets built, this skill designs it. Defined in
+`.claude/skills/os-researcher/SKILL.md`, it takes an OS topic (e.g. "virtual
+filesystem layer", "POSIX signals", "demand paging") and runs a full
+research-to-RFC pipeline:
+
+1. **Research** — spawns parallel sub-agents to query OSDev Wiki, Linux kernel
+   docs, Intel/AMD manuals, the POSIX spec, and academic literature, then
+   synthesizes the findings into a research brief.
+2. **Draft** — writes a structured RFC under `docs/RFC/` covering motivation,
+   design, security/performance considerations, alternatives, and an
+   implementation roadmap.
+3. **Peer review** — four archetype reviewers (security researcher, OS engineer,
+   user-space staff engineer, academic) post structured review comments on the
+   PR. The skill defends blocking findings across up to two revision cycles.
+4. **Merge and file issues** — once all reviewers approve, the RFC is marked
+   `Accepted`, merged, and each roadmap item is filed as a tracked GitHub issue
+   for `/auto-engineer` to pick up.
+
+Invoke it in a Claude Code session:
+
+```
+/os-researcher <topic>
+```
+
+Pass `--skip-research` to jump straight to drafting if a research summary is
+already in context.
 
 ## Requirements
 
