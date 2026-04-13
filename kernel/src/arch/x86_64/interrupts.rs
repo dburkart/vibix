@@ -15,6 +15,7 @@ use crate::arch::x86_64::pic::{notify_eoi, PIC_1_OFFSET};
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     Keyboard = PIC_1_OFFSET + 1,
+    Serial = PIC_1_OFFSET + 4,
 }
 
 impl InterruptIndex {
@@ -41,4 +42,12 @@ pub extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
     let code: u8 = unsafe { Port::new(0x60).read() };
     crate::input::push_scancode_from_isr(code);
     notify_eoi(InterruptIndex::Keyboard.as_u8());
+}
+
+pub extern "x86-interrupt" fn serial_interrupt(_frame: InterruptStackFrame) {
+    // Draining RBR until LSR.DR clears acks the Received-Data-Available
+    // condition in IIR, so no separate register read is needed to
+    // dismiss the IRQ.
+    crate::serial::drain_rx_hardware();
+    notify_eoi(InterruptIndex::Serial.as_u8());
 }

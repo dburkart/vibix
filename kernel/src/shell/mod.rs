@@ -1,12 +1,10 @@
 //! Tiny kernel shell, spawned as its own preemptively-scheduled task.
 //!
-//! Reads a line from the PS/2 keyboard, dispatches it against a small
-//! table of builtins, and loops. When no input is pending the task
-//! `hlt`s — the keyboard ISR wakes the CPU on the next keypress, and
-//! the PIT preempt tick rotates other tasks in meanwhile.
-//!
-//! The input path is PS/2-only for now. Serial RX is orthogonal (needs
-//! IOAPIC IRQ4 routing) and deliberately out of scope for this module.
+//! Reads a line from either the PS/2 keyboard or COM1 serial input,
+//! dispatches it against a small table of builtins, and loops. When no
+//! input is pending the task `hlt`s — the keyboard or UART ISR wakes
+//! the CPU on the next byte, and the PIT preempt tick rotates other
+//! tasks in meanwhile.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +13,7 @@ use pc_keyboard::DecodedKey;
 
 use crate::mem::{frame, heap, FRAME_SIZE};
 use crate::task::TaskStateView;
-use crate::{input, pci, serial_print, serial_println, task, time};
+use crate::{input, pci, serial, serial_print, serial_println, task, time};
 
 /// Flipped to `true` the first time the shell's `run` enters its main
 /// loop. Integration tests poll this to confirm the shell actually
@@ -36,33 +34,53 @@ pub fn run() -> ! {
 
     let mut line = String::new();
     loop {
-        match input::try_read_key() {
-            Some(DecodedKey::Unicode('\r')) | Some(DecodedKey::Unicode('\n')) => {
-                serial_print!("\r\n");
-                // Only strip leading whitespace so `echo` can round-trip
-                // user-entered trailing spaces.
-                dispatch(line.trim_start());
-                line.clear();
-                prompt();
-            }
-            // Backspace (0x08) or DEL (0x7f) — both map to "erase one char".
-            Some(DecodedKey::Unicode('\x08')) | Some(DecodedKey::Unicode('\x7f')) => {
-                if line.pop().is_some() {
-                    serial_print!("\x08 \x08");
-                }
-            }
-            Some(DecodedKey::Unicode(c)) if !c.is_control() => {
-                if line.len() + c.len_utf8() <= MAX_LINE_LEN {
-                    line.push(c);
-                    serial_print!("{}", c);
-                }
-            }
-            Some(_) => {}
-            // Nothing in the scancode ring. Halt until the next IRQ
-            // (keyboard press wakes us; PIT rotates us out on slice
-            // expiry).
-            None => x86_64::instructions::hlt(),
+        if let Some(c) = next_char() {
+            on_char(c, &mut line);
+        } else {
+            // Nothing in either input ring. Halt until the next IRQ
+            // (keyboard or UART byte wakes us; PIT rotates us out on
+            // slice expiry).
+            x86_64::instructions::hlt();
         }
+    }
+}
+
+/// Pull the next character from whichever input source has one ready.
+/// Serial is polled first so headless operation feels responsive even
+/// when both rings accumulate simultaneously.
+fn next_char() -> Option<char> {
+    if let Some(b) = serial::try_read_byte() {
+        return Some(b as char);
+    }
+    match input::try_read_key()? {
+        DecodedKey::Unicode(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn on_char(c: char, line: &mut String) {
+    match c {
+        '\r' | '\n' => {
+            serial_print!("\r\n");
+            // Only strip leading whitespace so `echo` can round-trip
+            // user-entered trailing spaces.
+            dispatch(line.trim_start());
+            line.clear();
+            prompt();
+        }
+        // Backspace (0x08) or DEL (0x7f) — both map to "erase one char".
+        '\x08' | '\x7f' => {
+            if line.pop().is_some() {
+                serial_print!("\x08 \x08");
+            }
+        }
+        c if !c.is_control() => {
+            if line.len() + c.len_utf8() <= MAX_LINE_LEN {
+                line.push(c);
+                serial_print!("{}", c);
+            }
+        }
+        _ => {}
     }
 }
 

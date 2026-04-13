@@ -29,4 +29,8 @@ pub fn init_apic(rsdp_phys: usize, hhdm_offset: u64) {
     apic::ioapic_init(hhdm_offset);
     apic::route_legacy_irq(0, interrupts::InterruptIndex::Timer.as_u8());
     apic::route_legacy_irq(1, interrupts::InterruptIndex::Keyboard.as_u8());
+    apic::route_legacy_irq(4, interrupts::InterruptIndex::Serial.as_u8());
+    // Enable RX IER only after the IOAPIC redirection for IRQ4 is in
+    // place — otherwise the first byte raises against a masked vector.
+    crate::serial::enable_rx_interrupts();
 }
