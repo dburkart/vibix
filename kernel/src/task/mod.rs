@@ -66,6 +66,14 @@ pub fn spawn(entry: fn() -> !) {
     sched.ready.push_back(Box::new(Task::new(entry)));
 }
 
+/// Public view of a task's scheduling state, used by [`TaskInfo`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskStateView {
+    Running,
+    Ready,
+    Blocked,
+}
+
 /// Snapshot of one task's diagnostic-relevant fields. Returned by
 /// [`for_each_task`] so callers (e.g. the shell's `tasks` builtin) can
 /// enumerate live tasks without touching the scheduler's internals.
@@ -73,27 +81,40 @@ pub fn spawn(entry: fn() -> !) {
 pub struct TaskInfo {
     pub id: usize,
     pub slice_remaining_ms: u32,
-    /// `true` for the currently-running task, `false` for ready-queue entries.
-    pub is_current: bool,
+    pub state: TaskStateView,
 }
 
-/// Invoke `f` once per live task (current first, then ready queue in
-/// FIFO order). Holds the scheduler lock for the duration, so `f` must
-/// not call back into `task::*`.
+impl TaskInfo {
+    pub fn is_current(&self) -> bool {
+        self.state == TaskStateView::Running
+    }
+}
+
+/// Invoke `f` once per live task: current first, then ready queue in
+/// FIFO order, then parked (blocked) tasks in id order. Holds the
+/// scheduler lock for the duration, so `f` must not call back into
+/// `task::*`.
 pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
     let sched = SCHED.lock();
     if let Some(cur) = sched.current.as_ref() {
         f(TaskInfo {
             id: cur.id,
             slice_remaining_ms: cur.slice_remaining_ms,
-            is_current: true,
+            state: TaskStateView::Running,
         });
     }
     for t in sched.ready.iter() {
         f(TaskInfo {
             id: t.id,
             slice_remaining_ms: t.slice_remaining_ms,
-            is_current: false,
+            state: TaskStateView::Ready,
+        });
+    }
+    for t in sched.parked.values() {
+        f(TaskInfo {
+            id: t.id,
+            slice_remaining_ms: t.slice_remaining_ms,
+            state: TaskStateView::Blocked,
         });
     }
 }

@@ -105,13 +105,21 @@ mod kernel_side {
     /// scancodes through the `pc-keyboard` state machine and returns the
     /// first decoded key produced, or `None` if the ring is empty or the
     /// drained codes only advanced modifier state.
+    /// Feed one scancode through the `pc-keyboard` state machine. Returns
+    /// `Some(key)` only when the byte completes a decoded keypress; scancodes
+    /// that only advance modifier state yield `None`.
+    fn decode_scancode(code: u8) -> Option<DecodedKey> {
+        let mut kbd = KEYBOARD.lock();
+        if let Ok(Some(event)) = kbd.add_byte(code) {
+            return kbd.process_keyevent(event);
+        }
+        None
+    }
+
     pub fn try_read_key() -> Option<DecodedKey> {
         while let Some(code) = try_read_scancode() {
-            let mut kbd = KEYBOARD.lock();
-            if let Ok(Some(event)) = kbd.add_byte(code) {
-                if let Some(key) = kbd.process_keyevent(event) {
-                    return Some(key);
-                }
+            if let Some(key) = decode_scancode(code) {
+                return Some(key);
             }
         }
         None
@@ -129,11 +137,8 @@ mod kernel_side {
     pub fn read_key() -> DecodedKey {
         loop {
             while let Some(code) = try_read_scancode() {
-                let mut kbd = KEYBOARD.lock();
-                if let Ok(Some(event)) = kbd.add_byte(code) {
-                    if let Some(key) = kbd.process_keyevent(event) {
-                        return key;
-                    }
+                if let Some(key) = decode_scancode(code) {
+                    return key;
                 }
             }
             interrupts::disable();

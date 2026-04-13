@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use pc_keyboard::DecodedKey;
 
 use crate::mem::{frame, heap, FRAME_SIZE};
+use crate::task::TaskStateView;
 use crate::{input, serial_print, serial_println, task, time};
 
 /// Flipped to `true` the first time the shell's `run` enters its main
@@ -129,10 +130,15 @@ fn cmd_tasks() {
     task::for_each_task(|t| tasks.push(t));
 
     for t in tasks {
+        let tag = match t.state {
+            TaskStateView::Running => "[run]",
+            TaskStateView::Ready => "[rdy]",
+            TaskStateView::Blocked => "[blk]",
+        };
         serial_println!(
             "  task {:>3} {} slice={} ms",
             t.id,
-            if t.is_current { "[run]" } else { "[rdy]" },
+            tag,
             t.slice_remaining_ms,
         );
     }
