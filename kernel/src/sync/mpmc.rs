@@ -214,6 +214,13 @@ impl<T> Sender<T> {
         }
     }
 
+    /// Number of receivers currently parked in `recv`. Test-only
+    /// inspection point; the count can change the instant it's read,
+    /// so it isn't suitable for production logic.
+    pub fn receivers_parked(&self) -> usize {
+        self.shared.not_empty.waiter_count()
+    }
+
     /// Non-blocking send. Returns a [`TrySendError`] that
     /// distinguishes "full right now" from "channel closed".
     pub fn try_send(&self, val: T) -> Result<(), TrySendError<T>> {
@@ -270,6 +277,12 @@ impl<T> Receiver<T> {
                 inner.queue.is_empty()
             });
         }
+    }
+
+    /// Number of senders currently parked in `send`. Test-only
+    /// inspection point; see [`Sender::receivers_parked`] for caveats.
+    pub fn senders_parked(&self) -> usize {
+        self.shared.not_full.waiter_count()
     }
 
     /// Non-blocking recv. Returns [`TryRecvError::Empty`] if the

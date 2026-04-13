@@ -172,6 +172,15 @@ impl<T> Sender<T> {
         }
     }
 
+    /// Number of receivers currently parked in `recv` waiting for an
+    /// item. Test-only inspection point — lets a driver confirm the
+    /// peer has actually reached its park before firing a wake. Not
+    /// for production logic; the count can change the instant it's
+    /// read.
+    pub fn receivers_parked(&self) -> usize {
+        self.shared.not_empty.waiter_count()
+    }
+
     /// Non-blocking send. Returns [`TrySendError::Full`] when the
     /// queue is at capacity and [`TrySendError::Closed`] when the
     /// receiver has been dropped.
@@ -227,6 +236,13 @@ impl<T> Receiver<T> {
                 inner.queue.is_empty()
             });
         }
+    }
+
+    /// Number of senders currently parked in `send` waiting for space.
+    /// Test-only inspection point; see [`Sender::receivers_parked`] for
+    /// rationale and caveats.
+    pub fn senders_parked(&self) -> usize {
+        self.shared.not_full.waiter_count()
     }
 
     /// Non-blocking recv. Returns [`TryRecvError::Empty`] when the
