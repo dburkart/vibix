@@ -101,8 +101,7 @@ pub fn init() -> Result<(), HpetError> {
     // guarantees, so plain field access is UB even on x86_64 where
     // the load itself would succeed.
     let table = table_ptr as *const HpetTable;
-    let address_space_id =
-        unsafe { ptr::addr_of!((*table).address_space_id).read_unaligned() };
+    let address_space_id = unsafe { ptr::addr_of!((*table).address_space_id).read_unaligned() };
     if address_space_id != 0 {
         return Err(HpetError::UnsupportedAddressSpace(address_space_id));
     }
