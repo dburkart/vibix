@@ -130,6 +130,11 @@ pub extern "C" fn _start() -> ! {
     x86_64::instructions::interrupts::enable();
     serial_println!("interrupts enabled");
 
+    // TSC calibration needs IRQs on so the PIT can advance TICKS under
+    // the spin loop; runs before task::init() so sleep/bench callers
+    // see the calibrated clock from their first tick.
+    vibix::time::calibrate_tsc();
+
     vibix::task::init();
     vibix::task::spawn(vibix::shell::run);
     vibix::task::spawn(cursor_blink_task);

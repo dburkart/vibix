@@ -81,6 +81,7 @@ fn dispatch(line: &str) {
     match cmd {
         "help" => cmd_help(),
         "uptime" => cmd_uptime(),
+        "time" => cmd_time(),
         "mem" => cmd_mem(),
         "tasks" => cmd_tasks(),
         "echo" => serial_println!("{}", rest),
@@ -93,6 +94,7 @@ fn cmd_help() {
     serial_println!("builtins:");
     serial_println!("  help            show this list");
     serial_println!("  uptime          milliseconds since boot");
+    serial_println!("  time            seconds since boot, ms precision");
     serial_println!("  mem             heap + free-frame counters");
     serial_println!("  tasks           live task ids and remaining slices");
     serial_println!("  echo <args>     echo the rest of the line");
@@ -102,6 +104,13 @@ fn cmd_help() {
 fn cmd_uptime() {
     let ms = time::uptime_ms();
     serial_println!("uptime: {} ms ({}.{:03} s)", ms, ms / 1000, ms % 1000);
+}
+
+fn cmd_time() {
+    let ns = time::uptime_ns();
+    let secs = ns / 1_000_000_000;
+    let ms = (ns % 1_000_000_000) / 1_000_000;
+    serial_println!("time: {}.{:03} s", secs, ms);
 }
 
 fn cmd_mem() {
