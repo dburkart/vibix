@@ -27,8 +27,7 @@ use super::FRAME_SIZE;
 pub const REFCOUNT_LEN: usize = (MAX_PHYS_BYTES / FRAME_SIZE) as usize;
 
 #[cfg(target_os = "none")]
-static REFCOUNTS: [AtomicU16; REFCOUNT_LEN] =
-    [const { AtomicU16::new(0) }; REFCOUNT_LEN];
+static REFCOUNTS: [AtomicU16; REFCOUNT_LEN] = [const { AtomicU16::new(0) }; REFCOUNT_LEN];
 
 fn index_of(phys: u64) -> usize {
     assert!(
@@ -63,12 +62,7 @@ pub fn inc_refcount_in(slots: &[AtomicU16], phys: u64) -> u16 {
         if cur == u16::MAX {
             return u16::MAX;
         }
-        match slot.compare_exchange_weak(
-            cur,
-            cur + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match slot.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(prev) => return prev,
             Err(observed) => cur = observed,
         }
@@ -83,10 +77,7 @@ pub fn inc_refcount_in(slots: &[AtomicU16], phys: u64) -> u16 {
 pub fn dec_refcount_in(slots: &[AtomicU16], phys: u64) -> u16 {
     let slot = page_refcount_in(slots, phys);
     let prev = slot.fetch_sub(1, Ordering::Release);
-    assert!(
-        prev > 0,
-        "refcount: decrement underflow at {phys:#x}",
-    );
+    assert!(prev > 0, "refcount: decrement underflow at {phys:#x}",);
     prev
 }
 
