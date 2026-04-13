@@ -37,13 +37,13 @@ pub(super) struct Scheduler {
     /// Blocking primitives (see `crate::sync`) move tasks in and out
     /// of here via the task-level API.
     pub parked: BTreeMap<usize, Box<Task>>,
-    /// A task that has called `task::exit` and is awaiting reaping on
-    /// the next scheduler tick. At most one at a time — `task::exit`
-    /// refuses to enter if the slot is occupied. The reaper runs from
+    /// Tasks that have called `task::exit` and are awaiting reaping on
+    /// the next scheduler tick. FIFO: back-to-back exits between ticks
+    /// queue here rather than panicking. The reaper drains this on every
     /// `preempt_tick` (so it executes on a stack that isn't about to be
-    /// unmapped) and drops the `Box<Task>` after reclaiming the stack
+    /// unmapped) and drops each `Box<Task>` after reclaiming the stack
     /// pages, VMA-backed frames, and PML4 frame.
-    pub pending_exit: Option<Box<Task>>,
+    pub pending_exit: VecDeque<Box<Task>>,
 }
 
 impl Scheduler {
@@ -52,7 +52,7 @@ impl Scheduler {
             current: None,
             ready: BTreeMap::new(),
             parked: BTreeMap::new(),
-            pending_exit: None,
+            pending_exit: VecDeque::new(),
         }
     }
 

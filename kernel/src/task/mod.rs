@@ -440,18 +440,12 @@ pub fn current_vma_lookup(
 /// # Panics
 /// - No other ready task exists (exiting the last runnable task would
 ///   halt the kernel).
-/// - A prior `task::exit` has not yet been reaped. At most one task
-///   may be awaiting reap at a time; with reaping on every tick this
-///   only trips if the scheduler lock is so contended that no tick
-///   ever reaps — i.e. never, in practice.
+/// - The bootstrap task calls `exit` — it owns the kernel PML4 and the
+///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
     interrupts::disable();
     let (prev_rsp_ptr, next_rsp, next_cr3) = {
         let mut sched = SCHED.lock();
-        assert!(
-            sched.pending_exit.is_none(),
-            "task::exit: prior exit not yet reaped"
-        );
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
         // it up-front rather than relying on per-field guards deeper
@@ -474,12 +468,14 @@ pub fn exit() -> ! {
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
-        sched.pending_exit = Some(prev);
-        let prev_ref = sched.pending_exit.as_mut().unwrap();
-        // SAFETY: prev_ref is a stable Box<Task> in pending_exit; the
-        // heap-allocated Task it points at does not move while the
-        // Box lives, and context_switch only writes to this location
-        // once (we never read it back — the task is doomed).
+        // Enqueue the doomed task; the next `preempt_tick` drains the
+        // whole queue. Back-to-back exits between ticks just append.
+        sched.pending_exit.push_back(prev);
+        let prev_ref = sched.pending_exit.back_mut().unwrap();
+        // SAFETY: `prev_ref` is a stable `Box<Task>` in the queue tail.
+        // We never push in front of it (push_back only) and never
+        // reap it until a later tick, so the heap location remains
+        // valid for this context_switch's single write.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         (prev_rsp_ptr, next_rsp, next_cr3)
     };
@@ -589,10 +585,11 @@ pub fn preempt_tick() {
         return;
     };
 
-    // Reap a task that called `task::exit` on a prior tick, before
+    // Reap any task that called `task::exit` on a prior tick, before
     // touching the ready bank — keeps this tick's rotation consistent
-    // and bounds pending_exit to at most one tick of latency.
-    if let Some(victim) = sched.pending_exit.take() {
+    // and bounds reap latency to one tick per exit. Multiple exits
+    // between ticks drain here in FIFO order.
+    while let Some(victim) = sched.pending_exit.pop_front() {
         drop(sched);
         reap_pending(victim);
         let Some(s) = SCHED.try_lock() else {
