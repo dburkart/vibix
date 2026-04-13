@@ -150,48 +150,38 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
     );
 }
 
-/// First canonical upper-half address — same boundary as `loader::UPPER_HALF_START`.
-/// Any `buf` pointer at or above this is a kernel address and must be rejected.
-const USER_VA_END: u64 = 0x0000_8000_0000_0000;
-
-/// `-EFAULT` — returned when a user pointer fails the bounds check.
-const EFAULT: i64 = -14;
+use super::uaccess;
 
 /// Syscall handler called from the `syscall_entry` trampoline.
 ///
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
-/// interrupts disabled. User-supplied pointer arguments (`a1` for `write`)
-/// are validated against `USER_VA_END` before any dereference.
+/// interrupts disabled. User pointer arguments are validated and
+/// marshalled via `uaccess::copy_from_user` before any dereference.
 #[no_mangle]
 pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     match nr {
         // write(fd, buf, len) — fd=1 (stdout/stderr) → serial
         1 => {
             let fd = a0;
-            let buf_va = a1;
+            let buf_va = a1 as usize;
             let len = a2 as usize;
-            // Reject kernel-space or obviously wrapping buf pointers.
-            // A zero-length write is a no-op; skip the pointer check.
-            if len > 0 {
-                let end = buf_va.saturating_add(len as u64);
-                if buf_va >= USER_VA_END || end > USER_VA_END {
-                    return EFAULT;
-                }
-            }
             if fd == 1 && len > 0 {
-                let buf = buf_va as *const u8;
-                // Write each byte via direct port I/O. Avoids acquiring the
-                // COM1 spinlock (which could deadlock if another task holds
-                // it while IF=0 during a syscall) and avoids the Rust
-                // fmt machinery with its associated stack depth.
-                //
-                // Safety: `buf` is a validated user-space VA in the active
-                // PML4 (checked against USER_VA_END above). IF is cleared
-                // (SFMASK) so no context switch can invalidate the mapping.
-                for i in 0..len {
-                    let b = unsafe { core::ptr::read_volatile(buf.add(i)) };
-                    uart_putc(b);
+                // Chunk through a small kernel-stack bounce buffer so the
+                // ring-0 access window stays short and bounded — a single
+                // STAC/CLAC bracket per chunk, not per byte.
+                let mut chunk = [0u8; 256];
+                let mut off = 0;
+                while off < len {
+                    let n = core::cmp::min(chunk.len(), len - off);
+                    match uaccess::copy_from_user(&mut chunk[..n], buf_va + off) {
+                        Ok(()) => {}
+                        Err(e) => return e.as_errno(),
+                    }
+                    for &b in &chunk[..n] {
+                        uart_putc(b);
+                    }
+                    off += n;
                 }
             }
             len as i64
