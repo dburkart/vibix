@@ -29,6 +29,8 @@ pub mod bench;
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod framebuffer;
+#[cfg(any(test, target_os = "none"))]
+pub mod hpet;
 #[cfg(target_os = "none")]
 pub mod ksymtab;
 #[cfg(target_os = "none")]
@@ -66,6 +68,10 @@ pub fn init() {
     arch::init();
     mem::init();
     arch::init_apic(rsdp, hhdm);
+    match hpet::init() {
+        Ok(()) => {}
+        Err(e) => serial_println!("hpet: unavailable ({:?}), falling back to PIT", e),
+    }
     time::init();
 }
 
