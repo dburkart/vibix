@@ -3,8 +3,8 @@
 //!
 //! The test is tolerant to QEMU's machine-type variations (q35 in
 //! `xtask test`) — it only asserts devices that are guaranteed by
-//! *both* machine types: the host bridge, the ISA bridge, an IDE
-//! controller, and a VGA class device.
+//! *both* machine types: the host bridge, the ISA bridge, an IDE/AHCI
+//! storage controller, and a VGA class device.
 
 #![no_std]
 #![no_main]

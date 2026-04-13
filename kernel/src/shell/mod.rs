@@ -151,16 +151,27 @@ fn cmd_pci() {
             d.prog_if,
             d.class_name(),
         );
-        for (i, bar) in d.bars.iter().enumerate() {
-            if !bar.is_empty() {
-                let kind = if bar.is_io() {
-                    "io"
-                } else if bar.is_64bit() {
-                    "mem64"
-                } else {
-                    "mem32"
-                };
-                serial_println!("     bar{}: {:#010x} ({})", i, bar.addr(), kind);
+        // Walk BARs skipping the high-dword slot that follows a 64-bit
+        // memory BAR — that slot holds raw upper address bits, not a
+        // self-describing BAR, and calling is_io/is_64bit/addr on it
+        // produces nonsense (e.g. a set low bit would mislabel it as io).
+        let mut i = 0;
+        while i < d.bars.len() {
+            let bar = d.bars[i];
+            if bar.is_empty() {
+                i += 1;
+                continue;
+            }
+            if bar.is_io() {
+                serial_println!("     bar{}: {:#010x} (io)", i, bar.addr());
+                i += 1;
+            } else if bar.is_64bit() && i + 1 < d.bars.len() {
+                let full = bar.addr64(d.bars[i + 1]);
+                serial_println!("     bar{}: {:#018x} (mem64)", i, full);
+                i += 2;
+            } else {
+                serial_println!("     bar{}: {:#010x} (mem32)", i, bar.addr());
+                i += 1;
             }
         }
     }

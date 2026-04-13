@@ -66,13 +66,22 @@ impl Bar {
     pub fn is_64bit(self) -> bool {
         self.is_mem() && ((self.0 >> 1) & 0x3) == 0x2
     }
-    /// Base address with the type flags masked out.
+    /// Base address (low dword) with the type flags masked out.
+    ///
+    /// For 64-bit memory BARs ([`is_64bit`](Self::is_64bit) is true) this
+    /// only exposes the low 32 bits; use [`addr64`](Self::addr64) with the
+    /// adjacent BAR slot to recover the full 64-bit base.
     pub fn addr(self) -> u32 {
         if self.is_io() {
             self.0 & 0xFFFF_FFFC
         } else {
             self.0 & 0xFFFF_FFF0
         }
+    }
+    /// Full 64-bit base for a 64-bit memory BAR, combining this slot (low
+    /// dword) with the adjacent slot that holds the high dword.
+    pub fn addr64(self, next: Bar) -> u64 {
+        ((next.0 as u64) << 32) | ((self.0 as u64) & 0xFFFF_FFF0)
     }
     pub fn is_empty(self) -> bool {
         self.0 == 0
