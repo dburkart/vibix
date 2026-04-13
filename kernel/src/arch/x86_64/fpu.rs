@@ -12,9 +12,9 @@
 //!    `CR4.OSFXSR` / `CR4.OSXMMEXCPT`. With those, `fxsave64` /
 //!    `fxrstor64` are legal and SSE instructions don't raise `#NM`.
 //!  - Each [`Task`](crate::task::task::Task) owns a 64-byte-aligned,
-//!    512-byte [`FpuArea`]. [`FpuArea::new_initialized`] uses `fninit`
-//!    + `fxsave64` to seed a fresh task with a canonical FPU state (no
-//!    denormals trapped, round-to-nearest, exceptions masked).
+//!    512-byte [`FpuArea`]. [`FpuArea::new_initialized`] clones a
+//!    canonical FXSAVE image (x87 reset + `MXCSR=0x1F80`) captured
+//!    once during [`init`], so spawning never touches the live FPU.
 //!  - [`save`] / [`restore`] wrap `fxsave64` / `fxrstor64` against a
 //!    Task's `FpuArea`; the scheduler (`task::mod`) calls them around
 //!    every `context_switch`.
@@ -31,6 +31,7 @@
 //!    an AVX `memcpy`) actually wants SIMD.
 
 use alloc::boxed::Box;
+use spin::Once;
 
 /// Size of an FXSAVE area, in bytes. Fixed by the ISA.
 pub const FXSAVE_SIZE: usize = 512;
@@ -48,30 +49,27 @@ pub struct FpuArea {
     bytes: [u8; FXSAVE_SIZE],
 }
 
+/// Canonical FXSAVE image captured once in [`init`], cloned by
+/// [`FpuArea::new_initialized`] into every new task. Holding this as a
+/// template (rather than regenerating via `fninit` + `fxsave64` on each
+/// spawn) means spawning never mutates the live CPU FPU — which would
+/// otherwise clobber whatever state the spawning task was using.
+static CANONICAL_FPU_IMAGE: Once<FpuArea> = Once::new();
+
 impl FpuArea {
-    /// Allocate a fresh save area and seed it with the canonical
-    /// post-`fninit` FPU state (x87 reset: `FCW=0x037F`, `MXCSR=0x1F80`,
-    /// all data registers empty). Using the live FPU to populate the
-    /// image avoids hand-writing an FXSAVE layout.
+    /// Allocate a fresh save area pre-populated with the canonical FPU
+    /// image (x87 reset: `FCW=0x037F`, all data registers empty;
+    /// `MXCSR=0x1F80`).
     ///
-    /// Must not be called before [`init`] — `fxsave64` requires
-    /// `CR4.OSFXSR` and will `#UD` otherwise.
+    /// Must not be called before [`init`] — that's where the template
+    /// is captured.
     pub fn new_initialized() -> Box<Self> {
-        let mut area = Box::new(Self {
-            bytes: [0u8; FXSAVE_SIZE],
-        });
-        // SAFETY: `area` is 64-byte aligned, 512 bytes, and exclusively
-        // owned by this Box. `init()` has run by the time any task is
-        // spawned, so `fninit` + `fxsave64` are legal.
-        unsafe {
-            core::arch::asm!(
-                "fninit",
-                "fxsave64 [{p}]",
-                p = in(reg) area.bytes.as_mut_ptr(),
-                options(nostack, preserves_flags),
-            );
-        }
-        area
+        let template = CANONICAL_FPU_IMAGE
+            .get()
+            .expect("fpu::init must run before FpuArea::new_initialized");
+        Box::new(Self {
+            bytes: template.bytes,
+        })
     }
 }
 
@@ -101,6 +99,34 @@ pub fn init() {
             f.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
         });
     }
+
+    // Capture the canonical FXSAVE image once — immediately after the
+    // FPU is enabled and before any task has had a chance to touch it.
+    // Running `fninit` + `ldmxcsr(0x1F80)` here only mutates the live
+    // FPU state that nothing has used yet, so there's no caller state
+    // to clobber. Every subsequent `FpuArea::new_initialized` clones
+    // this template without touching the CPU.
+    CANONICAL_FPU_IMAGE.call_once(|| {
+        let mut image = FpuArea {
+            bytes: [0u8; FXSAVE_SIZE],
+        };
+        let default_mxcsr: u32 = 0x1F80;
+        // SAFETY: CR0.EM is clear and CR4.OSFXSR is set by the updates
+        // above, so `fninit`, `ldmxcsr`, and `fxsave64` are all legal.
+        // `image.bytes` is 64-byte aligned and 512 bytes, satisfying
+        // `fxsave64`'s operand requirements.
+        unsafe {
+            core::arch::asm!(
+                "fninit",
+                "ldmxcsr [{m}]",
+                "fxsave64 [{p}]",
+                m = in(reg) &default_mxcsr,
+                p = in(reg) image.bytes.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+        image
+    });
 
     crate::serial_println!("fpu: FXSAVE context switch online");
 }
