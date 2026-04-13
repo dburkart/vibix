@@ -448,6 +448,89 @@ pub unsafe fn free_pml4_frame(pml4_frame: PhysFrame<Size4KiB>) {
     KernelFrameAllocator.deallocate_frame(pml4_frame);
 }
 
+/// Walk the user (lower) half of `pml4_frame` and free every intermediate
+/// L3/L2/L1 page-table frame. Does **not** free leaf data frames (those
+/// are VMA-owned and freed by the AddressSpace VMA-reclaim pass) and does
+/// **not** free the PML4 frame itself (caller calls [`free_pml4_frame`]
+/// last). The kernel upper half (entries `256..512`) is skipped — its
+/// L3 subtrees are shared with the kernel PML4 and outlive this address
+/// space.
+///
+/// Closes the leak documented in #146 and is the main reclaim primitive
+/// behind `Drop for AddressSpace` (#161).
+///
+/// # Safety
+/// * `pml4_frame` must be a per-task PML4 that no CPU is using as its
+///   active page table and that has no outstanding `&mut PageTable` /
+///   `OffsetPageTable` references.
+/// * Callers must already have unmapped every leaf VMA frame so that
+///   the L1 entries this walker frees are decoupled from any owned
+///   data; freeing an L1 frame whose PTEs still point at live data
+///   leaks those frames silently.
+pub unsafe fn free_user_page_tables(pml4_frame: PhysFrame<Size4KiB>) {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before free_user_page_tables");
+
+    let l4_virt = hhdm + pml4_frame.start_address().as_u64();
+    // SAFETY: per fn safety contract.
+    let l4: &mut PageTable = unsafe { &mut *(l4_virt.as_mut_ptr::<PageTable>()) };
+
+    let mut alloc = KernelFrameAllocator;
+
+    // Lower half only — entries 0..256 cover the userspace canonical
+    // half. Entries 256..512 alias the shared kernel PML4 subtrees and
+    // must not be touched here.
+    for l4_idx in 0..256 {
+        let l4_entry = &mut l4[l4_idx];
+        if !l4_entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let Ok(l3_frame) = l4_entry.frame() else {
+            continue;
+        };
+        let l3_virt = hhdm + l3_frame.start_address().as_u64();
+        // SAFETY: l3 frame reachable via HHDM, exclusively owned by this PML4.
+        let l3: &mut PageTable = unsafe { &mut *(l3_virt.as_mut_ptr::<PageTable>()) };
+
+        for l3_entry in l3.iter_mut() {
+            if !l3_entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            // 1 GiB huge leaf: no L2 child to free.
+            if l3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                continue;
+            }
+            let Ok(l2_frame) = l3_entry.frame() else {
+                continue;
+            };
+            let l2_virt = hhdm + l2_frame.start_address().as_u64();
+            let l2: &mut PageTable = unsafe { &mut *(l2_virt.as_mut_ptr::<PageTable>()) };
+
+            for l2_entry in l2.iter_mut() {
+                if !l2_entry.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                // 2 MiB huge leaf: no L1 child to free.
+                if l2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                if let Ok(l1_frame) = l2_entry.frame() {
+                    // SAFETY: per fn contract — leaf VMA frames already freed
+                    // by the AddressSpace reclaim pass; this L1 frame holds
+                    // only PTEs and is itself the intermediate table.
+                    unsafe { alloc.deallocate_frame(l1_frame) };
+                }
+            }
+            // SAFETY: every L1 child of this L2 has been freed above.
+            unsafe { alloc.deallocate_frame(l2_frame) };
+        }
+        // SAFETY: every L2 child of this L3 has been freed above.
+        unsafe { alloc.deallocate_frame(l3_frame) };
+        l4_entry.set_unused();
+    }
+}
+
 /// HHDM offset currently in use. Panics if [`init`] hasn't run.
 /// Exposed for tests that need to poke raw frame contents via the
 /// high half.
