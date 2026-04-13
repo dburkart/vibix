@@ -16,10 +16,6 @@ const PF_W: u32 = 1 << 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 
-#[cfg(target_os = "none")]
-static CACHED_MODULE_ELF_SUMMARY: spin::mutex::Mutex<Option<(VirtAddr, usize)>> =
-    spin::mutex::Mutex::new(None);
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64Ehdr {
@@ -68,6 +64,33 @@ pub(super) struct ParsedElf<'a> {
     ehdr: Elf64Ehdr,
     phdr_bytes: &'a [u8],
     phnum: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElfParseError {
+    TooSmallEhdr,
+    BadMagic,
+    NotElfClass64,
+    UnexpectedPhEntSize,
+    PhdrTableSizeOverflow,
+    PhdrTableOutOfRange,
+    NonCanonicalEntry,
+    NonCanonicalLoadVaddr,
+}
+
+impl ElfParseError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::TooSmallEhdr => "ELF too small for Ehdr",
+            Self::BadMagic => "ELF bad magic",
+            Self::NotElfClass64 => "ELF not ELFCLASS64",
+            Self::UnexpectedPhEntSize => "unexpected e_phentsize",
+            Self::PhdrTableSizeOverflow => "ELF phdr table size overflow",
+            Self::PhdrTableOutOfRange => "ELF phdr table out of range",
+            Self::NonCanonicalEntry => "ELF entry address is non-canonical",
+            Self::NonCanonicalLoadVaddr => "ELF PT_LOAD virtual address is non-canonical",
+        }
+    }
 }
 
 pub(super) struct LoadSegmentIter<'a> {
@@ -169,72 +192,31 @@ pub(super) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     Some((parsed.entry(), parsed.load_segments().count()))
 }
 
-#[cfg(target_os = "none")]
-pub(super) fn snapshot_module_elf_summary_before_reclaim() {
-    *CACHED_MODULE_ELF_SUMMARY.lock() = first_loaded_module_elf_summary();
-}
-
-#[cfg(target_os = "none")]
-pub(super) fn cached_module_elf_summary() -> Option<(VirtAddr, usize)> {
-    *CACHED_MODULE_ELF_SUMMARY.lock()
-}
-
 pub(super) fn try_parse_elf64(bytes: &[u8]) -> Option<ParsedElf<'_>> {
-    if bytes.len() < core::mem::size_of::<Elf64Ehdr>() {
-        return None;
-    }
-
-    // SAFETY: length checked above and we use `read_unaligned` so no
-    // alignment assumptions are required for the input slice.
-    let ehdr = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Elf64Ehdr>()) };
-    if ehdr.e_ident[..4] != ELF_MAGIC || ehdr.e_ident[4] != ELFCLASS64 {
-        return None;
-    }
-    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
-        return None;
-    }
-
-    let phoff = ehdr.e_phoff as usize;
-    let phnum = ehdr.e_phnum as usize;
-    let phsz = ehdr.e_phentsize as usize;
-    let phdr_table_end = phnum.checked_mul(phsz)?.checked_add(phoff)?;
-    if phdr_table_end > bytes.len() {
-        return None;
-    }
-    VirtAddr::try_new(ehdr.e_entry).ok()?;
-    for i in 0..phnum {
-        let off = phoff + i * phsz;
-        // SAFETY: `phdr_table_end` bounds-check above guarantees every
-        // header read in this loop stays within `bytes`.
-        let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
-        if ph.p_type == PT_LOAD && ph.p_memsz != 0 {
-            VirtAddr::try_new(ph.p_vaddr).ok()?;
-        }
-    }
-
-    Some(ParsedElf {
-        ehdr,
-        phdr_bytes: &bytes[phoff..phdr_table_end],
-        phnum,
-    })
+    parse_elf64_inner(bytes).ok()
 }
 
 pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
-    assert!(
-        bytes.len() >= core::mem::size_of::<Elf64Ehdr>(),
-        "ELF too small for Ehdr"
-    );
+    parse_elf64_inner(bytes).unwrap_or_else(|err| panic!("{}", err.message()))
+}
+
+fn parse_elf64_inner(bytes: &[u8]) -> Result<ParsedElf<'_>, ElfParseError> {
+    if bytes.len() < core::mem::size_of::<Elf64Ehdr>() {
+        return Err(ElfParseError::TooSmallEhdr);
+    }
 
     // SAFETY: length checked above and we use `read_unaligned` so no
     // alignment assumptions are required for the input slice.
     let ehdr = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Elf64Ehdr>()) };
-    assert_eq!(ehdr.e_ident[..4], ELF_MAGIC, "ELF bad magic");
-    assert_eq!(ehdr.e_ident[4], ELFCLASS64, "ELF not ELFCLASS64");
-    assert_eq!(
-        ehdr.e_phentsize as usize,
-        core::mem::size_of::<Elf64Phdr>(),
-        "unexpected e_phentsize"
-    );
+    if ehdr.e_ident[..4] != ELF_MAGIC {
+        return Err(ElfParseError::BadMagic);
+    }
+    if ehdr.e_ident[4] != ELFCLASS64 {
+        return Err(ElfParseError::NotElfClass64);
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
+        return Err(ElfParseError::UnexpectedPhEntSize);
+    }
 
     let phoff = ehdr.e_phoff as usize;
     let phnum = ehdr.e_phnum as usize;
@@ -242,30 +224,29 @@ pub(super) fn parse_elf64(bytes: &[u8]) -> ParsedElf<'_> {
     let phdr_table_end = phnum
         .checked_mul(phsz)
         .and_then(|n| phoff.checked_add(n))
-        .expect("ELF phdr table size overflow");
-    assert!(phdr_table_end <= bytes.len(), "ELF phdr table out of range");
-    assert!(
-        VirtAddr::try_new(ehdr.e_entry).is_ok(),
-        "ELF entry address is non-canonical"
-    );
+        .ok_or(ElfParseError::PhdrTableSizeOverflow)?;
+    if phdr_table_end > bytes.len() {
+        return Err(ElfParseError::PhdrTableOutOfRange);
+    }
+    if VirtAddr::try_new(ehdr.e_entry).is_err() {
+        return Err(ElfParseError::NonCanonicalEntry);
+    }
+
     for i in 0..phnum {
         let off = phoff + i * phsz;
         // SAFETY: `phdr_table_end` bounds-check above guarantees every
         // header read in this loop stays within `bytes`.
         let ph = unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(off).cast::<Elf64Phdr>()) };
-        if ph.p_type == PT_LOAD && ph.p_memsz != 0 {
-            assert!(
-                VirtAddr::try_new(ph.p_vaddr).is_ok(),
-                "ELF PT_LOAD virtual address is non-canonical"
-            );
+        if ph.p_type == PT_LOAD && ph.p_memsz != 0 && VirtAddr::try_new(ph.p_vaddr).is_err() {
+            return Err(ElfParseError::NonCanonicalLoadVaddr);
         }
     }
 
-    ParsedElf {
+    Ok(ParsedElf {
         ehdr,
         phdr_bytes: &bytes[phoff..phdr_table_end],
         phnum,
-    }
+    })
 }
 
 #[cfg(test)]
