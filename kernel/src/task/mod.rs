@@ -449,6 +449,13 @@ pub fn preempt_tick() {
         return;
     }
 
+    // Drain any tick-deadline wakeups (see `task::sleep_ms`) and
+    // promote their targets. Runs before the preemption decision so a
+    // freshly-unparked task is visible in the highest-ready check.
+    for id in crate::time::drain_expired(crate::time::ticks()) {
+        wake_in_sched(&mut sched, id);
+    }
+
     {
         let top_ready = sched.highest_ready_priority();
         let current = sched.current.as_mut().unwrap();
@@ -628,39 +635,38 @@ pub fn wake(id: usize) {
     interrupts::disable();
 
     let mut sched = SCHED.lock();
+    wake_in_sched(&mut sched, id);
+    drop(sched);
 
-    // Parked → Ready is the happy path: move the Box across and hand
-    // the task a fresh slice so it gets a full tick the next time the
-    // scheduler rotates through.
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Body of [`wake`] that operates on a caller-held scheduler lock.
+/// Used by [`preempt_tick`] after draining tick-deadline wakeups so the
+/// unpark happens without re-entering the mutex.
+fn wake_in_sched(sched: &mut Scheduler, id: usize) {
+    // Parked → Ready is the happy path.
     if let Some(mut task) = sched.parked.remove(&id) {
         task.state = TaskState::Ready;
         task.slice_remaining_ms = DEFAULT_SLICE_MS;
         let prio = task.priority;
         sched.push_ready(task);
-        // If the newly-ready task outranks the current one, cut the
-        // current slice short so the next tick rotates it in.
-        maybe_preempt_current_for_priority(&mut sched, prio);
-        drop(sched);
-        if was_on {
-            interrupts::enable();
-        }
+        maybe_preempt_current_for_priority(sched, prio);
         return;
     }
 
     // Task is Running or Ready. Set wake_pending so the next
-    // block_current call on it returns immediately. This is the
-    // wake-before-park race cure — see `block_current`'s fast path.
+    // block_current call on it returns immediately — this is the
+    // wake-before-park race cure (see `block_current`'s fast path).
     if let Some(current) = sched.current.as_ref() {
         if current.id == id {
             current.wake_pending.store(true, Ordering::Release);
-            drop(sched);
-            if was_on {
-                interrupts::enable();
-            }
             return;
         }
     }
-    let ready_hit = sched.iter_ready().any(|task| {
+    let _ = sched.iter_ready().any(|task| {
         if task.id == id {
             task.wake_pending.store(true, Ordering::Release);
             true
@@ -668,18 +674,23 @@ pub fn wake(id: usize) {
             false
         }
     });
-    if ready_hit {
-        drop(sched);
-        if was_on {
-            interrupts::enable();
-        }
-        return;
-    }
+    // Unknown id — drop on the floor.
+}
 
-    // Unknown id — drop the wake on the floor. Tasks don't exit yet so
-    // this only fires if somebody handed us a stale or invented id.
-    drop(sched);
-    if was_on {
-        interrupts::enable();
-    }
+/// Park the current task for at least `ms` milliseconds.
+///
+/// Computes a deadline in PIT ticks (ceil-div against [`TICK_MS`] so a
+/// short sleep never returns early), registers the current task id
+/// with the time subsystem, and parks via [`block_current`]. The PIT
+/// ISR drains expired deadlines and unparks through the normal
+/// scheduler path.
+///
+/// Resolution is the PIT tick (10 ms at 100 Hz); callers asking for
+/// less will sleep for at least one full tick.
+pub fn sleep_ms(ms: u64) {
+    let ticks_to_wait = ms.div_ceil(crate::time::TICK_MS).max(1);
+    let deadline = crate::time::ticks().saturating_add(ticks_to_wait);
+    let id = current_id();
+    crate::time::enqueue_wakeup(deadline, id);
+    block_current();
 }

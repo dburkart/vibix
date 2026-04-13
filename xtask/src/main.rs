@@ -539,6 +539,7 @@ fn test_all() -> R<()> {
         "per_task_cr3",
         "demand_paging",
         "userspace_module",
+        "sleep",
     ] {
         cmd.arg("--test").arg(t);
     }

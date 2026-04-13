@@ -4,8 +4,11 @@
 //! Separately, the CMOS RTC provides a best-effort wall-clock snapshot
 //! during boot for human-readable timestamps.
 
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 
 /// PIT oscillator frequency, in Hz. Divisor = this / desired Hz.
 #[cfg(target_os = "none")]
@@ -16,6 +19,12 @@ pub const TICK_HZ: u32 = 100;
 pub const TICK_MS: u64 = 1000 / TICK_HZ as u64;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Pending task wakeups keyed by deadline (in ticks). A single deadline
+/// may accumulate multiple task ids (unlikely at 100 Hz but cheap to
+/// support). Drained by `preempt_tick` each PIT IRQ; see
+/// `drain_expired`.
+static WAKEUPS: Mutex<BTreeMap<u64, Vec<usize>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateTime {
@@ -109,6 +118,37 @@ pub fn ticks() -> u64 {
 
 pub fn uptime_ms() -> u64 {
     ticks() * TICK_MS
+}
+
+/// Register `id` to be woken once the tick counter reaches
+/// `deadline_ticks`. Callers are task context only — uses a blocking
+/// lock. A deadline of `0` or one already in the past will be drained
+/// on the very next `preempt_tick`.
+pub fn enqueue_wakeup(deadline_ticks: u64, id: usize) {
+    WAKEUPS.lock().entry(deadline_ticks).or_default().push(id);
+}
+
+/// Pop every task id whose deadline is ≤ `now` from the wakeup list,
+/// in deadline order. Returns an empty `Vec` if the list is empty, if
+/// the lock is contended (ISR caller), or if no entry has expired.
+///
+/// Safe to call from an interrupt context: uses `try_lock` and bails
+/// cleanly on contention. A missed drain is self-healing — the next
+/// tick's call picks the same entries up.
+pub fn drain_expired(now: u64) -> Vec<usize> {
+    let Some(mut wakeups) = WAKEUPS.try_lock() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<usize> = Vec::new();
+    while let Some((&deadline, _)) = wakeups.iter().next() {
+        if deadline > now {
+            break;
+        }
+        if let Some(mut bucket) = wakeups.remove(&deadline) {
+            ids.append(&mut bucket);
+        }
+    }
+    ids
 }
 
 pub fn wall_clock() -> Option<DateTime> {
