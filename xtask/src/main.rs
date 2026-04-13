@@ -60,6 +60,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "apic: BSP online",
     "ioapic: initialized",
     "timer: 100 Hz",
+    "rtc:",
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
