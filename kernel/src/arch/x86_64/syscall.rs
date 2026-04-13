@@ -7,8 +7,9 @@
 //! - `IA32_STAR`: encodes the kernel CS base (0x0008) and the user CS
 //!   base for SYSRETQ (0x0010 → CS=0x20|3, SS=0x18|3 on return).
 //! - `IA32_LSTAR`: address of `syscall_entry` — the naked asm trampoline.
-//! - `IA32_FMASK`: clears IF (bit 9) on SYSCALL entry so the handler runs
-//!   with interrupts disabled, preventing IRQ re-use of the same kernel stack.
+//! - `IA32_FMASK`: masks IF, TF, DF, NT, and AC on SYSCALL entry so the
+//!   handler always runs with interrupts and single-step disabled, DF=0
+//!   (forward-direction string ops), and no stray NTAS/AC bits.
 //!
 //! ## Kernel stack
 //!
@@ -51,8 +52,15 @@ const MSR_FMASK: u32 = 0xC000_0084;
 /// EFER.SCE — enables SYSCALL/SYSRET.
 const EFER_SCE: u64 = 1 << 0;
 
-/// RFLAGS.IF — cleared by SFMASK on SYSCALL entry.
-const RFLAGS_IF: u64 = 1 << 9;
+/// RFLAGS bits cleared by SFMASK on SYSCALL entry.
+/// TF (bit 8) — trap / single-step
+/// IF (bit 9) — interrupts: disabled while handling syscall to prevent
+///              IRQ re-use of the shared `INIT_KERNEL_STACK`
+/// DF (bit 10) — direction: clear so string instructions run forward
+/// NT (bit 14) — nested task: should never be set in 64-bit mode, clear defensively
+/// AC (bit 18) — alignment check: clear to avoid spurious faults in handler
+const RFLAGS_SYSCALL_MASK: u64 =
+    (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
 
 /// Dedicated kernel stack for ring-3 privilege changes: IRQs/exceptions
 /// (via TSS.rsp[0]) and SYSCALL (via SYSCALL_KERNEL_RSP below).
@@ -68,14 +76,10 @@ struct AlignedStack([u8; 16 * 1024]);
 static mut INIT_KERNEL_STACK: AlignedStack = AlignedStack([0u8; 16 * 1024]);
 
 /// Top of `INIT_KERNEL_STACK`. Written by `setup_ring3_stacks` before
-/// ring-3 entry; read by `syscall_entry` to switch off the user stack.
+/// ring-3 entry; read by `syscall_entry` (via RIP-relative `lea`) to
+/// switch off the user stack onto the dedicated kernel stack.
 #[no_mangle]
 pub static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-
-/// User RSP stashed here by `syscall_entry` before switching stacks;
-/// restored before `sysretq`.
-#[no_mangle]
-pub static SYSCALL_USER_RSP: AtomicU64 = AtomicU64::new(0);
 
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
@@ -97,8 +101,8 @@ pub fn init() {
         let entry_fn: unsafe extern "C" fn() = syscall_entry;
         Msr::new(MSR_LSTAR).write(entry_fn as u64);
 
-        // FMASK: clear IF on syscall entry.
-        Msr::new(MSR_FMASK).write(RFLAGS_IF);
+        // FMASK: clear TF, IF, DF, NT, AC on syscall entry.
+        Msr::new(MSR_FMASK).write(RFLAGS_SYSCALL_MASK);
     }
 
     crate::serial_println!("syscall: SYSCALL/SYSRET enabled");
@@ -147,29 +151,45 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
     );
 }
 
+/// First canonical upper-half address — same boundary as `loader::UPPER_HALF_START`.
+/// Any `buf` pointer at or above this is a kernel address and must be rejected.
+const USER_VA_END: u64 = 0x0000_8000_0000_0000;
+
+/// `-EFAULT` — returned when a user pointer fails the bounds check.
+const EFAULT: i64 = -14;
+
 /// Syscall handler called from the `syscall_entry` trampoline.
 ///
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
-/// interrupts disabled. `a1` is a user virtual address valid in the
-/// currently-loaded PML4 when `nr == 1` (write).
+/// interrupts disabled. User-supplied pointer arguments (`a1` for `write`)
+/// are validated against `USER_VA_END` before any dereference.
 #[no_mangle]
 pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     match nr {
         // write(fd, buf, len) — fd=1 (stdout/stderr) → serial
         1 => {
             let fd = a0;
-            let buf = a1 as *const u8;
+            let buf_va = a1;
             let len = a2 as usize;
+            // Reject kernel-space or obviously wrapping buf pointers.
+            // A zero-length write is a no-op; skip the pointer check.
+            if len > 0 {
+                let end = buf_va.saturating_add(len as u64);
+                if buf_va >= USER_VA_END || end > USER_VA_END {
+                    return EFAULT;
+                }
+            }
             if fd == 1 && len > 0 {
+                let buf = buf_va as *const u8;
                 // Write each byte via direct port I/O. Avoids acquiring the
                 // COM1 spinlock (which could deadlock if another task holds
                 // it while IF=0 during a syscall) and avoids the Rust
                 // fmt machinery with its associated stack depth.
                 //
-                // Safety: `buf` is a user-space VA in the active PML4. IF
-                // is cleared (SFMASK) so no context switch can invalidate
-                // the mapping while we iterate.
+                // Safety: `buf` is a validated user-space VA in the active
+                // PML4 (checked against USER_VA_END above). IF is cleared
+                // (SFMASK) so no context switch can invalidate the mapping.
                 for i in 0..len {
                     let b = unsafe { core::ptr::read_volatile(buf.add(i)) };
                     uart_putc(b);

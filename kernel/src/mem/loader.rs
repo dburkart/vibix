@@ -149,6 +149,18 @@ fn map_user_segment(
     if seg.vaddr.as_u64() >= UPPER_HALF_START {
         return Err(LoadError::SegmentNotLowerHalf);
     }
+    // Reject segments whose virtual range overflows or crosses the
+    // lower-half ceiling. Without this check, a large `p_memsz` could
+    // push later pages into non-canonical space, panicking in
+    // `VirtAddr::new()` during the mapping loop.
+    if seg
+        .vaddr
+        .as_u64()
+        .checked_add(seg.memsz)
+        .map_or(true, |end| end > UPPER_HALF_START)
+    {
+        return Err(LoadError::SegmentNotLowerHalf);
+    }
     if seg.vaddr.as_u64() & (PAGE_SIZE - 1) != 0 {
         return Err(LoadError::SegmentNotPageAligned);
     }

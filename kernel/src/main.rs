@@ -163,8 +163,8 @@ pub extern "C" fn _start() -> ! {
             vibix::init_process::launch(bytes);
         }
         None => {
-            serial_println!("kernel panic: no init found at /init");
-            panic!("no init found at /init");
+            serial_println!("kernel panic: Limine userspace init module missing");
+            panic!("Limine userspace init module missing");
         }
     }
 
