@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 /// PIT oscillator frequency, in Hz. Divisor = this / desired Hz.
 #[cfg(target_os = "none")]
@@ -25,6 +25,23 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// support). Drained by `preempt_tick` each PIT IRQ; see
 /// `drain_expired`.
 static WAKEUPS: Mutex<BTreeMap<u64, Vec<usize>>> = Mutex::new(BTreeMap::new());
+
+/// Calibrated TSC frequency in Hz. Set once by [`calibrate_tsc`]; left
+/// unset when `RDTSCP` is unavailable, in which case [`uptime_ns`]
+/// falls back to the PIT tick counter.
+static TSC_HZ: Once<u64> = Once::new();
+
+/// TSC value captured at the start of calibration. [`uptime_ns`]
+/// measures from this point rather than CPU reset so the nanosecond
+/// clock aligns with the PIT monotonic counter at calibration time.
+static TSC_START: Once<u64> = Once::new();
+
+/// Number of PIT ticks spanned by the calibration window.
+///
+/// At 100 Hz this is 100 ms — long enough to average over several
+/// boundary ticks so scheduling jitter in the spin loop doesn't
+/// dominate, short enough that boot latency is still small.
+const TSC_CALIBRATION_TICKS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateTime {
@@ -117,8 +134,97 @@ pub fn ticks() -> u64 {
 }
 
 pub fn uptime_ms() -> u64 {
-    ticks() * TICK_MS
+    uptime_ns() / 1_000_000
 }
+
+/// Monotonic uptime in nanoseconds. Uses the calibrated TSC when
+/// available, otherwise falls back to the 10 ms PIT tick counter.
+///
+/// The TSC path measures from [`calibrate_tsc`]'s start sample, not
+/// CPU reset — the two domains are aligned at calibration time so the
+/// TSC and PIT clocks agree (within calibration error) from that
+/// point on.
+pub fn uptime_ns() -> u64 {
+    if let (Some(&hz), Some(&start)) = (TSC_HZ.get(), TSC_START.get()) {
+        let now = read_tsc();
+        return tsc_to_ns(now.wrapping_sub(start), hz);
+    }
+    ticks() * TICK_MS * 1_000_000
+}
+
+/// Convert a TSC delta to nanoseconds given the calibrated frequency.
+/// Pulled out of [`uptime_ns`] so the formula is unit-testable on the
+/// host.
+fn tsc_to_ns(tsc_delta: u64, tsc_hz: u64) -> u64 {
+    ((tsc_delta as u128 * 1_000_000_000u128) / tsc_hz as u128) as u64
+}
+
+/// Derive the TSC frequency in Hz from a measured cycle delta over
+/// `ticks_elapsed` PIT ticks. Pulled out for host testability.
+fn compute_tsc_hz(tsc_delta: u64, ticks_elapsed: u64) -> u64 {
+    (tsc_delta as u128 * TICK_HZ as u128 / ticks_elapsed as u128) as u64
+}
+
+/// Read the current TSC value. Host builds return `0` — only the
+/// kernel target has the intrinsic and care what the value is.
+#[cfg(target_os = "none")]
+fn read_tsc() -> u64 {
+    // SAFETY: RDTSC is an unprivileged instruction available on every
+    // x86_64 CPU the kernel supports. No side effects beyond reading
+    // the timestamp counter.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(not(target_os = "none"))]
+fn read_tsc() -> u64 {
+    0
+}
+
+/// Calibrate the TSC against the PIT. Must be called after interrupts
+/// are enabled (otherwise [`ticks`] never advances and the spin loop
+/// below would deadlock) and after [`init`] has programmed the PIT.
+///
+/// No-op when `RDTSCP` is unavailable — [`uptime_ns`] silently falls
+/// back to the PIT clock in that case.
+#[cfg(target_os = "none")]
+pub fn calibrate_tsc() {
+    use crate::cpu::{self, Feature};
+
+    if !cpu::has(Feature::Rdtscp) {
+        crate::serial_println!("timer: TSC calibration skipped (no RDTSCP)");
+        return;
+    }
+
+    // Wait for the next tick boundary so the window is aligned.
+    let start_ticks = ticks();
+    while ticks() == start_ticks {
+        core::hint::spin_loop();
+    }
+    let window_start_ticks = ticks();
+    let window_start_tsc = read_tsc();
+
+    while ticks() - window_start_ticks < TSC_CALIBRATION_TICKS {
+        core::hint::spin_loop();
+    }
+    let window_end_tsc = read_tsc();
+    let elapsed_ticks = ticks() - window_start_ticks;
+
+    let tsc_delta = window_end_tsc.wrapping_sub(window_start_tsc);
+    let hz = compute_tsc_hz(tsc_delta, elapsed_ticks);
+    if hz == 0 {
+        crate::serial_println!("timer: TSC calibration produced 0 Hz — falling back to PIT");
+        return;
+    }
+
+    TSC_HZ.call_once(|| hz);
+    TSC_START.call_once(|| window_start_tsc);
+    crate::serial_println!("timer: TSC {} MHz", hz / 1_000_000);
+}
+
+/// Host build stub. Present so non-kernel callers can reference the
+/// symbol without guarding every call site.
+#[cfg(not(target_os = "none"))]
+pub fn calibrate_tsc() {}
 
 /// Register `id` to be woken once the tick counter reaches
 /// `deadline_ticks`. Callers are task context only — uses a blocking
@@ -285,8 +391,41 @@ fn read_cmos(register: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_wall_clock, DateTime, RawRtc, RTC_24_HOUR_MODE, RTC_BINARY_MODE, RTC_HOUR_PM_BIT,
+        compute_tsc_hz, decode_wall_clock, tsc_to_ns, DateTime, RawRtc, RTC_24_HOUR_MODE,
+        RTC_BINARY_MODE, RTC_HOUR_PM_BIT,
     };
+
+    #[test]
+    fn tsc_to_ns_ghz_clock() {
+        // A 3 GHz clock: one second = 3_000_000_000 cycles → 10^9 ns.
+        assert_eq!(tsc_to_ns(3_000_000_000, 3_000_000_000), 1_000_000_000);
+        // Half a second's worth of cycles = 5 * 10^8 ns.
+        assert_eq!(tsc_to_ns(1_500_000_000, 3_000_000_000), 500_000_000);
+    }
+
+    #[test]
+    fn tsc_to_ns_handles_large_deltas_without_overflow() {
+        // A sustained read a full hour after calibration on a 4 GHz
+        // clock: 4e9 * 3600 = 1.44e13 cycles. Naive (u64 * 1e9) would
+        // overflow; the u128 intermediate must not.
+        let tsc_delta: u64 = 4_000_000_000u64 * 3600;
+        let ns = tsc_to_ns(tsc_delta, 4_000_000_000);
+        assert_eq!(ns, 3_600_000_000_000u64);
+    }
+
+    #[test]
+    fn compute_tsc_hz_matches_expected_frequency() {
+        // 30_000_000 cycles across 10 PIT ticks at 100 Hz (100 ms)
+        // implies a 300 MHz clock.
+        assert_eq!(compute_tsc_hz(30_000_000, 10), 300_000_000);
+    }
+
+    #[test]
+    fn compute_tsc_hz_single_tick_window() {
+        // One PIT tick at 100 Hz = 10 ms. A 2_000_000-cycle delta
+        // implies 200 MHz.
+        assert_eq!(compute_tsc_hz(2_000_000, 1), 200_000_000);
+    }
 
     #[test]
     fn decodes_bcd_rtc_snapshot() {
