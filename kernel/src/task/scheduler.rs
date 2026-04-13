@@ -50,10 +50,7 @@ impl Scheduler {
 
     /// Enqueue `task` at the back of its priority's ready FIFO.
     pub fn push_ready(&mut self, task: Box<Task>) {
-        self.ready
-            .entry(task.priority)
-            .or_default()
-            .push_back(task);
+        self.ready.entry(task.priority).or_default().push_back(task);
     }
 
     /// Pop the highest-priority ready task, or `None` if nothing is

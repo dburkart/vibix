@@ -36,10 +36,22 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("nice_sets_visible_priority", &(nice_sets_visible_priority as fn())),
-        ("set_affinity_round_trip", &(set_affinity_round_trip as fn())),
-        ("set_priority_round_trip", &(set_priority_round_trip as fn())),
-        ("high_priority_runs_before_low", &(high_priority_runs_before_low as fn())),
+        (
+            "nice_sets_visible_priority",
+            &(nice_sets_visible_priority as fn()),
+        ),
+        (
+            "set_affinity_round_trip",
+            &(set_affinity_round_trip as fn()),
+        ),
+        (
+            "set_priority_round_trip",
+            &(set_priority_round_trip as fn()),
+        ),
+        (
+            "high_priority_runs_before_low",
+            &(high_priority_runs_before_low as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -233,9 +245,15 @@ fn set_affinity_round_trip() {
     let id = AFF_ID.load(Ordering::SeqCst);
     assert!(id != 0);
     // Pin to CPU 0 only.
-    assert!(task::set_affinity(id, 0b1), "set_affinity on live task failed");
+    assert!(
+        task::set_affinity(id, 0b1),
+        "set_affinity on live task failed"
+    );
     // Zero mask is rejected (a task must be runnable somewhere).
-    assert!(!task::set_affinity(id, 0), "set_affinity accepted zero mask");
+    assert!(
+        !task::set_affinity(id, 0),
+        "set_affinity accepted zero mask"
+    );
     // Unknown id is rejected.
     assert!(
         !task::set_affinity(usize::MAX, 0b1),

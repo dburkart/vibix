@@ -145,8 +145,8 @@ pub fn adjust_nice(id: usize, delta: i8) -> Option<i8> {
     let current_prio = find_priority(&sched, id);
     let result = current_prio.map(|prio| {
         let current_nice = nice_from_priority(prio);
-        let new_nice = (current_nice as i16 + delta as i16)
-            .clamp(NICE_MIN as i16, NICE_MAX as i16) as i8;
+        let new_nice =
+            (current_nice as i16 + delta as i16).clamp(NICE_MIN as i16, NICE_MAX as i16) as i8;
         let new_prio = priority_from_nice(new_nice);
         apply_priority(&mut sched, id, new_prio);
         new_nice

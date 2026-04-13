@@ -48,7 +48,11 @@ pub const fn priority_from_nice(nice: i8) -> u8 {
 /// produce this priority. Priorities above [`MAX_PRIORITY`] clamp to
 /// `NICE_MIN`.
 pub const fn nice_from_priority(prio: u8) -> i8 {
-    let p = if prio > MAX_PRIORITY { MAX_PRIORITY } else { prio };
+    let p = if prio > MAX_PRIORITY {
+        MAX_PRIORITY
+    } else {
+        prio
+    };
     (DEFAULT_PRIORITY as i16 - p as i16) as i8
 }
 
@@ -60,4 +64,3 @@ pub const fn clamp_priority(p: u8) -> u8 {
         p
     }
 }
-
