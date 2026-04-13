@@ -175,4 +175,3 @@ fn print_row(name: &str, s: Stats) {
         s.p99
     );
 }
-

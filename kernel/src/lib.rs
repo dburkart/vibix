@@ -18,10 +18,10 @@ pub mod mem;
 #[cfg(target_os = "none")]
 pub mod acpi;
 
-#[cfg(all(target_os = "none", feature = "bench"))]
-pub mod bench;
 #[cfg(target_os = "none")]
 pub mod arch;
+#[cfg(all(target_os = "none", feature = "bench"))]
+pub mod bench;
 #[cfg(target_os = "none")]
 pub mod boot;
 #[cfg(target_os = "none")]
