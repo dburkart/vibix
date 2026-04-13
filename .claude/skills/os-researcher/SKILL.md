@@ -316,6 +316,7 @@ All four archetypes have issued `LGTM`. Proceed:
    remaining as "deferred to implementation."
 3. Commit and push:
    ```
+   git add docs/RFC/<NNNN>-<kebab-slug>.md
    git commit -m "rfc(<NNNN>): mark Accepted
 
    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
