@@ -389,11 +389,15 @@ pub fn unmap_in_pml4(
     let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
     let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
     let (frame, flush) = mapper.unmap(page)?;
-    if Cr3::read().0 == pml4_frame {
-        flush.flush();
-    } else {
-        flush.ignore();
-    }
+    // Always flush this CPU's TLB for `page`. `Cr3::read().0 ==
+    // pml4_frame` isn't sufficient: upper-half L3 subtrees are aliased
+    // into every PML4 (shared kernel window), so an unmap performed
+    // through the victim PML4 invalidates entries that the active CR3's
+    // TLB may have cached. Leaving them behind lets freed frames be
+    // reallocated while stale translations still point at them.
+    // `invlpg` is a single-CPU op; multi-CPU shootdown is a follow-up
+    // once we have >1 AP online.
+    flush.flush();
     Ok(frame)
 }
 

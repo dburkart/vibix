@@ -445,7 +445,7 @@ pub fn current_vma_lookup(
 ///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
     interrupts::disable();
-    let (prev_rsp_ptr, next_rsp, next_cr3) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr) = {
         let mut sched = SCHED.lock();
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
@@ -469,6 +469,7 @@ pub fn exit() -> ! {
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
         // Enqueue the doomed task; the next `preempt_tick` drains the
         // whole queue. Back-to-back exits between ticks just append.
         sched.pending_exit.push_back(prev);
@@ -478,11 +479,14 @@ pub fn exit() -> ! {
         // reap it until a later tick, so the heap location remains
         // valid for this context_switch's single write.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
-        (prev_rsp_ptr, next_rsp, next_cr3)
+        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr)
     };
     // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
-    // a stable heap location, next_cr3 is a valid per-task PML4.
+    // a stable heap location, next_cr3 is a valid per-task PML4,
+    // next_fpu_ptr points into a Box<FpuArea> pinned by the scheduler.
+    // We intentionally skip `fpu::save` — the exiting task is doomed.
     unsafe {
+        fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
     unreachable!("task::exit returned from context_switch");
