@@ -70,6 +70,8 @@ const SMOKE_MARKERS: &[&str] = &[
     "interrupts enabled",
     "tasks: scheduler online",
     "userspace module ELF entry=",
+    "userspace: loader mapping image",
+    "USRHELLO",
 ];
 
 fn main() -> R<()> {
@@ -209,8 +211,22 @@ fn userspace_hello_binary() -> PathBuf {
 }
 
 fn build_userspace_hello() -> R<PathBuf> {
+    // Setting RUSTFLAGS wholesale overrides the workspace
+    // `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
+    // so we must re-supply every flag the kernel target still needs —
+    // only the linker script differs (userspace payload maps at
+    // 0xffffffffc0000000, not the kernel's 0xffffffff80000000).
+    let rustflags = [
+        "-C link-arg=-Tuserspace/hello/link.ld",
+        "-C relocation-model=static",
+        "-C code-model=kernel",
+        "-C no-redzone=yes",
+        "-C force-frame-pointers=yes",
+    ]
+    .join(" ");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
         .args(["build", "--package", "userspace_hello"])
         .args(KERNEL_BUILD_STD_ARGS);
     check(cmd.status()?)?;
@@ -604,6 +620,7 @@ fn test_all() -> R<()> {
         "per_task_cr3",
         "demand_paging",
         "userspace_module",
+        "userspace_loader",
         "sleep",
         "pci_enum",
         "serial_rx",
