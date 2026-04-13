@@ -63,7 +63,15 @@ pub enum HpetError {
     ZeroPeriod,
     PeriodTooLarge(u64),
     PeriodicUnsupported,
+    LegacyReplacementUnsupported,
 }
+
+/// Bit 15 of the General Capabilities register: set when the HPET
+/// supports LegacyReplacement routing (timer 0 → IRQ0, timer 1 → IRQ8).
+/// Without it, writing `CFG_LEG_RT` is silently ignored, so we must
+/// refuse to initialize rather than end up with a live ACTIVE flag and
+/// no timer IRQ.
+const CAPS_LEG_RT_SUPPORTED: u64 = 1 << 15;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -109,6 +117,14 @@ pub fn init() -> Result<(), HpetError> {
     // Spec caps the tick period at 100 ns = 10^8 fs.
     if period_fs > 100_000_000 {
         return Err(HpetError::PeriodTooLarge(period_fs));
+    }
+    // LegacyReplacement is how we land on IRQ0; refuse to proceed if
+    // the HPET can't support it. Otherwise the CFG_LEG_RT write below
+    // is a no-op, ACTIVE still flips true, time::init skips the PIT,
+    // and calibrate_tsc spins forever waiting on a timer IRQ that
+    // never fires.
+    if caps & CAPS_LEG_RT_SUPPORTED == 0 {
+        return Err(HpetError::LegacyReplacementUnsupported);
     }
 
     let timer0_caps = unsafe { read64(base, REG_TIMER0_CONFIG) };
