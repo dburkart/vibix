@@ -290,10 +290,7 @@ fn preempt_if_higher_ready(sched: &mut Scheduler) {
         return;
     };
     let cur_prio = cur.priority;
-    if sched
-        .highest_ready_priority()
-        .is_some_and(|p| p > cur_prio)
-    {
+    if sched.highest_ready_priority().is_some_and(|p| p > cur_prio) {
         sched.current.as_mut().unwrap().slice_remaining_ms = 0;
     }
 }
