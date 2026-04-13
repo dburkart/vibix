@@ -5,6 +5,13 @@ description: Autonomously drive vibix work end-to-end — pick an unblocked issu
 
 # auto-engineer
 
+Read these shared playbooks first:
+
+- `docs/agent-playbooks/sdlc.md`
+- `docs/agent-playbooks/build-run.md`
+- `docs/agent-playbooks/testing.md`
+- `docs/agent-playbooks/pr-review.md`
+
 Closes the full SDLC loop without prompting the user between steps. Each invocation runs **one cycle** (pick → plan → implement → PR → wait → merge), then reschedules itself via `ScheduleWakeup` with prompt `/auto-engineer` for the next cycle. Stops cleanly when it runs out of work or hits something it can't safely resolve.
 
 This skill is a deliberate override of the project's default "don't merge your own PRs" rule — merging is the whole point of closing the loop. It only applies while auto-engineer is driving.
@@ -41,7 +48,7 @@ Sort preference:
 
 If the candidate list is empty → **stop** (see Stopping below) with message *"no unblocked issues — auto-engineer idle."*
 
-Assign and branch per `sdlc`:
+Assign and branch per `docs/agent-playbooks/sdlc.md`:
 
 ```sh
 gh issue edit <N> --add-assignee dburkart
@@ -66,7 +73,7 @@ The parent proceeds directly with `Edit` / `Write` per the returned plan. No use
 
 ### 4. Build + test
 
-Run in order, per the `build` and `test` skills:
+Run in order, following the shared build and testing playbooks:
 
 ```sh
 cargo xtask build
@@ -78,7 +85,7 @@ On failure: diagnose and fix in place. **Maximum 3 fix attempts per cycle.** If 
 
 ### 5. Commit and open PR
 
-Per `sdlc`:
+Per `docs/agent-playbooks/sdlc.md`:
 
 - Coherent commits (not a single mega-commit, not micro-commits). Each with the standard `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` trailer.
 - `git push -u origin <branch>`.
@@ -92,6 +99,10 @@ Invoke the `wait-for-pr` skill. It handles:
 - CI polling with cache-friendly `ScheduleWakeup` cadence.
 - Review-bot timing (30-min bot window).
 - Auto-fix for fmt / clippy failures.
+
+The classification of actionable bugs, in-scope nits, and out-of-scope nits comes from
+`docs/agent-playbooks/pr-review.md`; this skill only owns the Claude-native loop around that
+policy.
 
 When `wait-for-pr` returns a summary:
 

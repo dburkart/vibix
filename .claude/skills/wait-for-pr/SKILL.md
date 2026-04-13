@@ -5,7 +5,11 @@ description: After opening a PR or pushing a fix, wait for all CI checks AND rev
 
 # wait-for-pr
 
-Right after a PR is opened or a new commit is pushed to its branch, don't stop at the first `gh pr checks` poll — checks take minutes and review bots (CodeRabbit, Greptile, GHAS) post later still. This skill runs the full wait loop so the user sees one consolidated report instead of prompting "are we there yet?" repeatedly.
+Read `docs/agent-playbooks/pr-review.md` first for repo-level CI readiness and review-classification
+rules.
+
+This skill keeps only the Claude-specific wait loop and automation needed to turn those shared rules
+into a single consolidated PR-status report.
 
 ## When to invoke
 
@@ -23,19 +27,30 @@ gh pr list --head "$(git branch --show-current)" --json number,url --jq '.[0]'
 
 Record the number and URL; reuse them for every poll tick.
 
-## What "done" means
+## Shared-vs-Claude split
 
-The PR isn't ready for a summary until **all** are true:
-
-1. Every GitHub Actions check is in a terminal state: `success`, `failure`, `skipped`, `cancelled`, `neutral`, `timed_out`, or `stale`. Nothing `in_progress`, `queued`, or `pending`.
-2. No check is sitting in `action_required` waiting on manual approval (flag it and stop — the user needs to act).
-3. At least one review-bot comment / review exists, **or** 30 minutes have elapsed since the PR opened (bots may not be wired up on this repo; don't block forever).
+- The shared playbook defines what CI-ready means and how to classify review findings.
+- This wrapper defines the Claude-only polling cadence, wake-up loop, and optional auto-fix behavior.
+- If the repo's review policy changes, update the shared playbook first and keep this file focused on
+  runtime mechanics.
 
 Known review-bot author logins:
 
 - `coderabbitai` / `coderabbitai[bot]`
 - `greptile-apps` / `greptile-bot`
 - `github-advanced-security[bot]`
+
+## What "done" means
+
+The PR isn't ready for a summary until **all** are true:
+
+1. Every GitHub Actions check is in a terminal state: `success`, `failure`, `skipped`,
+   `cancelled`, `neutral`, `timed_out`, or `stale`. Nothing `in_progress`, `queued`, or
+   `pending`.
+2. No check is sitting in `action_required` waiting on manual approval (flag it and stop — the user
+   needs to act).
+3. At least one review-bot comment / review exists, **or** 30 minutes have elapsed since the PR
+   opened (bots may not be wired up on this repo; don't block forever).
 
 ## Poll cadence
 
@@ -124,37 +139,13 @@ Never auto-fix:
 
 ## Summarize
 
-When everything has reported, output one structured report:
+When everything has reported, output one structured report that follows the buckets from
+`docs/agent-playbooks/pr-review.md`:
 
-```
-## PR #<N> — <title>
-
-### CI
-- ✓ <check-name>        [success]
-- ✗ <check-name>        [failure] — <short conclusion if available>
-- ⊘ <check-name>        [skipped]
-
-Overall: <ALL PASSING | N check(s) failed>
-
-### Review findings
-
-**Actionable bugs** (fix before merge):
-- <file:line> — <description>
-
-**In-scope nits** (cheap to fix):
-- <file:line> — <description>
-
-**Out-of-scope nits** (defer):
-- <description> → reply "deferred to #<issue> / future work"
-
-**No findings** (if the review bots posted nothing actionable)
-```
-
-Classification matches the `sdlc` skill:
-
-- **Actionable bugs**: correctness issues, panics, unsoundness, broken invariants.
-- **In-scope nits**: style / naming / minor issues on code this PR actually changed.
-- **Out-of-scope nits**: suggestions about untouched code, or architectural changes that would balloon scope.
+- PR number and title
+- CI results grouped by pass/fail/skipped state
+- Review findings grouped into actionable bugs, in-scope nits, and out-of-scope nits
+- Any explicit follow-up items that were deferred
 
 If the 30-min bot timeout hit with no comment, note it explicitly:
 
