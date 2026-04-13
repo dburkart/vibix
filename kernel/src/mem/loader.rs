@@ -71,11 +71,21 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
 
     let mut segments = 0usize;
     let mut flusher = Flusher::new_active();
+    let mut err: Option<LoadError> = None;
     for seg in parsed.load_segments() {
-        map_segment(bytes, seg, &mut flusher)?;
+        if let Err(e) = map_segment(bytes, seg, &mut flusher) {
+            err = Some(e);
+            break;
+        }
         segments += 1;
     }
+    // `finish` on every path: early-returning via `?` on `map_segment`
+    // would drop the Flusher un-finished and trip its Drop-time panic,
+    // turning a graceful `LoadError` into a kernel panic.
     flusher.finish();
+    if let Some(e) = err {
+        return Err(e);
+    }
 
     Ok(LoadedImage { entry, segments })
 }

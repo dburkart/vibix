@@ -207,6 +207,15 @@ pub fn unmap(
 /// [`map`] / [`map_range`].
 pub fn unmap_and_free(page: Page<Size4KiB>, flusher: &mut Flusher) -> Result<(), UnmapError> {
     let frame = unmap(page, flusher)?;
+    // Local invlpg *before* returning the frame to the allocator. The
+    // caller's Flusher batches with other mutations and finish()
+    // happens later — in the meantime the allocator could hand this
+    // frame to someone else. A stale cached translation for `page`
+    // would then let this CPU read or write another owner's data.
+    // This is a single-CPU flush today; the SMP-shootdown follow-up
+    // will turn it into an IPI. The Flusher still carries the VA
+    // queued, so `finish` re-invalidates harmlessly.
+    x86_64::instructions::tlb::flush(page.start_address());
     // SAFETY: the caller's contract is that `page`'s frame came from
     // the global allocator — `map` is the only supported producer.
     unsafe { KernelFrameAllocator.deallocate_frame(frame) };
