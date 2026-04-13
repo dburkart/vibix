@@ -341,11 +341,13 @@ impl VmaTree {
         }
 
         // Pass 3: coalesce. Re-insert in order — `insert` handles the
-        // forward+backward merge. Remove then re-insert so the merge
-        // predicate runs against the current state.
+        // forward+backward merge. A prior iteration's `insert` may have
+        // already consumed the next affected key via forward-merge, so
+        // skip keys that are no longer present instead of panicking.
         for k in affected {
-            let v = self.map.remove(&k).expect("affected key");
-            self.insert(v);
+            if let Some(v) = self.map.remove(&k) {
+                self.insert(v);
+            }
         }
     }
 
@@ -579,6 +581,26 @@ mod tests {
             vs,
             [(0, K, RW, 0), (K, 3 * K, R, K), (3 * K, 4 * K, RW, 3 * K),],
         );
+    }
+
+    #[test]
+    fn change_protection_coalesces_multiple_affected() {
+        // Regression: Pass 3 must not panic when `insert` forward-merges
+        // consumes a later key from the `affected` list.
+        let obj = stub();
+        let mut t = VmaTree::new();
+        // Three adjacent VMAs with distinct prots so nothing merges.
+        t.insert(vma(0, K, RW, Arc::clone(&obj), 0));
+        t.insert(vma(K, 2 * K, R, Arc::clone(&obj), K));
+        t.insert(vma(2 * K, 3 * K, RW, obj, 2 * K));
+        assert_eq!(t.len(), 3);
+        // Rewrite the whole span to a uniform prot — all three become
+        // mergeable after Pass 2, and Pass 3 must coalesce without
+        // panicking on the already-consumed keys.
+        t.change_protection(0, 3 * K, RW, 0);
+        assert_eq!(t.len(), 1);
+        let only = t.iter().next().unwrap();
+        assert_eq!((only.start, only.end), (0, 3 * K));
     }
 
     #[test]
