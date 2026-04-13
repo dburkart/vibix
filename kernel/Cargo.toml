@@ -111,3 +111,7 @@ harness = false
 [[test]]
 name = "userspace_module"
 harness = false
+
+[[test]]
+name = "sleep"
+harness = false
