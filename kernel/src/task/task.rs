@@ -18,12 +18,14 @@
 //! new task lands in `task_entry_trampoline`, which then calls the entry
 //! function.
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
+use crate::arch::x86_64::fpu::FpuArea;
 use crate::mem::paging;
 use crate::mem::vma::VmaList;
 
@@ -114,6 +116,11 @@ pub(super) struct Task {
     /// until something installs a VMA via
     /// [`super::install_vma_on_current`].
     pub vmas: VmaList,
+    /// Per-task x87/SSE register image. Saved on every switch-out and
+    /// restored on switch-in. A fresh area is seeded with the
+    /// post-`fninit` canonical FPU state so a spawned task sees the
+    /// same FPU starting conditions as the bootstrap thread.
+    pub fpu: Box<FpuArea>,
 }
 
 impl Task {
@@ -135,6 +142,12 @@ impl Task {
             // CR3 currently points at.
             cr3: Cr3::read().0,
             vmas: VmaList::new(),
+            // The bootstrap task hasn't touched the FPU yet (kernel is
+            // soft-float), so seeding with the canonical `fninit` image
+            // is correct: the first switch-away from bootstrap will
+            // overwrite this buffer with whatever live FPU state exists
+            // at that moment.
+            fpu: FpuArea::new_initialized(),
         }
     }
 
@@ -217,6 +230,7 @@ impl Task {
             affinity: AFFINITY_ALL,
             cr3,
             vmas: VmaList::new(),
+            fpu: FpuArea::new_initialized(),
         }
     }
 
