@@ -533,25 +533,30 @@ pub fn exit() -> ! {
     unreachable!("task::exit returned from context_switch");
 }
 
-/// Reclaim the stack pages, VMA-backed frames, and PML4 frame of a
-/// task that called [`exit`]. Called from [`preempt_tick`] on a stack
-/// that is *not* the victim's — the victim already context-switched
-/// away, so unmapping its stack is safe.
+/// Reclaim the stack pages of a task that called [`exit`], then drop
+/// the `Box<Task>`. Called from [`preempt_tick`] on a stack that is
+/// *not* the victim's — the victim already context-switched away, so
+/// unmapping its stack is safe.
+///
+/// VMA-backed leaf frames, intermediate page tables, and the PML4 are
+/// reclaimed by `Drop for AddressSpace`, which fires when the last
+/// `Arc<RwLock<AddressSpace>>` is released as the `Box<Task>` is
+/// dropped at the end of this function (#161).
 fn reap_pending(victim: alloc::boxed::Box<Task>) {
     use crate::mem::paging;
-    use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+    use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
-    // 1. Unmap + free stack pages. Stack pages live in the shared
-    //    upper-half kernel window (L4 entry 416) — the L3 subtree under
-    //    that entry is aliased into every per-task PML4, so unmapping
-    //    via the victim's PML4 propagates to every PML4.
+    // Unmap + free stack pages. Stack pages live in the shared
+    // upper-half kernel window (L4 entry 416) — the L3 subtree under
+    // that entry is aliased into every per-task PML4, so unmapping via
+    // the victim's PML4 propagates to every PML4.
     //
-    //    We deliberately route through `unmap_and_free_in_pml4` (temporary
-    //    mapper) rather than `unmap_and_free` (global `MAPPER` lock):
-    //    `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
-    //    interrupted task held `MAPPER`, spinning on it here would
-    //    deadlock with IRQs masked.
+    // We deliberately route through `unmap_and_free_in_pml4` (temporary
+    // mapper) rather than `unmap_and_free` (global `MAPPER` lock):
+    // `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
+    // interrupted task held `MAPPER`, spinning on it here would
+    // deadlock with IRQs masked.
     let stack_base = victim.stack_base();
     if stack_base != 0 {
         for i in 0..victim.stack_page_count() {
@@ -560,67 +565,8 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
                 .expect("stack page VA aligned by construction");
             let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
         }
-    }
 
-    // 2. Walk VMAs: unmap each page from the victim's private PML4.
-    //    Source frames are owned by the VmObject and freed by its Drop
-    //    when the Arc refcount reaches zero below. However, a
-    //    write-protection (CoW) fault allocates a *private copy* frame
-    //    via `cow_copy_and_remap`; that frame is stored in the PTE but
-    //    never added to the VmObject's cache (the cache retains the
-    //    original source frame). We detect private copies by comparing
-    //    the PTE frame against `VmObject::frame_at`: if they differ the
-    //    PTE holds a private copy that we must free here.
-    //
-    //    `reap_pending` runs from the timer ISR with IRQs masked, so a
-    //    blocking `read()` would deadlock the moment the address space is
-    //    contended. Today every task owns its address space outright (no
-    //    CLONE_VM), so the lock is uncontended at reap time — `try_read`
-    //    succeeds. The `expect` will fire loudly the first time a future
-    //    refactor introduces shared address spaces.
-    let aspace = victim
-        .address_space
-        .try_read()
-        .expect("reap_pending: address-space lock contended in ISR");
-    for vma in aspace.iter() {
-        let mut va = vma.start;
-        while va < vma.end {
-            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
-                .expect("vma page VA aligned by construction");
-            if let Ok(pte_frame) = paging::unmap_in_pml4(victim.cr3, page) {
-                let obj_offset = (va - vma.start) + vma.object_offset;
-                let cached = vma.object.frame_at(obj_offset);
-                if cached != Some(pte_frame.start_address().as_u64()) {
-                    // PTE holds a private CoW copy (or a frame from a
-                    // future non-caching VmObject). Free it now; the
-                    // object's Drop handles its own cached frames.
-                    // SAFETY: private copy allocated from the global frame
-                    // allocator by `cow_copy_and_remap`; exclusive owner.
-                    unsafe { paging::KernelFrameAllocator.deallocate_frame(pte_frame) }
-                }
-                // If cached == Some(pte_frame): the VmObject owns this
-                // frame; its Drop (via AnonObject::drop → frame::put)
-                // will free it — no action needed here.
-            }
-            va += 4096;
-        }
-    }
-    drop(aspace);
-    // Releasing the read guard does not drop the AddressSpace; that
-    // happens when `victim` (the Box<Task>) is dropped below. At that
-    // point the Arc<RwLock<AddressSpace>> reaches refcount 0, the
-    // AddressSpace is released, its VmaTree drops, each
-    // Arc<dyn VmObject> drops, and AnonObject::drop frees every
-    // cached (source) frame via frame::put.
-
-    // 3. Return the PML4 frame itself.
-    // SAFETY: victim is no longer on any CPU; we're running on a
-    //         different CR3 and no other reference to its PML4
-    //         survives — the Box<Task> is about to be dropped.
-    unsafe { paging::free_pml4_frame(victim.cr3) };
-
-    // 4. Log the leaked stack VA slot for diagnostics.
-    if stack_base != 0 {
+        // Log the leaked stack VA slot for diagnostics.
         serial_println!(
             "tasks: reaped task {} (stack VA slot {:#x}..{:#x} leaked)",
             victim.id,
@@ -629,7 +575,11 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
         );
     }
 
-    // 5. Drop the Box<Task>, returning its heap memory.
+    // Drop the Box<Task>. The Arc<RwLock<AddressSpace>> goes with it;
+    // when the strong count reaches zero, `Drop for AddressSpace`
+    // walks the VMAs, frees every leaf frame (detecting and freeing
+    // private CoW copies via VmObject::frame_at), frees the user-half
+    // intermediate page tables, and frees the PML4 itself.
     drop(victim);
 }
 
