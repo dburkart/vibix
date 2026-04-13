@@ -627,6 +627,7 @@ fn test_all() -> R<()> {
         "cow_vma",
         "fpu_context_switch",
         "task_exit",
+        "addrspace",
     ] {
         cmd.arg("--test").arg(t);
     }
