@@ -2,24 +2,27 @@
 //! resolved lazily by the `#PF` handler instead of eagerly mapped at
 //! spawn time.
 //!
-//! Today the only supported kind is [`VmaKind::AnonZero`] — anonymous
-//! zero-filled memory. A task installs a VMA via
-//! [`crate::task::install_vma_on_current`]; the first access to a page
-//! inside the range takes a `#PF` that the handler satisfies by
-//! allocating a zeroed frame and mapping it with the VMA's flags.
-//!
-//! This is the minimal groundwork for #51 — fork-time copy-on-write
-//! lives behind a richer VMA kind that isn't here yet.
+//! Two kinds today:
+//! - [`VmaKind::AnonZero`] — anonymous, zero-filled on first touch.
+//!   Each page is backed by a freshly-allocated frame zeroed via the
+//!   HHDM before it is mapped.
+//! - [`VmaKind::Cow`] — copy-on-write over a shared source frame. A
+//!   read fault maps the source read-only; a subsequent write fault
+//!   allocates a private frame, copies the source into it, and remaps
+//!   the page writable. The source frame is never freed by the CoW
+//!   resolver — other PML4s (post-`clone_for_fork`) may still alias it.
 
 use alloc::vec::Vec;
-use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
 
 /// Kind of backing a VMA describes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VmaKind {
-    /// Anonymous, zero-filled on first touch. Each page is backed by a
-    /// freshly-allocated frame zeroed via the HHDM before it is mapped.
+    /// Anonymous, zero-filled on first touch.
     AnonZero,
+    /// Copy-on-write over `frame`. Reads map `frame` read-only; writes
+    /// trigger a private copy.
+    Cow { frame: PhysFrame<Size4KiB> },
 }
 
 /// A half-open `[start, end)` VA range with a backing kind and the
@@ -81,5 +84,30 @@ impl VmaList {
     /// Find the VMA containing `addr`, if any.
     pub fn find(&self, addr: usize) -> Option<Vma> {
         self.entries.iter().copied().find(|v| v.contains(addr))
+    }
+
+    /// Remove the VMA whose `start` matches exactly and return it.
+    /// Keyed on `start` (not an arbitrary inclusion address) so
+    /// `munmap`-style callers must name the region they installed —
+    /// partial-range unmap is out of scope here.
+    pub fn remove(&mut self, start: usize) -> Option<Vma> {
+        let idx = self.entries.iter().position(|v| v.start == start)?;
+        Some(self.entries.swap_remove(idx))
+    }
+
+    /// Duplicate this list for a child address space. Metadata is
+    /// cloned verbatim — including any `Cow { frame }` kinds, which
+    /// means the child shares the source frames with the parent until
+    /// a write fault in either address space diverges them.
+    ///
+    /// Callers that fork mapped `AnonZero` pages should convert them
+    /// to `Cow` *before* calling this — `AnonZero` carries no frame,
+    /// so copying it verbatim leaves the child with no visibility into
+    /// whatever frames the parent's page-table already backs the
+    /// region with.
+    pub fn clone_for_fork(&self) -> VmaList {
+        VmaList {
+            entries: self.entries.clone(),
+        }
     }
 }

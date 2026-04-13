@@ -123,3 +123,7 @@ harness = false
 [[test]]
 name = "serial_rx"
 harness = false
+
+[[test]]
+name = "cow_vma"
+harness = false
