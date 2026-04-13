@@ -408,4 +408,50 @@ mod tests {
         put64(&mut bytes, 24, 0x0001_0000_0000_0000);
         let _ = parse_elf64(&bytes);
     }
+
+    #[test]
+    fn try_parse_rejects_filesz_exceeds_memsz() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        put64(&mut bytes, p0 + 32, 0x3000); // p_filesz > p_memsz (0x2000)
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_file_range_overflow() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        put64(&mut bytes, p0 + 8, u64::MAX); // p_offset
+        put64(&mut bytes, p0 + 32, 1); // p_filesz (memsz already 0x2000)
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_file_range_out_of_range() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        let len = bytes.len() as u64;
+        put64(&mut bytes, p0 + 8, len); // p_offset at end
+        put64(&mut bytes, p0 + 32, 1); // p_filesz=1 pushes past image
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_vaddr_range_overflow() {
+        let mut bytes = sample_elf_bytes();
+        let p0 = EHDR_SIZE;
+        // Canonical upper-half vaddr close to u64::MAX so p_vaddr+p_memsz wraps.
+        put64(&mut bytes, p0 + 16, 0xFFFF_FFFF_FFFF_F000);
+        put64(&mut bytes, p0 + 40, 0x2000); // p_memsz → overflow
+                                            // Move entry into p1's range so coverage doesn't mask the overflow.
+        put64(&mut bytes, 24, 0x402000);
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    #[test]
+    fn try_parse_rejects_entry_outside_load_segments() {
+        let mut bytes = sample_elf_bytes();
+        put64(&mut bytes, 24, 0x500000); // entry outside both PT_LOADs
+        assert!(try_parse_elf64(&bytes).is_none());
+    }
 }

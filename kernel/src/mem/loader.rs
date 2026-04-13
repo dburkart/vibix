@@ -19,6 +19,7 @@
 //! be applied at map time (e.g. read-only .text) without a separate
 //! read-only → writable → read-only dance.
 
+use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{Page, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -27,7 +28,7 @@ use super::paging;
 
 const PAGE_SIZE: u64 = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum LoadError {
     /// `bytes` failed ELF64 parsing (bad magic, wrong class, bad phdr
     /// table, non-canonical addresses, entry outside PT_LOAD, etc.).
@@ -41,7 +42,9 @@ pub enum LoadError {
     /// segments to that boundary.
     SegmentNotPageAligned,
     /// Frame allocation or page-table install failed mid-segment.
-    MapFailed,
+    /// Wraps the underlying `paging::map` error so callers can tell
+    /// `FrameAllocationFailed` from `PageAlreadyMapped` etc.
+    MapFailed(MapToError<Size4KiB>),
 }
 
 /// Result of a successful load: the entry point and the number of
@@ -94,7 +97,7 @@ fn map_segment(bytes: &[u8], seg: elf::LoadSegment) -> Result<(), LoadError> {
     for i in 0..page_count {
         let va = seg.vaddr + i * PAGE_SIZE;
         let page = Page::<Size4KiB>::containing_address(va);
-        let frame = paging::map(page, seg.flags).map_err(|_| LoadError::MapFailed)?;
+        let frame = paging::map(page, seg.flags).map_err(LoadError::MapFailed)?;
 
         // Fill this page through the HHDM window. The frame allocator
         // doesn't zero its output, so we clear the whole page first
