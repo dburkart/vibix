@@ -19,15 +19,17 @@
 //! function.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use spin::RwLock;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::fpu::FpuArea;
+use crate::mem::addrspace::AddressSpace;
 use crate::mem::paging;
-use crate::mem::vma::VmaList;
 
 use super::priority::{AFFINITY_ALL, DEFAULT_PRIORITY};
 use super::switch::task_entry_trampoline;
@@ -111,11 +113,17 @@ pub(super) struct Task {
     /// kernel mappings and whose lower half is empty — groundwork for
     /// per-task userspace address spaces (#26).
     pub cr3: PhysFrame<Size4KiB>,
-    /// Per-task virtual-memory areas resolved lazily by the `#PF`
-    /// handler. Empty for the bootstrap task and for spawned tasks
-    /// until something installs a VMA via
-    /// [`super::install_vma_on_current`].
-    pub vmas: VmaList,
+    /// Per-task virtual address space — owns the PML4 (mirrored in
+    /// [`Self::cr3`] as a switch-fast snapshot) and the lazily-resolved
+    /// VMA map. Wrapped in `Arc<RwLock<_>>` so future thread groups
+    /// (clone(2)-style) can share one address space across tasks; for
+    /// today every task has its own.
+    ///
+    /// The `RwLock` is the raw `spin::RwLock`, not [`crate::mem::addrspace::AddressSpaceLock`],
+    /// because the `#PF` handler must read this map with interrupts
+    /// disabled — the wrapper's IRQ-safety assertion belongs on
+    /// task-context syscall paths, not here.
+    pub address_space: Arc<RwLock<AddressSpace>>,
     /// Per-task x87/SSE register image. Saved on every switch-out and
     /// restored on switch-in. A fresh area is seeded with the
     /// post-`fninit` canonical FPU state so a spawned task sees the
@@ -128,6 +136,10 @@ impl Task {
     /// `rsp` is filled in by the first `context_switch` that yields
     /// away from this thread.
     pub fn bootstrap() -> Self {
+        // The bootstrap task runs on the kernel PML4 that
+        // build_and_switch_kernel_pml4 installed — capture whatever
+        // CR3 currently points at and wrap it in an AddressSpace.
+        let cr3 = Cr3::read().0;
         Self {
             id: 0,
             guard_base: 0,
@@ -137,11 +149,8 @@ impl Task {
             wake_pending: AtomicBool::new(false),
             priority: DEFAULT_PRIORITY,
             affinity: AFFINITY_ALL,
-            // The bootstrap task runs on the kernel PML4 that
-            // build_and_switch_kernel_pml4 installed — capture whatever
-            // CR3 currently points at.
-            cr3: Cr3::read().0,
-            vmas: VmaList::new(),
+            cr3,
+            address_space: Arc::new(RwLock::new(AddressSpace::for_bootstrap(cr3))),
             // The bootstrap task hasn't touched the FPU yet (kernel is
             // soft-float), so seeding with the canonical `fninit` image
             // is correct: the first switch-away from bootstrap will
@@ -193,12 +202,13 @@ impl Task {
         .expect("failed to map task stack");
         flusher.finish();
 
-        // Build the per-task PML4 *after* mapping the stack — the new
-        // PML4 snapshots the kernel PML4's upper half, and we want the
-        // fresh stack's L4 entry to already be in place. Later tasks'
-        // stacks fall under the same L4 entry and propagate by alias
-        // through the shared L3 subtree.
-        let cr3 = paging::new_task_pml4();
+        // Build the per-task AddressSpace *after* mapping the stack —
+        // its PML4 snapshots the kernel PML4's upper half, and we want
+        // the fresh stack's L4 entry to already be in place. Later
+        // tasks' stacks fall under the same L4 entry and propagate by
+        // alias through the shared L3 subtree.
+        let address_space = AddressSpace::new_empty();
+        let cr3 = address_space.page_table_frame();
 
         let top = stack_base + STACK_SIZE;
 
@@ -232,7 +242,7 @@ impl Task {
             priority: super::priority::clamp_priority(priority),
             affinity: AFFINITY_ALL,
             cr3,
-            vmas: VmaList::new(),
+            address_space: Arc::new(RwLock::new(address_space)),
             fpu: FpuArea::new_initialized(),
         }
     }
