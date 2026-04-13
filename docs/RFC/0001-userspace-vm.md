@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Userspace Virtual Memory Subsystem
-status: Draft
+status: In Review
 created: 2026-04-13
 ---
 
