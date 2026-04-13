@@ -194,6 +194,13 @@ impl<T> Receiver<T> {
             // Drain-first: buffered items beat close detection so a
             // receiver whose sender exited mid-stream still gets
             // everything that was in flight.
+            //
+            // The closed check MUST happen under the same `buf` lock
+            // as the pop attempt. Otherwise a sender could push +
+            // drop between our unlock and the `sender_closed` load:
+            // its `notify_one` would fire into an empty waitqueue
+            // (we're not parked yet), we'd then see `sender_closed`
+            // and return None, stranding the item in the queue.
             {
                 let mut inner = self.shared.buf.lock();
                 if let Some(val) = inner.queue.pop_front() {
@@ -201,9 +208,9 @@ impl<T> Receiver<T> {
                     self.shared.not_full.notify_one();
                     return Some(val);
                 }
-            }
-            if self.shared.sender_closed.load(Ordering::Acquire) {
-                return None;
+                if self.shared.sender_closed.load(Ordering::Acquire) {
+                    return None;
+                }
             }
             self.shared.not_empty.wait_while(|| {
                 if self.shared.sender_closed.load(Ordering::Acquire) {

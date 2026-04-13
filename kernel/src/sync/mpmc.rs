@@ -236,6 +236,14 @@ impl<T> Receiver<T> {
             // Drain-first: buffered items win over close detection.
             // A receiver that had some in flight when the last
             // sender dropped must still get them.
+            //
+            // The closed check MUST happen under the same `buf` lock
+            // acquisition as the pop attempt. Otherwise a sender
+            // could push + drop between the unlock and the count
+            // load: its `notify_one` / `notify_all` would fire into
+            // an empty waitqueue (we're not parked yet), we'd then
+            // see `sender_count == 0`, return None, and strand the
+            // item in the queue.
             {
                 let mut inner = self.shared.buf.lock();
                 if let Some(val) = inner.queue.pop_front() {
@@ -243,9 +251,9 @@ impl<T> Receiver<T> {
                     self.shared.not_full.notify_one();
                     return Some(val);
                 }
-            }
-            if self.shared.sender_count.load(Ordering::Acquire) == 0 {
-                return None;
+                if self.shared.sender_count.load(Ordering::Acquire) == 0 {
+                    return None;
+                }
             }
             // Park until a sender pushes or the last sender drops.
             self.shared.not_empty.wait_while(|| {

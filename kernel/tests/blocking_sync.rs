@@ -370,7 +370,6 @@ fn spsc_close_wakes_sender() {
 // drains all 3*M items and checksums. Exercises `Sender: Clone` and
 // the Mutex-protected queue under fan-in contention.
 
-static MPMC_M2O_TX: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
 static MPMC_M2O_RX: SpinMutex<Option<mpmc::Receiver<u32>>> = SpinMutex::new(None);
 static MPMC_M2O_SUM: AtomicUsize = AtomicUsize::new(0);
 static MPMC_M2O_PROD_DONE: AtomicUsize = AtomicUsize::new(0);
@@ -387,9 +386,15 @@ static MPMC_M2O_TX_B: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None
 static MPMC_M2O_TX_C: SpinMutex<Option<mpmc::Sender<u32>>> = SpinMutex::new(None);
 
 fn mpmc_m2o_prod_a() -> ! {
-    let tx = MPMC_M2O_TX_A.lock().take().expect("m2o prod A: tx not set");
-    for i in 0..MPMC_M2O_PER_PROD {
-        tx.send(i).expect("m2o prod A: send failed");
+    {
+        let tx = MPMC_M2O_TX_A.lock().take().expect("m2o prod A: tx not set");
+        for i in 0..MPMC_M2O_PER_PROD {
+            tx.send(i).expect("m2o prod A: send failed");
+        }
+        // tx drops here at end of the inner scope; releases this
+        // producer's sender count. The `-> !` function never
+        // returns, so the drop would never run if tx were a
+        // top-level local.
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -398,9 +403,11 @@ fn mpmc_m2o_prod_a() -> ! {
 }
 
 fn mpmc_m2o_prod_b() -> ! {
-    let tx = MPMC_M2O_TX_B.lock().take().expect("m2o prod B: tx not set");
-    for i in 0..MPMC_M2O_PER_PROD {
-        tx.send(100 + i).expect("m2o prod B: send failed");
+    {
+        let tx = MPMC_M2O_TX_B.lock().take().expect("m2o prod B: tx not set");
+        for i in 0..MPMC_M2O_PER_PROD {
+            tx.send(100 + i).expect("m2o prod B: send failed");
+        }
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -409,9 +416,11 @@ fn mpmc_m2o_prod_b() -> ! {
 }
 
 fn mpmc_m2o_prod_c() -> ! {
-    let tx = MPMC_M2O_TX_C.lock().take().expect("m2o prod C: tx not set");
-    for i in 0..MPMC_M2O_PER_PROD {
-        tx.send(1000 + i).expect("m2o prod C: send failed");
+    {
+        let tx = MPMC_M2O_TX_C.lock().take().expect("m2o prod C: tx not set");
+        for i in 0..MPMC_M2O_PER_PROD {
+            tx.send(1000 + i).expect("m2o prod C: send failed");
+        }
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -437,12 +446,9 @@ fn mpmc_many_to_one() {
     *MPMC_M2O_TX_A.lock() = Some(tx.clone());
     *MPMC_M2O_TX_B.lock() = Some(tx.clone());
     *MPMC_M2O_TX_C.lock() = Some(tx.clone());
-    // Retain the original in TX so the driver can observe the close
-    // path via `drop` after cloning to the three workers, but we
-    // don't need it after this point; drop it immediately so the
-    // channel closes once the workers finish.
-    *MPMC_M2O_TX.lock() = Some(tx);
-    MPMC_M2O_TX.lock().take();
+    // Drop the driver's original tx; only the three cloned handles
+    // in TX_A/_B/_C keep the channel open until the workers finish.
+    drop(tx);
 
     *MPMC_M2O_RX.lock() = Some(rx);
     MPMC_M2O_SUM.store(0, Ordering::SeqCst);
@@ -505,9 +511,14 @@ const MPMC_M2M_PER_PROD: u32 = 20;
 const MPMC_M2M_TOTAL: usize = 2 * MPMC_M2M_PER_PROD as usize;
 
 fn mpmc_m2m_prod_a() -> ! {
-    let tx = MPMC_M2M_TX_A.lock().take().expect("m2m prod A: tx");
-    for i in 0..MPMC_M2M_PER_PROD {
-        tx.send(i).expect("m2m prod A: send");
+    {
+        let tx = MPMC_M2M_TX_A.lock().take().expect("m2m prod A: tx");
+        for i in 0..MPMC_M2M_PER_PROD {
+            tx.send(i).expect("m2m prod A: send");
+        }
+        // tx drops here — critical for consumers' `while let Some`
+        // loop to terminate once both producers finish. `-> !` means
+        // we'd otherwise hold tx forever in the hlt loop.
     }
     MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
@@ -516,9 +527,11 @@ fn mpmc_m2m_prod_a() -> ! {
 }
 
 fn mpmc_m2m_prod_b() -> ! {
-    let tx = MPMC_M2M_TX_B.lock().take().expect("m2m prod B: tx");
-    for i in 0..MPMC_M2M_PER_PROD {
-        tx.send(500 + i).expect("m2m prod B: send");
+    {
+        let tx = MPMC_M2M_TX_B.lock().take().expect("m2m prod B: tx");
+        for i in 0..MPMC_M2M_PER_PROD {
+            tx.send(500 + i).expect("m2m prod B: send");
+        }
     }
     MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
     loop {
