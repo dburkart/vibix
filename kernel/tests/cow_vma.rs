@@ -36,8 +36,14 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("cow_read_then_write_diverges", &(cow_read_then_write_diverges as fn())),
-        ("vma_list_remove_roundtrip", &(vma_list_remove_roundtrip as fn())),
+        (
+            "cow_read_then_write_diverges",
+            &(cow_read_then_write_diverges as fn()),
+        ),
+        (
+            "vma_list_remove_roundtrip",
+            &(vma_list_remove_roundtrip as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -90,7 +96,10 @@ fn cow_read_then_write_diverges() {
     // The original source frame, peeked via the HHDM, is unchanged.
     // This is the divergence property the ticket asks to verify.
     let src_byte = unsafe { ptr::read_volatile(src_virt.as_ptr::<u8>()) };
-    assert_eq!(src_byte, 0xAA, "cow source frame was mutated by child write");
+    assert_eq!(
+        src_byte, 0xAA,
+        "cow source frame was mutated by child write"
+    );
 
     // And the rest of the private frame carries the full source
     // pattern, not a zero fill — proves the memcpy actually happened.
@@ -127,7 +136,10 @@ fn vma_list_remove_roundtrip() {
     assert!(list.find(0x1000).is_none(), "removed VMA still findable");
     assert!(list.find(0x3000).is_some(), "sibling VMA lost to remove");
 
-    assert!(list.remove(0x9000).is_none(), "remove of absent start must be None");
+    assert!(
+        list.remove(0x9000).is_none(),
+        "remove of absent start must be None"
+    );
 
     // clone_for_fork preserves entries.
     let child = list.clone_for_fork();

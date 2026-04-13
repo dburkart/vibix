@@ -113,11 +113,9 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
                 let ro = flags & !PageTableFlags::WRITABLE;
                 match crate::mem::paging::map_existing_in_pml4(active, page, frame, ro) {
                     Ok(()) => return,
-                    Err(e) => serial_println!(
-                        "#PF cow map-source failed addr={:#x}: {:?}",
-                        addr_u64,
-                        e
-                    ),
+                    Err(e) => {
+                        serial_println!("#PF cow map-source failed addr={:#x}: {:?}", addr_u64, e)
+                    }
                 }
             }
             (crate::mem::vma::VmaKind::Cow { frame }, true, true) => {
