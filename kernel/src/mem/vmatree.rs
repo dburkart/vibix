@@ -208,29 +208,37 @@ impl VmaTree {
     pub fn insert(&mut self, mut vma: Vma) {
         self.assert_no_overlap(vma.start, vma.end);
 
-        // Try to merge backwards with the immediate left neighbour.
-        if let Some((&lstart, _)) = self.map.range(..vma.start).next_back() {
+        // Merge backwards with left neighbours while each is mergeable.
+        // Looping (rather than a single step) matters for callers like
+        // `change_protection` that re-insert many keys in sequence: an
+        // earlier re-insertion can leave behind a mergeable left chain
+        // that the current insert must fully absorb.
+        while let Some((&lstart, _)) = self.map.range(..vma.start).next_back() {
             let left = self.map.get(&lstart).unwrap();
-            if left.mergeable_forward(&vma) {
-                let mut left = self.map.remove(&lstart).unwrap();
-                left.end = vma.end;
-                // Keep `left`'s object / offset / prot — `vma`'s are
-                // equal by the mergeability predicate.
-                vma = left;
+            if !left.mergeable_forward(&vma) {
+                break;
             }
+            let mut left = self.map.remove(&lstart).unwrap();
+            left.end = vma.end;
+            // Keep `left`'s object / offset / prot — `vma`'s are equal
+            // by the mergeability predicate.
+            vma = left;
         }
 
-        // Try to merge forwards with the immediate right neighbour.
-        if let Some((&rstart, _)) = self.map.range(vma.end..).next() {
+        // Merge forwards with right neighbours while each is mergeable.
+        // See the backward loop above for why this is a loop, not a
+        // single step.
+        while let Some((&rstart, _)) = self.map.range(vma.end..).next() {
             let right = self.map.get(&rstart).unwrap();
-            if vma.mergeable_forward(right) {
-                let right = self.map.remove(&rstart).unwrap();
-                vma.end = right.end;
-                // `right` is dropped here; its `Arc<dyn VmObject>` ref
-                // is released. `vma.object` still carries an Arc of
-                // its own (pointer-equal by mergeability).
-                drop(right);
+            if !vma.mergeable_forward(right) {
+                break;
             }
+            let right = self.map.remove(&rstart).unwrap();
+            vma.end = right.end;
+            // `right` is dropped here; its `Arc<dyn VmObject>` ref is
+            // released. `vma.object` still carries an Arc of its own
+            // (pointer-equal by mergeability).
+            drop(right);
         }
 
         let prev = self.map.insert(vma.start, vma);
@@ -601,6 +609,26 @@ mod tests {
         assert_eq!(t.len(), 1);
         let only = t.iter().next().unwrap();
         assert_eq!((only.start, only.end), (0, 3 * K));
+    }
+
+    #[test]
+    fn change_protection_merges_with_non_affected_right_neighbour() {
+        // Regression: with an even number of affected VMAs, Pass 3's
+        // leap-frog re-insertion could consume every affected key via
+        // forward-merge without ever touching the non-affected right
+        // neighbour. The surviving VMA must still coalesce with it.
+        let obj = stub();
+        let mut t = VmaTree::new();
+        t.insert(vma(0, K, RW, Arc::clone(&obj), 0));
+        t.insert(vma(K, 2 * K, R, Arc::clone(&obj), K));
+        t.insert(vma(2 * K, 3 * K, R, Arc::clone(&obj), 2 * K));
+        t.insert(vma(3 * K, 4 * K, RW, obj, 3 * K));
+        assert_eq!(t.len(), 3); // middle two coalesce: RW, R(2K), RW
+                                // Restore the middle to RW: all four become one.
+        t.change_protection(K, 3 * K, RW, 0);
+        assert_eq!(t.len(), 1);
+        let only = t.iter().next().unwrap();
+        assert_eq!((only.start, only.end), (0, 4 * K));
     }
 
     #[test]
