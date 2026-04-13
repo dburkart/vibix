@@ -150,11 +150,11 @@ If nothing worth filing, skip silently. **Do not file speculative or "nice-to-ha
 
 ### 9. Check session quota
 
-Before compacting and kicking off the next cycle, run `/usage` and parse the session-quota remaining percentage.
+Before compacting and kicking off the next cycle, run `/usage` (the `usage` skill). It emits two machine-readable lines — `remaining_pct: <float>` and `reset_ts: <ISO>` — plus a human summary. Parse `remaining_pct`.
 
 - **≥ 10% remaining** → proceed to step 10.
 - **< 10% remaining** → don't start a new cycle; the next one could tip over mid-PR and leave an orphaned branch. Instead:
-  1. Read the quota-reset timestamp from `/usage` output.
+  1. Read `reset_ts` from `/usage` output.
   2. Compute `secondsUntilReset = reset_ts - now`. Add a 60 s buffer so the wake-up lands *after* the reset, not on its edge.
   3. **Compaction decision:**
      - If `secondsUntilReset ≤ 90 min`: skip `/compact`. The wait is short enough that one or two un-compacted hops won't burn meaningful quota, and compaction itself costs tokens we want to save.
