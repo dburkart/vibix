@@ -454,7 +454,7 @@ fn mpmc_many_to_one() {
     task::spawn(mpmc_m2o_prod_c);
     task::spawn(mpmc_m2o_cons);
 
-    for _ in 0..5_000 {
+    for _ in 0..2_000 {
         if MPMC_M2O_PROD_DONE.load(Ordering::SeqCst) == MPMC_M2O_PRODUCERS as usize
             && MPMC_M2O_CONS_DONE.load(Ordering::SeqCst) == 1
         {
@@ -572,7 +572,7 @@ fn mpmc_many_to_many() {
     task::spawn(mpmc_m2m_cons_a);
     task::spawn(mpmc_m2m_cons_b);
 
-    for _ in 0..5_000 {
+    for _ in 0..2_000 {
         if MPMC_M2M_PROD_DONE.load(Ordering::SeqCst) == 2
             && MPMC_M2M_CONS_DONE.load(Ordering::SeqCst) == 2
         {
