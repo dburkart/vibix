@@ -69,6 +69,7 @@ fn main() -> R<()> {
     let release = take_flag(&mut args, "--release");
     let fault_test = take_flag(&mut args, "--fault-test");
     let panic_test = take_flag(&mut args, "--panic-test");
+    let bench = take_flag(&mut args, "--bench");
 
     let cmd = args
         .first()
@@ -80,6 +81,7 @@ fn main() -> R<()> {
         release,
         fault_test,
         panic_test,
+        bench,
     };
 
     match cmd.as_str() {
@@ -103,7 +105,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test]"
+                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test] [--bench]"
             );
             std::process::exit(2);
         }
@@ -124,6 +126,7 @@ struct BuildOpts {
     release: bool,
     fault_test: bool,
     panic_test: bool,
+    bench: bool,
 }
 
 fn workspace_root() -> PathBuf {
@@ -155,6 +158,9 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     }
     if opts.panic_test {
         cmd.arg("--features").arg("panic-test");
+    }
+    if opts.bench {
+        cmd.arg("--features").arg("bench");
     }
     check(cmd.status()?)?;
     let bin = kernel_binary(opts);
