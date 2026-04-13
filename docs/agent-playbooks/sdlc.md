@@ -67,8 +67,8 @@ Suggested PR body structure:
 - <what changed>
 - <why it changed>
 
-## Testing
-- <exact command and result>
+## Test plan
+- [x] <exact command and result>
 ```
 
 ## Responding to review

@@ -20,6 +20,8 @@ Use this skill when the task involves:
 
 ## Claude-specific notes
 
+- Each commit must include the `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>`
+  trailer.
 - When the runtime supports GitHub issue assignment or issue creation, you may use those features to
   reduce duplicate work and capture follow-up items; keep the shared SDLC playbook as the source of
   truth for the policy itself.
@@ -32,3 +34,4 @@ Use this skill when the task involves:
 
 - Commit directly to `main`.
 - Force-push or rewrite reviewed commits unless the user explicitly approves that change in workflow.
+- Merge a PR on the user's behalf unless asked.

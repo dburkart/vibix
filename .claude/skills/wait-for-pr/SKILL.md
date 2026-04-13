@@ -40,6 +40,18 @@ Known review-bot author logins:
 - `greptile-apps` / `greptile-bot`
 - `github-advanced-security[bot]`
 
+## What "done" means
+
+The PR isn't ready for a summary until **all** are true:
+
+1. Every GitHub Actions check is in a terminal state: `success`, `failure`, `skipped`,
+   `cancelled`, `neutral`, `timed_out`, or `stale`. Nothing `in_progress`, `queued`, or
+   `pending`.
+2. No check is sitting in `action_required` waiting on manual approval (flag it and stop — the user
+   needs to act).
+3. At least one review-bot comment / review exists, **or** 30 minutes have elapsed since the PR
+   opened (bots may not be wired up on this repo; don't block forever).
+
 ## Poll cadence
 
 Use `ScheduleWakeup` between ticks. Tune `delaySeconds` to stay friendly to the 5-minute prompt-cache TTL:

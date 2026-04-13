@@ -39,8 +39,6 @@ and compiles the host `limine` tool. That requires:
 - `cargo xtask run` launches QEMU with serial attached to stdio.
 - The normal kernel end-state is `hlt_loop()`, so QEMU idles until it is exited manually.
 - In an interactive terminal, exit QEMU with `Ctrl-a x`.
-- In Cursor Cloud, prefer `timeout 6 cargo xtask run` or a tmux-backed session, because
-  the kernel does not terminate on its own in the happy path.
 
 ## Gotchas
 
