@@ -25,7 +25,7 @@ Cloud's actual tool surface:
 - use `gh` only for read-only inspection of issues, PRs, CI, and review comments
 - do not assume Claude-only primitives such as `ScheduleWakeup`, `/compact`, `/usage`, or GitHub
   write MCPs are available
-- stop after one issue-to-PR cycle per invocation instead of trying to self-reschedule
+- keep any wait loop bounded to the current turn instead of trying to self-reschedule
 
 ## When to invoke
 
@@ -145,8 +145,8 @@ Never use `gh` for write operations such as creating or editing PRs.
 
 ### 6. Handle follow-up within the current turn only
 
-If the current turn still has room and the user asked for CI follow-up, inspect the PR with
-read-only GitHub commands such as:
+If the current turn still has room and the user asked for CI follow-up, run a bounded review round
+against the PR using read-only GitHub commands such as:
 
 ```sh
 gh pr view <PR>
@@ -154,18 +154,28 @@ gh pr checks <PR>
 gh api "repos/{owner}/{repo}/issues/<PR>/comments"
 ```
 
-Then:
+Use this cadence:
+
+1. Inspect immediately after opening or updating the PR.
+2. If checks or review-bot feedback are still pending, sleep `180` seconds.
+3. Re-check.
+4. Repeat until everything reaches a terminal state or the round has spent `900` seconds total
+   waiting.
+
+Treat one such bounded poll window as a single review round. Within that round:
 
 - fix actionable bugs or cheap in-scope nits as follow-up commits
 - never amend or force-push reviewed history
 - update the PR after each follow-up push
 
-If checks are still pending, a review bot has not posted yet, or manual approval is required,
-stop with a concise status instead of trying to emulate Claude's wake-up loop.
+If checks are still pending after `900` seconds, a review bot has not posted yet, or manual
+approval is required, stop with a concise status instead of trying to emulate Claude's wake-up
+loop across turns.
 
 ## Cursor Cloud differences from Claude auto-engineer
 
 - No self-rescheduling. One invocation handles one issue-to-PR cycle.
+- Review polling is bounded: sleep 3 minutes between checks, for up to 15 minutes per review round.
 - No `/compact` or `/usage` quota gate unless the active environment adds equivalents.
 - No GitHub write MCPs for issue assignment, issue filing, issue comments, or merge.
 - No self-merge. Leave the PR ready for a human reviewer unless the user explicitly grants a merge

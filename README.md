@@ -16,8 +16,9 @@ vibix is built by autonomous agents. The original loop lives in
 skill that picks an unblocked GitHub issue, plans the change, implements
 it, opens a PR, chases CI + review-bot feedback, and loops. Cursor Cloud now
 has a companion skill at `.cursor/skills/cursor-cloud-auto-engineer/SKILL.md`
-invoked as `/cursor-cloud-auto-engineer`, which mirrors the branch-to-PR flow
-but stops at the PR handoff instead of self-merging or self-rescheduling.
+invoked as `/cursor-cloud-auto-engineer`, which mirrors the branch-to-PR flow,
+polls review and CI status for up to 15 minutes per review round, and still
+stops short of cross-turn self-rescheduling or self-merging.
 
 To run the loop yourself, you need Docker, a Claude Code login on the host
 (`claude` logged in at least once, so `~/.claude.json` + `~/.claude/`
