@@ -1,4 +1,5 @@
 # vibix
+*Pronounced VIBE-IX*
 
 A hobby x86_64 kernel, vibe-coded in Rust. Boots under the Limine boot
 protocol, prints to serial + a framebuffer console, installs a full GDT/TSS +
