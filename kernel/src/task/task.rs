@@ -25,6 +25,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::mem::paging;
+use crate::mem::vma::VmaList;
 
 use super::priority::{AFFINITY_ALL, DEFAULT_PRIORITY};
 use super::switch::task_entry_trampoline;
@@ -108,6 +109,11 @@ pub(super) struct Task {
     /// kernel mappings and whose lower half is empty — groundwork for
     /// per-task userspace address spaces (#26).
     pub cr3: PhysFrame<Size4KiB>,
+    /// Per-task virtual-memory areas resolved lazily by the `#PF`
+    /// handler. Empty for the bootstrap task and for spawned tasks
+    /// until something installs a VMA via
+    /// [`super::install_vma_on_current`].
+    pub vmas: VmaList,
 }
 
 impl Task {
@@ -128,6 +134,7 @@ impl Task {
             // build_and_switch_kernel_pml4 installed — capture whatever
             // CR3 currently points at.
             cr3: Cr3::read().0,
+            vmas: VmaList::new(),
         }
     }
 
@@ -209,6 +216,7 @@ impl Task {
             priority: super::priority::clamp_priority(priority),
             affinity: AFFINITY_ALL,
             cr3,
+            vmas: VmaList::new(),
         }
     }
 

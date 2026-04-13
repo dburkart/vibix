@@ -20,6 +20,8 @@ pub mod heap;
 pub mod paging;
 #[cfg(target_os = "none")]
 pub mod pat;
+#[cfg(target_os = "none")]
+pub mod vma;
 
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;

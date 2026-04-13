@@ -393,6 +393,34 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
     }
 }
 
+/// Install a VMA on the currently-running task. The VMA is resolved
+/// lazily by the `#PF` handler on first touch of each page.
+pub fn install_vma_on_current(vma: crate::mem::vma::Vma) {
+    let mut sched = SCHED.lock();
+    let current = sched
+        .current
+        .as_mut()
+        .expect("install_vma_on_current: no running task");
+    current.vmas.insert(vma);
+}
+
+/// Consult the current task's VMA list for `addr`. Returns the VMA's
+/// backing kind and the flags the `#PF` resolver should apply.
+///
+/// Returns `None` if the scheduler lock is contended — the `#PF`
+/// handler treats that as "not a demand-page fault" and falls through
+/// to the generic hang path. In practice contention only arises when
+/// the fault hit mid-`context_switch`; for demand-paged tasks running
+/// normally the lock is free at fault time.
+pub fn current_vma_lookup(
+    addr: usize,
+) -> Option<(crate::mem::vma::VmaKind, x86_64::structures::paging::PageTableFlags)> {
+    let sched = SCHED.try_lock()?;
+    let current = sched.current.as_ref()?;
+    let vma = current.vmas.find(addr)?;
+    Some((vma.kind, vma.flags))
+}
+
 /// Called from the timer ISR after `notify_eoi`. Decrements the
 /// current task's slice; if it's exhausted and there's another task
 /// ready, rotates and context-switches. Bails on lock contention so
