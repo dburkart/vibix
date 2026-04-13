@@ -91,3 +91,7 @@ harness = false
 [[test]]
 name = "shell_smoke"
 harness = false
+
+[[test]]
+name = "priority"
+harness = false
