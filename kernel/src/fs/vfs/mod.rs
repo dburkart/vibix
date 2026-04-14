@@ -53,6 +53,7 @@ pub mod open_file;
 pub mod ops;
 pub mod path_walk;
 pub mod super_block;
+pub mod tarfs;
 
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
@@ -67,6 +68,7 @@ pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
+pub use tarfs::TarFs;
 
 /// POSIX-imposed cap on a single path component.
 pub const NAME_MAX: usize = 255;
