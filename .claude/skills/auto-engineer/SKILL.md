@@ -140,12 +140,22 @@ Record the PR open time. Run one poll tick (step 6b below), then either proceed 
    ```sh
    gh pr checks <M> --json name,state,bucket,link
    ```
-2. Count review-bot activity:
+2. Count review-bot activity. Bots post in **two** different places — check both:
    ```sh
+   # Issue-level comments (CodeRabbit summaries, top-level bot posts)
    gh api "repos/{owner}/{repo}/issues/<M>/comments" \
-     --jq '[.[] | select(.user.login | test("coderabbitai|greptile|github-advanced-security"))] | length'
+     --jq '[.[] | select(.user.login | test("coderabbitai|greptile|github-advanced-security|cursor"))] | length'
+
+   # Inline diff comments (Cursor Bugbot findings, some CodeRabbit inline notes)
+   gh api "repos/{owner}/{repo}/pulls/<M>/comments" \
+     --jq '[.[] | select(.user.login | test("coderabbitai|greptile|github-advanced-security|cursor"))] | length'
    ```
-   Also fetch formal reviews via `mcp__github__get_pull_request_reviews`.
+   Sum both counts. Also fetch formal reviews via `mcp__github__get_pull_request_reviews`.
+
+   > **Why two endpoints?** `issues/<M>/comments` returns issue-level (top-of-page) comments.
+   > `pulls/<M>/comments` returns inline review comments attached to specific diff lines.
+   > Cursor Bugbot posts exclusively inline; missing the second endpoint means all Cursor
+   > findings are invisible. The bot login is `cursor[bot]`, matched by the `cursor` pattern.
 
 3. Evaluate "done" criteria (from `docs/agent-playbooks/pr-review.md`):
    - Every check is in a terminal state (`success`, `failure`, `skipped`, `cancelled`,
@@ -196,6 +206,15 @@ ScheduleWakeup(
   ...
 )
 ```
+
+**Read all review findings before classifying.** There are three sources — collect all before
+deciding:
+
+1. `mcp__github__get_pull_request_reviews` — formal approve/request-changes reviews.
+2. `mcp__github__get_pull_request_comments` — **inline diff comments** (where Cursor Bugbot
+   and other bots post line-level findings). Do not skip this even if the issue-level comment
+   count was ≥1 — bots may have posted summaries at issue level AND findings inline.
+3. `gh api "repos/{owner}/{repo}/issues/<M>/comments"` — top-level issue comments.
 
 **Classify review findings** using `docs/agent-playbooks/pr-review.md`:
 
