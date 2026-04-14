@@ -287,6 +287,26 @@ pub fn new_task_pml4() -> PhysFrame<Size4KiB> {
     new_frame
 }
 
+/// Fallible variant of [`new_task_pml4`]: returns `None` when the frame
+/// allocator is exhausted. Used by `fork_address_space` so that PML4
+/// allocation failure surfaces as `ForkError::OutOfMemory` rather than
+/// a kernel panic.
+pub fn try_new_task_pml4() -> Option<PhysFrame<Size4KiB>> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before try_new_task_pml4");
+    // SAFETY: freshly allocated, exclusively owned, zeroed through HHDM.
+    let new_frame = unsafe { try_alloc_zeroed_frame(hhdm) }?;
+    let active = Cr3::read().0;
+    // SAFETY: same rationale as `new_task_pml4`.
+    unsafe {
+        let src = pml4_as_mut(active, hhdm) as *const PageTable as *const u64;
+        let dst = pml4_as_mut(new_frame, hhdm) as *mut PageTable as *mut u64;
+        core::ptr::copy_nonoverlapping(src.add(256), dst.add(256), 256);
+    }
+    Some(new_frame)
+}
+
 /// Map `page` to a freshly-allocated zeroed frame in the PML4 rooted
 /// at `pml4_frame`, with `flags`. Intended for the `#PF` demand-paging
 /// resolver: the handler runs in the faulting task's address space, so
@@ -632,6 +652,22 @@ unsafe fn alloc_zeroed_frame(hhdm: VirtAddr) -> PhysFrame<Size4KiB> {
     let virt = hhdm + frame.start_address().as_u64();
     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
     frame
+}
+
+/// Fallible variant of [`alloc_zeroed_frame`]: returns `None` when the
+/// frame allocator is exhausted. Used by [`try_new_task_pml4`] so that
+/// OOM during fork can be surfaced as `ForkError::OutOfMemory` instead
+/// of a kernel panic.
+///
+/// # Safety
+/// Same as [`alloc_zeroed_frame`]: the returned frame is exclusively
+/// owned by the caller.
+unsafe fn try_alloc_zeroed_frame(hhdm: VirtAddr) -> Option<PhysFrame<Size4KiB>> {
+    let mut alloc = KernelFrameAllocator;
+    let frame = alloc.allocate_frame()?;
+    let virt = hhdm + frame.start_address().as_u64();
+    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
+    Some(frame)
 }
 
 /// Turn a PML4-bearing physical frame into a `&'static mut PageTable`

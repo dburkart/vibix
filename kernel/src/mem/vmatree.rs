@@ -426,6 +426,10 @@ mod tests {
         fn len_pages(&self) -> Option<usize> {
             self.len
         }
+
+        fn clone_private(&self) -> Arc<dyn VmObject> {
+            Arc::new(StubObject { len: self.len })
+        }
     }
 
     fn stub() -> Arc<dyn VmObject> {

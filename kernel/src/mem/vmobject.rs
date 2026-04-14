@@ -76,6 +76,15 @@ pub trait VmObject: Send + Sync {
         let _ = offset;
         None
     }
+
+    /// Return a fresh backing object for a `Share::Private` fork child.
+    ///
+    /// Called by `fork_address_space` for every Private VMA so post-fork
+    /// demand faults on unfaulted pages allocate **independent** frames in
+    /// parent and child. `AnonObject` returns a new empty cache with the
+    /// same `len_pages` bound; future file-backed objects should return a
+    /// similarly independent copy.
+    fn clone_private(&self) -> Arc<dyn VmObject>;
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is
@@ -162,6 +171,20 @@ impl VmObject for AnonObject {
     fn frame_at(&self, offset: usize) -> Option<u64> {
         let idx = offset / (crate::mem::FRAME_SIZE as usize);
         self.inner.lock().frames.get(&idx).copied()
+    }
+
+    fn clone_private(&self) -> Arc<dyn VmObject> {
+        // Return a fresh empty `AnonObject` with the same size bound.
+        // Post-fork demand faults on unfaulted pages will allocate
+        // independent frames in the child; already-W-stripped frames are
+        // handled entirely at the PTE layer by `fork_address_space` and
+        // need no entry in this cache.
+        Arc::new(Self {
+            inner: Mutex::new(AnonInner {
+                frames: BTreeMap::new(),
+            }),
+            len_pages: self.len_pages,
+        })
     }
 }
 
@@ -304,14 +327,47 @@ mod tests {
     #[test]
     fn clone_for_fork_shares_cache() {
         let _g = release_test_lock();
-        // Arc-clone is the default for fork; the forked object sees the
-        // same cached frames as the parent until the CoW path diverges
-        // them at the PTE layer.
+        // `clone_for_fork` (the free function) performs an Arc::clone —
+        // used for Share::Shared VMAs. The forked Arc sees the same
+        // cached frames as the parent (sharing is intentional for Shared).
         let anon = AnonObject::new(Some(4));
         anon.insert_for_test(0, 0x4000);
         let parent: Arc<dyn VmObject> = anon;
         let forked = clone_for_fork(&parent);
         assert_eq!(forked.fault(0, Access::Read).unwrap(), 0x4000);
+    }
+
+    #[test]
+    fn clone_private_produces_empty_independent_object() {
+        let _g = release_test_lock();
+        // clone_private (used for Share::Private VMAs) must return a new
+        // object with an empty cache so post-fork demand faults in parent
+        // and child allocate independent frames.
+        let anon = AnonObject::new(Some(4));
+        anon.insert_for_test(0, 0x4000);
+        anon.insert_for_test(1, 0x5000);
+        let parent: Arc<dyn VmObject> = anon;
+        let child = parent.clone_private();
+        // Child cache is empty — frame_at returns None for every offset.
+        assert_eq!(child.frame_at(0), None);
+        assert_eq!(child.frame_at(4096), None);
+        // Child is a distinct allocation.
+        assert!(!core::ptr::addr_eq(
+            Arc::as_ptr(&parent) as *const (),
+            Arc::as_ptr(&(child as Arc<dyn VmObject>)) as *const ()
+        ));
+    }
+
+    #[test]
+    fn clone_private_preserves_len_pages() {
+        let _g = release_test_lock();
+        let parent: Arc<dyn VmObject> = AnonObject::new(Some(8));
+        let child = parent.clone_private();
+        assert_eq!(child.len_pages(), Some(8));
+
+        let unbounded: Arc<dyn VmObject> = AnonObject::new(None);
+        let child2 = unbounded.clone_private();
+        assert_eq!(child2.len_pages(), None);
     }
 
     #[test]
