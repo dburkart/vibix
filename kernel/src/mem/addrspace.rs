@@ -244,9 +244,38 @@ impl AddressSpace {
 
     /// Returns `true` if `vma` lies entirely inside the userspace
     /// canonical lower half and does not cross [`USER_VA_END`].
-    #[allow(dead_code)] // consumed by the mmap syscall
+    #[allow(dead_code)] // kept for future mmap(MAP_FIXED) bounds check
     pub(crate) fn vma_in_user_range(vma: &Vma) -> bool {
         (vma.end as u64) <= USER_VA_END
+    }
+
+    /// Find a free VA window of size `len` bytes for a fresh anonymous
+    /// `mmap`. Scans upwards from `mmap_base`, skipping any existing
+    /// VMAs. Returns the chosen start address, or `None` when no window
+    /// of that size fits below [`USER_VA_END`].
+    ///
+    /// `len` must be a non-zero multiple of the 4 KiB page size;
+    /// callers round up before calling.
+    pub fn find_unmapped_region(&self, len: usize) -> Option<usize> {
+        debug_assert!(len > 0 && len % 4096 == 0, "find_unmapped_region: bad len");
+
+        let mut cursor = self.mmap_base.as_u64() as usize;
+        for vma in self.vmas.iter() {
+            if vma.end <= cursor {
+                continue;
+            }
+            if vma.start >= cursor && vma.start - cursor >= len {
+                return Some(cursor);
+            }
+            if vma.end > cursor {
+                cursor = vma.end;
+            }
+        }
+        if (USER_VA_END as usize).checked_sub(cursor)? >= len {
+            Some(cursor)
+        } else {
+            None
+        }
     }
 }
 
@@ -646,5 +675,52 @@ mod tests {
         let aspace = AddressSpace::new_for_test(0x4000_0000);
         assert_eq!(aspace.brk_start, aspace.brk_cur);
         assert!(aspace.brk_max.as_u64() + DEFAULT_BRK_GUARD == aspace.mmap_base.as_u64());
+    }
+
+    #[test]
+    fn find_unmapped_region_empty_returns_mmap_base() {
+        let aspace = AddressSpace::new_for_test(0x4000_0000);
+        assert_eq!(aspace.find_unmapped_region(4096), Some(0x4000_0000));
+    }
+
+    #[test]
+    fn find_unmapped_region_skips_existing_vma() {
+        let mut aspace = AddressSpace::new_for_test(0x4000_0000);
+        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
+        assert_eq!(aspace.find_unmapped_region(4096), Some(0x4000_2000));
+    }
+
+    #[test]
+    fn find_unmapped_region_uses_gap_between_vmas() {
+        let mut aspace = AddressSpace::new_for_test(0x4000_0000);
+        // Two VMAs with a 2-page gap at [0x4000_2000, 0x4000_4000).
+        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
+        aspace.vmas.insert(anon(0x4000_4000, 0x4000_6000));
+        // Request fits in the gap.
+        assert_eq!(aspace.find_unmapped_region(4096), Some(0x4000_2000));
+        assert_eq!(aspace.find_unmapped_region(2 * 4096), Some(0x4000_2000));
+    }
+
+    #[test]
+    fn find_unmapped_region_skips_too_small_gap() {
+        let mut aspace = AddressSpace::new_for_test(0x4000_0000);
+        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
+        aspace.vmas.insert(anon(0x4000_3000, 0x4000_5000));
+        // Single-page gap at 0x4000_2000 too small for 2 pages — jump
+        // past the second VMA.
+        assert_eq!(aspace.find_unmapped_region(2 * 4096), Some(0x4000_5000));
+    }
+
+    #[test]
+    fn find_unmapped_region_respects_user_va_end() {
+        // Place mmap_base so there is less than a page left below
+        // USER_VA_END — any request should fail.
+        let near_top = USER_VA_END as usize - 2 * 4096;
+        let mut aspace = AddressSpace::new_for_test(near_top as u64);
+        aspace.vmas.insert(anon(near_top, near_top + 4096));
+        // Only one page free between [near_top+4096, USER_VA_END); a
+        // two-page request must return None.
+        assert_eq!(aspace.find_unmapped_region(2 * 4096), None);
+        assert_eq!(aspace.find_unmapped_region(4096), Some(near_top + 4096));
     }
 }

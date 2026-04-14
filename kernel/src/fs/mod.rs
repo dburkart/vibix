@@ -43,10 +43,13 @@ pub struct FileDescription {
 const MAX_FD: usize = 1024;
 
 /// Linux errno constants (negated so they match syscall return values).
+pub const ENOENT: i64 = -2;
 pub const EBADF: i64 = -9;
+pub const ENOMEM: i64 = -12;
 pub const EAGAIN: i64 = -11;
 pub const EINVAL: i64 = -22;
 pub const EMFILE: i64 = -24;
+pub const ENAMETOOLONG: i64 = -36;
 
 /// Per-process file-descriptor array.
 ///
