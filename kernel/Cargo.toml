@@ -191,3 +191,7 @@ harness = false
 [[test]]
 name = "vfs_hello"
 harness = false
+
+[[test]]
+name = "rootfs_module"
+harness = false

@@ -9,10 +9,10 @@
 //! | `/dev`     | devfs  | synthesised                   |
 //! | `/tmp`     | ramfs  | synthesised                   |
 //!
-//! The RFC names tarfs-on-a-ramdisk-module as the long-term backing
-//! for `/`, but the boot ISO does not yet ship a rootfs tarball, so
-//! ramfs is mounted there for now. Once a tar module lands, swap the
-//! `/` backing to [`TarFs`] with `MountSource::RamdiskModule`.
+//! On bare-metal, if a `rootfs.tar` module is present in the Limine
+//! config, TarFs is mounted at `/` instead of RamFs. `/dev` and `/tmp`
+//! are always overlaid with DevFs/RamFs respectively; their mountpoint
+//! dentries use synthetic bootstrap inodes when the root FS is read-only.
 //!
 //! ## Bootstrap: where does the namespace root come from?
 //!
@@ -37,7 +37,7 @@ use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::{alloc_fs_id, mount};
 use super::ops::{FileOps, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
 use super::super_block::{SbFlags, SuperBlock};
-use super::{DevFs, RamFs};
+use super::{DevFs, RamFs, TarFs};
 
 /// Global namespace root. Populated by [`init`]; `None` before the
 /// kernel has run boot-time VFS setup. Consumers who need to start a
@@ -64,6 +64,40 @@ pub fn init() {
 
     let bootstrap = bootstrap_target();
 
+    // On the bare-metal target, prefer tarfs-on-ramdisk-module for `/` per
+    // RFC 0002. Fall back to ramfs when the module is absent (host tests,
+    // early-boot without the ISO, or any future build that omits it).
+    #[cfg(target_os = "none")]
+    let root_edge = {
+        if let Some((ptr, len)) = find_rootfs_module() {
+            // SAFETY (inside tarfs): Limine places module payloads in
+            // EXECUTABLE_AND_MODULES memory, preserved for the kernel's
+            // lifetime. TarFs::mount() converts the raw pointer to a slice
+            // with an internal `unsafe` block.
+            let source = MountSource::RamdiskModule(ptr, len);
+            let edge = mount(
+                source,
+                &bootstrap,
+                TarFs::new_arc() as Arc<dyn super::ops::FileSystem>,
+                MountFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("vfs::init: mount tarfs / failed: errno={}", e));
+            crate::serial_println!("vfs: mounted tarfs at /");
+            edge
+        } else {
+            let edge = mount(
+                MountSource::None,
+                &bootstrap,
+                Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+                MountFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e));
+            crate::serial_println!("vfs: mounted ramfs at /");
+            edge
+        }
+    };
+
+    #[cfg(not(target_os = "none"))]
     let root_edge = mount(
         MountSource::None,
         &bootstrap,
@@ -74,7 +108,6 @@ pub fn init() {
 
     let root = root_edge.root_dentry.clone();
     ROOT_DENTRY.call_once(|| root.clone());
-    crate::serial_println!("vfs: mounted ramfs at /");
 
     mount_child(
         &root,
@@ -91,8 +124,25 @@ pub fn init() {
     crate::serial_println!("vfs: mounted ramfs at /tmp");
 }
 
+/// Locate the rootfs tarball module from the Limine module response.
+/// Returns `(ptr, len)` if found, `None` otherwise.
+#[cfg(target_os = "none")]
+fn find_rootfs_module() -> Option<(*const u8, usize)> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/rootfs.tar"))?;
+    Some((file.addr(), file.size() as usize))
+}
+
 /// Create a subdirectory `name` under `parent`, wrap it in a fresh
 /// dentry, and mount `fs` onto it. Panics on any step's failure.
+///
+/// When the parent filesystem is read-only (EROFS), `mkdir` will fail.
+/// In that case a synthetic bootstrap inode is used as the mountpoint —
+/// the mounted FS's own root takes over immediately, so the synthetic
+/// inode is never visible to callers.
 fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSystem>) {
     let parent_inode = parent
         .inode
@@ -101,16 +151,36 @@ fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSy
         .cloned()
         .unwrap_or_else(|| panic!("vfs::init: parent dentry is negative"));
 
-    let child_inode = parent_inode
-        .ops
-        .mkdir(&parent_inode, name, 0o755)
-        .unwrap_or_else(|e| {
-            panic!(
-                "vfs::init: mkdir {:?} under / failed: errno={}",
-                core::str::from_utf8(name).unwrap_or("<non-utf8>"),
-                e
-            )
-        });
+    // Attempt to create the directory in the parent FS. Falls back to a
+    // synthetic inode when the parent is read-only or doesn't support
+    // mkdir (EPERM = -1 default, EROFS = -30). The mounted child FS's
+    // root dentry takes over immediately, so the stub is never visible.
+    let child_inode = match parent_inode.ops.mkdir(&parent_inode, name, 0o755) {
+        Ok(inode) => inode,
+        Err(_) => {
+            let stub_sb = Arc::new(SuperBlock::new(
+                alloc_fs_id(),
+                Arc::new(BootstrapSuperOps) as Arc<dyn SuperOps>,
+                "mountpoint-stub",
+                4096,
+                SbFlags::default(),
+            ));
+            let stub_inode = Arc::new(Inode::new(
+                1,
+                Arc::downgrade(&stub_sb),
+                Arc::new(BootstrapInodeOps) as Arc<dyn InodeOps>,
+                Arc::new(BootstrapFileOps) as Arc<dyn FileOps>,
+                InodeKind::Dir,
+                InodeMeta {
+                    mode: 0o755,
+                    nlink: 2,
+                    ..Default::default()
+                },
+            ));
+            core::mem::forget(stub_sb);
+            stub_inode
+        }
+    };
 
     let child_dname =
         super::DString::try_from_bytes(name).unwrap_or_else(|_| panic!("vfs::init: invalid dname"));

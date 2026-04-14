@@ -809,6 +809,7 @@ fn test_all() -> R<()> {
         "vm_integration",
         "vfs_backend",
         "vfs_hello",
+        "rootfs_module",
     ] {
         cmd.arg("--test").arg(t);
     }
