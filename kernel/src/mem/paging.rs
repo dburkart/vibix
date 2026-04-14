@@ -366,36 +366,40 @@ pub fn map_existing_in_pml4(
     Ok(())
 }
 
-/// Copy-on-write resolve: `page` is currently mapped read-only to
-/// `source_frame` in `pml4_frame`. Allocate a fresh frame, memcpy the
-/// source into it through the HHDM, unmap the read-only PTE, then
+/// Copy-on-write resolve: `page` is currently mapped read-only in
+/// `pml4_frame`. Allocate a fresh frame, memcpy the **current PTE's
+/// frame** into it through the HHDM, unmap the read-only PTE, then
 /// remap the page to the new frame with `flags` (caller supplies the
 /// full flag set — must include `WRITABLE`). Returns the new frame.
 ///
-/// The source frame is *not* freed — it may still be aliased by other
-/// PML4s (a child post-fork, or another CoW VMA pointing to the same
-/// frame).
+/// The copy source is deliberately the frame currently referenced by
+/// the PTE — not an object-cache lookup. In a nested-fork chain
+/// (fork → write → fork → write) the intermediate generation has a
+/// private frame whose contents diverge from the original object-cache
+/// entry; copying from the PTE is what lets the grandchild see the
+/// intermediate generation's writes. It also makes the call work when
+/// the child VMA has an empty `clone_private()` cache that lacks any
+/// `frame_at(offset)` entry at all — the common case after a fork.
+///
+/// The old frame is *not* freed outright — we release one reference on
+/// its behalf (the PTE reference, acquired by `AnonObject::fault` /
+/// `fork_address_space` when the PTE was installed). Other PTEs in
+/// sibling PML4s that alias the same frame keep their own references.
 pub fn cow_copy_and_remap(
     pml4_frame: PhysFrame<Size4KiB>,
     page: Page<Size4KiB>,
-    source_frame: PhysFrame<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<PhysFrame<Size4KiB>, MapToError<Size4KiB>> {
     let hhdm = HHDM_OFFSET
         .lock()
         .expect("paging::init must run before cow_copy_and_remap");
     let mut alloc = KernelFrameAllocator;
+    // Allocate up front so an OOM leaves the existing read-only PTE in
+    // place; the caller can retry and user space sees a replayable
+    // fault rather than a torn address space.
     let new_frame = alloc
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
-    // SAFETY: both frames are in HHDM-covered RAM. `new_frame` was
-    // just allocated for our exclusive use; the source is read-only
-    // shared but we only copy *out* of it.
-    unsafe {
-        let src = (hhdm + source_frame.start_address().as_u64()).as_ptr::<u8>();
-        let dst = (hhdm + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
-        core::ptr::copy_nonoverlapping(src, dst, 4096);
-    }
     let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
     let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
     // The page must currently be mapped — we're resolving a write
@@ -408,10 +412,21 @@ pub fn cow_copy_and_remap(
     } else {
         unmap_flush.ignore();
     }
+    // SAFETY: both frames are in HHDM-covered RAM. `new_frame` was
+    // just allocated for our exclusive use; `old_frame` is still live
+    // (we hold one PTE reference we have not released yet) and no
+    // other CPU can alias a writable mapping to it — the PTE was
+    // read-only at entry, and we just unmapped it here.
+    unsafe {
+        let src = (hhdm + old_frame.start_address().as_u64()).as_ptr::<u8>();
+        let dst = (hhdm + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
+        core::ptr::copy_nonoverlapping(src, dst, 4096);
+    }
     // Release the PTE's reference to the old frame (it was acquired by
-    // AnonObject::fault via inc_refcount when the page was first mapped).
-    // The AnonObject's cache retains its own reference; this balances
-    // only the now-removed PTE mapping.
+    // AnonObject::fault via inc_refcount on first demand fault or by
+    // fork_address_space when the child / W-stripped parent PTE was
+    // installed). Other mappings that alias this frame keep their own
+    // references; the frame is only freed when the last one drops.
     frame::put(old_frame.start_address().as_u64());
     let flush = unsafe { mapper.map_to(page, new_frame, flags, &mut alloc)? };
     if Cr3::read().0 == pml4_frame {
