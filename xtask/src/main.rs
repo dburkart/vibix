@@ -806,11 +806,7 @@ fn integration_test_names() -> R<Vec<String>> {
     let body = fs::read_to_string(&manifest_path)?;
     let names = parse_test_names(&body);
     if names.is_empty() {
-        return Err(format!(
-            "no [[test]] entries found in {}",
-            manifest_path.display()
-        )
-        .into());
+        return Err(format!("no [[test]] entries found in {}", manifest_path.display()).into());
     }
     Ok(names)
 }
