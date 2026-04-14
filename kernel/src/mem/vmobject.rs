@@ -91,6 +91,12 @@ pub trait VmObject: Send + Sync {
     /// rather than waiting until the object is dropped. The default is a
     /// no-op; `AnonObject` overrides it to trim its frame cache.
     fn truncate_from_page(&self, _from_page: usize) {}
+
+    /// Release cached frames for page indices in `[first, last)`. Called
+    /// by `madvise(MADV_DONTNEED)` so the next fault returns a fresh
+    /// zero-filled frame instead of the one previously cached. Default
+    /// is a no-op; `AnonObject` overrides to evict the range.
+    fn evict_range(&self, _first: usize, _last: usize) {}
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is
@@ -199,6 +205,15 @@ impl VmObject for AnonObject {
         #[cfg(not(target_os = "none"))]
         let _ = from_page;
     }
+
+    fn evict_range(&self, first: usize, last: usize) {
+        #[cfg(target_os = "none")]
+        self.evict_cache_range(first, last);
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (first, last);
+        }
+    }
 }
 
 /// Kernel-only methods on `AnonObject`.
@@ -219,6 +234,24 @@ impl AnonObject {
         // Add the cache's reference. The PTE reference was set by the
         // original allocator/mapper; we are adding one more here.
         crate::mem::refcount::inc_refcount(phys);
+    }
+
+    /// Remove cached frames whose page index is in `[first, last)` and
+    /// release their cache references. Used by
+    /// `madvise(MADV_DONTNEED)` — the next fault on an evicted index
+    /// allocates a fresh zero-filled frame.
+    pub fn evict_cache_range(&self, first: usize, last: usize) {
+        let evicted: alloc::vec::Vec<(usize, u64)> = {
+            let mut inner = self.inner.lock();
+            let keys: alloc::vec::Vec<usize> =
+                inner.frames.range(first..last).map(|(&k, _)| k).collect();
+            keys.into_iter()
+                .filter_map(|k| inner.frames.remove(&k).map(|v| (k, v)))
+                .collect()
+        };
+        for (_, phys) in evicted {
+            crate::mem::frame::put(phys);
+        }
     }
 
     /// Remove all cached frames whose page index is ≥ `from_page` and
