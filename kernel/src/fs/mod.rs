@@ -50,6 +50,8 @@ pub const EAGAIN: i64 = -11;
 pub const EINVAL: i64 = -22;
 pub const EMFILE: i64 = -24;
 pub const ENAMETOOLONG: i64 = -36;
+pub const EEXIST: i64 = -17;
+pub const ENODEV: i64 = -19;
 
 /// Per-process file-descriptor array.
 ///

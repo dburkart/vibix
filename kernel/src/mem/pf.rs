@@ -45,6 +45,19 @@ pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+pub const MAP_GROWSDOWN: u32 = 0x100;
+pub const MAP_STACK: u32 = 0x20000;
+pub const MAP_FIXED_NOREPLACE: u32 = 0x10_0000;
+
+/// `madvise(2)` advice values. Only `MADV_DONTNEED` has side effects in
+/// this implementation; the rest are accepted as no-ops so userspace
+/// calls that treat them as hints succeed.
+pub const MADV_NORMAL: i32 = 0;
+pub const MADV_RANDOM: i32 = 1;
+pub const MADV_SEQUENTIAL: i32 = 2;
+pub const MADV_WILLNEED: i32 = 3;
+pub const MADV_DONTNEED: i32 = 4;
+pub const MADV_FREE: i32 = 8;
 
 // Raw bit positions in the x86 #PF error code. Kept as numeric
 // constants (not `PageFaultErrorCode` flags) so the module stays
@@ -235,6 +248,170 @@ mod growsdown_tests {
             check_growsdown(cr2, cr2 + 4096, TOP, RLIMIT, GAP),
             GrowResult::Segv
         );
+    }
+}
+
+// ── Address validation for mmap-family syscalls ──────────────────────────
+
+/// A validated `(addr, len)` range produced by [`validate_user_range`].
+///
+/// `addr` is page-aligned and `len` is rounded up to a whole page, so
+/// `addr + len` is also page-aligned and `<= USER_VA_END`. Downstream
+/// syscall code can treat the bounds as canonical without re-checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserRange {
+    pub addr: usize,
+    pub len: usize,
+}
+
+impl UserRange {
+    pub fn end(self) -> usize {
+        self.addr + self.len
+    }
+}
+
+/// Why [`validate_user_range`] rejected an `(addr, len)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeError {
+    /// `len == 0`, rounding overflowed, non-canonical address, or
+    /// `addr` was not page-aligned when the caller required exact
+    /// alignment.
+    Invalid,
+}
+
+/// Policy knob for [`validate_user_range`]. `mmap` without `MAP_FIXED`
+/// treats `addr` as a hint (rounded down); every other caller
+/// (`munmap`, `mprotect`, `madvise`, `MAP_FIXED` / `MAP_FIXED_NOREPLACE`)
+/// demands exact page alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrAlign {
+    /// Reject a non-page-aligned `addr` with [`RangeError::Invalid`].
+    Exact,
+    /// Round `addr` down to the nearest page.
+    RoundDown,
+}
+
+/// Validate an `(addr, len)` user range against the six steps from RFC
+/// 0001 "Address validation":
+///
+/// 1. `len == 0` → `Invalid`.
+/// 2. `len` rounded up to a page; overflow → `Invalid`.
+/// 3. `addr` must be canonical (lower-half — bits 48..63 clear).
+/// 4. `addr.checked_add(len_rounded)` must succeed.
+/// 5. `addr + len_rounded <= USER_VA_END`.
+/// 6. `addr` alignment per [`AddrAlign`] — `Exact` rejects non-aligned
+///    addresses, `RoundDown` rounds the hint to the containing page.
+///
+/// Returns the sanitized `(addr, len)` on success.
+pub fn validate_user_range(addr: u64, len: u64, align: AddrAlign) -> Result<UserRange, RangeError> {
+    if len == 0 {
+        return Err(RangeError::Invalid);
+    }
+    let len_rounded = match len.checked_add(4095) {
+        Some(v) => v & !4095,
+        None => return Err(RangeError::Invalid),
+    };
+    if len_rounded == 0 {
+        return Err(RangeError::Invalid);
+    }
+    if !is_user_va(addr) {
+        return Err(RangeError::Invalid);
+    }
+    let addr = match align {
+        AddrAlign::Exact => {
+            if addr & 0xFFF != 0 {
+                return Err(RangeError::Invalid);
+            }
+            addr
+        }
+        AddrAlign::RoundDown => addr & !0xFFF,
+    };
+    let end = match addr.checked_add(len_rounded) {
+        Some(v) => v,
+        None => return Err(RangeError::Invalid),
+    };
+    if end > USER_VA_END {
+        return Err(RangeError::Invalid);
+    }
+    Ok(UserRange {
+        addr: addr as usize,
+        len: len_rounded as usize,
+    })
+}
+
+#[cfg(test)]
+mod validate_range_tests {
+    use super::*;
+
+    #[test]
+    fn zero_len_rejected() {
+        assert_eq!(
+            validate_user_range(0x1000, 0, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn len_rounding_overflow_rejected() {
+        assert_eq!(
+            validate_user_range(0, u64::MAX, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn non_canonical_addr_rejected() {
+        // Kernel half.
+        assert_eq!(
+            validate_user_range(0xffff_8000_0000_0000, 4096, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+        // Non-canonical "hole".
+        assert_eq!(
+            validate_user_range(0x0000_8000_0000_0000, 4096, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn addr_plus_len_overflow_rejected() {
+        // addr near USER_VA_END; len rounds into the non-canonical hole.
+        assert_eq!(
+            validate_user_range(USER_VA_END - 0x1000, 0x2000, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn exact_alignment_required_for_fixed_paths() {
+        assert_eq!(
+            validate_user_range(0x1001, 4096, AddrAlign::Exact),
+            Err(RangeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn round_down_hint_accepted() {
+        let r = validate_user_range(0x1234, 4096, AddrAlign::RoundDown).unwrap();
+        assert_eq!(r.addr, 0x1000);
+        assert_eq!(r.len, 4096);
+    }
+
+    #[test]
+    fn len_rounded_up_to_page() {
+        let r = validate_user_range(0x1000, 1, AddrAlign::Exact).unwrap();
+        assert_eq!(r.addr, 0x1000);
+        assert_eq!(r.len, 4096);
+
+        let r = validate_user_range(0x1000, 4097, AddrAlign::Exact).unwrap();
+        assert_eq!(r.len, 8192);
+    }
+
+    #[test]
+    fn mapping_ending_exactly_at_user_va_end_is_legal() {
+        let addr = USER_VA_END - 4096;
+        let r = validate_user_range(addr, 4096, AddrAlign::Exact).unwrap();
+        assert_eq!(r.end() as u64, USER_VA_END);
     }
 }
 

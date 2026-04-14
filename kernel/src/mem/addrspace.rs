@@ -551,6 +551,164 @@ impl AddressSpace {
             None
         }
     }
+
+    /// True if any existing VMA overlaps `[start, start + len)`.
+    /// Used by `MAP_FIXED_NOREPLACE` to detect collisions before
+    /// inserting the new mapping.
+    pub fn range_overlaps_any(&self, start: usize, len: usize) -> bool {
+        let end = start + len;
+        // Left neighbour with end > start? Right neighbour with start < end?
+        self.vmas
+            .iter()
+            .any(|v| !(v.end <= start || v.start >= end))
+    }
+
+    /// True if every page in `[start, start + len)` is covered by some
+    /// existing VMA. Used by `sys_mprotect` to distinguish "partial hole
+    /// inside a covered range" (POSIX-conformant 0) from "sub-page
+    /// literally unmapped" (ENOMEM).
+    pub fn range_fully_covered(&self, start: usize, len: usize) -> bool {
+        let end = start + len;
+        let mut cursor = start;
+        for vma in self.vmas.iter() {
+            if vma.end <= cursor {
+                continue;
+            }
+            if vma.start > cursor {
+                return false; // hole at [cursor, vma.start)
+            }
+            cursor = vma.end;
+            if cursor >= end {
+                return true;
+            }
+        }
+        cursor >= end
+    }
+
+    /// Tear down PTEs for `[start, end)` in this PML4 and release each
+    /// PTE's refcount. VMA tree structure is not touched — call
+    /// `vmas.unmap_range` separately if the VMA entries themselves need
+    /// to be removed (`munmap`) vs. kept (`madvise(MADV_DONTNEED)`).
+    #[cfg(target_os = "none")]
+    pub fn drop_ptes_in_range(&mut self, start: usize, end: usize) {
+        use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+        let pml4 = self.page_table;
+        let mut va = start;
+        while va < end {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                .expect("drop_ptes_in_range: start page-aligned");
+            if let Ok(frame) = crate::mem::paging::unmap_in_pml4(pml4, page) {
+                unsafe {
+                    crate::mem::paging::KernelFrameAllocator.deallocate_frame(frame);
+                }
+                self.rss_pages = self.rss_pages.saturating_sub(1);
+            }
+            va += 4096;
+        }
+    }
+
+    /// `munmap(start, end)`: drop every PTE in `[start, end)` and remove
+    /// the corresponding VMA coverage, splitting straddling VMAs at the
+    /// boundaries. POSIX `munmap` over a hole is a success (returns 0) —
+    /// the caller receives no error.
+    #[cfg(target_os = "none")]
+    pub fn sys_munmap_range(&mut self, start: usize, end: usize) {
+        self.drop_ptes_in_range(start, end);
+        // Track VMA coverage delta for vm_pages accounting.
+        let before: usize = self.vmas.iter().map(|v| v.end - v.start).sum();
+        self.vmas.unmap_range(start, end);
+        let after: usize = self.vmas.iter().map(|v| v.end - v.start).sum();
+        self.vm_pages = after / 4096;
+        let _ = before; // covered by delta above; kept for readability
+    }
+
+    /// `mprotect(start, end, new_prot_user, new_prot_pte)` — installs the
+    /// new protection on every VMA intersecting the range, splitting at
+    /// the boundaries. Also narrows in-place PTEs so a subsequent access
+    /// that the new protection forbids faults. The caller has already
+    /// verified the range is fully covered.
+    #[cfg(target_os = "none")]
+    pub fn sys_mprotect_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        new_prot_user: crate::mem::vmatree::ProtUser,
+        new_prot_pte: crate::mem::vmatree::ProtPte,
+    ) {
+        use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+
+        self.vmas
+            .change_protection(start, end, new_prot_user, new_prot_pte);
+
+        // Walk present PTEs in the range and rewrite their flags to match
+        // the new protection. Pages that have not been faulted in stay
+        // unmapped; the next fault will install them with `new_prot_pte`.
+        let new_flags = PageTableFlags::from_bits_truncate(new_prot_pte);
+        let pml4 = self.page_table;
+        let mut va = start;
+        while va < end {
+            let vaddr = VirtAddr::new(va as u64);
+            if let Some((frame, _cur)) = crate::mem::paging::translate_in_pml4(pml4, vaddr) {
+                let page =
+                    Page::<Size4KiB>::from_start_address(vaddr).expect("mprotect: va page-aligned");
+                // Re-install the same frame with the new flags. `unmap_in_pml4`
+                // clears the PTE but does NOT touch the refcount (only
+                // `frame::put` / `deallocate_frame` does). The PTE's existing
+                // reference carries over to the re-installed mapping, so we
+                // neither inc nor put here.
+                if crate::mem::paging::unmap_in_pml4(pml4, page).is_ok() {
+                    let _ = crate::mem::paging::map_existing_in_pml4(pml4, page, frame, new_flags);
+                }
+            }
+            va += 4096;
+        }
+    }
+
+    /// `madvise(start, end, MADV_DONTNEED)` on anon-private VMAs: drop
+    /// every PTE in the range, decrement refcounts, and purge the
+    /// `AnonObject` cache entries so the next touch zero-fills a new
+    /// frame. VMA coverage is preserved.
+    #[cfg(target_os = "none")]
+    pub fn sys_madvise_dontneed(&mut self, start: usize, end: usize) {
+        use crate::mem::vmatree::Share;
+        // First pass: drop PTEs in every anon-private segment of the range.
+        // We can't hold iterator borrow while mutating, so snapshot the
+        // coverage first.
+        let segments: alloc::vec::Vec<(
+            usize,
+            usize,
+            usize,
+            alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
+        )> = self
+            .vmas
+            .iter()
+            .filter(|v| v.share == Share::Private)
+            .filter_map(|v| {
+                let a = core::cmp::max(v.start, start);
+                let b = core::cmp::min(v.end, end);
+                if a >= b {
+                    None
+                } else {
+                    Some((a, b, v.start, alloc::sync::Arc::clone(&v.object)))
+                }
+            })
+            .collect();
+
+        for (a, b, _vma_start, _obj) in &segments {
+            self.drop_ptes_in_range(*a, *b);
+        }
+
+        // Second pass: truncate each touched VmObject's cache for the
+        // affected page indices so the next fault zero-fills. We cannot
+        // use `truncate_from_page` because that drops a suffix; we need
+        // to evict specific indices. `AnonObject::evict_range` is the
+        // helper for this.
+        for (a, b, vma_start, obj) in segments {
+            let first_idx = (a - vma_start) / 4096;
+            let last_idx = (b - vma_start) / 4096; // exclusive
+            obj.evict_range(first_idx, last_idx);
+        }
+    }
 }
 
 /// Error returned by [`AddressSpace::fork_address_space`].

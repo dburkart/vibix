@@ -265,9 +265,19 @@ pub unsafe extern "C" fn syscall_dispatch(
         // backed by `SerialBackend`. Any other path returns -ENOENT.
         2 => sys_open(a0, a1, a2),
 
-        // mmap(addr, len, prot, flags, fd, off) — anonymous private
-        // mappings only for now. See `sys_mmap` for full validation.
+        // mmap(addr, len, prot, flags, fd, off) — anon-private and
+        // anon-shared with full MAP_FIXED / MAP_GROWSDOWN support. See
+        // `sys_mmap` for full validation.
         9 => sys_mmap(a0, a1, a2, a3, a4, a5),
+
+        // mprotect(addr, len, prot)
+        10 => sys_mprotect(a0, a1, a2),
+
+        // munmap(addr, len)
+        11 => sys_munmap(a0, a1),
+
+        // madvise(addr, len, advice)
+        28 => sys_madvise(a0, a1, a2),
 
         // close(fd)
         3 => {
@@ -533,29 +543,37 @@ unsafe fn sys_open(path_uva: u64, flags: u64, _mode: u64) -> i64 {
     }
 }
 
-/// `mmap(addr, len, prot, flags, fd, off)` — anonymous private only.
+/// Build `prot_pte` from user-visible `prot_user` bits. `PROT_WRITE`
+/// without `PROT_READ` installs `R|W` because x86 cannot separate the
+/// two; `prot_user` preserves the original request.
+fn prot_pte_from_prot_user(prot: u32) -> u64 {
+    use crate::mem::pf::{PROT_EXEC, PROT_WRITE};
+    use x86_64::structures::paging::PageTableFlags;
+    let mut pte = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        pte |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        pte |= PageTableFlags::NO_EXECUTE;
+    }
+    pte.bits()
+}
+
+/// `mmap(addr, len, prot, flags, fd, off)` — anon-private + anon-shared.
 ///
-/// Supported: `MAP_ANONYMOUS | MAP_PRIVATE`, `fd == -1`, `off == 0`.
-/// Everything else (file-backed, `MAP_SHARED`, `MAP_FIXED`, unknown
-/// flag bits) returns `-EINVAL`. The chosen VA is picked by
-/// `AddressSpace::find_unmapped_region`; the `addr` hint is ignored.
-unsafe fn sys_mmap(_addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
-    use crate::fs::{EINVAL, ENOMEM};
-    use crate::mem::pf::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-    use crate::mem::vmatree::{Share, Vma};
+/// Supports `MAP_PRIVATE` / `MAP_SHARED` (mutually exclusive) with
+/// `MAP_ANONYMOUS`; honours `MAP_FIXED`, `MAP_FIXED_NOREPLACE`,
+/// `MAP_GROWSDOWN`, and `MAP_STACK`. `fd != -1` returns `-ENODEV`
+/// (file-backed path not implemented). Validation follows RFC 0001.
+unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
+    use crate::fs::{EEXIST, EINVAL, ENODEV, ENOMEM};
+    use crate::mem::pf::{
+        validate_user_range, AddrAlign, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
+        MAP_GROWSDOWN, MAP_PRIVATE, MAP_SHARED, MAP_STACK, PROT_EXEC, PROT_READ, PROT_WRITE,
+    };
+    use crate::mem::vmatree::{Share, Vma, VMA_GROWSDOWN};
     use crate::mem::vmobject::{AnonObject, VmObject};
     use alloc::sync::Arc;
-    use x86_64::structures::paging::PageTableFlags;
-
-    if len == 0 {
-        return EINVAL;
-    }
-
-    // Page-round len, rejecting overflow.
-    let len = match (len as usize).checked_add(4095) {
-        Some(n) => n & !4095,
-        None => return EINVAL,
-    };
 
     let flags = flags as u32;
     let prot = prot as u32;
@@ -564,49 +582,172 @@ unsafe fn sys_mmap(_addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u6
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return EINVAL;
     }
-    // Require both MAP_ANONYMOUS and MAP_PRIVATE; reject every other bit.
-    if flags != (MAP_ANONYMOUS | MAP_PRIVATE) {
-        return EINVAL;
-    }
-    // Anonymous mapping: fd must be -1, offset must be 0.
+
+    // File-backed path not implemented — Linux returns ENODEV for
+    // "file type not supported by mmap", matching RFC 0001.
     if fd as i64 != -1 {
-        return EINVAL;
+        return ENODEV;
     }
     if off != 0 {
         return EINVAL;
     }
 
+    // Every supported bit must be one of the RFC set.
+    let known = MAP_SHARED
+        | MAP_PRIVATE
+        | MAP_FIXED
+        | MAP_FIXED_NOREPLACE
+        | MAP_ANONYMOUS
+        | MAP_GROWSDOWN
+        | MAP_STACK;
+    if flags & !known != 0 {
+        return EINVAL;
+    }
+
+    // Anonymous-only for now.
+    if flags & MAP_ANONYMOUS == 0 {
+        return ENODEV;
+    }
+
+    // Exactly one of MAP_PRIVATE / MAP_SHARED must be set.
+    let priv_bit = flags & MAP_PRIVATE != 0;
+    let shared_bit = flags & MAP_SHARED != 0;
+    if priv_bit == shared_bit {
+        return EINVAL;
+    }
+    let share = if priv_bit {
+        Share::Private
+    } else {
+        Share::Shared
+    };
+
+    // MAP_FIXED_NOREPLACE implies MAP_FIXED semantics for address handling.
+    let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+
+    // Validate the range: fixed → exact alignment required, hint → round down.
+    let align = if fixed {
+        AddrAlign::Exact
+    } else {
+        AddrAlign::RoundDown
+    };
+    let range = match validate_user_range(addr, len, align) {
+        Ok(r) => r,
+        Err(_) => return EINVAL,
+    };
+
     let aspace = crate::task::current_address_space();
     let mut guard = aspace.write();
 
-    let start = match guard.find_unmapped_region(len) {
-        Some(s) => s,
-        None => return ENOMEM,
+    let start = if fixed {
+        if flags & MAP_FIXED_NOREPLACE != 0 && guard.range_overlaps_any(range.addr, range.len) {
+            return EEXIST;
+        }
+        // Bare MAP_FIXED: evict any overlap so the new mapping can land.
+        if flags & MAP_FIXED_NOREPLACE == 0 {
+            guard.sys_munmap_range(range.addr, range.addr + range.len);
+        }
+        range.addr
+    } else {
+        match guard.find_unmapped_region(range.len) {
+            Some(s) => s,
+            None => return ENOMEM,
+        }
     };
 
-    // Build PTE flags: PRESENT|USER always; WRITABLE if PROT_WRITE;
-    // NX if !PROT_EXEC.
-    let mut pte = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if prot & PROT_WRITE != 0 {
-        pte |= PageTableFlags::WRITABLE;
-    }
-    if prot & PROT_EXEC == 0 {
-        pte |= PageTableFlags::NO_EXECUTE;
-    }
-
-    let pages = len / 4096;
+    let pte_bits = prot_pte_from_prot_user(prot);
+    let pages = range.len / 4096;
     let obj = AnonObject::new(Some(pages));
-    let vma = Vma::new(
+
+    let mut vma = Vma::new(
         start,
-        start + len,
+        start + range.len,
         prot,
-        pte.bits(),
-        Share::Private,
+        pte_bits,
+        share,
         obj as Arc<dyn VmObject>,
         0,
     );
+    if flags & MAP_GROWSDOWN != 0 {
+        vma.vma_flags |= VMA_GROWSDOWN;
+    }
     guard.insert(vma);
     start as i64
+}
+
+/// `munmap(addr, len)` — POSIX-conformant: returns 0 on success and on
+/// holes (partly-or-wholly unmapped ranges). `-EINVAL` only for the
+/// validation failures in RFC 0001.
+unsafe fn sys_munmap(addr: u64, len: u64) -> i64 {
+    use crate::fs::EINVAL;
+    use crate::mem::pf::{validate_user_range, AddrAlign};
+
+    let range = match validate_user_range(addr, len, AddrAlign::Exact) {
+        Ok(r) => r,
+        Err(_) => return EINVAL,
+    };
+
+    let aspace = crate::task::current_address_space();
+    let mut guard = aspace.write();
+    guard.sys_munmap_range(range.addr, range.addr + range.len);
+    0
+}
+
+/// `mprotect(addr, len, prot)` — Linux `mprotect_fixup` semantics.
+/// `-EINVAL` on validation failure or unknown PROT bits; `-ENOMEM` only
+/// when a sub-page of `[addr, addr+len)` is literally unmapped.
+unsafe fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    use crate::fs::{EINVAL, ENOMEM};
+    use crate::mem::pf::{validate_user_range, AddrAlign, PROT_EXEC, PROT_READ, PROT_WRITE};
+
+    let prot = prot as u32;
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return EINVAL;
+    }
+
+    let range = match validate_user_range(addr, len, AddrAlign::Exact) {
+        Ok(r) => r,
+        Err(_) => return EINVAL,
+    };
+
+    let aspace = crate::task::current_address_space();
+    let mut guard = aspace.write();
+
+    if !guard.range_fully_covered(range.addr, range.len) {
+        return ENOMEM;
+    }
+
+    let pte_bits = prot_pte_from_prot_user(prot);
+    guard.sys_mprotect_range(range.addr, range.addr + range.len, prot, pte_bits);
+    0
+}
+
+/// `madvise(addr, len, advice)`. `MADV_DONTNEED` on `MAP_PRIVATE |
+/// MAP_ANONYMOUS` drops the covered PTEs and evicts the backing
+/// `AnonObject`'s cached frames. Every other recognised advice value is
+/// accepted as a no-op; unknown advice returns `-EINVAL`.
+unsafe fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
+    use crate::fs::EINVAL;
+    use crate::mem::pf::{
+        validate_user_range, AddrAlign, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM,
+        MADV_SEQUENTIAL, MADV_WILLNEED,
+    };
+
+    let range = match validate_user_range(addr, len, AddrAlign::Exact) {
+        Ok(r) => r,
+        Err(_) => return EINVAL,
+    };
+
+    let advice = advice as i32;
+    match advice {
+        MADV_DONTNEED => {
+            let aspace = crate::task::current_address_space();
+            let mut guard = aspace.write();
+            guard.sys_madvise_dontneed(range.addr, range.addr + range.len);
+            0
+        }
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_FREE => 0,
+        _ => EINVAL,
+    }
 }
 
 unsafe extern "C" {

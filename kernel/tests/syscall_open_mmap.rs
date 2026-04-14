@@ -17,8 +17,8 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
-use vibix::fs::{EBADF, EINVAL, ENAMETOOLONG, ENOENT};
-use vibix::mem::pf::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE};
+use vibix::fs::{EBADF, EINVAL, ENAMETOOLONG, ENODEV, ENOENT};
+use vibix::mem::pf::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
 use vibix::{
@@ -78,7 +78,10 @@ fn run_tests() {
             "mmap_rejects_nonzero_off",
             &(mmap_rejects_nonzero_off as fn()),
         ),
-        ("mmap_rejects_fixed", &(mmap_rejects_fixed as fn())),
+        (
+            "mmap_fixed_returns_requested_va",
+            &(mmap_fixed_returns_requested_va as fn()),
+        ),
         (
             "mmap_two_calls_return_disjoint",
             &(mmap_two_calls_return_disjoint as fn()),
@@ -237,17 +240,22 @@ fn mmap_zero_len_einval() {
 }
 
 fn mmap_requires_anon_private() {
-    // Missing MAP_ANONYMOUS.
+    // Missing MAP_ANONYMOUS with fd=-1 → file-backed path is attempted
+    // and returns ENODEV (no VFS yet) per RFC 0001.
     let r = mmap(0, 4096, PROT_READ, MAP_PRIVATE, -1, 0);
-    assert_eq!(r, EINVAL, "MAP_PRIVATE alone must return EINVAL, got {}", r);
-    // MAP_SHARED is not yet supported.
-    let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    assert_eq!(
+        r, ENODEV,
+        "MAP_PRIVATE without MAP_ANONYMOUS routes to file-backed path: ENODEV"
+    );
+    // Neither MAP_PRIVATE nor MAP_SHARED → EINVAL.
+    let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS, -1, 0);
     assert_eq!(r, EINVAL);
 }
 
 fn mmap_rejects_non_neg_fd() {
+    // fd != -1 routes to the (unsupported) file-backed path → ENODEV.
     let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
-    assert_eq!(r, EINVAL);
+    assert_eq!(r, ENODEV);
 }
 
 fn mmap_rejects_nonzero_off() {
@@ -255,16 +263,20 @@ fn mmap_rejects_nonzero_off() {
     assert_eq!(r, EINVAL);
 }
 
-fn mmap_rejects_fixed() {
+fn mmap_fixed_returns_requested_va() {
+    // MAP_FIXED is now supported (RFC 0001): returns the requested VA,
+    // silently evicting any overlap.
+    let a = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    assert!(a > 0);
     let r = mmap(
-        0x4000_0000,
+        a as u64,
         4096,
         PROT_READ,
         MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
         -1,
         0,
     );
-    assert_eq!(r, EINVAL);
+    assert_eq!(r as u64, a as u64);
 }
 
 fn mmap_two_calls_return_disjoint() {
