@@ -54,12 +54,17 @@ pub enum LoadError {
     MapFailed(MapToError<Size4KiB>),
 }
 
-/// Result of a successful load: the entry point and the number of
-/// `PT_LOAD` segments that were mapped.
+/// Result of a successful load: the entry point, segment count, and the
+/// page-aligned virtual address one byte past the last `PT_LOAD` segment.
+/// `image_end` is the natural place to start the heap (`brk_start`) after
+/// the process image is loaded.
 #[derive(Debug, Clone, Copy)]
 pub struct LoadedImage {
     pub entry: VirtAddr,
     pub segments: usize,
+    /// First page-aligned address after the last PT_LOAD segment.
+    /// The `sys_brk` implementation uses this as the initial heap start.
+    pub image_end: u64,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -76,12 +81,18 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     }
 
     let mut segments = 0usize;
+    let mut image_end = 0u64;
     let mut flusher = Flusher::new_active();
     let mut err: Option<LoadError> = None;
     for seg in parsed.load_segments() {
         if let Err(e) = map_segment(bytes, seg, &mut flusher) {
             err = Some(e);
             break;
+        }
+        // Track the page-aligned end of the highest PT_LOAD segment.
+        let seg_end = (seg.vaddr.as_u64() + seg.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if seg_end > image_end {
+            image_end = seg_end;
         }
         segments += 1;
     }
@@ -93,7 +104,11 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         return Err(e);
     }
 
-    Ok(LoadedImage { entry, segments })
+    Ok(LoadedImage {
+        entry,
+        segments,
+        image_end,
+    })
 }
 
 /// First canonical upper-half address. Bits [63:47] must all be 1 for
@@ -124,11 +139,16 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
     }
 
     let mut segments = 0usize;
+    let mut image_end = 0u64;
     let mut err: Option<LoadError> = None;
     for seg in parsed.load_segments() {
         if let Err(e) = map_user_segment(bytes, seg, pml4) {
             err = Some(e);
             break;
+        }
+        let seg_end = (seg.vaddr.as_u64() + seg.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if seg_end > image_end {
+            image_end = seg_end;
         }
         segments += 1;
     }
@@ -140,7 +160,11 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         return Err(e);
     }
 
-    Ok(LoadedImage { entry, segments })
+    Ok(LoadedImage {
+        entry,
+        segments,
+        image_end,
+    })
 }
 
 /// Load `bytes` as a lower-half ELF into `pml4` AND register each
