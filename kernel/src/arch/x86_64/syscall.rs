@@ -520,8 +520,8 @@ unsafe fn sys_open(path_uva: u64, flags: u64, _mode: u64) -> i64 {
     }
 
     // Mask caller-supplied flags down to the bits our fd table honors.
-    let safe_flags = (flags as u32)
-        & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
+    let safe_flags =
+        (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
 
     let backend: Arc<dyn FileBackend> = Arc::new(SerialBackend);
     let desc = Arc::new(FileDescription {

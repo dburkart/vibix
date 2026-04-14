@@ -44,20 +44,50 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("open_dev_stdout_returns_fd", &(open_dev_stdout_returns_fd as fn())),
-        ("open_unknown_returns_enoent", &(open_unknown_returns_enoent as fn())),
-        ("open_bad_user_ptr_returns_efault", &(open_bad_user_ptr_returns_efault as fn())),
-        ("open_path_not_terminated", &(open_path_not_terminated as fn())),
+        (
+            "open_dev_stdout_returns_fd",
+            &(open_dev_stdout_returns_fd as fn()),
+        ),
+        (
+            "open_unknown_returns_enoent",
+            &(open_unknown_returns_enoent as fn()),
+        ),
+        (
+            "open_bad_user_ptr_returns_efault",
+            &(open_bad_user_ptr_returns_efault as fn()),
+        ),
+        (
+            "open_path_not_terminated",
+            &(open_path_not_terminated as fn()),
+        ),
         ("close_closes_opened_fd", &(close_closes_opened_fd as fn())),
-        ("mmap_anonymous_returns_user_va", &(mmap_anonymous_returns_user_va as fn())),
+        (
+            "mmap_anonymous_returns_user_va",
+            &(mmap_anonymous_returns_user_va as fn()),
+        ),
         ("mmap_zero_len_einval", &(mmap_zero_len_einval as fn())),
-        ("mmap_requires_anon_private", &(mmap_requires_anon_private as fn())),
-        ("mmap_rejects_non_neg_fd", &(mmap_rejects_non_neg_fd as fn())),
-        ("mmap_rejects_nonzero_off", &(mmap_rejects_nonzero_off as fn())),
+        (
+            "mmap_requires_anon_private",
+            &(mmap_requires_anon_private as fn()),
+        ),
+        (
+            "mmap_rejects_non_neg_fd",
+            &(mmap_rejects_non_neg_fd as fn()),
+        ),
+        (
+            "mmap_rejects_nonzero_off",
+            &(mmap_rejects_nonzero_off as fn()),
+        ),
         ("mmap_rejects_fixed", &(mmap_rejects_fixed as fn())),
-        ("mmap_two_calls_return_disjoint", &(mmap_two_calls_return_disjoint as fn())),
+        (
+            "mmap_two_calls_return_disjoint",
+            &(mmap_two_calls_return_disjoint as fn()),
+        ),
         ("read_write_via_new_fd", &(read_write_via_new_fd as fn())),
-        ("unknown_syscall_returns_enosys", &(unknown_syscall_returns_enosys as fn())),
+        (
+            "unknown_syscall_returns_enosys",
+            &(unknown_syscall_returns_enosys as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -79,8 +109,7 @@ const USER_PAGE_LEN: usize = 4 * 4096;
 /// paths) and the `#PF` handler backs them with a real frame on first
 /// touch.
 fn install_user_staging_vma() {
-    static INSTALLED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    static INSTALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if INSTALLED.swap(true, core::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -129,17 +158,7 @@ fn close(fd: u32) -> i64 {
 }
 
 fn mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i64, off: u64) -> i64 {
-    unsafe {
-        syscall_dispatch(
-            9,
-            addr,
-            len,
-            prot as u64,
-            flags as u64,
-            fd as u64,
-            off,
-        )
-    }
+    unsafe { syscall_dispatch(9, addr, len, prot as u64, flags as u64, fd as u64, off) }
 }
 
 // --- open() tests --------------------------------------------------------
