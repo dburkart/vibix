@@ -45,8 +45,8 @@ use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::alloc_fs_id;
 use super::open_file::OpenFile;
 use super::ops::{
-    meta_into_stat, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat,
-    StatFs, SuperOps, Whence,
+    meta_into_stat, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat, StatFs,
+    SuperOps, Whence,
 };
 use super::super_block::{SbFlags, SuperBlock};
 use super::DString;
@@ -71,9 +71,15 @@ const RAMFS_MAGIC: u64 = 0x858458f6;
 // ---------------------------------------------------------------------------
 
 pub(super) enum RamfsBody {
-    Reg { data: Vec<u8> },
-    Dir { children: BTreeMap<DString, Arc<Inode>> },
-    Sym { target: Vec<u8> },
+    Reg {
+        data: Vec<u8>,
+    },
+    Dir {
+        children: BTreeMap<DString, Arc<Inode>>,
+    },
+    Sym {
+        target: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +225,11 @@ impl InodeOps for RamfsInode {
             1,
             RamfsBody::Reg { data: Vec::new() },
         );
-        self.body.lock().as_dir_mut().unwrap().insert(key, child.clone());
+        self.body
+            .lock()
+            .as_dir_mut()
+            .unwrap()
+            .insert(key, child.clone());
         Ok(child)
     }
 
@@ -243,9 +253,15 @@ impl InodeOps for RamfsInode {
             InodeKind::Dir,
             mode & 0o7777,
             2, // self-link + ".."
-            RamfsBody::Dir { children: BTreeMap::new() },
+            RamfsBody::Dir {
+                children: BTreeMap::new(),
+            },
         );
-        self.body.lock().as_dir_mut().unwrap().insert(key, child.clone());
+        self.body
+            .lock()
+            .as_dir_mut()
+            .unwrap()
+            .insert(key, child.clone());
         // Parent gains a back-link from the new subdir's "..".
         dir.meta.write().nlink = dir.meta.read().nlink.saturating_add(1);
         Ok(child)
@@ -257,9 +273,7 @@ impl InodeOps for RamfsInode {
         let child = {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } => {
-                    children.get(&key).cloned().ok_or(ENOENT)?
-                }
+                RamfsBody::Dir { children } => children.get(&key).cloned().ok_or(ENOENT)?,
                 _ => return Err(ENOTDIR),
             }
         };
@@ -284,9 +298,7 @@ impl InodeOps for RamfsInode {
         let child = {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } => {
-                    children.get(&key).cloned().ok_or(ENOENT)?
-                }
+                RamfsBody::Dir { children } => children.get(&key).cloned().ok_or(ENOENT)?,
                 _ => return Err(ENOTDIR),
             }
         };
@@ -396,9 +408,7 @@ impl InodeOps for RamfsInode {
             let moving = {
                 let mut ob = old_body_arc.lock();
                 match &mut *ob {
-                    RamfsBody::Dir { children } => {
-                        children.get(&old_key).cloned().ok_or(ENOENT)?
-                    }
+                    RamfsBody::Dir { children } => children.get(&old_key).cloned().ok_or(ENOENT)?,
                     _ => return Err(ENOTDIR),
                 }
             };
@@ -462,11 +472,12 @@ impl InodeOps for RamfsInode {
             }
         }
         // Look up the canonical Arc<Inode> from the identity table.
-        let inode_arc = self
-            .state
-            .get(target.ino)
-            .ok_or(ENOENT)?;
-        self.body.lock().as_dir_mut().unwrap().insert(key, inode_arc);
+        let inode_arc = self.state.get(target.ino).ok_or(ENOENT)?;
+        self.body
+            .lock()
+            .as_dir_mut()
+            .unwrap()
+            .insert(key, inode_arc);
         target.meta.write().nlink = target.meta.read().nlink.saturating_add(1);
         Ok(())
     }
@@ -491,9 +502,15 @@ impl InodeOps for RamfsInode {
             InodeKind::Link,
             0o777,
             1,
-            RamfsBody::Sym { target: target.to_vec() },
+            RamfsBody::Sym {
+                target: target.to_vec(),
+            },
         );
-        self.body.lock().as_dir_mut().unwrap().insert(key, child.clone());
+        self.body
+            .lock()
+            .as_dir_mut()
+            .unwrap()
+            .insert(key, child.clone());
         Ok(child)
     }
 
@@ -660,7 +677,14 @@ impl FileOps for RamfsInode {
 
 /// Emits one `linux_dirent64` record at `buf[offset..]`.
 /// Returns the number of bytes written, or 0 if the buffer has no room.
-fn emit_dirent(buf: &mut [u8], offset: usize, d_ino: u64, d_off: u64, d_type: u8, name: &[u8]) -> usize {
+fn emit_dirent(
+    buf: &mut [u8],
+    offset: usize,
+    d_ino: u64,
+    d_off: u64,
+    d_type: u8,
+    name: &[u8],
+) -> usize {
     // linux_dirent64:
     //   u64  d_ino        (offset 0)
     //   i64  d_off        (offset 8)
@@ -669,7 +693,7 @@ fn emit_dirent(buf: &mut [u8], offset: usize, d_ino: u64, d_off: u64, d_type: u8
     //   char d_name[]     (offset 19, NUL-terminated, padded to 8-byte alignment)
     let header = 19usize;
     let raw = header + name.len() + 1; // +1 for NUL
-    let reclen = (raw + 7) & !7;       // round up to 8-byte boundary
+    let reclen = (raw + 7) & !7; // round up to 8-byte boundary
 
     let dest = match buf.get_mut(offset..offset + reclen) {
         Some(s) => s,
@@ -689,11 +713,11 @@ fn emit_dirent(buf: &mut [u8], offset: usize, d_ino: u64, d_off: u64, d_type: u8
 
 fn inode_kind_to_dt(kind: InodeKind) -> u8 {
     match kind {
-        InodeKind::Reg  => 8,  // DT_REG
-        InodeKind::Dir  => 4,  // DT_DIR
+        InodeKind::Reg => 8,   // DT_REG
+        InodeKind::Dir => 4,   // DT_DIR
         InodeKind::Link => 10, // DT_LNK
-        InodeKind::Chr  => 2,  // DT_CHR
-        InodeKind::Blk  => 6,  // DT_BLK
+        InodeKind::Chr => 2,   // DT_CHR
+        InodeKind::Blk => 6,   // DT_BLK
         InodeKind::Fifo => 1,  // DT_FIFO
         InodeKind::Sock => 12, // DT_SOCK
     }
@@ -800,7 +824,9 @@ impl FileSystem for RamFs {
                 InodeKind::Dir,
                 0o755,
                 2,
-                RamfsBody::Dir { children: BTreeMap::new() },
+                RamfsBody::Dir {
+                    children: BTreeMap::new(),
+                },
             );
             sb_inner.root.call_once(|| root);
             sb_inner
@@ -955,7 +981,9 @@ mod tests {
         root.ops.mkdir(&root, b"sub", 0o755).expect("mkdir");
         let sub = root.ops.lookup(&root, b"sub").expect("lookup sub");
         root.ops.create(&root, b"a", 0o644).expect("create a");
-        root.ops.rename(&root, b"a", &sub, b"a").expect("cross-dir rename");
+        root.ops
+            .rename(&root, b"a", &sub, b"a")
+            .expect("cross-dir rename");
         assert_eq!(root.ops.lookup(&root, b"a"), Err(ENOENT));
         assert!(sub.ops.lookup(&sub, b"a").is_ok());
     }
@@ -964,7 +992,9 @@ mod tests {
     fn symlink_and_readlink() {
         let sb = make_ramfs();
         let root = root_of(&sb);
-        root.ops.symlink(&root, b"lnk", b"/etc/passwd").expect("symlink");
+        root.ops
+            .symlink(&root, b"lnk", b"/etc/passwd")
+            .expect("symlink");
         let lnk = root.ops.lookup(&root, b"lnk").expect("lookup lnk");
         assert_eq!(lnk.kind, InodeKind::Link);
         let mut buf = [0u8; 64];
@@ -1050,8 +1080,7 @@ mod tests {
             }
             let mut pos = 0;
             while pos + 19 <= n {
-                let reclen =
-                    u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+                let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
                 if reclen == 0 {
                     break;
                 }
@@ -1074,7 +1103,9 @@ mod tests {
     #[test]
     fn statfs_returns_ramfs_magic() {
         let sb = make_ramfs();
-        let fs = StatFs { ..Default::default() };
+        let fs = StatFs {
+            ..Default::default()
+        };
         let sf = sb.ops.statfs().expect("statfs");
         assert_eq!(sf.f_type, RAMFS_MAGIC);
         assert_eq!(sf.f_bsize, 4096);
