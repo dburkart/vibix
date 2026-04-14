@@ -364,12 +364,15 @@ pub unsafe extern "C" fn syscall_dispatch(
                 Err(_) => return -8, // ENOEXEC
             };
 
+            // Set the heap base to immediately after the new ELF image.
+            use x86_64::VirtAddr;
+            aspace.write().set_brk_start(VirtAddr::new(image.image_end));
+
             // Map a fresh user stack page and register it as a VMA so the
             // exec'd process's stack frame is also reclaimed on exit.
             use crate::mem::vmatree::{Share, Vma};
             use crate::mem::vmobject::{AnonObject, VmObject};
             use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
-            use x86_64::VirtAddr;
             let stack_flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE
