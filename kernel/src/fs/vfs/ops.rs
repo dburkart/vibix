@@ -11,10 +11,10 @@
 
 use alloc::sync::Arc;
 
-use super::{Access, Credential, InodeKind, Timespec};
 use super::inode::{Inode, InodeMeta};
 use super::open_file::OpenFile;
 use super::super_block::SuperBlock;
+use super::{Access, Credential, InodeKind, Timespec};
 
 /// Source of a mount operation. Separated from the target path so
 /// future sources (block device, ramdisk module, network URL) can be
@@ -278,7 +278,13 @@ pub fn default_permission(inode: &Inode, cred: &Credential, access: Access) -> R
 /// private helper so callers inside this crate can reach for it
 /// without pulling in the whole stat-construction scaffolding.
 #[allow(dead_code)]
-pub(crate) fn meta_into_stat(meta: &InodeMeta, kind: InodeKind, fs_id: u64, ino: u64, out: &mut Stat) {
+pub(crate) fn meta_into_stat(
+    meta: &InodeMeta,
+    kind: InodeKind,
+    fs_id: u64,
+    ino: u64,
+    out: &mut Stat,
+) {
     let kind_bits: u32 = match kind {
         InodeKind::Reg => 0o100_000,
         InodeKind::Dir => 0o040_000,

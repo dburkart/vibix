@@ -19,9 +19,9 @@ use alloc::sync::{Arc, Weak};
 
 use crate::sync::{BlockingRwLock, Semaphore};
 
-use super::DString;
 use super::inode::Inode;
 use super::super_block::SuperBlock;
+use super::DString;
 
 /// Per-dentry flags (IS_ROOT, DISCONNECTED, ...). Empty for now;
 /// filled out by later RFC 0002 items.

@@ -9,9 +9,9 @@ use alloc::sync::{Arc, Weak};
 
 use crate::sync::{BlockingMutex, BlockingRwLock};
 
-use super::Timespec;
 use super::ops::{FileOps, InodeOps};
 use super::super_block::SuperBlock;
+use super::Timespec;
 
 /// Enumerated file kind. Packs into `S_IFMT` bits of `st_mode` at
 /// `getattr` time.

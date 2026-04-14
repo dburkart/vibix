@@ -13,9 +13,9 @@ use spin::Once;
 
 use crate::sync::BlockingMutex;
 
-use super::FsId;
 use super::inode::Inode;
 use super::ops::SuperOps;
+use super::FsId;
 
 /// Flags stored on a [`SuperBlock`]; a syscall bounces off them before
 /// calling into `*Ops`. Matches the Linux `SB_*` subset we need.
