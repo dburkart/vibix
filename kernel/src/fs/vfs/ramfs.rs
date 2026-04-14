@@ -808,8 +808,8 @@ impl SuperOps for RamfsSuperOps {
         })
     }
 
-    fn unmount(&self) -> Result<(), i64> {
-        Ok(()) // in-memory FS: nothing to flush
+    fn unmount(&self) {
+        // in-memory FS: nothing to flush
     }
 
     fn evict_inode(&self, ino: u64) -> Result<(), i64> {

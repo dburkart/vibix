@@ -481,9 +481,7 @@ mod tests {
         fn statfs(&self) -> Result<StatFs, i64> {
             Ok(StatFs::default())
         }
-        fn unmount(&self) -> Result<(), i64> {
-            Ok(())
-        }
+        fn unmount(&self) {}
     }
 
     fn mk_inode(ino: u64, kind: InodeKind, fs: Arc<FakeFs>, sb: Weak<SuperBlock>) -> Arc<Inode> {

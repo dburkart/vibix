@@ -196,9 +196,7 @@ mod tests {
         fn statfs(&self) -> Result<StatFs, i64> {
             Ok(StatFs::default())
         }
-        fn unmount(&self) -> Result<(), i64> {
-            Ok(())
-        }
+        fn unmount(&self) {}
         fn evict_inode(&self, _ino: u64) -> Result<(), i64> {
             self.evicted.fetch_add(1, Ordering::SeqCst);
             Ok(())

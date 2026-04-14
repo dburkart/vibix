@@ -97,9 +97,7 @@ impl SuperOps for TarSuper {
         })
     }
 
-    fn unmount(&self) -> Result<(), i64> {
-        Ok(())
-    }
+    fn unmount(&self) {}
 }
 
 /// Shared `InodeOps` implementation for every tarfs inode. The

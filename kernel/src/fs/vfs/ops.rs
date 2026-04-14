@@ -167,7 +167,21 @@ pub trait SuperOps: Send + Sync {
         Ok(())
     }
     fn statfs(&self) -> Result<StatFs, i64>;
-    fn unmount(&self) -> Result<(), i64>;
+    /// Called during Phase B of `unmount()`, after the mount edge has been
+    /// removed from the table (Phase A).  At this point the mount is
+    /// irrevocably gone regardless of what this method does.
+    ///
+    /// **Contract (Linux-compatible, option a)**: this method **must not
+    /// propagate errors** to the VFS layer.  Any I/O errors encountered while
+    /// flushing dirty state (e.g. syncing a block device) must be absorbed
+    /// inside the driver — logged if useful, then silently dropped.  A caller
+    /// that receives `Ok(())` from `fs::vfs::unmount()` is guaranteed the
+    /// mount is detached; a retry would receive `EINVAL`.
+    ///
+    /// Drivers that are purely in-memory (ramfs, devfs) implement this as a
+    /// no-op.  Drivers backed by persistent storage should flush dirty data
+    /// here and log errors via the kernel's serial log.
+    fn unmount(&self);
 }
 
 /// Per-inode operations: namespace mutation, metadata, permission.
