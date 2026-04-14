@@ -94,6 +94,12 @@ pub static FORK_USER_RFLAGS: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static FORK_USER_RSP: AtomicU64 = AtomicU64::new(0);
 
+/// Set to 1 by `sys_sigreturn` to tell `check_and_deliver_signals` to
+/// overwrite the saved user context with the restored register values
+/// rather than pushing a new signal frame.  Cleared after consumption.
+#[no_mangle]
+pub static SIGRETURN_PENDING: AtomicU64 = AtomicU64::new(0);
+
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
 pub fn init() {
@@ -413,6 +419,31 @@ pub unsafe extern "C" fn syscall_dispatch(
                     .wait_while(|| crate::process::exit_event_count() == snap);
             }
         }
+
+        // sigaction(sig, act, oldact) — register or query signal handler.
+        13 => crate::signal::sys_sigaction(a0, a1, a2),
+
+        // sigprocmask(how, set, oldset) — update signal mask.
+        14 => crate::signal::sys_sigprocmask(a0, a1, a2),
+
+        // sigreturn() — restore context from signal frame.
+        // The user RSP at syscall entry (saved by the trampoline in
+        // FORK_USER_RSP) points at the SigFrame on the user stack.
+        // We restore the saved [rip, rflags, rsp] and stash them in
+        // FORK_USER_* so check_and_deliver_signals can apply them to
+        // the kernel-stack-saved context before SYSRETQ.
+        15 => {
+            let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
+            let restored = crate::signal::sys_sigreturn(user_rsp);
+            FORK_USER_RIP.store(restored.rip, Ordering::Relaxed);
+            FORK_USER_RFLAGS.store(restored.rflags, Ordering::Relaxed);
+            FORK_USER_RSP.store(restored.rsp, Ordering::Relaxed);
+            SIGRETURN_PENDING.store(1, Ordering::Relaxed);
+            0i64
+        }
+
+        // kill(pid, sig) — send signal to process.
+        62 => crate::signal::sys_kill(a0, a1),
 
         _ => -38i64, // ENOSYS
     }
@@ -848,6 +879,16 @@ syscall_entry:
     call syscall_dispatch
     add rsp, 8
     // rax = return value
+
+    // 5b. Check for pending signals before returning to user.
+    //     Pass a pointer to the saved [user_rip, user_rflags, user_rsp]
+    //     on the kernel stack so check_and_deliver_signals can redirect
+    //     the return to a signal handler if needed.
+    //     Save rax across the call (it holds the syscall return value).
+    push rax
+    lea rdi, [rsp + 8]   // pointer to saved [rip, rflags, rsp]
+    call check_and_deliver_signals
+    pop rax
 
     // 6. Restore return-to-user context.
     pop rcx           // user RIP  → rcx  (for SYSRETQ)
