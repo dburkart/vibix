@@ -36,6 +36,9 @@ pub mod pf;
 pub mod addrspace;
 
 #[cfg(target_os = "none")]
+pub mod mmap;
+
+#[cfg(target_os = "none")]
 use spin::Once;
 
 #[cfg(target_os = "none")]

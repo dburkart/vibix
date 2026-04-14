@@ -411,6 +411,20 @@ pub fn update_current_cr3(
     current.cr3 = frame;
 }
 
+/// Clone the `Arc<RwLock<AddressSpace>>` for the currently-running task.
+///
+/// Syscall handlers that need to mutate the address space (mmap, munmap,
+/// mprotect, madvise) call this to get a handle they can lock independently
+/// of the scheduler lock.
+pub fn current_address_space() -> alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>> {
+    let sched = SCHED.lock();
+    let current = sched
+        .current
+        .as_ref()
+        .expect("current_address_space: no running task");
+    current.address_space.clone()
+}
+
 /// Install a VMA on the currently-running task. The VMA is resolved
 /// lazily by the `#PF` handler on first touch of each page via
 /// [`VmObject::fault`].

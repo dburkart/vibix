@@ -80,6 +80,17 @@ static mut INIT_KERNEL_STACK: AlignedStack = AlignedStack([0u8; 16 * 1024]);
 #[no_mangle]
 pub static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 
+/// Single-CPU scratch cell for the user's `r10` register on SYSCALL entry.
+///
+/// The Linux x86_64 ABI uses `r10` as the 4th syscall argument (flags for
+/// `mmap`, etc.) because SYSCALL overwrites `rcx` with the user RIP.  Our
+/// entry trampoline must clobber `r10` to temporarily hold the user RSP
+/// while switching stacks; it saves the original `r10` here first so the
+/// dispatcher can read it back as `a3`.  Safe on single-CPU because no
+/// concurrent syscall can be in flight; SMP will need a per-CPU slot.
+#[no_mangle]
+pub static SYSCALL_A3_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
 pub fn init() {
@@ -154,13 +165,34 @@ use super::uaccess;
 
 /// Syscall handler called from the `syscall_entry` trampoline.
 ///
+/// `a3` and `a4` are the 4th and 5th syscall arguments, supplied by the
+/// trampoline from the user's `r10` (saved before it is clobbered) and the
+/// user's `r8` respectively.  The 6th argument (`r9` / file offset) is not
+/// yet forwarded — it is only meaningful for file-backed `mmap`, which is
+/// not implemented in this issue.
+///
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
 /// interrupts disabled. User pointer arguments are validated and
 /// marshalled via `uaccess::copy_from_user` before any dereference.
 #[no_mangle]
-pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+pub unsafe extern "C" fn syscall_dispatch(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+) -> i64 {
     match nr {
+        // mmap(addr, len, prot, flags, fd, offset) — anon-private/shared only
+        9 => crate::mem::mmap::sys_mmap(a0, a1, a2, a3, a4, 0),
+        // mprotect(addr, len, prot)
+        10 => crate::mem::mmap::sys_mprotect(a0, a1, a2),
+        // munmap(addr, len)
+        11 => crate::mem::mmap::sys_munmap(a0, a1),
+        // madvise(addr, len, advice)
+        28 => crate::mem::mmap::sys_madvise(a0, a1, a2),
         // write(fd, buf, len) — fd=1 (stdout/stderr) → serial
         1 => {
             let fd = a0;
@@ -244,16 +276,17 @@ global_asm!(
     .align 16
 
 syscall_entry:
-    // On SYSCALL entry (x86_64):
-    //   rax=nr  rdi=a0  rsi=a1  rdx=a2
+    // On SYSCALL entry (x86_64 Linux ABI):
+    //   rax=nr  rdi=a0  rsi=a1  rdx=a2  r10=a3  r8=a4  r9=a5(unused)
     //   rcx=user_RIP  r11=user_RFLAGS  rsp=user_RSP
-    // IF is cleared by SFMASK; r10 is caller-saved and unused here.
+    // IF is cleared by SFMASK.
 
-    // 1. Save user RSP in r10 (caller-saved, not a syscall argument).
+    // 1. Preserve user r10 (a3 — flags for mmap etc.) before clobbering
+    //    it with user RSP.  Single-CPU scratch; SMP will need per-CPU slot.
+    mov [{a3_scratch}], r10
+
+    // 2. Save user RSP in r10, then switch to kernel stack.
     mov r10, rsp
-
-    // 2. Load kernel RSP: lea gives us the address of the static;
-    //    the second mov dereferences it to get the stack-top value.
     lea rsp, [rip + {kernel_rsp}]
     mov rsp, [rsp]
 
@@ -262,12 +295,16 @@ syscall_entry:
     push r11          // user RFLAGS  (SYSRETQ restores RFLAGS from r11)
     push rcx          // user RIP     (SYSRETQ jumps to rcx)
 
-    // 4. Build syscall_dispatch(nr, a0, a1, a2) in SysV AMD64 registers.
-    //    rcx is now free (user RIP is on the stack).
-    mov rcx, rdx      // a2
-    mov rdx, rsi      // a1
-    mov rsi, rdi      // a0
-    mov rdi, rax      // nr
+    // 4. Build syscall_dispatch(nr, a0, a1, a2, a3, a4) in SysV AMD64 registers.
+    //    Target ABI: rdi=nr, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4.
+    //    r8 currently holds user a4 (fd); move it to r9 first so we can
+    //    load a3 (flags) into r8 without clobbering a4.
+    mov r9, r8                    // r9 = a4 (user fd, was r8)
+    mov r8, [{a3_scratch}]        // r8 = a3 (user flags, saved above)
+    mov rcx, rdx                  // a2 (prot)
+    mov rdx, rsi                  // a1 (len)
+    mov rsi, rdi                  // a0 (addr)
+    mov rdi, rax                  // nr
 
     // 5. Call the Rust dispatcher. Align stack to 16 bytes first.
     sub rsp, 8
@@ -285,4 +322,5 @@ syscall_entry:
     sysretq
     "#,
     kernel_rsp = sym SYSCALL_KERNEL_RSP,
+    a3_scratch  = sym SYSCALL_A3_SCRATCH,
 );

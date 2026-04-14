@@ -159,3 +159,7 @@ harness = false
 [[test]]
 name = "smep_smap"
 harness = false
+
+[[test]]
+name = "mmap_syscall"
+harness = false
