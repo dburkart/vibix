@@ -53,7 +53,7 @@ const REG_EFLAGS: usize = 17;
 /// Bytes: `48 C7 C0 0F 00 00 00 0F 05`
 const SIGRETURN_TRAMPOLINE: [u8; 9] = [
     0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, // mov rax, 15
-    0x0F, 0x05,                                // syscall
+    0x0F, 0x05, // syscall
 ];
 
 /// The signal frame pushed on the user stack before entering the handler.
@@ -132,8 +132,8 @@ pub unsafe fn push_signal_frame(
 
     // Get current signal mask from the process.
     let task_id = crate::task::current_id();
-    let saved_mask = crate::process::with_signal_state_for_task(task_id, |state| state.blocked)
-        .unwrap_or(0);
+    let saved_mask =
+        crate::process::with_signal_state_for_task(task_id, |state| state.blocked).unwrap_or(0);
 
     // Build the frame in kernel memory, then copy it to user space.
     let mut frame = SigFrame {
@@ -161,10 +161,8 @@ pub unsafe fn push_signal_frame(
     frame.gregs[REG_RSP] = user_rsp;
 
     // Copy frame to user stack.
-    let frame_bytes = core::slice::from_raw_parts(
-        &frame as *const SigFrame as *const u8,
-        frame_size as usize,
-    );
+    let frame_bytes =
+        core::slice::from_raw_parts(&frame as *const SigFrame as *const u8, frame_size as usize);
     uaccess::copy_to_user(frame_addr as usize, frame_bytes).map_err(|_| ())?;
 
     // The new user RSP points at `pretcode` (the bottom of the frame).
@@ -189,10 +187,7 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
 
     // Read frame from user space into a kernel buffer.
     let mut frame = core::mem::MaybeUninit::<SigFrame>::uninit();
-    let frame_bytes = core::slice::from_raw_parts_mut(
-        frame.as_mut_ptr() as *mut u8,
-        frame_size,
-    );
+    let frame_bytes = core::slice::from_raw_parts_mut(frame.as_mut_ptr() as *mut u8, frame_size);
     uaccess::copy_from_user(frame_bytes, frame_addr as usize).map_err(|_| ())?;
     let frame = frame.assume_init();
 

@@ -398,19 +398,18 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
     if crate::arch::x86_64::syscall::SIGRETURN_PENDING.load(Ordering::Relaxed) != 0 {
         crate::arch::x86_64::syscall::SIGRETURN_PENDING.store(0, Ordering::Relaxed);
         (*ctx).user_rip = crate::arch::x86_64::syscall::FORK_USER_RIP.load(Ordering::Relaxed);
-        (*ctx).user_rflags =
-            crate::arch::x86_64::syscall::FORK_USER_RFLAGS.load(Ordering::Relaxed);
+        (*ctx).user_rflags = crate::arch::x86_64::syscall::FORK_USER_RFLAGS.load(Ordering::Relaxed);
         (*ctx).user_rsp = crate::arch::x86_64::syscall::FORK_USER_RSP.load(Ordering::Relaxed);
         // After sigreturn still check for any newly-pending signal.
     }
 
     let task_id = crate::task::current_id();
-    let sig = match crate::process::with_signal_state_for_task(task_id, |state| {
-        state.pop_next_pending()
-    }) {
-        Some(Some(sig)) => sig,
-        _ => return, // no pending signal or no process entry
-    };
+    let sig =
+        match crate::process::with_signal_state_for_task(task_id, |state| state.pop_next_pending())
+        {
+            Some(Some(sig)) => sig,
+            _ => return, // no pending signal or no process entry
+        };
     deliver_signal(sig, &mut *ctx);
 }
 
@@ -461,23 +460,19 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
         }
         Disposition::Handler(handler_va) => {
             // Push signal frame onto the user stack and redirect SYSRETQ.
-            let new_user_rsp = match frame::push_signal_frame(
-                ctx.user_rsp,
-                sig,
-                ctx.user_rip,
-                ctx.user_rflags,
-            ) {
-                Ok(sp) => sp,
-                Err(_) => {
-                    // Could not push the frame (bad user RSP) — terminate.
-                    let pid = crate::process::current_pid();
-                    if pid != 0 {
-                        crate::process::reparent_children(pid);
-                        crate::process::mark_zombie(pid, -(sig as i32));
+            let new_user_rsp =
+                match frame::push_signal_frame(ctx.user_rsp, sig, ctx.user_rip, ctx.user_rflags) {
+                    Ok(sp) => sp,
+                    Err(_) => {
+                        // Could not push the frame (bad user RSP) — terminate.
+                        let pid = crate::process::current_pid();
+                        if pid != 0 {
+                            crate::process::reparent_children(pid);
+                            crate::process::mark_zombie(pid, -(sig as i32));
+                        }
+                        crate::task::exit();
                     }
-                    crate::task::exit();
-                }
-            };
+                };
             ctx.user_rip = handler_va;
             ctx.user_rsp = new_user_rsp;
             // Leave ctx.user_rflags as-is (handler sees caller's rflags).
@@ -546,8 +541,8 @@ mod tests {
         assert_eq!(sig_bit(1), 1u64);
         assert_eq!(sig_bit(2), 2u64);
         assert_eq!(sig_bit(64), 1u64 << 63);
-        assert_eq!(sig_bit(0), 0u64);   // invalid
-        assert_eq!(sig_bit(65), 0u64);  // out of range
+        assert_eq!(sig_bit(0), 0u64); // invalid
+        assert_eq!(sig_bit(65), 0u64); // out of range
     }
 
     #[test]
@@ -578,7 +573,7 @@ mod tests {
         let mut s = SignalState::new();
         s.raise(SIGKILL);
         s.blocked = !0u64; // try to block everything
-        // SIGKILL must still be deliverable.
+                           // SIGKILL must still be deliverable.
         assert_eq!(s.pop_next_pending(), Some(SIGKILL));
     }
 
