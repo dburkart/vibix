@@ -90,8 +90,8 @@ fn build_partial_fail_elf() -> [u8; HEADER_SIZE] {
     bytes[p0 + 4..p0 + 8].copy_from_slice(&5u32.to_le_bytes()); // R+X
     bytes[p0 + 16..p0 + 24].copy_from_slice(&0x0000_0000_0040_0000u64.to_le_bytes()); // p_vaddr
     bytes[p0 + 40..p0 + 48].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
-                                                                      // p_offset/p_filesz/p_paddr default to 0 — a zero-filesz PT_LOAD is
-                                                                      // a valid .bss-only segment.
+                                                                       // p_offset/p_filesz/p_paddr default to 0 — a zero-filesz PT_LOAD is
+                                                                       // a valid .bss-only segment.
 
     // Phdr 1: PT_LOAD whose page-aligned end lands on USER_VA_END.
     let p1 = EHDR + PHDR;
@@ -142,7 +142,8 @@ fn partial_load_failure_does_not_leak_frames() {
     );
 
     assert_eq!(
-        after_teardown, before,
+        after_teardown,
+        before,
         "frame accounting mismatch after failed load+teardown: \
          before={before}, after_teardown={after_teardown}, \
          delta={} — a leaf frame leaked on the loader error path",
