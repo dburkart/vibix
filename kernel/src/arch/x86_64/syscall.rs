@@ -318,7 +318,9 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
 
             // Clear all user VMAs and reset the address space.
             {
-                crate::task::current_address_space().write().clear_for_exec();
+                crate::task::current_address_space()
+                    .write()
+                    .clear_for_exec();
             }
 
             // Close O_CLOEXEC fds as POSIX requires on exec.
@@ -401,9 +403,8 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
                 }
                 // Park until any child exits (EXIT_EVENT advances).
                 let snap = crate::process::exit_event_count();
-                crate::process::CHILD_WAIT.wait_while(|| {
-                    crate::process::exit_event_count() == snap
-                });
+                crate::process::CHILD_WAIT
+                    .wait_while(|| crate::process::exit_event_count() == snap);
             }
         }
 

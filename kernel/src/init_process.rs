@@ -19,8 +19,8 @@ use x86_64::VirtAddr;
 
 use crate::arch::x86_64::syscall;
 use crate::mem::addrspace::AddressSpace;
-use crate::mem::vmobject::{AnonObject, VmObject};
 use crate::mem::vmatree::{Share, Vma};
+use crate::mem::vmobject::{AnonObject, VmObject};
 use crate::mem::{loader, paging};
 use crate::serial_println;
 
