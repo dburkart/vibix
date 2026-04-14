@@ -187,3 +187,7 @@ harness = false
 [[test]]
 name = "vfs_backend"
 harness = false
+
+[[test]]
+name = "vfs_hello"
+harness = false
