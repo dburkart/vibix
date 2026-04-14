@@ -146,11 +146,24 @@ pub fn fork_current_task(
         parent_affinity,
         parent_fpu_ptr,
     ) = {
-        let sched = SCHED.lock();
+        let mut sched = SCHED.lock();
         let cur = sched
             .current
-            .as_ref()
+            .as_mut()
             .expect("fork_current_task: no running task");
+        // Flush live FPU/SSE registers into the parent's saved area before
+        // the child copies from it — otherwise the snapshot only reflects
+        // state as of the parent's last context switch, not what the parent
+        // has actually touched since. SCHED is held across the save so a
+        // timer tick can't preempt (and overwrite the area itself) between
+        // the fxsave and the copy_nonoverlapping inside new_forked.
+        //
+        // SAFETY: fpu::init ran at arch bringup; `cur` is the running task
+        // so its FpuArea is the one whose live CPU state we are capturing,
+        // and holding SCHED excludes any aliasing save from context_switch.
+        unsafe {
+            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+        }
         (
             Arc::clone(&cur.address_space),
             Arc::clone(&cur.fd_table),
