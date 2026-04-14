@@ -73,6 +73,8 @@ const SMOKE_MARKERS: &[&str] = &[
     "userspace: loader mapping image",
     "syscall: SYSCALL/SYSRET enabled",
     "init: hello from pid 1",
+    "hello: hello from execed child",
+    "init: fork+exec+wait ok",
 ];
 
 fn main() -> R<()> {
@@ -234,6 +236,39 @@ fn build_userspace_init() -> R<PathBuf> {
     let bin = userspace_init_binary();
     if !bin.exists() {
         return Err(format!("userspace init binary missing at {}", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
+fn userspace_hello_binary() -> PathBuf {
+    workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join("userspace_hello")
+}
+
+/// Build the hello binary — the exec() target for the fork+exec+wait test.
+/// Links at 0x400000 (lower half) just like init so load_user_elf accepts it.
+fn build_userspace_hello() -> R<PathBuf> {
+    let rustflags = [
+        "-C link-arg=-Tuserspace/hello/link.ld",
+        "-C relocation-model=static",
+        "-C code-model=small",
+        "-C no-redzone=yes",
+        "-C force-frame-pointers=yes",
+    ]
+    .join(" ");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .args(["build", "--package", "userspace_hello"])
+        .args(KERNEL_BUILD_STD_ARGS);
+    check(cmd.status()?)?;
+    let bin = userspace_hello_binary();
+    if !bin.exists() {
+        return Err(format!("userspace hello binary missing at {}", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
@@ -429,6 +464,7 @@ fn ensure_limine() -> R<PathBuf> {
 fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let limine = ensure_limine()?;
     let userspace_init = build_userspace_init()?;
+    let userspace_hello = build_userspace_hello()?;
     let iso_root = workspace_root().join("build").join(staging);
     let _ = fs::remove_dir_all(&iso_root);
     fs::create_dir_all(iso_root.join("boot/limine"))?;
@@ -436,6 +472,7 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
 
     fs::copy(kernel, iso_root.join("boot/vibix"))?;
     fs::copy(userspace_init, iso_root.join("boot/userspace_init.elf"))?;
+    fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
     fs::copy(
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),

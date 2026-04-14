@@ -116,3 +116,11 @@ pub fn userspace_module_elf_summary() -> Option<(x86_64::VirtAddr, usize)> {
 pub fn userspace_module_elf_bytes() -> Option<&'static [u8]> {
     USERSPACE_MODULE_ELF_BYTES.get().copied().flatten()
 }
+
+/// Raw bytes of the `userspace_hello.elf` Limine module. Fetched on
+/// demand (not cached in a Once because it's only needed at exec time).
+/// Returns `None` if the module was not included in the ISO.
+#[cfg(target_os = "none")]
+pub fn userspace_hello_elf_bytes() -> Option<&'static [u8]> {
+    elf::hello_module_bytes()
+}

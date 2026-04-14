@@ -202,6 +202,22 @@ pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(base, size) })
 }
 
+/// Return the raw bytes of the `userspace_hello.elf` Limine module, or
+/// `None` if the module was not loaded. Used by the `execve` syscall to
+/// replace the calling process's image with a fresh ELF payload.
+#[cfg(target_os = "none")]
+pub(crate) fn hello_module_bytes() -> Option<&'static [u8]> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+    let base = file.addr();
+    let size = file.size() as usize;
+    // SAFETY: same lifetime guarantee as first_loaded_module_bytes.
+    Some(unsafe { core::slice::from_raw_parts(base, size) })
+}
+
 #[cfg(target_os = "none")]
 pub(crate) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     let resp = crate::boot::MODULE_REQUEST.get_response()?;

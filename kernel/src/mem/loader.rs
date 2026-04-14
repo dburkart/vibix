@@ -23,6 +23,8 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
+use alloc::sync::Arc;
+
 use super::elf;
 use super::paging;
 use super::tlb::Flusher;
@@ -139,6 +141,59 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
     }
 
     Ok(LoadedImage { entry, segments })
+}
+
+/// Load `bytes` as a lower-half ELF into `pml4` AND register each
+/// `PT_LOAD` segment as a `Share::Private` VMA in `address_space` with
+/// a pre-populated `AnonObject` cache. This lets `fork_address_space`
+/// walk the segments when forking a process that was bootstrapped via
+/// the ELF loader.
+///
+/// Each frame allocated by the loader is inserted into the AnonObject
+/// cache with an extra reference count so the cache and PTE both hold
+/// independent references, matching the invariant `AnonObject::fault`
+/// establishes for demand-paged frames.
+#[cfg(target_os = "none")]
+pub fn load_user_elf_with_vmas(
+    bytes: &[u8],
+    pml4: PhysFrame<Size4KiB>,
+    address_space: &mut super::addrspace::AddressSpace,
+) -> Result<LoadedImage, LoadError> {
+    use super::vmobject::{AnonObject, VmObject};
+    use super::vmatree::{Share, Vma};
+    use x86_64::VirtAddr;
+
+    let image = load_user_elf(bytes, pml4)?;
+
+    let parsed = elf::try_parse_elf64(bytes).ok_or(LoadError::NotElf64)?;
+    for seg in parsed.load_segments() {
+        if seg.vaddr.as_u64() >= UPPER_HALF_START {
+            continue;
+        }
+        let page_count = seg.memsz.div_ceil(PAGE_SIZE) as usize;
+        let start = seg.vaddr.as_u64() as usize;
+        let end = start + page_count * PAGE_SIZE as usize;
+        let obj = AnonObject::new(Some(page_count));
+
+        // Pre-populate the cache with the frames the loader just mapped.
+        for i in 0..page_count {
+            let va = VirtAddr::new(seg.vaddr.as_u64() + i as u64 * PAGE_SIZE);
+            if let Some((frame, _)) = paging::translate_in_pml4(pml4, va) {
+                let phys = frame.start_address().as_u64();
+                // insert_existing_frame increments refcount by 1 for the
+                // cache reference. The PTE reference was set by load_user_elf.
+                obj.insert_existing_frame(i, phys);
+            }
+        }
+
+        let prot_pte = (seg.flags
+            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+            .bits();
+        let vma = Vma::new(start, end, 0x3, prot_pte, Share::Private, obj as Arc<dyn VmObject>, 0);
+        address_space.insert(vma);
+    }
+
+    Ok(image)
 }
 
 fn map_user_segment(

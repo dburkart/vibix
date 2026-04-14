@@ -1,13 +1,8 @@
-/* Linker script for the userspace hello ELF loaded by the kernel.
+/* Linker script for the userspace hello binary (ring-3, lower half).
  *
- * Virtual base: 0xffff_ffff_c000_0000 — 1 GiB into the top 2 GiB kernel
- * region. The kernel itself lives at 0xffff_ffff_8000_0000 and is at
- * most a few megabytes, leaving the rest of the -2 GiB window free.
- * The range is canonical, falls within `code-model=kernel`'s ±2 GiB
- * reach, and sits in the upper half of the address space — upper-half
- * PML4 slots are shared by every task PML4 via paging::new_task_pml4,
- * so a mapping installed in the kernel PML4 before task::init() is
- * visible to any task that later runs this code.
+ * Loaded by the kernel's exec() syscall into a fresh user address space.
+ * Uses the same lower-half layout as userspace/init so load_user_elf
+ * accepts it.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -16,14 +11,14 @@ ENTRY(_start)
 
 PHDRS
 {
-    text   PT_LOAD;
-    rodata PT_LOAD;
-    data   PT_LOAD;
+    text   PT_LOAD FLAGS(5);   /* R+X */
+    rodata PT_LOAD FLAGS(4);   /* R   */
+    data   PT_LOAD FLAGS(6);   /* R+W */
 }
 
 SECTIONS
 {
-    . = 0xffffffffc0000000;
+    . = 0x0000000000400000;
 
     .text : {
         *(.text .text.*)
@@ -51,5 +46,6 @@ SECTIONS
         *(.note.*)
         *(.comment)
         *(.dynamic)
+        *(.got .got.plt)
     }
 }

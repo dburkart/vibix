@@ -236,6 +236,27 @@ fn release_frame(_phys: u64) {
     tests::HOST_RELEASE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Kernel-only methods on `AnonObject`.
+#[cfg(target_os = "none")]
+impl AnonObject {
+    /// Insert `phys` into the frame cache at page index `idx` and
+    /// increment its refcount by one for the cache's ownership.
+    ///
+    /// Use this when frames are pre-mapped into a PML4 by an external
+    /// loader (e.g. `load_user_elf`) and you want to retroactively
+    /// register them in an `AnonObject` so the VMA machinery can track
+    /// and fork them correctly.
+    ///
+    /// The caller must ensure that `phys` already has a PTE reference
+    /// (refcount ≥ 1). This method adds the cache reference on top.
+    pub fn insert_existing_frame(&self, idx: usize, phys: u64) {
+        self.inner.lock().frames.insert(idx, phys);
+        // Add the cache's reference. The PTE reference was set by the
+        // original allocator/mapper; we are adding one more here.
+        crate::mem::refcount::inc_refcount(phys);
+    }
+}
+
 #[cfg(test)]
 impl AnonObject {
     /// Test-only: inject a synthetic frame address for page `idx` so

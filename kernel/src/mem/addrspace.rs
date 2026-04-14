@@ -165,6 +165,53 @@ impl AddressSpace {
         self.page_table
     }
 
+    /// Unmap all user-half VMAs and their PTE frames, free L1/L2/L3
+    /// intermediate page-table frames, and reset the `brk`/`mmap` layout —
+    /// but keep the PML4 frame and its kernel upper-half entries intact.
+    ///
+    /// Used by `execve()` to clear the old process image before loading
+    /// a new ELF into the same address-space slot. After this call the
+    /// lower half of the PML4 is empty and ready for `load_user_elf`.
+    #[cfg(target_os = "none")]
+    pub fn clear_for_exec(&mut self) {
+        use crate::mem::paging;
+        use x86_64::structures::paging::{FrameDeallocator, Page, Size4KiB};
+
+        let pml4 = self.page_table;
+        for vma in self.vmas.iter() {
+            let mut va = vma.start;
+            while va < vma.end {
+                let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                    .expect("vma page VA aligned");
+                if let Ok(pte_frame) = paging::unmap_in_pml4(pml4, page) {
+                    // SAFETY: frame belongs to this address space.
+                    unsafe {
+                        paging::KernelFrameAllocator.deallocate_frame(pte_frame);
+                    }
+                }
+                va += 4096;
+            }
+        }
+        // Drop all VMA objects (releases AnonObject caches and their frames).
+        self.vmas = crate::mem::vmatree::VmaTree::new();
+        self.vm_pages = 0;
+        self.rss_pages = 0;
+
+        // Free the now-empty L1/L2/L3 page-table frames in the user half.
+        // SAFETY: all leaf PTEs were removed above; the PML4 itself stays.
+        unsafe {
+            paging::free_user_page_tables(pml4);
+        }
+
+        // Reset brk/mmap to the constructor defaults so the new process
+        // image starts with a clean virtual-address layout.
+        let mmap_base = VirtAddr::new(0x0000_0000_4000_0000);
+        self.mmap_base = mmap_base;
+        self.brk_start = mmap_base;
+        self.brk_cur = mmap_base;
+        self.brk_max = VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD);
+    }
+
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours
     /// where possible. Panics if `vma` overlaps any existing entry —
     /// overlapping VMAs are a programmer error.
