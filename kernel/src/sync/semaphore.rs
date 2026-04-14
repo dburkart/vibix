@@ -84,4 +84,12 @@ impl Semaphore {
     pub fn available(&self) -> usize {
         *self.permits.lock()
     }
+
+    /// Number of tasks currently parked on `acquire`. Intended for
+    /// test-harness synchronisation — a driver can spin on
+    /// `waiter_count() >= N` to confirm N workers have enqueued before
+    /// firing a `release`. Not appropriate for production logic.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.waiter_count()
+    }
 }

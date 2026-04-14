@@ -1072,12 +1072,22 @@ fn semaphore_release_wakes_one() {
     task::spawn(sem_wake_worker);
     task::spawn(sem_wake_worker);
 
-    // Wait until both workers have actually parked inside `acquire`.
-    // Workers enqueue on the internal waitqueue, so we poll indirectly
-    // via the done counter staying at 0 after a grace period.
-    for _ in 0..50 {
+    // Wait for both workers to actually park inside `acquire`. We check
+    // the waitqueue directly rather than relying on a timing-only grace
+    // period — on a CI scheduler with many accumulated background tasks
+    // from earlier tests, a hlt-count grace can expire before both
+    // workers have run far enough to enqueue.
+    for _ in 0..500 {
+        if SEM_WAKE.waiter_count() >= 2 {
+            break;
+        }
         x86_64::instructions::hlt();
     }
+    assert_eq!(
+        SEM_WAKE.waiter_count(),
+        2,
+        "both workers did not park on the semaphore in time"
+    );
     assert_eq!(
         SEM_WAKE_COUNT.load(Ordering::SeqCst),
         0,
@@ -1086,7 +1096,7 @@ fn semaphore_release_wakes_one() {
 
     // One release — exactly one worker should wake.
     SEM_WAKE.release();
-    for _ in 0..200 {
+    for _ in 0..500 {
         if SEM_WAKE_COUNT.load(Ordering::SeqCst) >= 1 {
             break;
         }
@@ -1100,7 +1110,7 @@ fn semaphore_release_wakes_one() {
 
     // Second release frees the other worker.
     SEM_WAKE.release();
-    for _ in 0..200 {
+    for _ in 0..500 {
         if SEM_WAKE_COUNT.load(Ordering::SeqCst) == 2 {
             break;
         }
