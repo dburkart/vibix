@@ -611,12 +611,15 @@ global_asm!(
 
 syscall_entry:
     // On SYSCALL entry (x86_64):
-    //   rax=nr  rdi=a0  rsi=a1  rdx=a2
+    //   rax=nr  rdi=a0  rsi=a1  rdx=a2  r10=a3  r8=a4  r9=a5
     //   rcx=user_RIP  r11=user_RFLAGS  rsp=user_RSP
-    // IF is cleared by SFMASK; r10 is caller-saved and unused here.
+    // IF is cleared by SFMASK. Every GP register that isn't rsp is
+    // load-bearing: all Linux syscall args or SYSRETQ state.
 
-    // 1. Save user RSP in r10 (caller-saved, not a syscall argument).
-    mov r10, rsp
+    // 1. Stash user RSP straight into fork_rsp so we don't need a
+    //    scratch register — r10 is the Linux syscall ABI's `a3` and
+    //    must not be clobbered.
+    mov [rip + {fork_rsp}], rsp
 
     // 2. Load kernel RSP: lea gives us the address of the static;
     //    the second mov dereferences it to get the stack-top value.
@@ -624,16 +627,14 @@ syscall_entry:
     mov rsp, [rsp]
 
     // 3. Save return-to-user context on the kernel stack.
-    push r10          // user RSP
-    push r11          // user RFLAGS  (SYSRETQ restores RFLAGS from r11)
-    push rcx          // user RIP     (SYSRETQ jumps to rcx)
+    push [rip + {fork_rsp}]   // user RSP (already stashed above)
+    push r11                  // user RFLAGS (SYSRETQ restores from r11)
+    push rcx                  // user RIP    (SYSRETQ jumps to rcx)
 
-    // 3b. Stash user context in FORK_USER_* statics so fork() can prime
-    //     the child's kernel stack. Must happen before rcx is clobbered
-    //     in step 4.  r10 is user RSP, r11 is user RFLAGS, rcx is user RIP.
+    // 3b. Finish priming the FORK_USER_* statics so fork() can seed the
+    //     child's kernel stack. fork_rsp was already written in step 1.
     mov [rip + {fork_rip}], rcx
     mov [rip + {fork_rflags}], r11
-    mov [rip + {fork_rsp}], r10
 
     // 4. Build syscall_dispatch(nr, a0, a1, a2, a3, a4, a5) in SysV AMD64
     //    registers. Linux syscall ABI:  rax=nr  rdi=a0 rsi=a1 rdx=a2
@@ -653,7 +654,7 @@ syscall_entry:
     //
     //    Save r9 (a5) into the arg6 slot before the remap clobbers it.
     //    SysV requires rsp to be 16-byte aligned immediately before the
-    //    CALL instruction. The 3 preceding pushes (user r10, r11, rcx)
+    //    CALL instruction. The 3 preceding pushes (user RSP, RFLAGS, RIP)
     //    leave rsp at (top-24), i.e. 8 mod 16. Reserving one 8-byte slot
     //    for arg6 brings rsp to (top-32) — 0 mod 16, exactly what CALL
     //    needs.
