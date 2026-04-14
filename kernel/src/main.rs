@@ -68,6 +68,31 @@ pub extern "C" fn _start() -> ! {
             Ok(()) => serial_println!("block: lba0[0..16]={:02x?}", &sector[..16]),
             Err(e) => serial_println!("block: lba0 read failed: {:?}", e),
         }
+        // Exercise the write path end-to-end. Uses a sector in the tail
+        // of the test disk (LBA 2047 of a 1 MiB disk, well past anything
+        // the read probe above touches) so we don't trample the magic at
+        // LBA 0. The readback proves DMA both ways against a real device.
+        let mut probe = [0u8; vibix::block::SECTOR_SIZE];
+        probe[..8].copy_from_slice(b"WR-PROBE");
+        probe[8..12].copy_from_slice(&0xdeadbeef_u32.to_le_bytes());
+        const PROBE_LBA: u64 = 2047;
+        match vibix::block::write(PROBE_LBA, &probe) {
+            Ok(()) => {
+                let mut back = [0u8; vibix::block::SECTOR_SIZE];
+                match vibix::block::read(PROBE_LBA, &mut back) {
+                    Ok(()) if back == probe => {
+                        serial_println!("block: write+readback ok at lba {}", PROBE_LBA);
+                    }
+                    Ok(()) => serial_println!(
+                        "block: write+readback mismatch at lba {}: head={:02x?}",
+                        PROBE_LBA,
+                        &back[..16]
+                    ),
+                    Err(e) => serial_println!("block: readback failed: {:?}", e),
+                }
+            }
+            Err(e) => serial_println!("block: write failed: {:?}", e),
+        }
     }
 
     // Console init must come after mem::init() — the character grid and

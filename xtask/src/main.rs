@@ -67,6 +67,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "rtc:",
     "block: virtio-blk ready",
     "block: lba0[0..16]=[56, 49, 42, 49, 58, 42, 4c, 4b, 30",
+    "block: write+readback ok at lba 2047",
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
