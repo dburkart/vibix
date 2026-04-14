@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex as SpinMutex;
 use vibix::sync::{mpmc, spsc};
-use vibix::sync::{BlockingMutex, WaitQueue};
+use vibix::sync::{BlockingMutex, BlockingRwLock, Semaphore, WaitQueue};
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
@@ -83,6 +83,26 @@ fn run_tests() {
         (
             "mpmc_close_wakes_senders",
             &(mpmc_close_wakes_senders as fn()),
+        ),
+        (
+            "rwlock_concurrent_readers",
+            &(rwlock_concurrent_readers as fn()),
+        ),
+        (
+            "rwlock_writer_exclusion",
+            &(rwlock_writer_exclusion as fn()),
+        ),
+        (
+            "rwlock_writer_not_starved",
+            &(rwlock_writer_not_starved as fn()),
+        ),
+        (
+            "semaphore_permits_block",
+            &(semaphore_permits_block as fn()),
+        ),
+        (
+            "semaphore_release_wakes_one",
+            &(semaphore_release_wakes_one as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -753,5 +773,352 @@ fn mpmc_close_wakes_senders() {
         MPMC_CLOSE_TX_ERRS.load(Ordering::SeqCst),
         2,
         "senders didn't both wake with Err on last-receiver drop"
+    );
+}
+
+// --- rwlock_concurrent_readers --------------------------------------
+//
+// Three reader tasks hold a read guard simultaneously. The test asserts
+// that the observed peak reader count reaches 3 — proving the rwlock
+// actually allows multiple readers rather than silently serialising them.
+
+static RW_READERS: BlockingRwLock<u64> = BlockingRwLock::new(0);
+static RW_READ_LIVE: AtomicUsize = AtomicUsize::new(0);
+static RW_READ_PEAK: AtomicUsize = AtomicUsize::new(0);
+static RW_READ_DONE: AtomicUsize = AtomicUsize::new(0);
+
+const RW_READ_HOLD_SPINS: usize = 100_000;
+
+fn rw_reader_worker() -> ! {
+    let _g = RW_READERS.read();
+    let live = RW_READ_LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+    // Publish a new peak if we raised it. Racy by design — peak is a
+    // high-water mark, not a synchronisation point.
+    let mut peak = RW_READ_PEAK.load(Ordering::SeqCst);
+    while live > peak {
+        match RW_READ_PEAK.compare_exchange(peak, live, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => peak = actual,
+        }
+    }
+    for _ in 0..RW_READ_HOLD_SPINS {
+        core::hint::spin_loop();
+    }
+    RW_READ_LIVE.fetch_sub(1, Ordering::SeqCst);
+    RW_READ_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn rwlock_concurrent_readers() {
+    RW_READ_LIVE.store(0, Ordering::SeqCst);
+    RW_READ_PEAK.store(0, Ordering::SeqCst);
+    RW_READ_DONE.store(0, Ordering::SeqCst);
+
+    task::spawn(rw_reader_worker);
+    task::spawn(rw_reader_worker);
+    task::spawn(rw_reader_worker);
+
+    for _ in 0..2_000 {
+        if RW_READ_DONE.load(Ordering::SeqCst) == 3 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        RW_READ_DONE.load(Ordering::SeqCst),
+        3,
+        "readers didn't all finish — park/wake wedged"
+    );
+    assert_eq!(
+        RW_READ_PEAK.load(Ordering::SeqCst),
+        3,
+        "readers serialised — rwlock didn't grant shared access"
+    );
+}
+
+// --- rwlock_writer_exclusion ----------------------------------------
+//
+// Three writer tasks each increment a shared counter N times under the
+// write lock. Final value proves writes were serialised (no lost
+// updates) and every worker made forward progress.
+
+static RW_WRITERS: BlockingRwLock<u64> = BlockingRwLock::new(0);
+static RW_WRITE_DONE: AtomicUsize = AtomicUsize::new(0);
+
+const RW_WRITE_ROUNDS: u64 = 5;
+const RW_WRITE_CRIT_SPINS: usize = 50_000;
+
+fn rw_writer_worker() -> ! {
+    for _ in 0..RW_WRITE_ROUNDS {
+        let mut g = RW_WRITERS.write();
+        for _ in 0..RW_WRITE_CRIT_SPINS {
+            core::hint::spin_loop();
+        }
+        *g += 1;
+    }
+    RW_WRITE_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn rwlock_writer_exclusion() {
+    *RW_WRITERS.write() = 0;
+    RW_WRITE_DONE.store(0, Ordering::SeqCst);
+
+    task::spawn(rw_writer_worker);
+    task::spawn(rw_writer_worker);
+    task::spawn(rw_writer_worker);
+
+    for _ in 0..2_000 {
+        if RW_WRITE_DONE.load(Ordering::SeqCst) == 3 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        RW_WRITE_DONE.load(Ordering::SeqCst),
+        3,
+        "not all writer workers finished"
+    );
+    assert_eq!(
+        *RW_WRITERS.read(),
+        3 * RW_WRITE_ROUNDS,
+        "lost updates — rwlock didn't serialise writers"
+    );
+}
+
+// --- rwlock_writer_not_starved --------------------------------------
+//
+// One task holds the write lock and parks. A second task parks on
+// `write()` behind it. A stream of reader tasks then tries to acquire;
+// they must queue behind the pending writer (the rwlock's
+// writer-priority invariant). The test asserts the second writer
+// eventually gets through despite continuous reader churn.
+
+static RW_STARVE: BlockingRwLock<u64> = BlockingRwLock::new(0);
+static RW_STARVE_WRITER_DONE: AtomicUsize = AtomicUsize::new(0);
+static RW_STARVE_READERS_DONE: AtomicUsize = AtomicUsize::new(0);
+static RW_STARVE_GO: AtomicUsize = AtomicUsize::new(0);
+
+const RW_STARVE_READERS: u32 = 4;
+
+fn rw_starve_writer() -> ! {
+    // Wait until the driver signals us to go, then contend against
+    // the first writer (held by the driver).
+    while RW_STARVE_GO.load(Ordering::SeqCst) == 0 {
+        x86_64::instructions::hlt();
+    }
+    let mut g = RW_STARVE.write();
+    *g += 1;
+    drop(g);
+    RW_STARVE_WRITER_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn rw_starve_reader() -> ! {
+    while RW_STARVE_GO.load(Ordering::SeqCst) == 0 {
+        x86_64::instructions::hlt();
+    }
+    let _g = RW_STARVE.read();
+    RW_STARVE_READERS_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn rwlock_writer_not_starved() {
+    *RW_STARVE.write() = 0;
+    RW_STARVE_WRITER_DONE.store(0, Ordering::SeqCst);
+    RW_STARVE_READERS_DONE.store(0, Ordering::SeqCst);
+    RW_STARVE_GO.store(0, Ordering::SeqCst);
+
+    // Driver grabs the write lock first.
+    let g = RW_STARVE.write();
+
+    // Spawn the second writer and a flood of readers. All of them
+    // spin on RW_STARVE_GO so they queue up before any contention
+    // begins; when we release RW_STARVE_GO they race to acquire.
+    task::spawn(rw_starve_writer);
+    for _ in 0..RW_STARVE_READERS {
+        task::spawn(rw_starve_reader);
+    }
+
+    // Release the go-flag, then drop the driver's guard. The second
+    // writer should win the lock next (readers queue behind it due to
+    // writer_waiting), complete, then readers drain.
+    RW_STARVE_GO.store(1, Ordering::SeqCst);
+    // Give workers a chance to run and park inside their lock calls.
+    for _ in 0..20 {
+        x86_64::instructions::hlt();
+    }
+    drop(g);
+
+    for _ in 0..4_000 {
+        if RW_STARVE_WRITER_DONE.load(Ordering::SeqCst) == 1
+            && RW_STARVE_READERS_DONE.load(Ordering::SeqCst) == RW_STARVE_READERS as usize
+        {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        RW_STARVE_WRITER_DONE.load(Ordering::SeqCst),
+        1,
+        "second writer didn't make progress — starved by reader flood"
+    );
+    assert_eq!(
+        RW_STARVE_READERS_DONE.load(Ordering::SeqCst),
+        RW_STARVE_READERS as usize,
+        "not all readers finished"
+    );
+}
+
+// --- semaphore_permits_block ----------------------------------------
+//
+// Semaphore starts with 2 permits; three worker tasks each `acquire`,
+// hold briefly, then `release`. Only two can be inside the critical
+// region at once — the third must park until one of the first two
+// releases. Live-worker peak of exactly 2 proves the permit count is
+// honoured.
+
+static SEM_GATE: Semaphore = Semaphore::new(2);
+static SEM_LIVE: AtomicUsize = AtomicUsize::new(0);
+static SEM_PEAK: AtomicUsize = AtomicUsize::new(0);
+static SEM_DONE: AtomicUsize = AtomicUsize::new(0);
+
+const SEM_HOLD_SPINS: usize = 100_000;
+
+fn sem_worker() -> ! {
+    SEM_GATE.acquire();
+    let live = SEM_LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut peak = SEM_PEAK.load(Ordering::SeqCst);
+    while live > peak {
+        match SEM_PEAK.compare_exchange(peak, live, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => peak = actual,
+        }
+    }
+    for _ in 0..SEM_HOLD_SPINS {
+        core::hint::spin_loop();
+    }
+    SEM_LIVE.fetch_sub(1, Ordering::SeqCst);
+    SEM_GATE.release();
+    SEM_DONE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn semaphore_permits_block() {
+    // Reset the semaphore by draining any leftover permits and
+    // re-releasing to the starting count of 2.
+    while SEM_GATE.try_acquire() {}
+    SEM_GATE.release();
+    SEM_GATE.release();
+    SEM_LIVE.store(0, Ordering::SeqCst);
+    SEM_PEAK.store(0, Ordering::SeqCst);
+    SEM_DONE.store(0, Ordering::SeqCst);
+
+    task::spawn(sem_worker);
+    task::spawn(sem_worker);
+    task::spawn(sem_worker);
+
+    for _ in 0..4_000 {
+        if SEM_DONE.load(Ordering::SeqCst) == 3 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SEM_DONE.load(Ordering::SeqCst),
+        3,
+        "semaphore workers didn't all finish — park/wake wedged"
+    );
+    assert_eq!(
+        SEM_PEAK.load(Ordering::SeqCst),
+        2,
+        "permit budget exceeded — semaphore let more than 2 in concurrently"
+    );
+}
+
+// --- semaphore_release_wakes_one ------------------------------------
+//
+// Two workers park on a 0-permit semaphore. The driver calls
+// `release()` once; exactly one worker must unpark and record its
+// wake. A second `release()` frees the other. This mirrors
+// `ChildState::Loading`'s "one waiter wins, the rest stay parked until
+// their permit arrives" contract.
+
+static SEM_WAKE: Semaphore = Semaphore::new(0);
+static SEM_WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn sem_wake_worker() -> ! {
+    SEM_WAKE.acquire();
+    SEM_WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+fn semaphore_release_wakes_one() {
+    while SEM_WAKE.try_acquire() {}
+    SEM_WAKE_COUNT.store(0, Ordering::SeqCst);
+
+    task::spawn(sem_wake_worker);
+    task::spawn(sem_wake_worker);
+
+    // Wait for both workers to actually park inside `acquire`. We check
+    // the waitqueue directly rather than relying on a timing-only grace
+    // period — on a CI scheduler with many accumulated background tasks
+    // from earlier tests, a hlt-count grace can expire before both
+    // workers have run far enough to enqueue.
+    for _ in 0..500 {
+        if SEM_WAKE.waiter_count() >= 2 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SEM_WAKE.waiter_count(),
+        2,
+        "both workers did not park on the semaphore in time"
+    );
+    assert_eq!(
+        SEM_WAKE_COUNT.load(Ordering::SeqCst),
+        0,
+        "workers acquired before any permit was released"
+    );
+
+    // One release — exactly one worker should wake.
+    SEM_WAKE.release();
+    for _ in 0..500 {
+        if SEM_WAKE_COUNT.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SEM_WAKE_COUNT.load(Ordering::SeqCst),
+        1,
+        "first release didn't wake exactly one waiter"
+    );
+
+    // Second release frees the other worker.
+    SEM_WAKE.release();
+    for _ in 0..500 {
+        if SEM_WAKE_COUNT.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+    assert_eq!(
+        SEM_WAKE_COUNT.load(Ordering::SeqCst),
+        2,
+        "second release didn't wake the remaining waiter"
     );
 }
