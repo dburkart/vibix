@@ -326,28 +326,49 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             // Close O_CLOEXEC fds as POSIX requires on exec.
             crate::task::current_fd_table().lock().close_cloexec();
 
-            // Load the new ELF into the current (now empty) PML4.
+            // Load the new ELF with VMA tracking so AddressSpace::drop can
+            // reclaim the data frames when the exec'd process exits. Without
+            // VMA entries the leaf frames are orphaned permanently.
             let pml4 = crate::task::current_cr3();
-            let image = match crate::mem::loader::load_user_elf(elf_bytes, pml4) {
+            let aspace = crate::task::current_address_space();
+            let image = match crate::mem::loader::load_user_elf_with_vmas(
+                elf_bytes,
+                pml4,
+                &mut aspace.write(),
+            ) {
                 Ok(img) => img,
                 Err(_) => return -8, // ENOEXEC
             };
 
-            // Map a fresh user stack page at the canonical init stack VA.
+            // Map a fresh user stack page and register it as a VMA so the
+            // exec'd process's stack frame is also reclaimed on exit.
+            use crate::mem::vmatree::{Share, Vma};
+            use crate::mem::vmobject::{AnonObject, VmObject};
             use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
             use x86_64::VirtAddr;
+            let stack_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE;
             let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                 crate::init_process::USER_STACK_PAGE_VA,
             ));
-            crate::mem::paging::map_in_pml4(
-                pml4,
-                stack_page,
-                PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_EXECUTE,
-            )
-            .expect("exec: user stack mapping failed");
+            let stack_frame = crate::mem::paging::map_in_pml4(pml4, stack_page, stack_flags)
+                .expect("exec: user stack mapping failed");
+
+            let stack_obj = AnonObject::new(Some(1));
+            stack_obj.insert_existing_frame(0, stack_frame.start_address().as_u64());
+            let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
+            let stack_vma = Vma::new(
+                stack_start,
+                stack_start + 4096,
+                0x3,
+                stack_flags.bits(),
+                Share::Private,
+                stack_obj as alloc::sync::Arc<dyn VmObject>,
+                0,
+            );
+            aspace.write().insert(stack_vma);
 
             // Switch to the new image — never returns.
             unsafe { jump_to_ring3(image.entry.as_u64(), crate::init_process::USER_STACK_TOP) }
@@ -385,9 +406,13 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             }
 
             // Wait until a zombie child exists or no children remain.
-            // The condition only reads EXIT_EVENT (an atomic), so it is
-            // safe inside wait_while without taking the TABLE lock.
+            // Snapshot EXIT_EVENT BEFORE the reap attempt so a child that
+            // exits in the gap between reap_child returning None and the
+            // wait_while park is not missed: if the event fires before snap
+            // is read, the condition (count == snap) is immediately false and
+            // wait_while returns at once, letting us loop back to reap.
             loop {
+                let snap = crate::process::exit_event_count();
                 if let Some((child_pid, exit_status)) =
                     crate::process::reap_child(parent_pid, target_pid)
                 {
@@ -401,8 +426,7 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
                 if !crate::process::has_children(parent_pid) {
                     return -10; // ECHILD — last child was reaped by another path
                 }
-                // Park until any child exits (EXIT_EVENT advances).
-                let snap = crate::process::exit_event_count();
+                // Park while no new exit event has occurred.
                 crate::process::CHILD_WAIT
                     .wait_while(|| crate::process::exit_event_count() == snap);
             }
