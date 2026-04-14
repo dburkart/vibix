@@ -271,11 +271,7 @@ impl FileSystem for DevFs {
         "devfs"
     }
 
-    fn mount(
-        &self,
-        _source: MountSource<'_>,
-        _flags: MountFlags,
-    ) -> Result<Arc<SuperBlock>, i64> {
+    fn mount(&self, _source: MountSource<'_>, _flags: MountFlags) -> Result<Arc<SuperBlock>, i64> {
         let fs_id = alloc_fs_id();
         let ino_base = alloc_ino_base();
 
@@ -360,7 +356,14 @@ impl FileSystem for DevFs {
 // linux_dirent64 serialisation helper (mirrors ramfs::emit_dirent)
 // ---------------------------------------------------------------------------
 
-fn emit_dirent(buf: &mut [u8], offset: usize, d_ino: u64, d_off: u64, d_type: u8, name: &[u8]) -> usize {
+fn emit_dirent(
+    buf: &mut [u8],
+    offset: usize,
+    d_ino: u64,
+    d_off: u64,
+    d_type: u8,
+    name: &[u8],
+) -> usize {
     let header = 19usize;
     let raw = header + name.len() + 1;
     let reclen = (raw + 7) & !7;
@@ -621,7 +624,11 @@ mod tests {
         let f = open_inode(&sb, root);
         let mut buf = [0u8; 512];
         let mut cookie = 0u64;
-        let n = f.inode.file_ops.getdents(&f, &mut buf, &mut cookie).expect("getdents");
+        let n = f
+            .inode
+            .file_ops
+            .getdents(&f, &mut buf, &mut cookie)
+            .expect("getdents");
         assert!(n > 0);
         assert_eq!(cookie, 6);
     }
