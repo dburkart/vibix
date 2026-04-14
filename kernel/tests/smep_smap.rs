@@ -18,7 +18,8 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 use vibix::arch::x86_64::uaccess::{self, USER_VA_END};
-use vibix::mem::vma::{Vma, VmaKind};
+use vibix::mem::vmatree::{Share, Vma};
+use vibix::mem::vmobject::AnonObject;
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
@@ -101,14 +102,19 @@ fn copy_roundtrip_user() {
     // and the copy_*_user helpers would appear to work even if their
     // STAC/CLAC bracket were broken. With U/S=1 the round-trip only
     // succeeds when SMAP is actually toggled inside the helpers.
+    let pte_flags = (PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE)
+        .bits();
     task::install_vma_on_current(Vma::new(
         BASE,
         BASE + PAGES * 4096,
-        VmaKind::AnonZero,
-        PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::NO_EXECUTE,
+        0x3, // PROT_READ | PROT_WRITE
+        pte_flags,
+        Share::Private,
+        AnonObject::new(Some(PAGES)),
+        0,
     ));
 
     // No explicit warm-up touch: with USER_ACCESSIBLE mappings a ring-0
