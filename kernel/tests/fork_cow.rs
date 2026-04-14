@@ -232,8 +232,7 @@ fn fork_isolation_unfaulted_page() {
         let va = FORK_VA + 4096;
         let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
             .expect("page-aligned VA");
-        let frame =
-            PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
+        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
         let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
         paging::map_existing_in_pml4(child.page_table_frame(), page, frame, flags)
             .expect("child map_existing failed");
@@ -250,8 +249,7 @@ fn fork_isolation_unfaulted_page() {
         let va = FORK_VA + 4096;
         let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
             .expect("page-aligned VA");
-        let frame =
-            PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
+        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
         let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
         paging::map_existing_in_pml4(parent.page_table_frame(), page, frame, flags)
             .expect("parent map_existing failed");

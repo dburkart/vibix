@@ -135,8 +135,7 @@ impl AddressSpace {
     /// fork is handled gracefully.
     #[cfg(target_os = "none")]
     pub fn try_new_empty() -> Result<Self, ForkError> {
-        let page_table = crate::mem::paging::try_new_task_pml4()
-            .ok_or(ForkError::OutOfMemory)?;
+        let page_table = crate::mem::paging::try_new_task_pml4().ok_or(ForkError::OutOfMemory)?;
         let mmap_base = VirtAddr::new(0x0000_0000_4000_0000);
         let brk_start = mmap_base;
         Ok(Self {
