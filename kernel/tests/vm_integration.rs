@@ -6,7 +6,6 @@
 //! Out of scope for this file (tracked separately):
 //! - `mprotect` downgrade → write SIGSEGV: needs a ring-3 userspace
 //!   driver and the `#PF` test-hook dance.
-//! - `MAP_FIXED_NOREPLACE` EEXIST: no syscall plumbing yet.
 //! - Refcount saturation rollback in fork: the current fork path
 //!   silently pins at `u16::MAX` rather than erroring, so there is no
 //!   rollback to test until that lands.

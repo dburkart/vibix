@@ -676,6 +676,7 @@ fn test_all() -> R<()> {
         "smep_smap",
         "fd_table",
         "syscall_open_mmap",
+        "syscall_mmap_family",
         "vm_integration",
     ] {
         cmd.arg("--test").arg(t);

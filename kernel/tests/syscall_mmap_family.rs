@@ -63,6 +63,10 @@ fn run_tests() {
             &(mmap_fixed_noreplace_overlap_eexist as fn()),
         ),
         (
+            "mmap_fixed_noreplace_unused_succeeds",
+            &(mmap_fixed_noreplace_unused_succeeds as fn()),
+        ),
+        (
             "munmap_returns_zero_on_hole",
             &(munmap_returns_zero_on_hole as fn()),
         ),
@@ -201,6 +205,54 @@ fn mmap_fixed_noreplace_overlap_eexist() {
     );
     assert_eq!(r as u64, a, "MAP_FIXED must return the requested VA");
     let _ = munmap(a, 4096);
+}
+
+fn mmap_fixed_noreplace_unused_succeeds() {
+    // MAP_FIXED_NOREPLACE at an unused, aligned VA must honour the
+    // requested address exactly and install a working VMA.
+    let base: u64 = 0x0000_3000_1000_0000;
+    let r = mmap(
+        base,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    assert_eq!(r as u64, base, "expected exact VA, got {:#x}", r);
+
+    // The page must be usable — demand-fault on first write, read-back.
+    unsafe {
+        ptr::write_volatile(base as *mut u8, 0x5A);
+        assert_eq!(ptr::read_volatile(base as *const u8), 0x5A);
+    }
+
+    assert_eq!(munmap(base, 4096), 0);
+
+    // After unmap the VA is free again: a second NOREPLACE at the same
+    // VA must succeed, proving the earlier VMA was cleanly removed.
+    let r = mmap(
+        base,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    assert_eq!(r as u64, base);
+    let _ = munmap(base, 4096);
+
+    // Unaligned addr with MAP_FIXED_NOREPLACE must reject with EINVAL
+    // (fixed mappings demand exact page alignment).
+    let r = mmap(
+        base + 1,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    assert_eq!(r, EINVAL, "unaligned NOREPLACE must be EINVAL, got {}", r);
 }
 
 fn munmap_returns_zero_on_hole() {
