@@ -663,6 +663,7 @@ pub fn current_growsdown_lookup(
     alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
     usize,
     crate::mem::vmatree::ProtPte,
+    usize, // new_vma_start: the page address the VMA was installed at
 )> {
     let aspace = {
         let sched = SCHED.try_lock()?;

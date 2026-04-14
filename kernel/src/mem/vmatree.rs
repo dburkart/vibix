@@ -127,6 +127,7 @@ impl Vma {
             && self.prot_user == other.prot_user
             && self.prot_pte == other.prot_pte
             && self.share == other.share
+            && self.vma_flags == other.vma_flags
             && Arc::ptr_eq(&self.object, &other.object)
             && self.object_offset + self.len() == other.object_offset
     }

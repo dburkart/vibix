@@ -226,14 +226,19 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // Growsdown stack extension: if the fault address is just below a
     // VMA_GROWSDOWN VMA and within the allowed gap, extend the VMA by one
     // page and install the demand-page frame (same path as a normal miss).
-    if let Some((object, offset, prot_pte)) =
+    // Note: grow_stack always installs the VMA at `vma_start - 4096`, not at
+    // cr2, so we must map the PTE to that VMA page — not to addr_u64. When
+    // cr2 is 2+ pages below vma_start (allowed by the 256-page guard gap),
+    // mapping at cr2 would create an orphaned PTE with no VMA backing.
+    if let Some((object, offset, prot_pte, new_vma_start)) =
         crate::task::current_growsdown_lookup(addr_u64 as usize)
     {
         use crate::mem::vmobject::Access;
         use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
         use x86_64::{PhysAddr, VirtAddr};
 
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(new_vma_start as u64))
+            .expect("#PF growsdown: new_vma_start not page-aligned");
         let active = x86_64::registers::control::Cr3::read().0;
         let pte_flags = PageTableFlags::from_bits_truncate(prot_pte);
         match object.fault(offset, Access::Write) {

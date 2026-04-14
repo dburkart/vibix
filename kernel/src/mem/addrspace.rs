@@ -417,6 +417,7 @@ impl AddressSpace {
         alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
         usize,
         crate::mem::vmatree::ProtPte,
+        usize, // new_vma_start: the page the new VMA was installed at
     )> {
         use crate::mem::pf::{check_growsdown, GrowResult, STACK_GUARD_GAP_PAGES};
         use crate::mem::vmatree::{Share, Vma, VMA_GROWSDOWN, VMA_STACK_GUARD};
@@ -481,7 +482,7 @@ impl AddressSpace {
         self.vmas.insert(new_vma);
         self.vm_pages += 1;
 
-        Some((new_obj, 0, prot_pte))
+        Some((new_obj, 0, prot_pte, new_start))
     }
 
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours
