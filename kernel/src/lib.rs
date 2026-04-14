@@ -46,6 +46,8 @@ pub mod process;
 #[cfg(target_os = "none")]
 pub mod serial;
 #[cfg(target_os = "none")]
+pub mod signal;
+#[cfg(target_os = "none")]
 pub mod shell;
 #[cfg(target_os = "none")]
 pub mod sync;

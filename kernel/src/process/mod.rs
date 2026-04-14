@@ -11,10 +11,12 @@
 //! before the notify call.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU32 as ExitEvent, Ordering};
 
 use spin::{Lazy, Mutex};
 
+use crate::signal::SignalState;
 use crate::sync::WaitQueue;
 
 /// Scheduling / lifecycle state of a process entry.
@@ -37,6 +39,8 @@ pub struct ProcessEntry {
     pub exit_status: Option<i32>,
     /// Whether the process is still alive or waiting to be reaped.
     pub state: ProcessState,
+    /// Per-process signal state — pending mask, blocked mask, dispositions.
+    pub signals: Arc<Mutex<SignalState>>,
 }
 
 struct Table {
@@ -81,6 +85,7 @@ pub fn register_init(task_id: usize) {
             parent_pid: 0,
             exit_status: None,
             state: ProcessState::Alive,
+            signals: Arc::new(Mutex::new(SignalState::new())),
         },
     );
     t.pid_of.insert(task_id, 1);
@@ -99,6 +104,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
             parent_pid,
             exit_status: None,
             state: ProcessState::Alive,
+            signals: Arc::new(Mutex::new(SignalState::new())),
         },
     );
     t.pid_of.insert(task_id, pid);
@@ -197,4 +203,32 @@ pub fn update_task_id(pid: u32, new_task_id: usize) {
         entry.task_id = new_task_id;
     }
     t.pid_of.insert(new_task_id, pid);
+}
+
+// ── Signal helpers ────────────────────────────────────────────────────────
+
+/// Look up the `SignalState` for the process that owns `task_id` and call
+/// `f` with a mutable reference to it.  Returns `None` if no process entry
+/// exists for the task.
+///
+/// TABLE is held for the duration of `f`.  `f` must not call any function
+/// that tries to take TABLE again (lock-ordering).
+pub fn with_signal_state_for_task<R>(
+    task_id: usize,
+    f: impl FnOnce(&mut SignalState) -> R,
+) -> Option<R> {
+    let signals = {
+        let t = TABLE.lock();
+        let pid = *t.pid_of.get(&task_id)?;
+        let entry = t.by_pid.get(&pid)?;
+        Arc::clone(&entry.signals)
+    }; // TABLE released here
+    let x = Some(f(&mut signals.lock()));
+    x
+}
+
+/// Return the scheduler task ID for `pid`, or `None` if not found.
+pub fn task_id_for_pid(pid: u32) -> Option<usize> {
+    let t = TABLE.lock();
+    t.by_pid.get(&pid).map(|e| e.task_id)
 }
