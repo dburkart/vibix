@@ -166,9 +166,7 @@ mod tests {
         fn statfs(&self) -> Result<StatFs, i64> {
             Ok(StatFs::default())
         }
-        fn unmount(&self) -> Result<(), i64> {
-            Ok(())
-        }
+        fn unmount(&self) {}
     }
 
     fn make_inode() -> Arc<Inode> {

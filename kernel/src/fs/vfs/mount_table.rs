@@ -137,7 +137,7 @@ pub fn mount(
             // state it allocated; drop happens with no VFS locks held.
             let sb = edge.super_block.clone();
             drop(edge);
-            let _ = sb.ops.unmount();
+            sb.ops.unmount();
             Err(EBUSY)
         }
     }
@@ -180,7 +180,10 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
     };
 
     gc_drain_for(&sb);
-    sb.ops.unmount()
+    // Phase B: sb.ops.unmount() is infallible per the SuperOps contract —
+    // the mount is already detached; we always return Ok(()).
+    sb.ops.unmount();
+    Ok(())
 }
 
 /// Production [`MountResolver`] backed by [`MOUNT_TABLE`]. `path_walk`
@@ -240,9 +243,8 @@ mod tests {
         fn statfs(&self) -> Result<StatFs, i64> {
             Ok(StatFs::default())
         }
-        fn unmount(&self) -> Result<(), i64> {
+        fn unmount(&self) {
             self.unmount_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
         }
     }
 
@@ -455,6 +457,42 @@ mod tests {
         assert!(Arc::ptr_eq(&above, &edge));
         // Cleanup so subsequent tests aren't polluted.
         unmount(&target, UmountFlags::default()).expect("unmount");
+    }
+
+    /// Verify that `ops.unmount()` is called during Phase B even when the
+    /// caller has no way to propagate a driver error — the detach is
+    /// unconditional and the VFS always returns `Ok(())` from Phase B.
+    #[test]
+    fn phase_b_detach_is_unconditional() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let target = make_dir_dentry();
+        let fs = make_fs();
+        mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
+
+        // Unmount must succeed and ops.unmount must have been called once.
+        let result = unmount(&target, UmountFlags::default());
+        assert_eq!(result, Ok(()), "unmount must return Ok(()) from Phase B");
+        assert!(
+            target.mount.read().is_none(),
+            "mount edge must be gone after unmount"
+        );
+        assert_eq!(
+            MOUNT_TABLE.read().len(),
+            0,
+            "table must be empty after unmount"
+        );
+        assert_eq!(
+            fs.ops.unmount_calls.load(Ordering::SeqCst),
+            1,
+            "ops.unmount must be called exactly once"
+        );
     }
 
     #[allow(dead_code)]
