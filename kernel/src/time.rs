@@ -10,7 +10,14 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
+#[cfg(target_os = "none")]
 use crate::sync::IrqLock;
+
+// Host builds: `sync` is cfg-gated to `target_os = "none"`, so substitute
+// a plain `spin::Mutex` with the same interface for the WAKEUPS static
+// below. No ISR concurrency exists on host, so IF masking is moot.
+#[cfg(not(target_os = "none"))]
+use spin::Mutex as IrqLock;
 
 /// PIT oscillator frequency, in Hz. Divisor = this / desired Hz.
 #[cfg(target_os = "none")]
