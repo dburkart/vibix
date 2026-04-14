@@ -244,7 +244,8 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, _offset: u6
     // Must specify exactly one of MAP_PRIVATE or MAP_SHARED.
     let is_private = flags & MAP_PRIVATE != 0;
     let is_shared = flags & MAP_SHARED != 0;
-    if !is_private && !is_shared {
+    if is_private == is_shared {
+        // Neither set, or both set (Linux rejects MAP_PRIVATE|MAP_SHARED).
         return EINVAL;
     }
     let share = if is_shared { Share::Shared } else { Share::Private };
@@ -383,9 +384,12 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
                 // Only remap if the new protection is not PROT_NONE.
                 if new_pte.contains(PageTableFlags::PRESENT) {
                     let _ = paging::map_existing_in_pml4(pml4, page, old_frame, new_pte);
+                } else {
+                    // PROT_NONE: the PTE stays absent but the frame is still
+                    // owned by the VMA.  `unmap_in_pml4` does not decrement
+                    // the PTE refcount, so we must do it here to avoid a leak.
+                    frame::put(old_frame.start_address().as_u64());
                 }
-                // If PROT_NONE, the PTE stays absent; the VMA record still
-                // tracks the mapping so a future mprotect can re-enable it.
             }
         }
         va += FRAME_SIZE;
