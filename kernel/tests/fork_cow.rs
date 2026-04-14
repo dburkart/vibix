@@ -58,6 +58,10 @@ fn run_tests() {
             "fork_isolation_unfaulted_page",
             &(fork_isolation_unfaulted_page as fn()),
         ),
+        (
+            "cow_copy_uses_current_pte_frame",
+            &(cow_copy_uses_current_pte_frame as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -243,6 +247,91 @@ fn fork_isolation_unfaulted_page() {
     assert_ne!(
         child_phys, parent_phys,
         "parent and child must get distinct frames for unfaulted page (issue #188)"
+    );
+
+    drop(parent);
+    drop(child);
+}
+
+/// Issue #185: `cow_copy_and_remap` must copy from the current PTE
+/// frame, not from the backing object's cache.
+///
+/// After `fork_address_space` the child's `AnonObject` cache is fresh
+/// and empty (see `AnonObject::clone_private`). Its PTE still points
+/// at the parent's original frame, W-stripped. If the child then takes
+/// a second fork before writing, the grandchild PTE also points at the
+/// same original frame, and the intermediate generation may write
+/// before the grandchild reads. Previously the resolver looked up the
+/// "source" via `AnonObject::frame_at(offset)`, which in the child /
+/// grandchild is `None` — the CoW write simply failed. With the fix
+/// the resolver uses the PTE's own frame, which always holds the
+/// latest visible contents for this aspace's copy chain.
+///
+/// This test calls `cow_copy_and_remap` directly against an aspace
+/// whose PTE points at a frame seeded with a sentinel byte, then
+/// asserts the new private frame carries the sentinel. We do not
+/// switch CR3: the function only needs HHDM access, which is always
+/// mapped, and driving the page-fault handler would require an
+/// elaborate current-task swap that this unit-level check does not
+/// need.
+fn cow_copy_uses_current_pte_frame() {
+    use vibix::mem::paging::{cow_copy_and_remap, hhdm_offset};
+
+    let mut parent = make_parent_aspace();
+    prefault_page(&parent, 0);
+
+    // Stamp the parent's page-0 frame with a sentinel through HHDM so
+    // we can tell the pre- and post-fork frames apart later.
+    let parent_pte_frame_before = {
+        let vma = parent.find(FORK_VA).expect("parent vma");
+        vma.object
+            .frame_at(0)
+            .expect("parent AnonObject must have cached page 0 after prefault")
+    };
+    unsafe {
+        let dst = (hhdm_offset() + parent_pte_frame_before).as_mut_ptr::<u8>();
+        core::ptr::write_volatile(dst, 0xAB);
+    }
+
+    // Fork. Child's PTE aliases the parent's frame (W-stripped); child's
+    // VmObject cache is empty — which is the pre-fix failure condition.
+    let mut flusher = Flusher::new_active();
+    let child = parent
+        .fork_address_space(&mut flusher)
+        .expect("fork_address_space");
+    flusher.finish();
+
+    let child_vma = child.find(FORK_VA).expect("child vma");
+    assert!(
+        child_vma.object.frame_at(0).is_none(),
+        "precondition: child AnonObject cache must be empty after fork \
+         (clone_private should return a fresh object)"
+    );
+
+    // Resolve CoW on the child's PTE. With the fix this copies from
+    // whatever frame the PTE currently references (the one stamped
+    // with 0xAB). Before the fix the resolver had no source at all.
+    let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(FORK_VA as u64))
+        .expect("page-aligned");
+    let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
+    let new_frame = cow_copy_and_remap(child.page_table_frame(), page, flags)
+        .expect("cow_copy_and_remap must succeed even when child cache is empty");
+
+    // The new frame is distinct from the shared source and carries the
+    // sentinel byte the source had at entry.
+    assert_ne!(
+        new_frame.start_address().as_u64(),
+        parent_pte_frame_before,
+        "cow_copy_and_remap must allocate a fresh frame"
+    );
+    let copied = unsafe {
+        let src = (hhdm_offset() + new_frame.start_address().as_u64()).as_ptr::<u8>();
+        core::ptr::read_volatile(src)
+    };
+    assert_eq!(
+        copied, 0xAB,
+        "cow_copy_and_remap must copy from the current PTE frame, \
+         not from the (empty) child VmObject cache"
     );
 
     drop(parent);

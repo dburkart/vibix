@@ -200,25 +200,17 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         } else if is_write && pte_flags.contains(PageTableFlags::WRITABLE) {
             // Write-protection fault on a CoW-eligible page: the VMA
             // wants WRITABLE but the PTE was installed read-only by the
-            // fork path. Look up the source frame via frame_at (no
-            // PTE-refcount side-effect — fault() would inc_refcount for a
-            // frame that never gets a new PTE installed for it here).
-            if let Some(phys) = object.frame_at(offset) {
-                let source = PhysFrame::from_start_address(PhysAddr::new(phys))
-                    .expect("#PF: frame_at returned unaligned phys for CoW source");
-                match crate::mem::paging::cow_copy_and_remap(active, page, source, pte_flags) {
-                    Ok(_) => return,
-                    Err(e) => serial_println!(
-                        "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
-                        addr_u64,
-                        e
-                    ),
-                }
-            } else {
-                serial_println!(
-                    "#PF CoW: no cached frame for addr={:#x} (VmObject has no frame_at)",
-                    addr_u64
-                );
+            // fork path. `cow_copy_and_remap` copies out of whatever
+            // frame the PTE currently points at — the right source in
+            // every generation of a nested fork, and robust to the
+            // child VMA having an empty `clone_private()` cache.
+            match crate::mem::paging::cow_copy_and_remap(active, page, pte_flags) {
+                Ok(_) => return,
+                Err(e) => serial_println!(
+                    "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
+                    addr_u64,
+                    e
+                ),
             }
         }
     }
