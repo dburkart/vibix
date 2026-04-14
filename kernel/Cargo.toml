@@ -137,6 +137,10 @@ name = "fpu_context_switch"
 harness = false
 
 [[test]]
+name = "fork_fpu_inherit"
+harness = false
+
+[[test]]
 name = "task_exit"
 harness = false
 

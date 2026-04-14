@@ -811,6 +811,7 @@ fn test_all() -> R<()> {
         "serial_rx",
         "cow_vma",
         "fpu_context_switch",
+        "fork_fpu_inherit",
         "task_exit",
         "addrspace",
         "addrspace_drop",
