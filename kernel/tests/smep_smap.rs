@@ -18,8 +18,8 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 use vibix::arch::x86_64::uaccess::{self, USER_VA_END};
-use vibix::mem::vmobject::AnonObject;
 use vibix::mem::vmatree::{Share, Vma};
+use vibix::mem::vmobject::AnonObject;
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
