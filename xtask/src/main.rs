@@ -460,10 +460,22 @@ fn initrd_path() -> PathBuf {
 /// - bytes 124..136  size (octal, NUL-terminated, 0 for directories)
 /// - bytes 136..148  mtime (octal, NUL-terminated, 0 = epoch)
 /// - bytes 148..156  checksum (6 octal digits + NUL + space)
-/// - byte  156       typeflag ('5' = directory)
+/// - byte  156       typeflag ('5' = directory, '0' = regular file)
 /// - bytes 257..263  magic ("ustar\0")
 /// - bytes 263..265  version ("00")
 fn ustar_dir_block(name: &str) -> [u8; 512] {
+    ustar_header_block(name, b'5', 0o755, 0)
+}
+
+/// Build one USTAR regular-file header block (512 bytes).
+///
+/// Callers must follow the returned header with `size` bytes of file
+/// payload, padded with NULs to the next 512-byte boundary.
+fn ustar_file_block(name: &str, size: u64) -> [u8; 512] {
+    ustar_header_block(name, b'0', 0o644, size)
+}
+
+fn ustar_header_block(name: &str, typeflag: u8, mode: u16, size: u64) -> [u8; 512] {
     let mut block = [0u8; 512];
 
     // name field (bytes 0..100)
@@ -471,21 +483,23 @@ fn ustar_dir_block(name: &str) -> [u8; 512] {
     let copy_len = name_bytes.len().min(99);
     block[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-    // mode: 0755 for directories
-    block[100..107].copy_from_slice(b"0000755");
+    // mode: 7 octal digits + NUL
+    let mode_str = format!("{mode:07o}");
+    block[100..107].copy_from_slice(mode_str.as_bytes());
 
     // uid / gid: both 0
     block[108..115].copy_from_slice(b"0000000");
     block[116..123].copy_from_slice(b"0000000");
 
-    // size: 0 (11 octal digits + NUL)
-    block[124..135].copy_from_slice(b"00000000000");
+    // size: 11 octal digits + NUL
+    let size_str = format!("{size:011o}");
+    block[124..135].copy_from_slice(size_str.as_bytes());
 
     // mtime: 0 (epoch)
     block[136..147].copy_from_slice(b"00000000000");
 
-    // typeflag: '5' = directory
-    block[156] = b'5';
+    // typeflag
+    block[156] = typeflag;
 
     // USTAR magic and version
     block[257..263].copy_from_slice(b"ustar\0");
@@ -512,21 +526,23 @@ fn ustar_dir_block(name: &str) -> [u8; 512] {
 
 /// Build the minimal rootfs USTAR tarball at `target/rootfs.tar`.
 ///
-/// The tarball contains four empty directory entries required by RFC 0002
-/// §Initialization order:
-///   - `dev/`   — mount point for devfs
-///   - `tmp/`   — mount point for ramfs
-///   - `bin/`   — conventional userspace binary directory stub
-///   - `etc/`   — conventional configuration directory stub
+/// The tarball contains:
+///   - `dev/`, `tmp/`, `bin/`, `etc/` — stub mount points and directories
+///     required by RFC 0002 §Initialization order.
+///   - `etc/init/` — nested directory exercising multi-level path resolution
+///     (issue #85).
+///   - `etc/init/hello.txt` — nested regular file whose presence proves the
+///     full `path_walk` chain resolves `/etc/init/hello.txt` end-to-end.
 ///
 /// The tarball ends with two 512-byte all-zero blocks per the USTAR spec.
-/// Total size: 6 × 512 = 3072 bytes (deterministic, used for idempotency).
 fn ensure_initrd() -> R<PathBuf> {
     let path = initrd_path();
 
-    // The archive size is deterministic: 4 directory entries + 2 end blocks.
-    const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/"];
-    const EXPECTED_SIZE: u64 = ((DIRS.len() + 2) * 512) as u64;
+    const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/", "etc/init/"];
+    const NESTED_FILE: &str = "etc/init/hello.txt";
+    const NESTED_PAYLOAD: &[u8] = b"nested\n";
+    // DIRS headers + 1 file header + 1 padded data block + 2 end blocks.
+    const EXPECTED_SIZE: u64 = ((DIRS.len() + 1 + 1 + 2) * 512) as u64;
 
     let needs_write = match fs::metadata(&path) {
         Ok(m) => m.len() != EXPECTED_SIZE,
@@ -541,6 +557,10 @@ fn ensure_initrd() -> R<PathBuf> {
         for &dir in DIRS {
             data.extend_from_slice(&ustar_dir_block(dir));
         }
+        data.extend_from_slice(&ustar_file_block(NESTED_FILE, NESTED_PAYLOAD.len() as u64));
+        let mut payload_block = [0u8; 512];
+        payload_block[..NESTED_PAYLOAD.len()].copy_from_slice(NESTED_PAYLOAD);
+        data.extend_from_slice(&payload_block);
         // Two 512-byte zero blocks mark end-of-archive.
         data.extend_from_slice(&[0u8; 1024]);
         fs::write(&path, &data)?;
