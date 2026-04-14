@@ -19,11 +19,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::alloc_fs_id;
+use super::open_file::OpenFile;
 use super::ops::{
     meta_into_stat, FileOps, FileSystem, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps,
     Whence,
 };
-use super::open_file::OpenFile;
 use super::super_block::{SbFlags, SuperBlock};
 use super::MountFlags;
 use crate::fs::{EINVAL, ENOENT, ENOTDIR};
@@ -32,16 +32,9 @@ const BLOCK: usize = 512;
 
 /// Parsed contents of a single inode, keyed by `ino` in `TarSuper.nodes`.
 enum NodeData {
-    Dir {
-        children: BTreeMap<Vec<u8>, u64>,
-    },
-    Reg {
-        offset: usize,
-        len: usize,
-    },
-    Link {
-        target: Vec<u8>,
-    },
+    Dir { children: BTreeMap<Vec<u8>, u64> },
+    Reg { offset: usize, len: usize },
+    Link { target: Vec<u8> },
 }
 
 struct TarNode {
@@ -278,7 +271,9 @@ fn build_inode(sup: &Arc<TarSuper>, ino: u64, sb: Weak<SuperBlock>) -> Result<Ar
     let file_ops: Arc<dyn FileOps> = Arc::new(TarFileOps {
         sb: Arc::downgrade(sup),
     });
-    Ok(Arc::new(Inode::new(ino, sb, ops, file_ops, node.kind, node.meta)))
+    Ok(Arc::new(Inode::new(
+        ino, sb, ops, file_ops, node.kind, node.meta,
+    )))
 }
 
 // --- Parser ----------------------------------------------------------
@@ -412,9 +407,7 @@ fn build_nodes(bytes: &[u8]) -> Result<Vec<TarNode>, i64> {
     let mut off = 0usize;
     let mut zero_blocks = 0usize;
     while off + BLOCK <= bytes.len() {
-        let hdr: &[u8; BLOCK] = bytes[off..off + BLOCK]
-            .try_into()
-            .map_err(|_| EINVAL)?;
+        let hdr: &[u8; BLOCK] = bytes[off..off + BLOCK].try_into().map_err(|_| EINVAL)?;
         off += BLOCK;
 
         let entry = match parse_header(hdr)? {
@@ -763,7 +756,10 @@ mod tests {
         let archive = build_archive();
         let fs = TarFs::new();
         let sb = fs
-            .mount(MountSource::Static(archive.as_slice()), MountFlags::default())
+            .mount(
+                MountSource::Static(archive.as_slice()),
+                MountFlags::default(),
+            )
             .expect("mount");
 
         let root = sb.root.get().expect("root").clone();
@@ -772,7 +768,10 @@ mod tests {
         let a_inode = root.ops.lookup(&root, b"a").expect("lookup a");
         assert_eq!(a_inode.kind, InodeKind::Dir);
 
-        let hello = a_inode.ops.lookup(&a_inode, b"hello").expect("lookup hello");
+        let hello = a_inode
+            .ops
+            .lookup(&a_inode, b"hello")
+            .expect("lookup hello");
         assert_eq!(hello.kind, InodeKind::Reg);
         assert_eq!(hello.meta.read().size, 5);
 
@@ -780,10 +779,7 @@ mod tests {
         assert_eq!(link.kind, InodeKind::Link);
 
         // Missing name.
-        assert_eq!(
-            a_inode.ops.lookup(&a_inode, b"nope").err(),
-            Some(ENOENT)
-        );
+        assert_eq!(a_inode.ops.lookup(&a_inode, b"nope").err(), Some(ENOENT));
     }
 
     #[test]
@@ -791,7 +787,10 @@ mod tests {
         let archive = build_archive();
         let fs = TarFs::new();
         let sb = fs
-            .mount(MountSource::Static(archive.as_slice()), MountFlags::default())
+            .mount(
+                MountSource::Static(archive.as_slice()),
+                MountFlags::default(),
+            )
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -828,7 +827,10 @@ mod tests {
         let archive = build_archive();
         let fs = TarFs::new();
         let sb = fs
-            .mount(MountSource::Static(archive.as_slice()), MountFlags::default())
+            .mount(
+                MountSource::Static(archive.as_slice()),
+                MountFlags::default(),
+            )
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -845,7 +847,10 @@ mod tests {
         let archive = build_archive();
         let fs = TarFs::new();
         let sb = fs
-            .mount(MountSource::Static(archive.as_slice()), MountFlags::default())
+            .mount(
+                MountSource::Static(archive.as_slice()),
+                MountFlags::default(),
+            )
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -877,7 +882,7 @@ mod tests {
         // Valid magic + bogus size field that isn't octal.
         let mut hdr = make_header(b"bad", 0, b'0', b"", 0o644);
         hdr[124] = b'Z'; // garbage in the size field
-        // Rewrite checksum around the tampered size.
+                         // Rewrite checksum around the tampered size.
         hdr[148..156].copy_from_slice(b"        ");
         let sum: u64 = hdr.iter().map(|&b| b as u64).sum();
         write_octal(&mut hdr[148..155], sum, 6);
@@ -886,7 +891,10 @@ mod tests {
         archive.extend_from_slice(&[0u8; BLOCK * 2]);
 
         let fs = TarFs::new();
-        let r = fs.mount(MountSource::Static(archive.as_slice()), MountFlags::default());
+        let r = fs.mount(
+            MountSource::Static(archive.as_slice()),
+            MountFlags::default(),
+        );
         assert!(r.is_err());
     }
 }
