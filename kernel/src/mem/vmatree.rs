@@ -155,7 +155,7 @@ impl Vma {
             share: self.share,
             object: Arc::clone(&self.object),
             object_offset: self.object_offset,
-            vma_flags: 0,
+            vma_flags: self.vma_flags, // preserve behaviour flags on split
         };
         let right = Vma {
             start: addr,
@@ -165,7 +165,7 @@ impl Vma {
             share: self.share,
             object: self.object,
             object_offset: self.object_offset + delta,
-            vma_flags: 0,
+            vma_flags: self.vma_flags, // preserve behaviour flags on split
         };
         (left, right)
     }

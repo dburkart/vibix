@@ -403,11 +403,13 @@ impl AddressSpace {
     }
 
     /// Handle a growsdown stack fault at `cr2`. If the address is within
-    /// the growsdown gap of a `VMA_GROWSDOWN` VMA, extends the VMA's
-    /// start one page downward and returns the VMA's object/offset/prot
-    /// so the caller can install the demand-page frame. Returns `None`
-    /// (SIGSEGV path) if no growsdown VMA is nearby, the gap is too
-    /// large, the RLIMIT would be exceeded, or another VMA is in the way.
+    /// the growsdown gap of a `VMA_GROWSDOWN` VMA, inserts a **new
+    /// single-page VMA** for the faulting page so its AnonObject cache
+    /// index is always 0 — this avoids object-offset aliasing with
+    /// previously faulted pages in the existing stack VMA. Returns the
+    /// new page's object/offset/prot so the caller can install the PTE.
+    ///
+    /// Returns `None` (SIGSEGV path) if validation fails.
     pub fn grow_stack(
         &mut self,
         cr2: usize,
@@ -417,7 +419,8 @@ impl AddressSpace {
         crate::mem::vmatree::ProtPte,
     )> {
         use crate::mem::pf::{check_growsdown, GrowResult, STACK_GUARD_GAP_PAGES};
-        use crate::mem::vmatree::{VMA_GROWSDOWN, VMA_STACK_GUARD};
+        use crate::mem::vmatree::{Share, Vma, VMA_GROWSDOWN, VMA_STACK_GUARD};
+        use crate::mem::vmobject::AnonObject;
 
         // Find the growsdown VMA whose start is just above cr2.
         let above = self.vmas.find_above(cr2)?;
@@ -427,7 +430,6 @@ impl AddressSpace {
         let vma_start = above.start;
         let stack_top = above.end as u64;
         let prot_pte = above.prot_pte;
-        let obj = alloc::sync::Arc::clone(&above.object);
 
         let result = check_growsdown(
             cr2 as u64,
@@ -441,27 +443,39 @@ impl AddressSpace {
             GrowResult::Grow { new_start } => new_start as usize,
             GrowResult::Segv => return None,
         };
+        let new_end = new_start + 4096; // exactly one new page
 
-        // Collision: reject if any other VMA occupies [new_start, vma_start).
+        // Collision: reject if any VMA already occupies the new page.
         if self.vmas.find(new_start).is_some() {
             return None;
         }
-        // Guard VMA collision: reject if a guard VMA's end > new_start.
+        // Guard VMA collision: reject if a guard VMA would cover new_start.
         if let Some(below) = self.vmas.last_below(vma_start) {
             if below.vma_flags & VMA_STACK_GUARD != 0 && below.end > new_start {
                 return None;
             }
         }
 
-        // Extend the VMA downward.
-        let old_pages = (stack_top as usize - vma_start) / 4096;
-        let new_pages = (stack_top as usize - new_start) / 4096;
-        self.vm_pages = self.vm_pages - old_pages + new_pages;
-        self.vmas.rekey_start(vma_start, new_start);
+        // Insert a fresh single-page VMA for the new stack page.
+        // Using an independent AnonObject per page ensures object_offset=0
+        // always maps to this specific page — no aliasing with cached frames
+        // in the parent stack VMA.
+        let new_obj: alloc::sync::Arc<dyn crate::mem::vmobject::VmObject> =
+            AnonObject::new(Some(1));
+        let mut new_vma = Vma::new(
+            new_start,
+            new_end,
+            0x3, // PROT_READ|WRITE
+            prot_pte,
+            Share::Private,
+            alloc::sync::Arc::clone(&new_obj),
+            0,
+        );
+        new_vma.vma_flags = VMA_GROWSDOWN;
+        self.vmas.insert(new_vma);
+        self.vm_pages += 1;
 
-        // The new bottom page's object offset (page index from new_start).
-        let page_idx = (cr2 & !0xFFF) - new_start;
-        Some((obj, page_idx, prot_pte))
+        Some((new_obj, 0, prot_pte))
     }
 
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours
@@ -548,6 +562,7 @@ impl AddressSpace {
 
         // Collect VMAs first (avoids borrow conflict when we later
         // mutate the child and call paging helpers on self.page_table).
+        // vma_flags is included so growsdown/guard behaviour carries over.
         type VmaSnap = (
             usize,
             usize,
@@ -556,6 +571,7 @@ impl AddressSpace {
             Share,
             Arc<dyn crate::mem::vmobject::VmObject>,
             usize,
+            crate::mem::vmatree::VmaFlags,
         );
         let vma_snapshot: alloc::vec::Vec<VmaSnap> = self
             .vmas
@@ -569,24 +585,28 @@ impl AddressSpace {
                     v.share,
                     Arc::clone(&v.object),
                     v.object_offset,
+                    v.vma_flags,
                 )
             })
             .collect();
 
-        for (start, end, prot_user, prot_pte, share, object, object_offset) in &vma_snapshot {
+        for (start, end, prot_user, prot_pte, share, object, object_offset, vma_flags) in
+            &vma_snapshot
+        {
             let prot_user = *prot_user;
             let prot_pte = *prot_pte;
             let share = *share;
             let start = *start;
             let end = *end;
             let object_offset = *object_offset;
+            let vma_flags = *vma_flags;
 
             // Private VMAs get an independent empty cache; Shared VMAs alias the same frames.
             let child_object = match share {
                 Share::Private => object.clone_private(),
                 Share::Shared => Arc::clone(object),
             };
-            let child_vma = VmaEntry::new(
+            let mut child_vma = VmaEntry::new(
                 start,
                 end,
                 prot_user,
@@ -595,6 +615,7 @@ impl AddressSpace {
                 child_object,
                 object_offset,
             );
+            child_vma.vma_flags = vma_flags; // preserve growsdown/guard flags
             child.vmas.insert(child_vma);
             child.vm_pages += (end - start) / 4096;
 
