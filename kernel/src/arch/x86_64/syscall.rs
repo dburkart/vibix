@@ -198,12 +198,8 @@ pub unsafe extern "C" fn syscall_dispatch(
             let fd = a0 as u32;
             let buf_va = a1 as usize;
             let len = a2 as usize;
-            if len == 0 {
-                return 0;
-            }
-            if let Err(e) = uaccess::check_user_range(buf_va, len) {
-                return e.as_errno();
-            }
+            // Validate the fd BEFORE checking len==0: POSIX requires
+            // read(invalid_fd, buf, 0) to return EBADF, not 0.
             // Get the backend without holding the fd-table lock during I/O.
             let backend = {
                 let tbl = crate::task::current_fd_table();
@@ -213,6 +209,12 @@ pub unsafe extern "C" fn syscall_dispatch(
                 };
                 x
             };
+            if len == 0 {
+                return 0;
+            }
+            if let Err(e) = uaccess::check_user_range(buf_va, len) {
+                return e.as_errno();
+            }
             // Read into a kernel bounce buffer, then copy to user.
             let mut chunk = [0u8; 256];
             let n = core::cmp::min(chunk.len(), len);
@@ -259,6 +261,13 @@ pub unsafe extern "C" fn syscall_dispatch(
                     Err(e) => return e.as_errno(),
                 }
                 match backend.write(&chunk[..n]) {
+                    Ok(0) => {
+                        // Short-write / end-of-stream: return however many
+                        // bytes we've written so far rather than looping
+                        // forever. (A backend that always returns Ok(0) for
+                        // non-empty input would loop indefinitely otherwise.)
+                        break;
+                    }
                     Ok(nw) => written += nw,
                     Err(e) => return e,
                 }
@@ -583,17 +592,19 @@ unsafe fn sys_open(path_uva: u64, flags: u64, _mode: u64) -> i64 {
         return ENOENT;
     }
 
-    // Mask caller-supplied flags down to the bits our fd table honors.
-    let safe_flags =
-        (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
+    // Split caller flags: access mode goes into FileDescription.flags;
+    // O_CLOEXEC goes into the per-fd slot flags (so dup() can clear it
+    // without touching the shared description).
+    let access_flags = (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR);
+    let fd_flags = (flags as u32) & oflags::O_CLOEXEC;
 
     let backend: Arc<dyn FileBackend> = Arc::new(SerialBackend);
     let desc = Arc::new(FileDescription {
         backend,
-        flags: safe_flags,
+        flags: access_flags,
     });
     let tbl = crate::task::current_fd_table();
-    let result = tbl.lock().alloc_fd(desc);
+    let result = tbl.lock().alloc_fd_with_flags(desc, fd_flags);
     match result {
         Ok(fd) => fd as i64,
         Err(e) => e,
