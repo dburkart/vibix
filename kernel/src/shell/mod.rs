@@ -9,6 +9,7 @@
 //! Line-editing state (history ring, current line) lives in the
 //! [`line_editor`] submodule as pure logic so it's host-unit-testable.
 
+pub mod ansi;
 pub mod line_editor;
 
 #[cfg(target_os = "none")]
@@ -17,6 +18,7 @@ mod kernel_side {
 
     use pc_keyboard::{DecodedKey, KeyCode};
 
+    use super::ansi::{self, CsiFinal, Event};
     use super::line_editor::{Effect, Input, LineEditor};
     use crate::mem::{frame, heap, FRAME_SIZE};
     use crate::task::TaskStateView;
@@ -29,16 +31,6 @@ mod kernel_side {
 
     const PROMPT: &str = "vibix> ";
 
-    /// Serial-side ANSI CSI state. Serial arrow keys arrive as three
-    /// bytes `ESC [ A..D`; xterm sometimes prefixes with `O` instead of
-    /// `[`, so we accept both.
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum Ansi {
-        Ground,
-        Esc,
-        Csi,
-    }
-
     /// Task entry point. Spawn as `task::spawn(shell::run)`.
     pub fn run() -> ! {
         serial_println!("shell: prompt online");
@@ -46,7 +38,7 @@ mod kernel_side {
         prompt();
 
         let mut editor = LineEditor::new();
-        let mut ansi = Ansi::Ground;
+        let mut ansi = ansi::State::default();
         loop {
             if let Some(ev) = next_input(&mut ansi) {
                 for eff in editor.on_input(ev) {
@@ -66,9 +58,9 @@ mod kernel_side {
     /// responsive even when both rings accumulate simultaneously. The
     /// `ansi` state machine is threaded across calls so multi-byte
     /// escape sequences on serial survive across `hlt` gaps.
-    fn next_input(ansi: &mut Ansi) -> Option<Input> {
+    fn next_input(state: &mut ansi::State) -> Option<Input> {
         if let Some(b) = serial::try_read_byte() {
-            return serial_byte(b, ansi);
+            return serial_byte(b, state);
         }
         let key = input::try_read_key()?;
         match key {
@@ -81,42 +73,27 @@ mod kernel_side {
 
     /// Translate a serial byte through the CSI state machine. On
     /// completion of an arrow escape, return the corresponding `Input`.
-    /// Unrecognised finals drop the sequence silently.
-    fn serial_byte(b: u8, ansi: &mut Ansi) -> Option<Input> {
-        match (*ansi, b) {
-            (Ansi::Ground, 0x1b) => {
-                *ansi = Ansi::Esc;
-                None
-            }
-            (Ansi::Esc, b'[') | (Ansi::Esc, b'O') => {
-                *ansi = Ansi::Csi;
-                None
-            }
-            (Ansi::Esc, _) => {
-                // Bare ESC followed by non-CSI: drop, reset.
-                *ansi = Ansi::Ground;
-                None
-            }
-            (Ansi::Csi, b'A') => {
-                *ansi = Ansi::Ground;
-                Some(Input::HistoryPrev)
-            }
-            (Ansi::Csi, b'B') => {
-                *ansi = Ansi::Ground;
-                Some(Input::HistoryNext)
-            }
-            (Ansi::Csi, b'C') | (Ansi::Csi, b'D') => {
-                // Left/right — deferred per issue #112.
-                *ansi = Ansi::Ground;
-                None
-            }
-            (Ansi::Csi, _) => {
-                // Unrecognised CSI final — drop and resync.
-                *ansi = Ansi::Ground;
-                None
-            }
-            (Ansi::Ground, _) => char_to_input(b as char),
+    /// Unrecognised finals and parameterised sequences with non-arrow
+    /// finals drop silently.
+    fn serial_byte(b: u8, state: &mut ansi::State) -> Option<Input> {
+        match ansi::step(state, b)? {
+            Event::Byte(b) => byte_to_input(b),
+            Event::Csi(CsiFinal::Up) => Some(Input::HistoryPrev),
+            Event::Csi(CsiFinal::Down) => Some(Input::HistoryNext),
+            // Left/right and other finals: deferred per issue #112.
+            Event::Csi(_) => None,
         }
+    }
+
+    /// Ground-state byte from the ANSI state machine. Bytes above
+    /// 0x7F (UTF-8 continuation bytes, 8-bit terminals) are ignored
+    /// rather than cast blindly to `char`, which would coerce them
+    /// into unrelated Latin-1 code points.
+    fn byte_to_input(b: u8) -> Option<Input> {
+        if b > 0x7F {
+            return None;
+        }
+        char_to_input(b as char)
     }
 
     /// Map a single decoded character to an editor event. Ctrl+C/L
