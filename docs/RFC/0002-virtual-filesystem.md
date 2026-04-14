@@ -207,8 +207,18 @@ pub struct SuperBlock {
     pub flags: SbFlags,                 // RDONLY, NOEXEC, NOSUID, NODEV
     pub rename_mutex: BlockingMutex<()>, // s_vfs_rename_mutex — directory-rename
                                         // global tiebreaker (see §Rename)
-    pub open_files: AtomicUsize,        // pins from live OpenFile; unmount barrier
-    pub draining: AtomicBool,           // set by unmount; blocks new opens
+    // Generalized busy counter. Incremented by every in-flight syscall
+    // that touches this SB — `sys_open`, `sys_{unlink,mkdir,rmdir,
+    // rename,link,symlink,readlink,stat,chdir,setattr,...}` — plus
+    // every live `OpenFile`. `sys_umount` Phase A commits `draining =
+    // true` then checks `sb_active == 0`; syscalls mirror that by
+    // `fetch_add` then checking `draining`, rolling back on either
+    // side. This closes the SB-teardown TOCTOU for all path-based
+    // mutators, not just open. See `SbActiveGuard` in §Locking
+    // discipline. (Renamed from `open_files` in defense cycle 3;
+    // addresses Sec-B7 / OS-B9.)
+    pub sb_active: AtomicUsize,
+    pub draining:  AtomicBool,           // set by unmount; blocks new pins
 }
 
 pub struct Inode {
@@ -371,6 +381,13 @@ pub struct NameIdata {
     pub flags:   LookupFlags,           // FOLLOW, DIRECTORY, PARENT, AT_EMPTY_PATH
     pub symlink_depth: u8,              // incremented per symlink follow
     pub cred:    Credential,            // caller's (uid, gid, groups)
+    // Every `MountEdge` the walker crossed is retained here so the
+    // corresponding `SuperBlock`s stay pinned for the duration of the
+    // walk (prevents a concurrent `sys_umount` Phase A from unlinking
+    // a SB whose Inode the walker is about to return). Dropped when
+    // `NameIdata` drops — i.e., at the end of the syscall, or when
+    // ownership is handed off to an `OpenFile`/`sb_active` guard.
+    pub edges:   SmallVec<Arc<MountEdge>>,
 }
 
 pub enum Last {
@@ -477,7 +494,8 @@ Background/Design inconsistency [Acad-B3].
 Install and uninstall both hold `MOUNT_TABLE.write()` across *both*
 mutations (mount-table vector *and* `Dentry.mount` slot). This closes
 the torn-view race [OS-B4, Sec-B6]. Unmount also sets the `draining`
-flag before checking `open_files`, closing the TOCTOU [OS-B5]. All
+flag before checking `sb_active`, closing the TOCTOU [OS-B5, OS-B9,
+Sec-B7]. All
 `Weak::upgrade().unwrap()` panics are replaced with error paths; the
 walker's retained `Arc<MountEdge>` (§Path resolution) guarantees the
 mountpoint dentry is still upgradeable during the install/uninstall
@@ -512,7 +530,7 @@ unmount(target_path: &str, flags: MountFlags) -> Result<(), i64>:
     // Phase A (under MOUNT_TABLE.write()): set the drain flag and decide
     // busy-or-proceed. This is a short critical section — no FS-driver
     // code runs here. Once the edge is marked draining and (for the
-    // non-force case) open_files == 0, we remove the edge from the
+    // non-force case) sb_active == 0, we remove the edge from the
     // visibility set so no new path walk can reach it.
     let edge = {
         let mut mt = MOUNT_TABLE.write();
@@ -520,34 +538,35 @@ unmount(target_path: &str, flags: MountFlags) -> Result<(), i64>:
             .find(|e| Arc::ptr_eq(&e.root_dentry, &target_nd.dentry))
             .cloned().ok_or(EINVAL)?;
 
-        // 1) Set draining first. sys_open's commit-then-validate dance
-        //    (see below) means every thread that has incremented
-        //    open_files has already passed the draining check; any
-        //    thread that has not yet incremented open_files will see
-        //    draining=true and bail.
+        // Anchor the mountpoint BEFORE we touch `draining`. If the
+        // mountpoint is gone we return ESTALE without perturbing
+        // observable state — no spurious ENOENT for a concurrent
+        // opener (addresses OS-A10).
+        let mp = edge.mountpoint.upgrade().ok_or(ESTALE)?;
+
+        // 1) Set draining. sys_open / sys_mkdir / … commit-then-
+        //    validate (see SbActiveGuard below) means every thread
+        //    that has incremented sb_active has already passed the
+        //    draining check; any thread that has not yet incremented
+        //    will see draining=true and bail with ENOENT.
         edge.super_block.draining.store(true, Ordering::SeqCst);
 
         // 2) SeqCst fence via the store above pairs with the fence in
-        //    sys_open; now loading open_files gives a stable answer.
+        //    SbActiveGuard::try_acquire; loading sb_active now gives
+        //    a stable answer.
         if !flags.contains(MNT_FORCE)
-            && edge.super_block.open_files.load(Ordering::SeqCst) > 0
+            && edge.super_block.sb_active.load(Ordering::SeqCst) > 0
         {
-            // Revert the drain flag — abort cleanly, edge stays visible.
             edge.super_block.draining.store(false, Ordering::SeqCst);
             return Err(EBUSY);
         }
 
         // 3) Make the edge invisible to path walk while still holding
         //    MOUNT_TABLE.write(). Any path walk that started earlier
-        //    either holds a strong Arc<MountEdge> (pinned for its
-        //    duration) or will re-observe a table that no longer
-        //    contains this edge on its next MOUNT_TABLE.read().
-        let mp = edge.mountpoint.upgrade().ok_or_else(|| {
-            // Failed to anchor; undo drain and bail without mutating
-            // the table — the mountpoint dentry was evicted under us.
-            edge.super_block.draining.store(false, Ordering::SeqCst);
-            ESTALE
-        })?;
+        //    either holds a strong Arc<MountEdge> in NameIdata.edges
+        //    (pinning the SB for its duration) or will re-observe a
+        //    table that no longer contains this edge on its next
+        //    MOUNT_TABLE.read().
         *mp.mount.write() = None;
         mt.retain(|e| !Arc::ptr_eq(e, &edge));
         edge
@@ -561,7 +580,7 @@ unmount(target_path: &str, flags: MountFlags) -> Result<(), i64>:
     // from within unmount see a consistent "unmounted" table.
 
     // 4) Drain any Inode drops the GC queue accumulated; then run the
-    //    FS-driver-specific teardown. At this point open_files == 0
+    //    FS-driver-specific teardown. At this point sb_active == 0
     //    (non-force case) or the caller accepted the force semantics.
     vfs::gc_drain_for(&edge.super_block);
     edge.super_block.ops.unmount()?;
@@ -849,6 +868,68 @@ thread holding `state` must not acquire any other VFS lock. Mount
 install/uninstall are the only places `MOUNT_TABLE` nests with
 `Dentry.mount` — they are always paired under `MOUNT_TABLE.write()`.
 
+**Unmount barrier for path-based syscalls (`SbActiveGuard`).** Every
+syscall that touches an SB — `sys_open`, `sys_unlink`, `sys_mkdir`,
+`sys_rmdir`, `sys_rename`, `sys_link`, `sys_symlink`, `sys_readlink`,
+`sys_stat`, `sys_fstatat`, `sys_chdir`, `sys_setattr` — pins the SB
+for the rest of its execution through a single RAII helper:
+
+```rust
+pub struct SbActiveGuard<'a> { sb: &'a SuperBlock }
+
+impl<'a> SbActiveGuard<'a> {
+    /// Commit-then-validate against `sb.draining`. Pairs with the
+    /// mirrored `store(draining); load(sb_active)` in `sys_umount`
+    /// Phase A. Both orderings are SeqCst so the two atomics form
+    /// a single total order.
+    pub fn try_acquire(sb: &'a SuperBlock) -> Result<Self, i64> {
+        sb.sb_active.fetch_add(1, Ordering::SeqCst);
+        if sb.draining.load(Ordering::SeqCst) {
+            sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+            return Err(ENOENT);
+        }
+        Ok(SbActiveGuard { sb })
+    }
+}
+
+impl Drop for SbActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+```
+
+Every path-based syscall resolves its target via `path_walk` (which
+additionally pins every traversed `Arc<MountEdge>` in
+`NameIdata.edges` — see §Path resolution), then calls
+`SbActiveGuard::try_acquire(&sb)?` on the resolved `SuperBlock`
+*before* invoking any `InodeOps` mutator. If `draining` is already
+set, the syscall returns `ENOENT`. For `sys_open`, the success path
+transfers the guard's pin to `OpenFile` via `core::mem::forget`;
+`OpenFile::Drop` then performs the matching `fetch_sub`.
+
+This single helper closes the SB-teardown TOCTOU for *all* path-based
+mutators, not just `open` (addresses Sec-B7, OS-B9). Fd-based
+syscalls (`read`, `write`, `lseek`, `fsync`, `close`) inherit the
+pin from the `OpenFile` they were issued against, so they do not
+need their own `SbActiveGuard`.
+
+**`OpenFile` drop.** The pin-transfer from `sys_open` would be a
+silent leak without a matching decrement, so `OpenFile` spells out
+its `Drop` explicitly (addresses Sec-B8):
+
+```rust
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        self.sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+        // Note: the `self.inode: Arc<Inode>` and `self.dentry:
+        // Arc<Dentry>` fields drop normally after this runs and
+        // may push onto `vfs::gc_queue` per the deferred-eviction
+        // discipline below.
+    }
+}
+```
+
 **Deferred eviction.** To close [OS-B3] (reentrancy under `Drop`),
 the last-ref drop of an `Arc<Inode>` does **not** call
 `SuperOps::evict_inode` inline. Instead, `Inode::Drop` pushes the
@@ -871,11 +952,12 @@ into a softirq-style deferred worker and the VFS call must land from
 that worker, not from the ISR. Added as an advisory constraint in
 §Performance Considerations [OS-A8].
 
-**Primitive names.** `BlockingRwLock` is the tree's existing blocking
-reader-writer lock (`kernel/src/sync/rwlock.rs`); `BlockingMutex` is
-`kernel/src/sync/mutex.rs::BlockingMutex`. These replace the
-earlier-draft `RwLock`/`Mutex` names that did not match the tree
-[OS-A2]. None of them disables interrupts.
+**Primitive names.** `BlockingMutex` is today's
+`kernel/src/sync/mutex.rs::BlockingMutex`. `BlockingRwLock` and
+`Semaphore` are **new primitives introduced by this RFC** (see §
+Synchronization primitives introduced by this RFC); they land in
+`kernel/src/sync/` as the first roadmap item, before any VFS type that
+uses them. None of them disables interrupts.
 
 #### Rename — full protocol
 
@@ -968,30 +1050,10 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
     let sb = inode.sb.upgrade().ok_or(ESTALE)?;      // no unwrap
 
     // 3. SB barriers (§Security: NOSUID/NOEXEC/NODEV are enforced here
-    //    and at mmap/exec). Commit-then-validate sequence for the
-    //    unmount barrier (addresses Sec-B1' / OS-B5'):
-    //
-    //      (a) fetch_add(open_files) — publishes our intent
-    //      (b) SeqCst fence (implicit in fetch_add with SeqCst ordering)
-    //      (c) load(draining) — if set, unmount already won the race,
-    //          decrement and bail with ENOENT
-    //      (d) every FS-mutating step after this point sees a non-zero
-    //          open_files count, so concurrent unmount in Phase A
-    //          returns EBUSY (non-force) before it can toggle draining.
-    //
-    // The reverse sequence in sys_umount (store(draining); load(
-    // open_files)) plus SeqCst ordering on both sides means at least
-    // one of the two parties always observes the other's store — no
-    // window exists where both see "all clear".
-    sb.open_files.fetch_add(1, Ordering::SeqCst);
-    if sb.draining.load(Ordering::SeqCst) {
-        sb.open_files.fetch_sub(1, Ordering::SeqCst);
-        return Err(ENOENT);
-    }
-    // From this point, an error path MUST decrement open_files before
-    // returning. We centralize that in a small RAII guard in real
-    // code; here the pseudocode spells it out.
-    let _open_guard = OpenGuard(&sb); // dec on drop
+    //    and at mmap/exec). Pin the SB across the rest of the syscall
+    //    with the shared SbActiveGuard (see §Locking discipline —
+    //    Unmount barrier for path-based syscalls).
+    let _sb_guard = SbActiveGuard::try_acquire(&sb)?; // ENOENT if draining
 
     check_sb_mount_flags(&sb, flags, &inode)?;       // Sec-B1
 
@@ -1018,8 +1080,9 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
 
     // 6. Build the OpenFile. Pinning the SB here is what makes
     //    OS-B6 safe: the Inode can never outlive its SB. Hand
-    //    ownership of the open_files increment over to the OpenFile
-    //    by forgetting the guard.
+    //    ownership of the sb_active increment over to the OpenFile
+    //    by forgetting the guard; OpenFile::Drop (below) handles
+    //    the matching fetch_sub.
     let of = Arc::new(OpenFile {
         dentry:  nd.dentry.clone(),
         inode:   inode.clone(),
@@ -1028,8 +1091,7 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
         ops:     inode.file_ops.clone(),
         sb:      sb.clone(),
     });
-    core::mem::forget(_open_guard);
-    // OpenFile::Drop is responsible for the matching fetch_sub.
+    core::mem::forget(_sb_guard);
 
     let backend: Arc<dyn FileBackend> = Arc::new(VfsBackend { open_file: of });
     let fd_table = current_task().fd_table();
@@ -1224,17 +1286,24 @@ unknown cookie, and MUST NOT return entries the caller could not
 obtain via a fresh `opendir`+walk. A separate host test exercises
 this per driver.
 
-**Unmount and open files.** `unmount` without `MNT_FORCE` returns
-`EBUSY` if `SuperBlock::open_files > 0`. The TOCTOU between the
-check and the unmount [OS-B5] is closed by: (a) taking
-`MOUNT_TABLE.write()` across the entire unmount bracket, and (b)
-setting `sb.draining = true` before the check, so any concurrent
-`sys_open` that resolved into this SB *before* we took the lock
-will observe `draining` on its way to incrementing `open_files`
-and return `ENOENT`. With `MOUNT_TABLE.write()` held, no new
-walker can reach the mount root, because the walker descends via
-`MOUNT_TABLE.read()` and the `Arc<MountEdge>` clone (§Path
-resolution).
+**Unmount and in-flight syscalls.** `unmount` without `MNT_FORCE`
+returns `EBUSY` if `SuperBlock::sb_active > 0`. The TOCTOU between
+the check and the unmount [OS-B5, OS-B9, Sec-B7] is closed by: (a)
+`sys_umount` Phase A runs under `MOUNT_TABLE.write()` and, via the
+`SbActiveGuard` commit-then-validate protocol (§Locking discipline),
+sees every path-based mutator (`sys_{open, unlink, mkdir, rmdir,
+rename, link, symlink, readlink, stat, chdir, setattr}`) plus every
+live `OpenFile`; (b) setting `sb.draining = true` *before* loading
+`sb_active` pairs (SeqCst) with each guard's `fetch_add`-then-load
+of `draining`, guaranteeing at least one side observes the other's
+store; (c) the edge is unlinked from `MOUNT_TABLE` and from its
+`mountpoint.mount` slot within the same `MOUNT_TABLE.write()`
+critical section, so no *new* walker can reach the mount root.
+Walkers that were mid-resolution at Phase A hold a strong
+`Arc<MountEdge>` in `NameIdata.edges`, which pins the SB for the
+remainder of their syscall; they complete normally against an
+already-detached SB and `ops.unmount()` (Phase B) runs only after
+they release their `SbActiveGuard`.
 
 **Mount-point bootstrap**: [Sec-A6] noted that `/dev` and `/tmp`
 rely on tarfs containing those directories as mount points. The
