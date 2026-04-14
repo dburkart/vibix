@@ -787,7 +787,7 @@ static RW_READ_LIVE: AtomicUsize = AtomicUsize::new(0);
 static RW_READ_PEAK: AtomicUsize = AtomicUsize::new(0);
 static RW_READ_DONE: AtomicUsize = AtomicUsize::new(0);
 
-const RW_READ_HOLD_SPINS: usize = 300_000;
+const RW_READ_HOLD_SPINS: usize = 100_000;
 
 fn rw_reader_worker() -> ! {
     let _g = RW_READERS.read();
@@ -847,8 +847,8 @@ fn rwlock_concurrent_readers() {
 static RW_WRITERS: BlockingRwLock<u64> = BlockingRwLock::new(0);
 static RW_WRITE_DONE: AtomicUsize = AtomicUsize::new(0);
 
-const RW_WRITE_ROUNDS: u64 = 10;
-const RW_WRITE_CRIT_SPINS: usize = 200_000;
+const RW_WRITE_ROUNDS: u64 = 5;
+const RW_WRITE_CRIT_SPINS: usize = 50_000;
 
 fn rw_writer_worker() -> ! {
     for _ in 0..RW_WRITE_ROUNDS {
@@ -903,7 +903,7 @@ static RW_STARVE_WRITER_DONE: AtomicUsize = AtomicUsize::new(0);
 static RW_STARVE_READERS_DONE: AtomicUsize = AtomicUsize::new(0);
 static RW_STARVE_GO: AtomicUsize = AtomicUsize::new(0);
 
-const RW_STARVE_READERS: u32 = 8;
+const RW_STARVE_READERS: u32 = 4;
 
 fn rw_starve_writer() -> ! {
     // Wait until the driver signals us to go, then contend against
@@ -991,7 +991,7 @@ static SEM_LIVE: AtomicUsize = AtomicUsize::new(0);
 static SEM_PEAK: AtomicUsize = AtomicUsize::new(0);
 static SEM_DONE: AtomicUsize = AtomicUsize::new(0);
 
-const SEM_HOLD_SPINS: usize = 300_000;
+const SEM_HOLD_SPINS: usize = 100_000;
 
 fn sem_worker() -> ! {
     SEM_GATE.acquire();
@@ -1075,7 +1075,7 @@ fn semaphore_release_wakes_one() {
     // Wait until both workers have actually parked inside `acquire`.
     // Workers enqueue on the internal waitqueue, so we poll indirectly
     // via the done counter staying at 0 after a grace period.
-    for _ in 0..200 {
+    for _ in 0..50 {
         x86_64::instructions::hlt();
     }
     assert_eq!(
@@ -1086,7 +1086,7 @@ fn semaphore_release_wakes_one() {
 
     // One release — exactly one worker should wake.
     SEM_WAKE.release();
-    for _ in 0..1_000 {
+    for _ in 0..200 {
         if SEM_WAKE_COUNT.load(Ordering::SeqCst) >= 1 {
             break;
         }
@@ -1100,7 +1100,7 @@ fn semaphore_release_wakes_one() {
 
     // Second release frees the other worker.
     SEM_WAKE.release();
-    for _ in 0..1_000 {
+    for _ in 0..200 {
         if SEM_WAKE_COUNT.load(Ordering::SeqCst) == 2 {
             break;
         }

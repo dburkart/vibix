@@ -3,9 +3,9 @@
 //!
 //! Shares the park/wake path with [`BlockingMutex`] via a single
 //! [`WaitQueue`]: both readers and writers enqueue on the same queue,
-//! so waiters fall out in FIFO order — a writer blocked behind a
-//! reader wakes before a later reader does, which prevents writer
-//! starvation under continuous reader churn.
+//! so the wake order is FIFO — a writer blocked behind a reader wakes
+//! before a later reader does, which keeps writers making progress
+//! under reader churn.
 //!
 //! Lock order (see [`super`] module docs): `WaitQueue.inner` → the
 //! internal `state` spin-lock.
@@ -17,15 +17,13 @@ use spin::Mutex as SpinMutex;
 use super::WaitQueue;
 
 /// Internal lock state. `writer` is exclusive with any non-zero
-/// `readers` count; FIFO fairness is enforced by `writer_waiting`,
-/// which tells new readers to queue behind a pending writer.
+/// `readers` count. `writer_waiting` tells arriving readers to queue
+/// behind a parked writer so long reader streams can't indefinitely
+/// defer a writer's acquisition.
 #[derive(Clone, Copy)]
 struct State {
     readers: u32,
     writer: bool,
-    /// Number of writers currently parked. While non-zero, new
-    /// readers park too — that's what gives the writer a window to
-    /// reach the head of the queue under reader churn.
     writer_waiting: u32,
 }
 
@@ -115,24 +113,27 @@ impl<T: ?Sized> BlockingRwLock<T> {
                     return RwLockReadGuard { rw: self };
                 }
             }
-            // Park — see `BlockingMutex::lock` for the cond-under-
-            // waitqueue-lock race argument. `can_read` re-checks
-            // under the waitqueue lock so a release between our
-            // fast-path check and the park can't be dropped.
+            // Park. `wait_while` re-checks the cond under the
+            // waitqueue lock, so a release between our fast-path
+            // check and the park can't be dropped — see
+            // `BlockingMutex::lock`.
             self.waiters.wait_while(|| !self.state.lock().can_read());
         }
     }
 
     /// Acquire the exclusive (write) lock, parking until it's
-    /// available. New readers block behind a parked writer, so a
-    /// writer will get the lock within a bounded number of reader
-    /// releases regardless of reader churn.
+    /// available. New readers queue behind a parked writer, so long
+    /// reader streams don't indefinitely defer writer acquisition.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        // Register writer-waiting up front so new readers queue
-        // behind us. Released whether we take the fast path, the
-        // slow path, or early-return.
+        // Fast path: uncontended grab. No need to touch
+        // `writer_waiting` if the lock is immediately available.
         {
             let mut st = self.state.lock();
+            if st.can_write() {
+                st.writer = true;
+                return RwLockWriteGuard { rw: self };
+            }
+            // Contended — register ourselves so readers back off.
             st.writer_waiting += 1;
         }
         loop {
@@ -149,8 +150,8 @@ impl<T: ?Sized> BlockingRwLock<T> {
     }
 }
 
-/// RAII shared-access guard. Drop to release; wakes one waiter if the
-/// last reader leaves the lock in a state a writer could now claim.
+/// RAII shared-access guard. Drop to release; wakes waiters if the
+/// last reader leaves the lock in a state a writer could claim.
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     rw: &'a BlockingRwLock<T>,
 }
@@ -172,17 +173,16 @@ impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
             st.readers == 0
         };
         if was_last {
-            // Last reader out: a writer at the head of the queue can
-            // now proceed. Notifying more wouldn't help — at most one
-            // writer can acquire, and readers are already parked
-            // behind `writer_waiting`.
-            self.rw.waiters.notify_one();
+            // Last reader out: wake every waiter so the FIFO head —
+            // likely the writer that incremented `writer_waiting` —
+            // can take the lock. Anyone who doesn't get it re-parks.
+            self.rw.waiters.notify_all();
         }
     }
 }
 
 /// RAII exclusive-access guard. Drop to release; wakes every waiter
-/// so readers queued behind this writer can batch-enter.
+/// so whoever's at the head of the FIFO queue can proceed.
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     rw: &'a BlockingRwLock<T>,
 }
@@ -208,9 +208,8 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
             let mut st = self.rw.state.lock();
             st.writer = false;
         }
-        // `notify_all` so a burst of readers queued behind us can
-        // all wake and the next writer (if any) reasserts
-        // `writer_waiting` for its own park iteration.
+        // Wake every waiter so a burst of readers queued behind us
+        // can all re-check and enter, or the next writer can claim.
         self.rw.waiters.notify_all();
     }
 }
