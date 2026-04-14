@@ -85,6 +85,12 @@ pub trait VmObject: Send + Sync {
     /// same `len_pages` bound; future file-backed objects should return a
     /// similarly independent copy.
     fn clone_private(&self) -> Arc<dyn VmObject>;
+
+    /// Release cached frames for all page indices ≥ `from_page`. Called
+    /// by `sys_brk` during heap shrink so stale frames are freed promptly
+    /// rather than waiting until the object is dropped. The default is a
+    /// no-op; `AnonObject` overrides it to trim its frame cache.
+    fn truncate_from_page(&self, _from_page: usize) {}
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is
@@ -186,6 +192,53 @@ impl VmObject for AnonObject {
             len_pages: self.len_pages,
         })
     }
+
+    fn truncate_from_page(&self, from_page: usize) {
+        #[cfg(target_os = "none")]
+        self.truncate_cache(from_page);
+        #[cfg(not(target_os = "none"))]
+        let _ = from_page;
+    }
+}
+
+/// Kernel-only methods on `AnonObject`.
+#[cfg(target_os = "none")]
+impl AnonObject {
+    /// Insert `phys` into the frame cache at page index `idx` and
+    /// increment its refcount by one for the cache's ownership.
+    ///
+    /// Use this when frames are pre-mapped into a PML4 by an external
+    /// loader (e.g. `load_user_elf`) and you want to retroactively
+    /// register them in an `AnonObject` so the VMA machinery can track
+    /// and fork them correctly.
+    ///
+    /// The caller must ensure that `phys` already has a PTE reference
+    /// (refcount ≥ 1). This method adds the cache reference on top.
+    pub fn insert_existing_frame(&self, idx: usize, phys: u64) {
+        self.inner.lock().frames.insert(idx, phys);
+        // Add the cache's reference. The PTE reference was set by the
+        // original allocator/mapper; we are adding one more here.
+        crate::mem::refcount::inc_refcount(phys);
+    }
+
+    /// Remove all cached frames whose page index is ≥ `from_page` and
+    /// release their cache references. Used by `sys_brk` when the heap
+    /// is shrunk so memory is not pinned until process exit.
+    pub fn truncate_cache(&self, from_page: usize) {
+        let evicted: alloc::vec::Vec<(usize, u64)> = {
+            let mut inner = self.inner.lock();
+            let keys: alloc::vec::Vec<usize> =
+                inner.frames.range(from_page..).map(|(&k, _)| k).collect();
+            keys.into_iter()
+                .filter_map(|k| inner.frames.remove(&k).map(|v| (k, v)))
+                .collect()
+        };
+        // Release cache references outside the lock so `frame::put` can
+        // re-enter the allocator without a spinlock collision.
+        for (_, phys) in evicted {
+            crate::mem::frame::put(phys);
+        }
+    }
 }
 
 impl Drop for AnonObject {
@@ -234,27 +287,6 @@ fn alloc_zeroed_page() -> Result<u64, VmFault> {
 fn release_frame(_phys: u64) {
     #[cfg(test)]
     tests::HOST_RELEASE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Kernel-only methods on `AnonObject`.
-#[cfg(target_os = "none")]
-impl AnonObject {
-    /// Insert `phys` into the frame cache at page index `idx` and
-    /// increment its refcount by one for the cache's ownership.
-    ///
-    /// Use this when frames are pre-mapped into a PML4 by an external
-    /// loader (e.g. `load_user_elf`) and you want to retroactively
-    /// register them in an `AnonObject` so the VMA machinery can track
-    /// and fork them correctly.
-    ///
-    /// The caller must ensure that `phys` already has a PTE reference
-    /// (refcount ≥ 1). This method adds the cache reference on top.
-    pub fn insert_existing_frame(&self, idx: usize, phys: u64) {
-        self.inner.lock().frames.insert(idx, phys);
-        // Add the cache's reference. The PTE reference was set by the
-        // original allocator/mapper; we are adding one more here.
-        crate::mem::refcount::inc_refcount(phys);
-    }
 }
 
 #[cfg(test)]

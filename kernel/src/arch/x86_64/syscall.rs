@@ -286,6 +286,13 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             }
         }
 
+        // brk(addr) — set the program break; returns the new break on success
+        // or the current (unchanged) break on failure.
+        12 => {
+            let addr = a0;
+            crate::task::current_address_space().write().sys_brk(addr) as i64
+        }
+
         // fork() — clone the calling process; parent returns child PID, child returns 0.
         57 => {
             let user_rip = FORK_USER_RIP.load(Ordering::Relaxed);
@@ -339,6 +346,12 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
                 Ok(img) => img,
                 Err(_) => return -8, // ENOEXEC
             };
+
+            // Position the heap start immediately after the ELF image so
+            // sys_brk allocates from the right base address.
+            aspace
+                .write()
+                .set_brk_start(x86_64::VirtAddr::new(image.image_end));
 
             // Map a fresh user stack page and register it as a VMA so the
             // exec'd process's stack frame is also reclaimed on exit.
