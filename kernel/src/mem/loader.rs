@@ -25,6 +25,7 @@ use x86_64::VirtAddr;
 
 use alloc::sync::Arc;
 
+use super::addrspace::USER_VA_END;
 use super::elf;
 use super::paging;
 use super::tlb::Flusher;
@@ -52,6 +53,12 @@ pub enum LoadError {
     /// Wraps the underlying `paging::map` error so callers can tell
     /// `FrameAllocationFailed` from `PageAlreadyMapped` etc.
     MapFailed(MapToError<Size4KiB>),
+    /// A `PT_LOAD` segment's page-aligned end lands at or past
+    /// `USER_VA_END` (`0x0000_8000_0000_0000`). `LoadedImage::image_end`
+    /// is eventually wrapped in `VirtAddr::new`, which panics on the
+    /// first non-canonical lower-half address. Reject at load time so
+    /// the panic can't be reached from a malformed user ELF.
+    SegmentEndsAtUserVaEnd,
 }
 
 /// Result of a successful load: the entry point, segment count, and the
@@ -142,11 +149,21 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
     let mut image_end = 0u64;
     let mut err: Option<LoadError> = None;
     for seg in parsed.load_segments() {
+        let seg_end = (seg.vaddr.as_u64() + seg.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // Reject before mapping: `image_end` is later fed to
+        // `VirtAddr::new` (set_brk_start, exec), which panics at
+        // USER_VA_END. Prior segments in the same ELF may already be
+        // mapped in `pml4` — the caller drops the partial PML4 on
+        // error, matching the existing MapFailed / SegmentNotLowerHalf
+        // paths.
+        if seg_end >= USER_VA_END {
+            err = Some(LoadError::SegmentEndsAtUserVaEnd);
+            break;
+        }
         if let Err(e) = map_user_segment(bytes, seg, pml4) {
             err = Some(e);
             break;
         }
-        let seg_end = (seg.vaddr.as_u64() + seg.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if seg_end > image_end {
             image_end = seg_end;
         }

@@ -138,7 +138,14 @@ pub fn fork_current_task(
 
     // Snapshot everything needed from the current task while holding
     // SCHED, then release it before calling fork_address_space.
-    let (parent_address_space, parent_fd_table, parent_priority, parent_affinity, parent_fpu_ptr) = {
+    let (
+        parent_address_space,
+        parent_fd_table,
+        parent_cwd,
+        parent_priority,
+        parent_affinity,
+        parent_fpu_ptr,
+    ) = {
         let sched = SCHED.lock();
         let cur = sched
             .current
@@ -147,6 +154,7 @@ pub fn fork_current_task(
         (
             Arc::clone(&cur.address_space),
             Arc::clone(&cur.fd_table),
+            cur.cwd.clone(),
             cur.priority,
             cur.affinity,
             // SAFETY: the parent Task is the currently-running task and stays
@@ -183,6 +191,7 @@ pub fn fork_current_task(
             child_aspace,
             child_cr3,
             child_fd,
+            parent_cwd,
         )
     };
     let child_id = child.id;
@@ -353,6 +362,25 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::fs::FileDescTab
         .expect("current_fd_table: no running task")
         .fd_table
         .clone()
+}
+
+/// Return the per-process current working directory dentry, or `None`
+/// if no cwd has been set (bootstrap / kernel-only tasks). Callers
+/// should fall back to [`crate::fs::vfs::root`] on `None`.
+///
+/// Briefly locks the scheduler to clone the `Arc`, then releases it.
+pub fn current_cwd() -> Option<alloc::sync::Arc<crate::fs::vfs::Dentry>> {
+    SCHED.lock().current.as_ref().and_then(|t| t.cwd.clone())
+}
+
+/// Set the per-process current working directory to `dentry`.
+///
+/// Called by `sys_chdir` after successfully resolving and verifying
+/// that the target is a directory.
+pub fn set_current_cwd(dentry: alloc::sync::Arc<crate::fs::vfs::Dentry>) {
+    if let Some(cur) = SCHED.lock().current.as_mut() {
+        cur.cwd = Some(dentry);
+    }
 }
 
 /// Return the current scheduling priority of the currently-running
