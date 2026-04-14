@@ -271,11 +271,25 @@ pub fn path_walk(nd: &mut NameIdata, path: &[u8], mounts: &dyn MountResolver) ->
 
             let name = DString::try_from_bytes(comp)?;
             let child_inode = nd.path.inode.ops.lookup(&nd.path.inode, comp)?;
-            let child_dentry = Dentry::new(
-                name.clone(),
-                Arc::downgrade(&nd.path.dentry),
-                Some(child_inode.clone()),
-            );
+            // Reuse a cached dentry if the parent already has one for this
+            // name — the cached dentry may have a `.mount` slot populated
+            // (e.g. `/dev` after init mounts devfs there). A fresh dentry
+            // would miss that and fail to cross the mount boundary.
+            let cached = {
+                let children = nd.path.dentry.children.read();
+                if let Some(crate::fs::vfs::dentry::ChildState::Resolved(d)) = children.get(&name) {
+                    Some(d.clone())
+                } else {
+                    None
+                }
+            };
+            let child_dentry = cached.unwrap_or_else(|| {
+                Dentry::new(
+                    name.clone(),
+                    Arc::downgrade(&nd.path.dentry),
+                    Some(child_inode.clone()),
+                )
+            });
             nd.path = Path {
                 dentry: child_dentry,
                 inode: child_inode,
