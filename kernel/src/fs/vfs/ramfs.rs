@@ -12,7 +12,10 @@
 //! are:
 //!
 //! - `Reg { data: Vec<u8> }` — inline byte buffer.
-//! - `Dir { children: BTreeMap<DString, Arc<Inode>> }` — directory.
+//! - `Dir { children: BTreeMap<DString, Arc<Inode>>, parent_ino: u64 }`
+//!   — directory. `parent_ino` is the ino of the directory's parent
+//!   (the mount root is its own parent per POSIX `/..` convention), and
+//!   is what `getdents` emits for the `".."` virtual entry.
 //! - `Sym { target: Vec<u8> }` — symbolic-link target.
 //!
 //! Hardlinks are first-class: the `inode_table`
@@ -76,6 +79,10 @@ pub(super) enum RamfsBody {
     },
     Dir {
         children: BTreeMap<DString, Arc<Inode>>,
+        /// Ino of the parent directory. The mount root stores its own
+        /// ino here so `/..` resolves to `/` per POSIX convention. Kept
+        /// up to date by `mkdir` and cross-directory `rename`.
+        parent_ino: u64,
     },
     Sym {
         target: Vec<u8>,
@@ -195,7 +202,7 @@ impl InodeOps for RamfsInode {
         let _guard = dir.dir_rwsem.read();
         let body = self.body.lock();
         match &*body {
-            RamfsBody::Dir { children } => {
+            RamfsBody::Dir { children, .. } => {
                 let key = DString::try_from_bytes(name).map_err(|_| ENOENT)?;
                 children.get(&key).cloned().ok_or(ENOENT)
             }
@@ -210,7 +217,7 @@ impl InodeOps for RamfsInode {
         {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } if children.contains_key(&key) => {
+                RamfsBody::Dir { children, .. } if children.contains_key(&key) => {
                     return Err(crate::fs::EEXIST);
                 }
                 RamfsBody::Dir { .. } => {}
@@ -240,7 +247,7 @@ impl InodeOps for RamfsInode {
         {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } if children.contains_key(&key) => {
+                RamfsBody::Dir { children, .. } if children.contains_key(&key) => {
                     return Err(crate::fs::EEXIST);
                 }
                 RamfsBody::Dir { .. } => {}
@@ -255,6 +262,7 @@ impl InodeOps for RamfsInode {
             2, // self-link + ".."
             RamfsBody::Dir {
                 children: BTreeMap::new(),
+                parent_ino: dir.ino,
             },
         );
         self.body
@@ -276,7 +284,7 @@ impl InodeOps for RamfsInode {
         let child = {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } => children.get(&key).cloned().ok_or(ENOENT)?,
+                RamfsBody::Dir { children, .. } => children.get(&key).cloned().ok_or(ENOENT)?,
                 _ => return Err(ENOTDIR),
             }
         };
@@ -301,7 +309,7 @@ impl InodeOps for RamfsInode {
         let child = {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } => children.get(&key).cloned().ok_or(ENOENT)?,
+                RamfsBody::Dir { children, .. } => children.get(&key).cloned().ok_or(ENOENT)?,
                 _ => return Err(ENOTDIR),
             }
         };
@@ -313,7 +321,7 @@ impl InodeOps for RamfsInode {
             let child_body_arc = body_of_ops(&child.ops);
             let child_body = child_body_arc.lock();
             match &*child_body {
-                RamfsBody::Dir { children } if !children.is_empty() => {
+                RamfsBody::Dir { children, .. } if !children.is_empty() => {
                     return Err(ENOTEMPTY);
                 }
                 _ => {}
@@ -362,7 +370,7 @@ impl InodeOps for RamfsInode {
             }
             let mut body = self.body.lock();
             let children = match &mut *body {
-                RamfsBody::Dir { children } => children,
+                RamfsBody::Dir { children, .. } => children,
                 _ => return Err(ENOTDIR),
             };
             let moving = children.get(&old_key).cloned().ok_or(ENOENT)?;
@@ -374,7 +382,7 @@ impl InodeOps for RamfsInode {
                     }
                     let ex_body_arc = body_of_ops(&existing.ops);
                     let ex_body = ex_body_arc.lock();
-                    if let RamfsBody::Dir { children: c } = &*ex_body {
+                    if let RamfsBody::Dir { children: c, .. } = &*ex_body {
                         if !c.is_empty() {
                             return Err(ENOTEMPTY);
                         }
@@ -418,7 +426,9 @@ impl InodeOps for RamfsInode {
             let moving = {
                 let mut ob = old_body_arc.lock();
                 match &mut *ob {
-                    RamfsBody::Dir { children } => children.get(&old_key).cloned().ok_or(ENOENT)?,
+                    RamfsBody::Dir { children, .. } => {
+                        children.get(&old_key).cloned().ok_or(ENOENT)?
+                    }
                     _ => return Err(ENOTDIR),
                 }
             };
@@ -426,7 +436,7 @@ impl InodeOps for RamfsInode {
             {
                 let mut nb = new_body_arc.lock();
                 match &mut *nb {
-                    RamfsBody::Dir { children } => {
+                    RamfsBody::Dir { children, .. } => {
                         // Validate and handle displaced target (mirror same-dir checks).
                         if let Some(existing) = children.get(&new_key).cloned() {
                             if existing.kind == InodeKind::Dir {
@@ -435,7 +445,7 @@ impl InodeOps for RamfsInode {
                                 }
                                 let ex_body_arc = body_of_ops(&existing.ops);
                                 let ex_body = ex_body_arc.lock();
-                                if let RamfsBody::Dir { children: c } = &*ex_body {
+                                if let RamfsBody::Dir { children: c, .. } = &*ex_body {
                                     if !c.is_empty() {
                                         return Err(ENOTEMPTY);
                                     }
@@ -468,7 +478,7 @@ impl InodeOps for RamfsInode {
 
             {
                 let mut ob = old_body_arc.lock();
-                if let RamfsBody::Dir { children } = &mut *ob {
+                if let RamfsBody::Dir { children, .. } = &mut *ob {
                     children.remove(&old_key);
                 }
             }
@@ -482,6 +492,13 @@ impl InodeOps for RamfsInode {
                 {
                     let mut meta = new_dir.meta.write();
                     meta.nlink = meta.nlink.saturating_add(1);
+                }
+                // Update the moved directory's parent_ino so its ".."
+                // entry reflects its new parent.
+                let moving_body_arc = body_of_ops(&moving.ops);
+                let mut mb = moving_body_arc.lock();
+                if let RamfsBody::Dir { parent_ino, .. } = &mut *mb {
+                    *parent_ino = new_dir.ino;
                 }
             }
             let _ = first_is_old; // used only for documentation
@@ -504,7 +521,7 @@ impl InodeOps for RamfsInode {
         {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } if children.contains_key(&key) => {
+                RamfsBody::Dir { children, .. } if children.contains_key(&key) => {
                     return Err(crate::fs::EEXIST);
                 }
                 RamfsBody::Dir { .. } => {}
@@ -532,7 +549,7 @@ impl InodeOps for RamfsInode {
         {
             let body = self.body.lock();
             match &*body {
-                RamfsBody::Dir { children } if children.contains_key(&key) => {
+                RamfsBody::Dir { children, .. } if children.contains_key(&key) => {
                     return Err(crate::fs::EEXIST);
                 }
                 RamfsBody::Dir { .. } => {}
@@ -650,7 +667,7 @@ impl FileOps for RamfsInode {
             let body = self.body.lock();
             match &*body {
                 RamfsBody::Reg { data } => data.len() as i64,
-                RamfsBody::Dir { children } => children.len() as i64,
+                RamfsBody::Dir { children, .. } => children.len() as i64,
                 RamfsBody::Sym { target } => target.len() as i64,
             }
         };
@@ -675,15 +692,15 @@ impl FileOps for RamfsInode {
         let inode = &f.inode;
         let _guard = inode.dir_rwsem.read();
         let body = self.body.lock();
-        let children = match &*body {
-            RamfsBody::Dir { children } => children,
+        let (children, parent_ino) = match &*body {
+            RamfsBody::Dir {
+                children,
+                parent_ino,
+            } => (children, *parent_ino),
             _ => return Err(-20i64), // ENOTDIR
         };
 
         let dir_ino = inode.ino;
-        // Without traversing parent dentries, use the same ino for "..".
-        // Callers that need accurate parent ino use path_walk instead.
-        let parent_ino = dir_ino;
 
         let mut written = 0usize;
         let mut idx: u64 = 0;
@@ -773,7 +790,7 @@ fn inode_kind_to_dt(kind: InodeKind) -> u8 {
 impl RamfsBody {
     fn as_dir_mut(&mut self) -> Option<&mut BTreeMap<DString, Arc<Inode>>> {
         match self {
-            RamfsBody::Dir { children } => Some(children),
+            RamfsBody::Dir { children, .. } => Some(children),
             _ => None,
         }
     }
@@ -860,6 +877,7 @@ impl FileSystem for RamFs {
             );
 
             // Root inode: ino=1, dir, mode=0o755, nlink=2.
+            // Root is its own parent — `/..` resolves to `/` per POSIX.
             let root = alloc_inode_with_ino(
                 1,
                 weak_sb,
@@ -869,6 +887,7 @@ impl FileSystem for RamFs {
                 2,
                 RamfsBody::Dir {
                     children: BTreeMap::new(),
+                    parent_ino: 1,
                 },
             );
             sb_inner.root.call_once(|| root);
@@ -1141,6 +1160,78 @@ mod tests {
         assert!(all_names.iter().any(|n| n == b".."), "missing ..");
         assert!(all_names.iter().any(|n| n == b"alpha"), "missing alpha");
         assert!(all_names.iter().any(|n| n == b"beta"), "missing beta");
+    }
+
+    /// Parses a getdents buffer and returns `(name, d_ino)` pairs.
+    fn parse_dirents(buf: &[u8], n: usize) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)> {
+        let mut out = alloc::vec::Vec::new();
+        let mut pos = 0;
+        while pos + 19 <= n {
+            let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if reclen == 0 {
+                break;
+            }
+            let d_ino = u64::from_ne_bytes(buf[pos..pos + 8].try_into().expect("d_ino bytes"));
+            let name_raw = &buf[pos + 19..pos + reclen];
+            let nul = name_raw
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_raw.len());
+            out.push((name_raw[..nul].to_vec(), d_ino));
+            pos += reclen;
+        }
+        out
+    }
+
+    fn dotdot_ino(sb: &Arc<SuperBlock>, dir: Arc<Inode>) -> u64 {
+        let file = open_inode(sb, dir.clone());
+        let mut buf = [0u8; 256];
+        let mut cookie = 0u64;
+        let n = dir
+            .file_ops
+            .getdents(&file, &mut buf, &mut cookie)
+            .expect("getdents");
+        parse_dirents(&buf, n)
+            .into_iter()
+            .find(|(name, _)| name == b"..")
+            .map(|(_, ino)| ino)
+            .expect("missing ..")
+    }
+
+    #[test]
+    fn getdents_dotdot_in_subdir_reports_parent_ino() {
+        let sb = make_ramfs();
+        let root = root_of(&sb);
+        root.ops.mkdir(&root, b"sub", 0o755).expect("mkdir");
+        let sub = root.ops.lookup(&root, b"sub").expect("lookup");
+        assert_eq!(dotdot_ino(&sb, sub.clone()), root.ino);
+        assert_ne!(
+            dotdot_ino(&sb, sub),
+            root.ops.lookup(&root, b"sub").unwrap().ino
+        );
+    }
+
+    #[test]
+    fn getdents_dotdot_at_root_reports_self_ino() {
+        let sb = make_ramfs();
+        let root = root_of(&sb);
+        assert_eq!(dotdot_ino(&sb, root.clone()), root.ino);
+    }
+
+    #[test]
+    fn cross_dir_rename_updates_dotdot_parent_ino() {
+        let sb = make_ramfs();
+        let root = root_of(&sb);
+        root.ops.mkdir(&root, b"a", 0o755).expect("mkdir a");
+        let a = root.ops.lookup(&root, b"a").expect("a");
+        a.ops.mkdir(&a, b"b", 0o755).expect("mkdir a/b");
+        let b = a.ops.lookup(&a, b"b").expect("b");
+        assert_eq!(dotdot_ino(&sb, b.clone()), a.ino);
+        // Move a/b -> /c. b's ".." should now point at root.
+        root.ops.rename(&a, b"b", &root, b"c").expect("rename");
+        let c = root.ops.lookup(&root, b"c").expect("c after rename");
+        assert!(Arc::ptr_eq(&c, &b), "same inode after rename");
+        assert_eq!(dotdot_ino(&sb, c), root.ino);
     }
 
     #[test]
