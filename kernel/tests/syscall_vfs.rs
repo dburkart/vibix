@@ -16,6 +16,7 @@ use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
 use vibix::fs::vfs::ops::Stat;
+use vibix::fs::vfs::path_walk::PATH_MAX;
 use vibix::fs::{EBADF, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
@@ -95,6 +96,10 @@ fn run_tests() {
         (
             "stat_enametoolong_on_overlong_path",
             &(stat_enametoolong_on_overlong_path as fn()),
+        ),
+        (
+            "stat_pathmax_boundary_is_accepted",
+            &(stat_pathmax_boundary_is_accepted as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -253,13 +258,13 @@ fn lstat_same_as_stat_on_dir() {
 }
 
 fn stat_enametoolong_on_overlong_path() {
-    // VFS PATH_MAX is 4096. A user path of 4097 non-NUL bytes means
-    // `copy_path_from_user` fills the whole kernel buffer (4096 + 1)
+    // A user path of PATH_MAX + 1 non-NUL bytes means
+    // `copy_path_from_user` fills the whole kernel buffer (PATH_MAX + 1)
     // without seeing a NUL and must return ENAMETOOLONG. Stage the path
     // at page 4 of USER_PAGE_VA so it doesn't collide with the stat
     // destination at page 1.
     install_user_staging_vma();
-    const OVERLONG: usize = 4097;
+    const OVERLONG: usize = PATH_MAX + 1;
     let path_uva = (USER_PAGE_VA + 4 * 4096) as u64;
     unsafe {
         let dst = path_uva as *mut u8;
@@ -274,6 +279,36 @@ fn stat_enametoolong_on_overlong_path() {
     }
     let r = unsafe { syscall_dispatch(SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r, ENAMETOOLONG, "expected ENAMETOOLONG, got {}", r);
+}
+
+fn stat_pathmax_boundary_is_accepted() {
+    // Boundary case for issue #328: a user path of exactly PATH_MAX
+    // non-NUL bytes plus a terminating NUL must pass the length check.
+    // Since the path doesn't exist, the expected error is ENOENT —
+    // crucially NOT ENAMETOOLONG (which would mean the accept side has
+    // an off-by-one). Stage at page 6 to avoid the overlong test's
+    // page 4 and the staging stat page.
+    install_user_staging_vma();
+    let path_uva = (USER_PAGE_VA + 6 * 4096) as u64;
+    unsafe {
+        let dst = path_uva as *mut u8;
+        // First byte is '/' so path_walk treats this as absolute; the
+        // remaining PATH_MAX - 1 bytes are a single component name that
+        // doesn't exist. Total non-NUL bytes = PATH_MAX.
+        ptr::write_volatile(dst, b'/');
+        let mut i = 1;
+        while i < PATH_MAX {
+            ptr::write_volatile(dst.add(i), b'a');
+            i += 1;
+        }
+        ptr::write_volatile(dst.add(PATH_MAX), 0);
+    }
+    let r = unsafe { syscall_dispatch(SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
+    assert_eq!(
+        r, ENOENT,
+        "PATH_MAX-length non-existent path must be ENOENT (accept side), got {}",
+        r
+    );
 }
 
 fn open_o_directory_on_nondir_enotdir() {

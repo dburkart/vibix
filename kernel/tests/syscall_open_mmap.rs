@@ -17,6 +17,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
+use vibix::fs::vfs::path_walk::PATH_MAX;
 use vibix::fs::{EBADF, EINVAL, ENAMETOOLONG, ENODEV, ENOENT};
 use vibix::mem::pf::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use vibix::mem::vmatree::{Share, Vma};
@@ -187,9 +188,9 @@ fn open_path_not_terminated() {
     install_user_staging_vma();
     // Fill enough of the staging page with non-NUL bytes that the
     // kernel's `PATH_MAX + 1`-sized copy-in buffer exhausts before
-    // hitting a terminator. `path_walk::PATH_MAX` is 4096, so the
-    // kernel reads up to 4097 bytes looking for a NUL.
-    const UNTERMINATED_BYTES: usize = 4097;
+    // hitting a terminator: the kernel reads up to PATH_MAX + 1 bytes
+    // looking for a NUL.
+    const UNTERMINATED_BYTES: usize = PATH_MAX + 1;
     unsafe {
         let dst = USER_PAGE_VA as *mut u8;
         let mut i = 0;
