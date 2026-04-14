@@ -52,6 +52,7 @@ pub mod mount_table;
 pub mod open_file;
 pub mod ops;
 pub mod path_walk;
+pub mod ramfs;
 pub mod super_block;
 
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
@@ -66,6 +67,7 @@ pub use ops::{
 pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
+pub use ramfs::RamFs;
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
 
 /// POSIX-imposed cap on a single path component.
