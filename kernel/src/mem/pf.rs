@@ -38,6 +38,14 @@ pub const PROT_READ: ProtUser = 1;
 pub const PROT_WRITE: ProtUser = 2;
 pub const PROT_EXEC: ProtUser = 4;
 
+/// `MAP_*` flag bits for `mmap`, matching the Linux x86_64 ABI values.
+/// `MAP_ANONYMOUS` and `MAP_PRIVATE` are the only combinations the
+/// initial syscall implementation accepts.
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
+pub const MAP_FIXED: u32 = 0x10;
+pub const MAP_ANONYMOUS: u32 = 0x20;
+
 // Raw bit positions in the x86 #PF error code. Kept as numeric
 // constants (not `PageFaultErrorCode` flags) so the module stays
 // host-compilable — the `x86_64` crate is target-only.

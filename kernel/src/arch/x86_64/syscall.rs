@@ -168,13 +168,24 @@ use super::uaccess;
 
 /// Syscall handler called from the `syscall_entry` trampoline.
 ///
+/// Takes the six Linux x86_64 syscall argument registers. Handlers
+/// that only need fewer args simply ignore the extras.
+///
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
 /// interrupts disabled. User pointer arguments are validated and
 /// marshalled via `uaccess::copy_from_user` / `copy_to_user` before
 /// any dereference.
 #[no_mangle]
-pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+pub unsafe extern "C" fn syscall_dispatch(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> i64 {
     match nr {
         // read(fd, buf, len) — non-blocking; returns -EAGAIN if no data.
         0 => {
@@ -249,8 +260,14 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             written as i64
         }
 
-        // open(path, flags, mode) — VFS not yet available; stub.
-        2 => -38i64, // ENOSYS
+        // open(path, flags, mode) — pre-VFS: only `/dev/stdin`,
+        // `/dev/stdout`, `/dev/stderr`, and `/dev/serial` resolve, all
+        // backed by `SerialBackend`. Any other path returns -ENOENT.
+        2 => sys_open(a0, a1, a2),
+
+        // mmap(addr, len, prot, flags, fd, off) — anonymous private
+        // mappings only for now. See `sys_mmap` for full validation.
+        9 => sys_mmap(a0, a1, a2, a3, a4, a5),
 
         // close(fd)
         3 => {
@@ -347,18 +364,15 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
                 Err(_) => return -8, // ENOEXEC
             };
 
-            // Position the heap start immediately after the ELF image so
-            // sys_brk allocates from the right base address.
-            aspace
-                .write()
-                .set_brk_start(x86_64::VirtAddr::new(image.image_end));
+            // Set the heap base to immediately after the new ELF image.
+            use x86_64::VirtAddr;
+            aspace.write().set_brk_start(VirtAddr::new(image.image_end));
 
             // Map a fresh user stack page and register it as a VMA so the
             // exec'd process's stack frame is also reclaimed on exit.
             use crate::mem::vmatree::{Share, Vma};
             use crate::mem::vmobject::{AnonObject, VmObject};
             use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
-            use x86_64::VirtAddr;
             let stack_flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE
@@ -449,6 +463,152 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
     }
 }
 
+/// Maximum path length accepted by `sys_open`, including the terminating
+/// NUL. Matches the longest special path we handle today.
+const OPEN_PATH_MAX: usize = 128;
+
+/// Copy a NUL-terminated path from user VA `uva` into `buf`. Returns
+/// the slice (without the NUL) on success, or a negative errno on
+/// failure. Mirrors Linux `strncpy_from_user` semantics: short path →
+/// truncated slice; missing NUL within `buf` → `-ENAMETOOLONG`.
+unsafe fn copy_path_from_user(uva: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    if buf.is_empty() {
+        return Err(crate::fs::ENAMETOOLONG);
+    }
+    // Validate the full candidate range up front; then copy byte-by-byte
+    // until we hit a NUL. Going byte-by-byte keeps the bound tight — a
+    // short path backed by one page doesn't get rejected because the
+    // full `OPEN_PATH_MAX` would overflow into an unmapped page.
+    for (i, slot) in buf.iter_mut().enumerate() {
+        match uaccess::copy_from_user(core::slice::from_mut(slot), uva + i) {
+            Ok(()) => {}
+            Err(e) => return Err(e.as_errno()),
+        }
+        if *slot == 0 {
+            return Ok(i);
+        }
+    }
+    Err(crate::fs::ENAMETOOLONG)
+}
+
+/// `open(path, flags, mode)` — pre-VFS stub.
+///
+/// Resolves only the four special device paths listed below, each
+/// backed by `SerialBackend`. Any other path returns `-ENOENT` so that
+/// userspace gets the real "no such file" signal rather than `-ENOSYS`.
+/// `mode` is accepted but unused (there is nothing to create yet).
+unsafe fn sys_open(path_uva: u64, flags: u64, _mode: u64) -> i64 {
+    use crate::fs::{flags as oflags, FileBackend, FileDescription, SerialBackend, ENOENT};
+    use alloc::sync::Arc;
+
+    let mut buf = [0u8; OPEN_PATH_MAX];
+    let n = match copy_path_from_user(path_uva as usize, &mut buf) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let path = &buf[..n];
+
+    let is_special = matches!(
+        path,
+        b"/dev/stdin" | b"/dev/stdout" | b"/dev/stderr" | b"/dev/serial"
+    );
+    if !is_special {
+        return ENOENT;
+    }
+
+    // Mask caller-supplied flags down to the bits our fd table honors.
+    let safe_flags =
+        (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
+
+    let backend: Arc<dyn FileBackend> = Arc::new(SerialBackend);
+    let desc = Arc::new(FileDescription {
+        backend,
+        flags: safe_flags,
+    });
+    let tbl = crate::task::current_fd_table();
+    let result = tbl.lock().alloc_fd(desc);
+    match result {
+        Ok(fd) => fd as i64,
+        Err(e) => e,
+    }
+}
+
+/// `mmap(addr, len, prot, flags, fd, off)` — anonymous private only.
+///
+/// Supported: `MAP_ANONYMOUS | MAP_PRIVATE`, `fd == -1`, `off == 0`.
+/// Everything else (file-backed, `MAP_SHARED`, `MAP_FIXED`, unknown
+/// flag bits) returns `-EINVAL`. The chosen VA is picked by
+/// `AddressSpace::find_unmapped_region`; the `addr` hint is ignored.
+unsafe fn sys_mmap(_addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
+    use crate::fs::{EINVAL, ENOMEM};
+    use crate::mem::pf::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+    use crate::mem::vmatree::{Share, Vma};
+    use crate::mem::vmobject::{AnonObject, VmObject};
+    use alloc::sync::Arc;
+    use x86_64::structures::paging::PageTableFlags;
+
+    if len == 0 {
+        return EINVAL;
+    }
+
+    // Page-round len, rejecting overflow.
+    let len = match (len as usize).checked_add(4095) {
+        Some(n) => n & !4095,
+        None => return EINVAL,
+    };
+
+    let flags = flags as u32;
+    let prot = prot as u32;
+
+    // Reject unknown prot bits.
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return EINVAL;
+    }
+    // Require both MAP_ANONYMOUS and MAP_PRIVATE; reject every other bit.
+    if flags != (MAP_ANONYMOUS | MAP_PRIVATE) {
+        return EINVAL;
+    }
+    // Anonymous mapping: fd must be -1, offset must be 0.
+    if fd as i64 != -1 {
+        return EINVAL;
+    }
+    if off != 0 {
+        return EINVAL;
+    }
+
+    let aspace = crate::task::current_address_space();
+    let mut guard = aspace.write();
+
+    let start = match guard.find_unmapped_region(len) {
+        Some(s) => s,
+        None => return ENOMEM,
+    };
+
+    // Build PTE flags: PRESENT|USER always; WRITABLE if PROT_WRITE;
+    // NX if !PROT_EXEC.
+    let mut pte = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        pte |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        pte |= PageTableFlags::NO_EXECUTE;
+    }
+
+    let pages = len / 4096;
+    let obj = AnonObject::new(Some(pages));
+    let vma = Vma::new(
+        start,
+        start + len,
+        prot,
+        pte.bits(),
+        Share::Private,
+        obj as Arc<dyn VmObject>,
+        0,
+    );
+    guard.insert(vma);
+    start as i64
+}
+
 unsafe extern "C" {
     fn syscall_entry();
 }
@@ -461,12 +621,15 @@ global_asm!(
 
 syscall_entry:
     // On SYSCALL entry (x86_64):
-    //   rax=nr  rdi=a0  rsi=a1  rdx=a2
+    //   rax=nr  rdi=a0  rsi=a1  rdx=a2  r10=a3  r8=a4  r9=a5
     //   rcx=user_RIP  r11=user_RFLAGS  rsp=user_RSP
-    // IF is cleared by SFMASK; r10 is caller-saved and unused here.
+    // IF is cleared by SFMASK. Every GP register that isn't rsp is
+    // load-bearing: all Linux syscall args or SYSRETQ state.
 
-    // 1. Save user RSP in r10 (caller-saved, not a syscall argument).
-    mov r10, rsp
+    // 1. Stash user RSP straight into fork_rsp so we don't need a
+    //    scratch register — r10 is the Linux syscall ABI's `a3` and
+    //    must not be clobbered.
+    mov [rip + {fork_rsp}], rsp
 
     // 2. Load kernel RSP: lea gives us the address of the static;
     //    the second mov dereferences it to get the stack-top value.
@@ -474,26 +637,47 @@ syscall_entry:
     mov rsp, [rsp]
 
     // 3. Save return-to-user context on the kernel stack.
-    push r10          // user RSP
-    push r11          // user RFLAGS  (SYSRETQ restores RFLAGS from r11)
-    push rcx          // user RIP     (SYSRETQ jumps to rcx)
+    push [rip + {fork_rsp}]   // user RSP (already stashed above)
+    push r11                  // user RFLAGS (SYSRETQ restores from r11)
+    push rcx                  // user RIP    (SYSRETQ jumps to rcx)
 
-    // 3b. Stash user context in FORK_USER_* statics so fork() can prime
-    //     the child's kernel stack. Must happen before rcx is clobbered
-    //     in step 4.  r10 is user RSP, r11 is user RFLAGS, rcx is user RIP.
+    // 3b. Finish priming the FORK_USER_* statics so fork() can seed the
+    //     child's kernel stack. fork_rsp was already written in step 1.
     mov [rip + {fork_rip}], rcx
     mov [rip + {fork_rflags}], r11
-    mov [rip + {fork_rsp}], r10
 
-    // 4. Build syscall_dispatch(nr, a0, a1, a2) in SysV AMD64 registers.
-    //    rcx is now free (user RIP is on the stack).
-    mov rcx, rdx      // a2
-    mov rdx, rsi      // a1
-    mov rsi, rdi      // a0
-    mov rdi, rax      // nr
-
-    // 5. Call the Rust dispatcher. Align stack to 16 bytes first.
+    // 4. Build syscall_dispatch(nr, a0, a1, a2, a3, a4, a5) in SysV AMD64
+    //    registers. Linux syscall ABI:  rax=nr  rdi=a0 rsi=a1 rdx=a2
+    //                                   r10=a3  r8=a4  r9=a5
+    //    SysV C ABI (7 int args):       rdi=arg0 rsi=arg1 rdx=arg2
+    //                                   rcx=arg3 r8=arg4  r9=arg5
+    //                                   [rsp]=arg6 (passed on the stack)
+    //
+    //    Mapping (nr, a0..a5) → (arg0..arg6):
+    //      nr:  rax → rdi   (arg0)
+    //      a0:  rdi → rsi   (arg1)
+    //      a1:  rsi → rdx   (arg2)
+    //      a2:  rdx → rcx   (arg3)   rcx was user RIP, now on stack
+    //      a3:  r10 → r8    (arg4)   trampled old Linux a4 — must save first
+    //      a4:  r8  → r9    (arg5)   trampled old Linux a5 — must save first
+    //      a5:  r9  → [rsp] (arg6)   passed on the stack
+    //
+    //    Save r9 (a5) into the arg6 slot before the remap clobbers it.
+    //    SysV requires rsp to be 16-byte aligned immediately before the
+    //    CALL instruction. The 3 preceding pushes (user RSP, RFLAGS, RIP)
+    //    leave rsp at (top-24), i.e. 8 mod 16. Reserving one 8-byte slot
+    //    for arg6 brings rsp to (top-32) — 0 mod 16, exactly what CALL
+    //    needs.
     sub rsp, 8
+    mov [rsp], r9     // a5 → stack slot for arg6
+    mov r9, r8        // a4 → r9 (arg5)
+    mov r8, r10       // a3 → r8 (arg4)
+    mov rcx, rdx      // a2 → rcx (arg3)
+    mov rdx, rsi      // a1 → rdx (arg2)
+    mov rsi, rdi      // a0 → rsi (arg1)
+    mov rdi, rax      // nr → rdi (arg0)
+
+    // 5. Call the Rust dispatcher.
     call syscall_dispatch
     add rsp, 8
     // rax = return value

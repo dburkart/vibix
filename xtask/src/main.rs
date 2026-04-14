@@ -675,6 +675,7 @@ fn test_all() -> R<()> {
         "tlb_flusher",
         "smep_smap",
         "fd_table",
+        "syscall_open_mmap",
     ] {
         cmd.arg("--test").arg(t);
     }
