@@ -185,12 +185,17 @@ fn open_bad_user_ptr_returns_efault() {
 
 fn open_path_not_terminated() {
     install_user_staging_vma();
-    // Fill the staging page with non-NUL bytes so the loop exhausts
-    // its 128-byte budget before hitting a terminator.
+    // Fill enough of the staging page with non-NUL bytes that the
+    // kernel's `PATH_MAX + 1`-sized copy-in buffer exhausts before
+    // hitting a terminator. `path_walk::PATH_MAX` is 4096, so the
+    // kernel reads up to 4097 bytes looking for a NUL.
+    const UNTERMINATED_BYTES: usize = 4097;
     unsafe {
         let dst = USER_PAGE_VA as *mut u8;
-        for i in 0..200 {
+        let mut i = 0;
+        while i < UNTERMINATED_BYTES {
             ptr::write_volatile(dst.add(i), b'A');
+            i += 1;
         }
     }
     let r = unsafe { syscall_dispatch(2, USER_PAGE_VA as u64, 0, 0, 0, 0, 0) };
