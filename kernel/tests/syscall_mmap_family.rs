@@ -63,6 +63,10 @@ fn run_tests() {
             &(mmap_fixed_noreplace_overlap_eexist as fn()),
         ),
         (
+            "mmap_fixed_noreplace_fresh_addr_succeeds",
+            &(mmap_fixed_noreplace_fresh_addr_succeeds as fn()),
+        ),
+        (
             "munmap_returns_zero_on_hole",
             &(munmap_returns_zero_on_hole as fn()),
         ),
@@ -179,6 +183,11 @@ fn mmap_shared_anon_succeeds() {
 
 fn mmap_fixed_noreplace_overlap_eexist() {
     let a = anon_rw(4096);
+    // Write a marker into the original page so we can prove it survives the
+    // failed MAP_FIXED_NOREPLACE call.
+    unsafe {
+        ptr::write_volatile(a as *mut u8, 0xA5);
+    }
     // Re-requesting the same VA with MAP_FIXED_NOREPLACE must fail EEXIST.
     let r = mmap(
         a,
@@ -189,6 +198,18 @@ fn mmap_fixed_noreplace_overlap_eexist() {
         0,
     );
     assert_eq!(r, EEXIST, "expected EEXIST on overlap, got {:#x}", r);
+    // The original VMA must be untouched: exact same start/end and the marker
+    // byte is still readable.
+    {
+        let aspace = vibix::task::current_address_space();
+        let guard = aspace.read();
+        let vma = guard.find(a as usize).expect("original VMA missing");
+        assert_eq!(vma.start, a as usize);
+        assert_eq!(vma.end, (a as usize) + 4096);
+    }
+    unsafe {
+        assert_eq!(ptr::read_volatile(a as *const u8), 0xA5);
+    }
     // Bare MAP_FIXED at the same VA should succeed (silently evicts) and
     // return the requested address.
     let r = mmap(
@@ -201,6 +222,44 @@ fn mmap_fixed_noreplace_overlap_eexist() {
     );
     assert_eq!(r as u64, a, "MAP_FIXED must return the requested VA");
     let _ = munmap(a, 4096);
+}
+
+fn mmap_fixed_noreplace_fresh_addr_succeeds() {
+    // MAP_FIXED_NOREPLACE at an unmapped VA must succeed and install the
+    // mapping at exactly that address.
+    let anchor = anon_rw(4096);
+    let target = anchor + 0x0020_0000; // 2 MiB away — comfortably outside anchor
+    // Sanity: target range must be a hole. If something is squatting there,
+    // use a larger offset.
+    {
+        let aspace = vibix::task::current_address_space();
+        let guard = aspace.read();
+        assert!(
+            !guard.range_overlaps_any(target as usize, 4096),
+            "target VA {:#x} unexpectedly occupied",
+            target
+        );
+    }
+    let r = mmap(
+        target,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    assert_eq!(
+        r as u64, target,
+        "MAP_FIXED_NOREPLACE at a fresh VA must return exactly that VA, got {:#x}",
+        r
+    );
+    // The mapping must be usable: demand-fault + read-back.
+    unsafe {
+        ptr::write_volatile(target as *mut u8, 0x5A);
+        assert_eq!(ptr::read_volatile(target as *const u8), 0x5A);
+    }
+    let _ = munmap(target, 4096);
+    let _ = munmap(anchor, 4096);
 }
 
 fn munmap_returns_zero_on_hole() {
