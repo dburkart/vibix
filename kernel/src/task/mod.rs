@@ -651,6 +651,28 @@ pub fn current_vma_lookup(
     ))
 }
 
+/// Try to resolve a growsdown stack fault at `addr`. Called from the
+/// `#PF` handler when `current_vma_lookup` returns `None` (address
+/// is below the current VMA start of a growsdown VMA). On success,
+/// extends the VMA one page downward and returns the object/offset/prot
+/// needed to install the demand-page PTE. Returns `None` on contention
+/// or if the fault is not a valid growsdown extension.
+pub fn current_growsdown_lookup(
+    addr: usize,
+) -> Option<(
+    alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
+    usize,
+    crate::mem::vmatree::ProtPte,
+)> {
+    let aspace = {
+        let sched = SCHED.try_lock()?;
+        let current = sched.current.as_ref()?;
+        current.address_space.clone()
+    };
+    let mut guard = aspace.try_write()?;
+    guard.grow_stack(addr)
+}
+
 /// Terminate the currently-running task. Reclaims the task's mapped
 /// stack pages, VMA-backed frames, and PML4 frame on the next
 /// scheduler tick, then drops the `Box<Task>`.

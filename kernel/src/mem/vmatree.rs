@@ -41,13 +41,25 @@ pub enum Share {
     Shared,
 }
 
+/// VMA behaviour flags (stored in `Vma::vma_flags`).
+pub type VmaFlags = u32;
+
+/// The VMA grows downward (stack). A page-fault one page below
+/// `vma.start` triggers an automatic one-page extension instead of a
+/// SIGSEGV.
+pub const VMA_GROWSDOWN: VmaFlags = 1 << 0;
+
+/// Read-only guard region below a growsdown stack. Any fault into this
+/// VMA unconditionally produces a SIGSEGV (stack-overflow sentinel).
+pub const VMA_STACK_GUARD: VmaFlags = 1 << 1;
+
 /// One virtual-memory area: half-open `[start, end)` byte range backed
 /// by `object` at `object_offset`, with user-visible protection
 /// `prot_user` and cached PTE flags `prot_pte`.
 ///
 /// `#[repr(C)]` so the layout is stable enough for eventual inspection
-/// by a debugger / introspection tool; `_lock_seq` is the reserved
-/// future-work slot for per-VMA seqlock ordering.
+/// by a debugger / introspection tool. `vma_flags` carries behaviour
+/// bits (`VMA_GROWSDOWN`, `VMA_STACK_GUARD`).
 #[repr(C)]
 pub struct Vma {
     pub start: usize,
@@ -57,7 +69,7 @@ pub struct Vma {
     pub share: Share,
     pub object: Arc<dyn VmObject>,
     pub object_offset: usize,
-    pub _lock_seq: u32,
+    pub vma_flags: VmaFlags,
 }
 
 impl Vma {
@@ -93,7 +105,7 @@ impl Vma {
             share,
             object,
             object_offset,
-            _lock_seq: 0,
+            vma_flags: 0,
         }
     }
 
@@ -143,7 +155,7 @@ impl Vma {
             share: self.share,
             object: Arc::clone(&self.object),
             object_offset: self.object_offset,
-            _lock_seq: 0,
+            vma_flags: 0,
         };
         let right = Vma {
             start: addr,
@@ -153,7 +165,7 @@ impl Vma {
             share: self.share,
             object: self.object,
             object_offset: self.object_offset + delta,
-            _lock_seq: 0,
+            vma_flags: 0,
         };
         (left, right)
     }
@@ -382,6 +394,36 @@ impl VmaTree {
     /// that does not split bordering VMAs.
     pub fn remove_exact(&mut self, start: usize) -> Option<Vma> {
         self.map.remove(&start)
+    }
+
+    /// Return a reference to the VMA whose `start` is the smallest value
+    /// strictly greater than `addr`, or `None` if no such VMA exists.
+    /// Used by the growsdown resolver to find the VMA that should be
+    /// extended downward when a below-start fault fires.
+    pub fn find_above(&self, addr: usize) -> Option<&Vma> {
+        self.map.range((addr + 1)..).next().map(|(_, v)| v)
+    }
+
+    /// Return a reference to the last VMA whose start is < `addr`, if any.
+    pub fn last_below(&self, addr: usize) -> Option<&Vma> {
+        self.map.range(..addr).next_back().map(|(_, v)| v)
+    }
+
+    /// Re-key VMA at `old_start` to `new_start`, leaving all other fields
+    /// unchanged. Used by `grow_stack` to extend a growsdown VMA downward.
+    /// Panics if `old_start` is not present or `new_start` is already
+    /// occupied.
+    pub fn rekey_start(&mut self, old_start: usize, new_start: usize) {
+        let mut vma = self
+            .map
+            .remove(&old_start)
+            .expect("rekey_start: old_start not found");
+        vma.start = new_start;
+        assert!(
+            !self.map.contains_key(&new_start),
+            "rekey_start: new_start {new_start:#x} already occupied"
+        );
+        self.map.insert(new_start, vma);
     }
 
     fn assert_no_overlap(&self, start: usize, end: usize) {

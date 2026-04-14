@@ -66,6 +66,11 @@ pub struct AddressSpace {
     /// `unmap_range`.
     pub(crate) vm_pages: usize,
 
+    /// Maximum stack size in bytes; enforced by `grow_stack`. Default is
+    /// `DEFAULT_STACK_RLIMIT` (8 MiB). Future `setrlimit(RLIMIT_STACK)`
+    /// syscall writes this field.
+    pub(crate) stack_rlimit: u64,
+
     /// `true` for the bootstrap task's address space, whose `page_table`
     /// is the live kernel PML4. `Drop` skips reclaim entirely in that
     /// case — freeing the kernel PML4 (or walking its lower half, which
@@ -95,6 +100,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            stack_rlimit: crate::mem::pf::DEFAULT_STACK_RLIMIT,
             bootstrap: true,
         }
     }
@@ -134,6 +140,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            stack_rlimit: crate::mem::pf::DEFAULT_STACK_RLIMIT,
             bootstrap: false,
         })
     }
@@ -151,6 +158,7 @@ impl AddressSpace {
             brk_max: VirtAddr::new(mmap_base - DEFAULT_BRK_GUARD),
             rss_pages: 0,
             vm_pages: 0,
+            stack_rlimit: crate::mem::pf::DEFAULT_STACK_RLIMIT,
             bootstrap: false,
         }
     }
@@ -392,6 +400,68 @@ impl AddressSpace {
         // page-aligned values were used only to decide VMA extent changes.
         self.brk_cur = exact_brk;
         exact_brk.as_u64()
+    }
+
+    /// Handle a growsdown stack fault at `cr2`. If the address is within
+    /// the growsdown gap of a `VMA_GROWSDOWN` VMA, extends the VMA's
+    /// start one page downward and returns the VMA's object/offset/prot
+    /// so the caller can install the demand-page frame. Returns `None`
+    /// (SIGSEGV path) if no growsdown VMA is nearby, the gap is too
+    /// large, the RLIMIT would be exceeded, or another VMA is in the way.
+    pub fn grow_stack(
+        &mut self,
+        cr2: usize,
+    ) -> Option<(
+        alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>,
+        usize,
+        crate::mem::vmatree::ProtPte,
+    )> {
+        use crate::mem::pf::{check_growsdown, GrowResult, STACK_GUARD_GAP_PAGES};
+        use crate::mem::vmatree::{VMA_GROWSDOWN, VMA_STACK_GUARD};
+
+        // Find the growsdown VMA whose start is just above cr2.
+        let above = self.vmas.find_above(cr2)?;
+        if above.vma_flags & VMA_GROWSDOWN == 0 {
+            return None;
+        }
+        let vma_start = above.start;
+        let stack_top = above.end as u64;
+        let prot_pte = above.prot_pte;
+        let obj = alloc::sync::Arc::clone(&above.object);
+
+        let result = check_growsdown(
+            cr2 as u64,
+            vma_start as u64,
+            stack_top,
+            self.stack_rlimit,
+            STACK_GUARD_GAP_PAGES,
+        );
+
+        let new_start = match result {
+            GrowResult::Grow { new_start } => new_start as usize,
+            GrowResult::Segv => return None,
+        };
+
+        // Collision: reject if any other VMA occupies [new_start, vma_start).
+        if self.vmas.find(new_start).is_some() {
+            return None;
+        }
+        // Guard VMA collision: reject if a guard VMA's end > new_start.
+        if let Some(below) = self.vmas.last_below(vma_start) {
+            if below.vma_flags & VMA_STACK_GUARD != 0 && below.end > new_start {
+                return None;
+            }
+        }
+
+        // Extend the VMA downward.
+        let old_pages = (stack_top as usize - vma_start) / 4096;
+        let new_pages = (stack_top as usize - new_start) / 4096;
+        self.vm_pages = self.vm_pages - old_pages + new_pages;
+        self.vmas.rekey_start(vma_start, new_start);
+
+        // The new bottom page's object offset (page index from new_start).
+        let page_idx = (cr2 & !0xFFF) - new_start;
+        Some((obj, page_idx, prot_pte))
     }
 
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours

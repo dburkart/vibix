@@ -223,6 +223,40 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         }
     }
 
+    // Growsdown stack extension: if the fault address is just below a
+    // VMA_GROWSDOWN VMA and within the allowed gap, extend the VMA by one
+    // page and install the demand-page frame (same path as a normal miss).
+    if let Some((object, offset, prot_pte)) =
+        crate::task::current_growsdown_lookup(addr_u64 as usize)
+    {
+        use crate::mem::vmobject::Access;
+        use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+        use x86_64::{PhysAddr, VirtAddr};
+
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
+        let active = x86_64::registers::control::Cr3::read().0;
+        let pte_flags = PageTableFlags::from_bits_truncate(prot_pte);
+        match object.fault(offset, Access::Write) {
+            Ok(phys) => {
+                let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
+                    .expect("#PF growsdown: VmObject returned unaligned phys");
+                match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        #[cfg(target_os = "none")]
+                        crate::mem::refcount::dec_refcount(phys);
+                        serial_println!("#PF growsdown map failed addr={:#x}: {:?}", addr_u64, e)
+                    }
+                }
+            }
+            Err(e) => serial_println!(
+                "#PF growsdown VmObject::fault failed addr={:#x}: {:?}",
+                addr_u64,
+                e
+            ),
+        }
+    }
+
     // Check whether the fault address lands inside a kernel task's guard
     // page — if so, this is a stack overflow, not a generic fault.
     if let Some(task_id) = crate::task::find_stack_overflow(addr_u64 as usize) {
