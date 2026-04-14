@@ -557,10 +557,7 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
 /// syscall handlers in `super::syscalls::vfs`. Keeping one copy-in
 /// implementation guarantees every path syscall uses identical
 /// validation (user-range bound, NUL-termination, `ENAMETOOLONG`).
-pub(super) unsafe fn copy_path_from_user_pub(
-    uva: usize,
-    buf: &mut [u8],
-) -> Result<usize, i64> {
+pub(super) unsafe fn copy_path_from_user_pub(uva: usize, buf: &mut [u8]) -> Result<usize, i64> {
     copy_path_from_user(uva, buf)
 }
 

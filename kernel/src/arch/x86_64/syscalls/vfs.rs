@@ -22,13 +22,13 @@ use alloc::sync::Arc;
 
 use super::super::syscall::copy_path_from_user_pub;
 use super::super::uaccess;
-use crate::fs::vfs::ops::{Stat, meta_into_stat};
+use crate::fs::vfs::ops::{meta_into_stat, Stat};
 use crate::fs::vfs::path_walk::{path_walk, LookupFlags, NameIdata};
 use crate::fs::vfs::super_block::SbActiveGuard;
+use crate::fs::vfs::Credential;
 use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
-use crate::fs::vfs::Credential;
 use crate::fs::{flags as oflags, FileBackend, FileDescription, EBADF, EINVAL, ENOENT, ENOTDIR};
 
 /// Linux x86_64 value of the "use the current working directory"
@@ -209,8 +209,8 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, _mode: u64) -
         guard,
     );
     let backend: Arc<dyn FileBackend> = Arc::new(VfsBackend { open_file: of });
-    let fd_flags = (flags as u32)
-        & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
+    let fd_flags =
+        (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
     install_fd(backend, fd_flags)
 }
 

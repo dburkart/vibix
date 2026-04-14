@@ -71,7 +71,10 @@ fn run_tests() {
             "newfstatat_empty_path_needs_at_empty_path",
             &(newfstatat_empty_path_needs_at_empty_path as fn()),
         ),
-        ("lstat_same_as_stat_on_dir", &(lstat_same_as_stat_on_dir as fn())),
+        (
+            "lstat_same_as_stat_on_dir",
+            &(lstat_same_as_stat_on_dir as fn()),
+        ),
         (
             "open_o_directory_on_nondir_enotdir",
             &(open_o_directory_on_nondir_enotdir as fn()),
@@ -207,18 +210,12 @@ fn newfstatat_rejects_unknown_flag() {
 fn newfstatat_empty_path_needs_at_empty_path() {
     // Empty path without AT_EMPTY_PATH → ENOENT from path_walk.
     let path = stage_path(b"");
-    let r = unsafe {
-        syscall_dispatch(
-            SYS_NEWFSTATAT,
-            AT_FDCWD_U64,
-            path,
-            statbuf_uva(),
-            0,
-            0,
-            0,
-        )
-    };
-    assert_eq!(r, ENOENT, "empty path without AT_EMPTY_PATH → ENOENT, got {}", r);
+    let r = unsafe { syscall_dispatch(SYS_NEWFSTATAT, AT_FDCWD_U64, path, statbuf_uva(), 0, 0, 0) };
+    assert_eq!(
+        r, ENOENT,
+        "empty path without AT_EMPTY_PATH → ENOENT, got {}",
+        r
+    );
 }
 
 fn lstat_same_as_stat_on_dir() {
