@@ -15,11 +15,13 @@
 //!
 //! - `unmount` is two-phase to close the umount/syscall TOCTOU
 //!   ([`SbActiveGuard`]):
-//!     - Phase A (under `MOUNT_TABLE.write()`): take the edge, set
-//!       `draining=true`, observe `sb_active==0` (or honour
-//!       `MNT_FORCE`), unlink. If the active count is non-zero and
-//!       force is off, restore `draining=false`, reinstate the edge,
-//!       return `EBUSY`.
+//!     - Phase A (under `MOUNT_TABLE.write()`): take the edge,
+//!       pre-check `sb_active==0` *before* publishing `draining=true`
+//!       so racing callers don't see a transient drain we'll roll
+//!       back; set `draining=true`; re-check `sb_active==0` (or
+//!       honour `MNT_FORCE`) to close the zero->one window; unlink.
+//!       If either check fails and force is off, clear `draining`
+//!       (if set), reinstate the edge, return `EBUSY`.
 //!     - Phase B (no VFS locks held): `gc_drain_for(&sb)` to flush any
 //!       pending evictions, then `sb.ops.unmount()`.
 //!
@@ -115,16 +117,30 @@ pub fn mount(
         flags,
     });
 
-    let mut table = MOUNT_TABLE.write();
-    {
+    let publish_result = {
+        let mut table = MOUNT_TABLE.write();
         let existing = target.mount.read();
         if existing.is_some() {
-            return Err(EBUSY);
+            Err(())
+        } else {
+            drop(existing);
+            table.push(edge.clone());
+            *target.mount.write() = Some(edge.clone());
+            Ok(())
+        }
+    };
+    match publish_result {
+        Ok(()) => Ok(edge),
+        Err(()) => {
+            // Lost the mountpoint race after fs.mount() already succeeded.
+            // Tear down the freshly-built SB so the driver can release any
+            // state it allocated; drop happens with no VFS locks held.
+            let sb = edge.super_block.clone();
+            drop(edge);
+            let _ = sb.ops.unmount();
+            Err(EBUSY)
         }
     }
-    table.push(edge.clone());
-    *target.mount.write() = Some(edge.clone());
-    Ok(edge)
 }
 
 /// Unmount the filesystem rooted at `target` (the mountpoint dentry,
@@ -142,9 +158,16 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
         let mut edge_slot = target.mount.write();
         let edge = edge_slot.take().ok_or(EINVAL)?;
         let sb = edge.super_block.clone();
+        // Pre-check sb_active before publishing `draining=true`, so racing
+        // SbActiveGuard::try_acquire callers don't observe a transient
+        // drain when we're going to roll back anyway. Then publish
+        // draining and re-check to close the zero->one window.
+        if !force && sb.sb_active.load(Ordering::SeqCst) != 0 {
+            *edge_slot = Some(edge);
+            return Err(EBUSY);
+        }
         sb.draining.store(true, Ordering::SeqCst);
-        let active = sb.sb_active.load(Ordering::SeqCst);
-        if active != 0 && !force {
+        if !force && sb.sb_active.load(Ordering::SeqCst) != 0 {
             sb.draining.store(false, Ordering::SeqCst);
             *edge_slot = Some(edge);
             return Err(EBUSY);
