@@ -101,6 +101,7 @@ pub const ENODEV: i64 = -19;
 pub const ENOTDIR: i64 = -20;
 pub const ELOOP: i64 = -40;
 pub const EACCES: i64 = -13;
+pub const EBUSY: i64 = -16;
 
 /// Per-process file-descriptor array.
 ///

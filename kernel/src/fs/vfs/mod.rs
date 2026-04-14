@@ -48,6 +48,7 @@ use alloc::vec::Vec;
 pub mod dentry;
 pub mod gc_queue;
 pub mod inode;
+pub mod mount_table;
 pub mod open_file;
 pub mod ops;
 pub mod path_walk;
@@ -56,6 +57,7 @@ pub mod super_block;
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
+pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
 pub use open_file::OpenFile;
 pub use ops::{
     default_permission, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat,
