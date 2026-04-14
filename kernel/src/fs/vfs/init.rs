@@ -152,14 +152,12 @@ fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSy
         .unwrap_or_else(|| panic!("vfs::init: parent dentry is negative"));
 
     // Attempt to create the directory in the parent FS. Falls back to a
-    // synthetic inode when the parent is read-only (EROFS = -30).
+    // synthetic inode when the parent is read-only or doesn't support
+    // mkdir (EPERM = -1 default, EROFS = -30). The mounted child FS's
+    // root dentry takes over immediately, so the stub is never visible.
     let child_inode = match parent_inode.ops.mkdir(&parent_inode, name, 0o755) {
         Ok(inode) => inode,
-        Err(-30) => {
-            // Parent is read-only (e.g. TarFs at /). Synthesise a
-            // bootstrap placeholder — the mounted child FS's root
-            // dentry takes over immediately and the synthetic inode
-            // is never reachable through the mounted namespace.
+        Err(_) => {
             let stub_sb = Arc::new(SuperBlock::new(
                 alloc_fs_id(),
                 Arc::new(BootstrapSuperOps) as Arc<dyn SuperOps>,
@@ -182,11 +180,6 @@ fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSy
             core::mem::forget(stub_sb);
             stub_inode
         }
-        Err(e) => panic!(
-            "vfs::init: mkdir {:?} under / failed: errno={}",
-            core::str::from_utf8(name).unwrap_or("<non-utf8>"),
-            e
-        ),
     };
 
     let child_dname =
