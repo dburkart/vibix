@@ -599,14 +599,8 @@ mod tests {
         v.vma_flags = VMA_GROWSDOWN;
         t.insert(v);
         t.unmap_range(K, 3 * K);
-        let vs: alloc::vec::Vec<_> = t
-            .iter()
-            .map(|v| (v.start, v.end, v.vma_flags))
-            .collect();
-        assert_eq!(
-            vs,
-            [(0, K, VMA_GROWSDOWN), (3 * K, 4 * K, VMA_GROWSDOWN)],
-        );
+        let vs: alloc::vec::Vec<_> = t.iter().map(|v| (v.start, v.end, v.vma_flags)).collect();
+        assert_eq!(vs, [(0, K, VMA_GROWSDOWN), (3 * K, 4 * K, VMA_GROWSDOWN)],);
     }
 
     #[test]
