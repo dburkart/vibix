@@ -69,12 +69,8 @@ pub fn init() {
     // early-boot without the ISO, or any future build that omits it).
     #[cfg(target_os = "none")]
     let root_edge = {
-        if let Some((ptr, len)) = find_rootfs_module() {
-            // SAFETY (inside tarfs): Limine places module payloads in
-            // EXECUTABLE_AND_MODULES memory, preserved for the kernel's
-            // lifetime. TarFs::mount() converts the raw pointer to a slice
-            // with an internal `unsafe` block.
-            let source = MountSource::RamdiskModule(ptr, len);
+        if let Some(module_bytes) = find_rootfs_module() {
+            let source = MountSource::RamdiskModule(module_bytes);
             let edge = mount(
                 source,
                 &bootstrap,
@@ -124,16 +120,25 @@ pub fn init() {
     crate::serial_println!("vfs: mounted ramfs at /tmp");
 }
 
-/// Locate the rootfs tarball module from the Limine module response.
-/// Returns `(ptr, len)` if found, `None` otherwise.
+/// Locate the rootfs tarball module from the Limine module response and
+/// convert the raw bootloader pointer into a `&'static [u8]`.
+///
+/// # Safety of the `unsafe` block
+///
+/// Limine guarantees that module payloads reside in
+/// `EXECUTABLE_AND_MODULES` memory, which it preserves for the kernel's
+/// entire lifetime. `file.addr()` and `file.size()` come directly from
+/// the validated bootloader response and form a valid, non-overlapping
+/// byte range. The resulting slice is therefore sound for `'static`.
 #[cfg(target_os = "none")]
-fn find_rootfs_module() -> Option<(*const u8, usize)> {
+fn find_rootfs_module() -> Option<&'static [u8]> {
     let resp = crate::boot::MODULE_REQUEST.get_response()?;
     let file = resp
         .modules()
         .iter()
         .find(|f| f.path().to_bytes().ends_with(b"/boot/rootfs.tar"))?;
-    Some((file.addr(), file.size() as usize))
+    // SAFETY: see doc comment above.
+    Some(unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) })
 }
 
 /// Create a subdirectory `name` under `parent`, wrap it in a fresh
