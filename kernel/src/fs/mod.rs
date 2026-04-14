@@ -98,6 +98,9 @@ pub const EMFILE: i64 = -24;
 pub const ENAMETOOLONG: i64 = -36;
 pub const EEXIST: i64 = -17;
 pub const ENODEV: i64 = -19;
+pub const ENOTDIR: i64 = -20;
+pub const ELOOP: i64 = -40;
+pub const EACCES: i64 = -13;
 
 /// Per-process file-descriptor array.
 ///
