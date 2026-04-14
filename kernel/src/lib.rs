@@ -79,6 +79,7 @@ pub fn init() {
         .address();
     arch::init();
     mem::init();
+    fs::vfs::init::init();
     arch::init_apic(rsdp, hhdm);
     match hpet::init() {
         Ok(()) => {}

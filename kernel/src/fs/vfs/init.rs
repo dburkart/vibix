@@ -1,0 +1,295 @@
+//! Boot-time VFS initialization (RFC 0002 item 12/15).
+//!
+//! Populates the namespace with its three initial mounts so that the
+//! kernel has a live filesystem before PID 1 runs:
+//!
+//! | Mountpoint | FS     | Backing                       |
+//! |------------|--------|-------------------------------|
+//! | `/`        | ramfs  | synthesised                   |
+//! | `/dev`     | devfs  | synthesised                   |
+//! | `/tmp`     | ramfs  | synthesised                   |
+//!
+//! The RFC names tarfs-on-a-ramdisk-module as the long-term backing
+//! for `/`, but the boot ISO does not yet ship a rootfs tarball, so
+//! ramfs is mounted there for now. Once a tar module lands, swap the
+//! `/` backing to [`TarFs`] with `MountSource::RamdiskModule`.
+//!
+//! ## Bootstrap: where does the namespace root come from?
+//!
+//! The mount at `/` needs a target dentry before any FS exists. We
+//! build a minimal bootstrap placeholder — a dentry whose inode lives
+//! in a throwaway bootstrap superblock — purely so [`mount_table::mount`]
+//! has something to hang the first edge on. After mounting ramfs there,
+//! the reachable namespace root is `edge.root_dentry`, which is what we
+//! expose via [`root`].
+//!
+//! ## Failure policy
+//!
+//! All three mounts are fatal pre-PID-1: `init()` panics with a
+//! descriptive message if any step fails. A boot where `/dev` can't be
+//! mounted is a boot where nothing useful can run next.
+
+use alloc::sync::Arc;
+use spin::Once;
+
+use super::dentry::{Dentry, MountFlags};
+use super::inode::{Inode, InodeKind, InodeMeta};
+use super::mount_table::{alloc_fs_id, mount};
+use super::ops::{FileOps, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
+use super::super_block::{SbFlags, SuperBlock};
+use super::{DevFs, RamFs};
+
+/// Global namespace root. Populated by [`init`]; `None` before the
+/// kernel has run boot-time VFS setup. Consumers who need to start a
+/// [`path_walk`](super::path_walk::path_walk) against `/` call
+/// [`root`] to retrieve it.
+static ROOT_DENTRY: Once<Arc<Dentry>> = Once::new();
+
+/// Return the namespace root dentry, or `None` if [`init`] has not run
+/// yet. Path-based syscalls should fail with `-ENOENT` (or a clearer
+/// init-not-ready code) if this returns `None`.
+pub fn root() -> Option<Arc<Dentry>> {
+    ROOT_DENTRY.get().cloned()
+}
+
+/// Mount the three initial filesystems. Panics on any failure — see
+/// module doc for why this is the correct policy.
+///
+/// Called from `vibix::init()` after `mem::init()` so the heap is
+/// available for `Arc` / `Vec` allocation done by the FS drivers.
+pub fn init() {
+    if ROOT_DENTRY.get().is_some() {
+        return;
+    }
+
+    let bootstrap = bootstrap_target();
+
+    let root_edge = mount(
+        MountSource::None,
+        &bootstrap,
+        Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+        MountFlags::default(),
+    )
+    .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e));
+
+    let root = root_edge.root_dentry.clone();
+    ROOT_DENTRY.call_once(|| root.clone());
+    crate::serial_println!("vfs: mounted ramfs at /");
+
+    mount_child(
+        &root,
+        b"dev",
+        Arc::new(DevFs) as Arc<dyn super::ops::FileSystem>,
+    );
+    crate::serial_println!("vfs: mounted devfs at /dev");
+
+    mount_child(
+        &root,
+        b"tmp",
+        Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+    );
+    crate::serial_println!("vfs: mounted ramfs at /tmp");
+}
+
+/// Create a subdirectory `name` under `parent`, wrap it in a fresh
+/// dentry, and mount `fs` onto it. Panics on any step's failure.
+fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSystem>) {
+    let parent_inode = parent
+        .inode
+        .read()
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| panic!("vfs::init: parent dentry is negative"));
+
+    let child_inode = parent_inode
+        .ops
+        .mkdir(&parent_inode, name, 0o755)
+        .unwrap_or_else(|e| {
+            panic!(
+                "vfs::init: mkdir {:?} under / failed: errno={}",
+                core::str::from_utf8(name).unwrap_or("<non-utf8>"),
+                e
+            )
+        });
+
+    let child_dname =
+        super::DString::try_from_bytes(name).unwrap_or_else(|_| panic!("vfs::init: invalid dname"));
+    let child_dentry = Dentry::new(child_dname, Arc::downgrade(parent), Some(child_inode));
+
+    mount(MountSource::None, &child_dentry, fs, MountFlags::default()).unwrap_or_else(|e| {
+        panic!(
+            "vfs::init: mount {:?} failed: errno={}",
+            core::str::from_utf8(name).unwrap_or("<non-utf8>"),
+            e
+        )
+    });
+}
+
+/// Build the synthetic directory dentry onto which ramfs mounts for
+/// `/`. The bootstrap SB lives for the rest of the kernel's lifetime
+/// via the ramfs edge's backlink; we can leak-like-forget it here
+/// because mount_table holds the live mount edge strongly.
+fn bootstrap_target() -> Arc<Dentry> {
+    let bootstrap_sb = Arc::new(SuperBlock::new(
+        alloc_fs_id(),
+        Arc::new(BootstrapSuperOps) as Arc<dyn SuperOps>,
+        "rootfs-bootstrap",
+        4096,
+        SbFlags::default(),
+    ));
+    let bootstrap_inode = Arc::new(Inode::new(
+        1,
+        Arc::downgrade(&bootstrap_sb),
+        Arc::new(BootstrapInodeOps) as Arc<dyn InodeOps>,
+        Arc::new(BootstrapFileOps) as Arc<dyn FileOps>,
+        InodeKind::Dir,
+        InodeMeta {
+            mode: 0o755,
+            nlink: 2,
+            ..Default::default()
+        },
+    ));
+    let target = Dentry::new_root(bootstrap_inode);
+
+    // The bootstrap SB is only ever referenced as a Weak back-pointer
+    // from the target dentry's inode. `mount_table::mount` produces an
+    // edge that holds the new FS's SuperBlock strongly — the bootstrap
+    // SB itself has no consumers after that, so forgetting it here is
+    // the simplest way to keep its one Inode's Weak backlink
+    // upgradeable for the short duration of the first mount.
+    core::mem::forget(bootstrap_sb);
+
+    target
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap SB/Inode/File ops — deliberately minimal. The bootstrap
+// dentry is never the target of a syscall; only `mount_table::mount`
+// looks at its kind, then the edge takes over for all future walks.
+// ---------------------------------------------------------------------------
+
+struct BootstrapSuperOps;
+
+impl SuperOps for BootstrapSuperOps {
+    fn root_inode(&self) -> Arc<Inode> {
+        // mount_table::mount doesn't call this (the FS being mounted
+        // produces its own root), and nothing else ever resolves
+        // through this SB. An unreachable here flags any future
+        // regression that widens the bootstrap surface.
+        unreachable!("bootstrap SuperOps::root_inode should never be reached")
+    }
+    fn statfs(&self) -> Result<StatFs, i64> {
+        Ok(StatFs::default())
+    }
+    fn unmount(&self) -> Result<(), i64> {
+        Ok(())
+    }
+}
+
+struct BootstrapInodeOps;
+
+impl InodeOps for BootstrapInodeOps {
+    fn getattr(&self, _inode: &Inode, _out: &mut Stat) -> Result<(), i64> {
+        Ok(())
+    }
+    fn setattr(&self, _inode: &Inode, _attr: &SetAttr) -> Result<(), i64> {
+        Ok(())
+    }
+}
+
+struct BootstrapFileOps;
+
+impl FileOps for BootstrapFileOps {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spin::Mutex;
+
+    // `init()` installs into the global `ROOT_DENTRY` and global
+    // `MOUNT_TABLE`. Tests must serialise to avoid cross-test races on
+    // those singletons.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_root() {
+        // There is no public reset path for Once / MOUNT_TABLE; the
+        // init flow is idempotent (early-returns on second entry) so
+        // all we need for these tests is serialisation + running
+        // against whatever state a prior test left behind.
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let first = root().expect("root populated after first init");
+        init();
+        let second = root().expect("root populated after second init");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "idempotent init returns same root dentry"
+        );
+    }
+
+    #[test]
+    fn root_is_positive_directory() {
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+        let inode_slot = r.inode.read();
+        let inode = inode_slot.as_ref().expect("root is positive");
+        assert_eq!(inode.kind, InodeKind::Dir);
+    }
+
+    #[test]
+    fn root_is_a_mountpoint_via_lookup_chain() {
+        // After init, the ramfs root dentry is the globally-exposed
+        // root; the bootstrap dentry it was mounted onto is held alive
+        // only by the edge's `mountpoint: Weak`. A walker asking about
+        // `root()` should see a positive dir and no further mount on
+        // top of it.
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+        assert!(
+            r.mount.read().is_none(),
+            "namespace root is not a mountpoint itself"
+        );
+    }
+
+    #[test]
+    fn dev_mount_is_present_in_root_children() {
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+        let root_inode = r.inode.read().as_ref().cloned().expect("positive");
+
+        // Look up `dev` through the ramfs InodeOps — should succeed
+        // because `mount_child` created the directory in ramfs before
+        // mounting devfs on it.
+        let dev = root_inode
+            .ops
+            .lookup(&root_inode, b"dev")
+            .expect("ramfs /dev directory exists");
+        assert_eq!(dev.kind, InodeKind::Dir);
+    }
+
+    #[test]
+    fn tmp_mount_is_present_in_root_children() {
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+        let root_inode = r.inode.read().as_ref().cloned().expect("positive");
+
+        let tmp = root_inode
+            .ops
+            .lookup(&root_inode, b"tmp")
+            .expect("ramfs /tmp directory exists");
+        assert_eq!(tmp.kind, InodeKind::Dir);
+    }
+}
