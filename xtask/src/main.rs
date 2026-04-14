@@ -505,6 +505,8 @@ fn run(opts: &BuildOpts) -> R<()> {
         .args([
             "-M",
             "q35",
+            "-cpu",
+            "max",
             "-m",
             "256M",
             "-serial",
@@ -549,6 +551,8 @@ fn test_runner(kernel: &Path) -> R<()> {
         .args([
             "-M",
             "q35",
+            "-cpu",
+            "max",
             "-m",
             "256M",
             "-serial",
@@ -631,6 +635,7 @@ fn test_all() -> R<()> {
         "addrspace",
         "addrspace_drop",
         "tlb_flusher",
+        "smep_smap",
     ] {
         cmd.arg("--test").arg(t);
     }
@@ -649,6 +654,8 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         .args([
             "-M",
             "q35",
+            "-cpu",
+            "max",
             "-m",
             "256M",
             "-serial",

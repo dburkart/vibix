@@ -7,12 +7,17 @@ pub mod interrupts;
 pub mod ist_guard;
 pub mod pic;
 pub mod syscall;
+pub mod uaccess;
 
 /// Bring up arch-specific interrupt plumbing that doesn't depend on
 /// the kernel mapper. Interrupts stay disabled throughout.
 pub fn init() {
     // Feature detection first — everything below may query cpu::has().
     crate::cpu::init();
+    // SMEP/SMAP enforcement: blocks ring-0 fetch/access of user pages
+    // outside a `stac`/`clac` bracket. Must precede `syscall::init` so
+    // the first SYSCALL fires with enforcement already live.
+    uaccess::enable_smep_smap();
     // FPU init needs CR0/CR4 writes but no heap, so it fits here —
     // ahead of task::init() which spawns the first saving task.
     fpu::init();

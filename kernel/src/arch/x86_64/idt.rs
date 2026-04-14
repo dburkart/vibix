@@ -75,6 +75,19 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+    // Clear RFLAGS.AC immediately so the handler runs with SMAP live,
+    // even if we entered mid-`stac` bracket from `uaccess::copy_*`. The
+    // IRET at exit restores the saved RFLAGS (and therefore AC) from
+    // `frame`, so a legitimate user access inside the bracket retries
+    // correctly. The `is_smap_violation` check below still inspects the
+    // saved `frame.cpu_flags` AC bit — that's the ring-0 caller's AC,
+    // which is what the RFC needs.
+    //
+    // SAFETY: `clac` is a single-instruction flag clear with no memory
+    // effects; it's a no-op on CPUs without SMAP.
+    if crate::cpu::has(crate::cpu::Feature::Smap) {
+        unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+    }
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
