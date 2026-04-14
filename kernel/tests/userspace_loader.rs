@@ -10,6 +10,7 @@ use vibix::{
     test_harness::{test_panic_handler, Testable},
     QemuExitCode,
 };
+use x86_64::structures::paging::PageTableFlags;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -54,10 +55,30 @@ fn load_user_elf_maps_lower_half_segments() {
         image.entry.as_u64()
     );
     assert!(image.segments > 0, "at least one PT_LOAD must map");
+
+    // The entry PTE must be present *and* USER_ACCESSIBLE. A regression
+    // that maps lower-half segments without the U bit would leave the
+    // returned `LoadedImage` metadata intact while silently breaking
+    // ring-3 execution — walking the leaf PTE catches that.
+    let (frame, flags) = vibix::mem::paging::translate_in_pml4(pml4, image.entry)
+        .expect("entry VA must be mapped in new PML4");
+    assert!(
+        flags.contains(PageTableFlags::PRESENT),
+        "entry PTE must be PRESENT, got {:?}",
+        flags
+    );
+    assert!(
+        flags.contains(PageTableFlags::USER_ACCESSIBLE),
+        "entry PTE missing USER_ACCESSIBLE: {:?}",
+        flags
+    );
+
     serial_println!(
-        "load_user_elf: entry={:#x} segments={}",
+        "load_user_elf: entry={:#x} segments={} frame={:#x} flags={:?}",
         image.entry.as_u64(),
-        image.segments
+        image.segments,
+        frame.start_address().as_u64(),
+        flags
     );
 }
 
