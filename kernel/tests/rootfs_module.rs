@@ -42,8 +42,10 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 fn run_tests() {
-    let tests: &[(&str, &dyn Testable)] =
-        &[("rootfs_etc_is_directory", &(rootfs_etc_is_directory as fn()))];
+    let tests: &[(&str, &dyn Testable)] = &[(
+        "rootfs_etc_is_directory",
+        &(rootfs_etc_is_directory as fn()),
+    )];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
         serial_println!("test {name}");
@@ -52,8 +54,8 @@ fn run_tests() {
 }
 
 fn rootfs_etc_is_directory() {
-    let root = vibix::fs::vfs::root()
-        .expect("rootfs_module: vfs root not populated after vibix::init()");
+    let root =
+        vibix::fs::vfs::root().expect("rootfs_module: vfs root not populated after vibix::init()");
 
     let mut nd = NameIdata::new(
         root.clone(),
@@ -63,8 +65,7 @@ fn rootfs_etc_is_directory() {
     )
     .expect("rootfs_module: seed namei");
 
-    path_walk(&mut nd, b"/etc", &GlobalMountResolver)
-        .expect("rootfs_module: path_walk /etc");
+    path_walk(&mut nd, b"/etc", &GlobalMountResolver).expect("rootfs_module: path_walk /etc");
 
     let etc_inode = nd.path.inode.clone();
     if etc_inode.kind != InodeKind::Dir {
