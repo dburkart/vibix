@@ -1,10 +1,21 @@
 //! Per-process file-descriptor table and file-backend abstraction.
 //!
+//! This module is a thin adapter between syscalls and the filesystem layer
+//! that lives in [`vfs`]. The real name→inode lookup, mount table, dentry
+//! cache, and concrete filesystems (`ramfs`, `tarfs`, `devfs`) are implemented
+//! there; everything in this file is just the per-process fd array plus the
+//! small [`FileBackend`] trait that hides whether a given fd is path-opened
+//! (VFS-backed via [`vfs::VfsBackend`]) or synthetic (`SerialBackend` for
+//! stdio, test stubs in unit tests).
+//!
+//! See [`docs/RFC/0002-virtual-filesystem.md`] for the overall design.
+//!
 //! The module is split into:
 //! - Core types (`FileBackend`, `FileDescription`, `FileDescTable`) — compiled
 //!   for both `target_os = "none"` and host unit tests.
 //! - `SerialBackend` + `FileDescTable::new_with_stdio()` — compiled for
 //!   `target_os = "none"` only (require port I/O and the serial subsystem).
+//! - [`vfs`] — the real filesystem layer, compiled for `target_os = "none"`.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -308,8 +319,9 @@ impl FileDescTable {
 
 /// Serial (COM1) backend.
 ///
-/// Used as the backend for fds 0/1/2 in early userspace before a real VFS
-/// is available.
+/// Used as the backend for fds 0/1/2. Stdio bypasses the VFS on purpose:
+/// every task gets a direct [`SerialBackend`] so console I/O works even
+/// before `/dev/console` is wired up in `devfs`.
 #[cfg(target_os = "none")]
 pub struct SerialBackend;
 
@@ -346,8 +358,8 @@ impl FileDescTable {
     /// Create a table with fds 0/1/2 wired to the COM1 serial port.
     ///
     /// This is the standard starting point for every new task: stdin, stdout,
-    /// and stderr all map to the same `SerialBackend` until the VFS is
-    /// available.
+    /// and stderr all map to the same [`SerialBackend`], bypassing the VFS
+    /// so console I/O works before any filesystem is mounted.
     pub fn new_with_stdio() -> Self {
         let serial = Arc::new(SerialBackend) as Arc<dyn FileBackend>;
         Self::new_with_backends(serial.clone(), serial.clone(), serial.clone())
