@@ -32,7 +32,7 @@
 use alloc::sync::Arc;
 use spin::Once;
 
-use super::dentry::{Dentry, MountFlags};
+use super::dentry::{ChildState, Dentry, MountFlags};
 use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::{alloc_fs_id, mount};
 use super::ops::{FileOps, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
@@ -114,7 +114,21 @@ fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSy
 
     let child_dname =
         super::DString::try_from_bytes(name).unwrap_or_else(|_| panic!("vfs::init: invalid dname"));
-    let child_dentry = Dentry::new(child_dname, Arc::downgrade(parent), Some(child_inode));
+    let child_dentry = Dentry::new(
+        child_dname.clone(),
+        Arc::downgrade(parent),
+        Some(child_inode),
+    );
+
+    // Publish the child into `parent.children` *before* mounting so
+    // the parent's strong BTreeMap reference keeps it alive after we
+    // return. `mount_table::mount` only holds a `Weak<Dentry>` on the
+    // mountpoint; without this insert, `..` traversal out of the
+    // mounted FS would fail to upgrade and yield `ENOENT`.
+    parent
+        .children
+        .write()
+        .insert(child_dname, ChildState::Resolved(child_dentry.clone()));
 
     mount(MountSource::None, &child_dentry, fs, MountFlags::default()).unwrap_or_else(|e| {
         panic!(
@@ -291,5 +305,46 @@ mod tests {
             .lookup(&root_inode, b"tmp")
             .expect("ramfs /tmp directory exists");
         assert_eq!(tmp.kind, InodeKind::Dir);
+    }
+
+    #[test]
+    fn mount_child_dentries_survive_via_parent_children() {
+        // Regression: `mount()` stores only a `Weak<Dentry>` on the
+        // mountpoint, so the child dentry produced by `mount_child`
+        // would be dropped at function exit if the parent didn't hold
+        // it strongly. Upgrading the mount edge's `mountpoint` Weak
+        // proves the dentry is still alive, i.e. `..` traversal out of
+        // `/dev` or `/tmp` will succeed.
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+
+        let children = r.children.read();
+        let dev_dname = super::super::DString::try_from_bytes(b"dev").unwrap();
+        let tmp_dname = super::super::DString::try_from_bytes(b"tmp").unwrap();
+        for (dname, label) in [(&dev_dname, "dev"), (&tmp_dname, "tmp")] {
+            let state = children
+                .get(dname)
+                .unwrap_or_else(|| panic!("/{} should be registered under root.children", label));
+            let child = match state {
+                ChildState::Resolved(d) => d.clone(),
+                _ => panic!("/{} should be Resolved, not Loading/Negative", label),
+            };
+            let edge = child
+                .mount
+                .read()
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| panic!("/{} dentry should host a mount edge", label));
+            let upgraded = edge
+                .mountpoint
+                .upgrade()
+                .unwrap_or_else(|| panic!("mount edge's mountpoint Weak for /{} must upgrade — if it fails the child dentry was dropped", label));
+            assert!(
+                Arc::ptr_eq(&upgraded, &child),
+                "upgraded mountpoint should be the same dentry we registered under root.children"
+            );
+        }
     }
 }
