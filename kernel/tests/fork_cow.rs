@@ -311,8 +311,8 @@ fn cow_copy_uses_current_pte_frame() {
     // Resolve CoW on the child's PTE. With the fix this copies from
     // whatever frame the PTE currently references (the one stamped
     // with 0xAB). Before the fix the resolver had no source at all.
-    let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(FORK_VA as u64))
-        .expect("page-aligned");
+    let page =
+        Page::<Size4KiB>::from_start_address(VirtAddr::new(FORK_VA as u64)).expect("page-aligned");
     let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
     let new_frame = cow_copy_and_remap(child.page_table_frame(), page, flags)
         .expect("cow_copy_and_remap must succeed even when child cache is empty");
