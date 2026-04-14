@@ -55,6 +55,7 @@ pub mod ops;
 pub mod path_walk;
 pub mod ramfs;
 pub mod super_block;
+pub mod tarfs;
 
 pub use backend::VfsBackend;
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
@@ -71,6 +72,7 @@ pub use path_walk::{
 };
 pub use ramfs::RamFs;
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
+pub use tarfs::TarFs;
 
 /// POSIX-imposed cap on a single path component.
 pub const NAME_MAX: usize = 255;
