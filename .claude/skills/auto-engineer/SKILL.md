@@ -203,7 +203,7 @@ ScheduleWakeup(
 - **Actionable bugs** → apply follow-up commits (never amend), `git push`, then reschedule
   another poll tick with `--fix-round R+1`.
 - **Out-of-scope nits** → reply on the PR via `mcp__github__add_issue_comment` ("deferred to
-  future work"), open a follow-up issue via the `file-issue` skill, then proceed to merge.
+  future work"), open a follow-up issue via an `Agent()` call (see "Calling file-issue from a loop" below), then proceed to merge.
 
 ### 7. Merge
 
@@ -234,10 +234,9 @@ Before reloading the next issue, scan for work that surfaced during this cycle b
 - Build/test warnings observed during step 4 that weren't blocking but deserve follow-up.
 - Anything the sub-agent's plan (step 2) explicitly listed as "out of scope" or "risks."
 
-For each distinct follow-up, **invoke the `file-issue` skill** — do not call
-`mcp__github__issue_write` directly. The `file-issue` skill handles dedupe against existing
-issues, enforces the label taxonomy from `docs/agent-playbooks/prioritization.md`, and
-produces a body in the canonical template. Feed it:
+For each distinct follow-up, open an issue via an `Agent()` call (see "Calling file-issue
+from a loop" below). Do **not** call `Skill("file-issue")` — that replaces this skill's
+context and terminates the loop. Feed each Agent():
 
 - A specific title.
 - A 1–3 sentence motivation, including `discovered while merging #<PR>` so the origin is
@@ -249,11 +248,20 @@ If nothing worth filing, skip silently. **Do not file speculative or "nice-to-ha
 
 ### 9. Check session quota
 
-Before compacting and kicking off the next cycle, run `/usage` (the `usage` skill). It emits two machine-readable lines — `remaining_pct: <float>` and `reset_ts: <ISO>` — plus a human summary. Parse `remaining_pct`.
+Before compacting and kicking off the next cycle, check quota by running the probe script
+**directly** — do **not** call `Skill("usage")`, which would terminate the loop:
+
+```sh
+bash .claude/skills/usage/probe.sh
+```
+
+Parse the single-line JSON output (see `docs/agent-playbooks/skill-composition.md` for why
+direct invocation is required here). Derive `remaining_pct` as
+`max(0, 100 - 5h.utilization*100)` and `reset_ts` as an ISO-8601 string of `5h.resets_at`.
 
 - **≥ 10% remaining** → proceed to step 10.
 - **< 10% remaining** → don't start a new cycle; the next one could tip over mid-PR and leave an orphaned branch. Instead:
-  1. Read `reset_ts` from `/usage` output.
+  1. Read `reset_ts` from the probe JSON output.
   2. Compute `secondsUntilReset = reset_ts - now`. Add a 60 s buffer so the wake-up lands *after* the reset, not on its edge.
   3. **Compaction decision:**
      - If `secondsUntilReset ≤ 90 min`: skip `/compact`. The wait is short enough that one or two un-compacted hops won't burn meaningful quota, and compaction itself costs tokens we want to save.
@@ -298,12 +306,40 @@ Stop conditions:
 - Iteration budget of 8 reached.
 - The issue was reassigned away from `dburkart` while auto-engineer held it.
 
+## Calling file-issue from a loop
+
+`Skill("file-issue")` replaces the current skill's execution context — calling it would
+terminate this loop. Instead, spawn a subagent via `Agent()`:
+
+```
+Agent(
+  description="File follow-up issue: <title>",
+  subagent_type="general-purpose",
+  prompt="""
+Read .claude/skills/file-issue/SKILL.md and docs/agent-playbooks/prioritization.md.
+Then file one GitHub issue against dburkart/vibix with:
+  title: <title>
+  motivation: <1-3 sentences, include "discovered while merging #<PR>">
+  work items: <concrete sub-tasks>
+  context: <file paths, SHAs, related issues>
+Return the new issue number and URL.
+"""
+)
+```
+
+Key points:
+- The Agent() call returns to this skill when done — the loop continues.
+- Pass all context explicitly in the prompt; the subagent starts cold with no conversation
+  history.
+- One Agent() call per issue; do not batch multiple issues into one subagent call.
+
 ## Never
 
 - Force-push, rebase pushed branches, or rewrite reviewed commits.
 - Edit `main` directly.
 - Merge without green CI.
 - Delegate the PR-wait loop to the `wait-for-pr` skill — it would steal the `ScheduleWakeup` thread. Use the embedded poll loop in step 6 instead.
+- Call `Skill("file-issue")` or `Skill("usage")` inline — use `Agent()` for file-issue and the probe script for usage. `Skill()` replaces the current context and terminates the loop.
 - Continue past 8 iterations without a fresh user invocation.
 - Auto-fix test or build logic in step 6c (fmt and clippy only; real fixes are follow-up commits).
 - Close an issue manually — let the squash-merge do it via the PR body's `Closes #N`.
