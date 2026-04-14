@@ -87,6 +87,8 @@ jobs:
             --allowed-tools
             "Bash(gh run view:*)"
             "Bash(gh issue list:*)"
+            "Bash(cat:*)"
+            "Read"
             "Skill(file-issue)"
             "mcp__github__search_issues"
             "mcp__github__add_issue_comment"
@@ -114,6 +116,5 @@ jobs:
             - The workflow run URL above so it is easy to navigate to the logs
             - The commit SHA and message that introduced the failure
 
-            Before filing, run:
-              gh issue list --state open --search "${{ github.sha }}"
-            and skip filing if an open issue for this exact commit SHA already exists.
+            The `file-issue` skill handles duplicate detection automatically (it searches
+            by issue title keywords). Do not add any extra deduplication step.
