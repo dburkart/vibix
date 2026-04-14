@@ -78,11 +78,18 @@ fn prot_pte_rw() -> u64 {
 
 // --- brk ---------------------------------------------------------------
 
-fn brk_grow_shrink_query() {
+/// Build an AddressSpace with the heap window opened at a low `image_end`,
+/// the way the ELF loader does after parsing PT_LOAD segments. `new_empty`
+/// leaves `brk_start == mmap_base` and `brk_max == mmap_base - guard`, an
+/// inverted window that rejects every grow; `set_brk_start` fixes that.
+fn make_brk_aspace() -> AddressSpace {
     let mut aspace = AddressSpace::new_empty();
-    // The loader normally calls set_brk_start; for a fresh AddressSpace
-    // brk_start defaults to mmap_base (0x4000_0000). sys_brk(0) returns
-    // the current break.
+    aspace.set_brk_start(VirtAddr::new(0x1000_0000));
+    aspace
+}
+
+fn brk_grow_shrink_query() {
+    let mut aspace = make_brk_aspace();
     let initial = aspace.sys_brk(0);
 
     // Grow by 2 pages: the exact requested address is stored.
@@ -106,10 +113,10 @@ fn brk_grow_shrink_query() {
 }
 
 fn brk_past_max_returns_prior() {
-    let mut aspace = AddressSpace::new_empty();
+    let mut aspace = make_brk_aspace();
     let initial = aspace.sys_brk(0);
-    // A brk request far past any reasonable brk_max should be refused
-    // and the prior break returned unchanged.
+    // A brk request far past brk_max must be refused; the prior break
+    // is returned unchanged.
     let got = aspace.sys_brk(u64::MAX - 4096);
     assert_eq!(
         got, initial,
