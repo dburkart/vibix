@@ -19,7 +19,6 @@ use super::{Access, Credential, InodeKind, Timespec};
 /// Source of a mount operation. Separated from the target path so
 /// future sources (block device, ramdisk module, network URL) can be
 /// added without breaking the trait signature.
-#[derive(Debug)]
 pub enum MountSource<'a> {
     /// No backing — the FS synthesises its own storage (ramfs, devfs).
     None,
@@ -27,6 +26,27 @@ pub enum MountSource<'a> {
     Path(&'a [u8]),
     /// Static byte slice with 'static lifetime (initrd tarball).
     Static(&'static [u8]),
+    /// Raw pointer + length from a Limine ramdisk module. The bytes
+    /// are expected to live for the kernel's lifetime. Non-`Send`
+    /// because the pointer is only meaningful on the mount thread;
+    /// the driver copies the `(ptr, len)` pair into its own state
+    /// under its own safety contract.
+    RamdiskModule(*const u8, usize),
+}
+
+impl core::fmt::Debug for MountSource<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MountSource::None => f.write_str("None"),
+            MountSource::Path(p) => f.debug_tuple("Path").field(p).finish(),
+            MountSource::Static(s) => f.debug_tuple("Static").field(&s.len()).finish(),
+            MountSource::RamdiskModule(ptr, len) => f
+                .debug_tuple("RamdiskModule")
+                .field(&(*ptr as usize))
+                .field(len)
+                .finish(),
+        }
+    }
 }
 
 /// Linux `struct stat` layout (x86_64). Emitted by
