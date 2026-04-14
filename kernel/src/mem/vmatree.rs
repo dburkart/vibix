@@ -701,4 +701,70 @@ mod tests {
         t.insert(vma(0, 2 * K, RW, obj, 0));
         assert_eq!(t.len(), 1);
     }
+
+    // RFC 0001 integration coverage (issue #165) — structural scenarios
+    // that exercise the full split/merge machinery, not just a single
+    // operation. These complement the per-op tests above.
+
+    #[test]
+    fn mmap_then_unmap_middle_splits_into_two() {
+        // mmap(8 pages) + munmap(middle 4) should leave two VMAs
+        // covering the left and right fragments with the original
+        // object_offset preserved on each side.
+        let obj = stub();
+        let mut t = VmaTree::new();
+        t.insert(vma(0, 8 * K, RW, Arc::clone(&obj), 0));
+        assert_eq!(t.len(), 1);
+
+        t.unmap_range(2 * K, 6 * K);
+        assert_eq!(t.len(), 2);
+        let mut it = t.iter();
+        let left = it.next().unwrap();
+        let right = it.next().unwrap();
+        assert_eq!((left.start, left.end), (0, 2 * K));
+        assert_eq!(left.object_offset, 0);
+        assert_eq!((right.start, right.end), (6 * K, 8 * K));
+        assert_eq!(right.object_offset, 6 * K);
+    }
+
+    #[test]
+    fn mprotect_downgrade_then_restore_remerges() {
+        // mmap + mprotect(downgrade middle) + mprotect(restore middle)
+        // should end with a single coalesced VMA.
+        let obj = stub();
+        let mut t = VmaTree::new();
+        t.insert(vma(0, 4 * K, RW, obj, 0));
+        assert_eq!(t.len(), 1);
+
+        t.change_protection(K, 3 * K, R, 0);
+        assert_eq!(t.len(), 3, "downgrade should split into 3 fragments");
+
+        t.change_protection(K, 3 * K, RW, 0);
+        assert_eq!(t.len(), 1, "restore should re-merge into one VMA");
+        let only = t.iter().next().unwrap();
+        assert_eq!((only.start, only.end), (0, 4 * K));
+    }
+
+    #[test]
+    fn unmap_range_spanning_hole_trims_both_sides() {
+        // Partial unmap over a range that spans a hole (some of the
+        // range has no VMA to unmap) must not panic, must leave the
+        // hole alone, and must correctly trim the neighbouring VMAs
+        // whose edges the range does overlap.
+        let obj = stub();
+        let mut t = VmaTree::new();
+        t.insert(vma(0, 2 * K, RW, Arc::clone(&obj), 0));
+        t.insert(vma(3 * K, 5 * K, RW, obj, 0));
+        assert_eq!(t.len(), 2);
+
+        // Unmap [K, 4*K): the gap at [2*K, 3*K) is left alone; the
+        // left VMA trims to [0, K) and the right VMA trims to [4*K, 5*K).
+        t.unmap_range(K, 4 * K);
+        assert_eq!(t.len(), 2);
+        let mut it = t.iter();
+        let a = it.next().unwrap();
+        let b = it.next().unwrap();
+        assert_eq!((a.start, a.end), (0, K));
+        assert_eq!((b.start, b.end), (4 * K, 5 * K));
+    }
 }

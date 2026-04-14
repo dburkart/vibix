@@ -167,3 +167,7 @@ harness = false
 [[test]]
 name = "syscall_open_mmap"
 harness = false
+
+[[test]]
+name = "vm_integration"
+harness = false
