@@ -273,13 +273,16 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, _offset: u6
         match validate_range(addr, len, true) {
             Ok((a, _)) if a == 0 => return EINVAL,
             Ok((a, _)) => {
-                if map_fixed_noreplace {
+                if map_fixed {
+                    // MAP_FIXED takes precedence over MAP_FIXED_NOREPLACE when
+                    // both are set (Linux-documented behaviour): replace any
+                    // existing mapping in the range unconditionally.
+                    unmap_range(&mut aspace, pml4, a as usize, (a + rounded_len) as usize);
+                } else {
+                    // MAP_FIXED_NOREPLACE only: fail if any VMA overlaps.
                     if range_has_vma(&aspace, a as usize, (a + rounded_len) as usize) {
                         return EEXIST;
                     }
-                } else {
-                    // MAP_FIXED: silently unmap whatever is there.
-                    unmap_range(&mut aspace, pml4, a as usize, (a + rounded_len) as usize);
                 }
                 a
             }
@@ -383,7 +386,11 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
 
                 // Only remap if the new protection is not PROT_NONE.
                 if new_pte.contains(PageTableFlags::PRESENT) {
-                    let _ = paging::map_existing_in_pml4(pml4, page, old_frame, new_pte);
+                    if paging::map_existing_in_pml4(pml4, page, old_frame, new_pte).is_err() {
+                        // Remap failed: PTE is gone but refcount was not
+                        // decremented by unmap_in_pml4; release it now.
+                        frame::put(old_frame.start_address().as_u64());
+                    }
                 } else {
                     // PROT_NONE: the PTE stays absent but the frame is still
                     // owned by the VMA.  `unmap_in_pml4` does not decrement
