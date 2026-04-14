@@ -159,3 +159,7 @@ harness = false
 [[test]]
 name = "smep_smap"
 harness = false
+
+[[test]]
+name = "fd_table"
+harness = false
