@@ -587,6 +587,22 @@ mod tests {
         assert_eq!(vs, [(0, K, 0), (3 * K, 4 * K, 3 * K)]);
     }
 
+    // Regression for #222: a partial-range unmap on a VMA carrying
+    // behaviour bits (`VMA_GROWSDOWN` here) must propagate those bits
+    // into both halves. `Vma::split_at` is private; drive it through
+    // the public `unmap_range` carve, which is the production caller.
+    #[test]
+    fn unmap_range_preserves_vma_flags_on_split() {
+        let obj = stub();
+        let mut t = VmaTree::new();
+        let mut v = vma(0, 4 * K, RW, obj, 0);
+        v.vma_flags = VMA_GROWSDOWN;
+        t.insert(v);
+        t.unmap_range(K, 3 * K);
+        let vs: alloc::vec::Vec<_> = t.iter().map(|v| (v.start, v.end, v.vma_flags)).collect();
+        assert_eq!(vs, [(0, K, VMA_GROWSDOWN), (3 * K, 4 * K, VMA_GROWSDOWN)],);
+    }
+
     #[test]
     fn unmap_range_drops_fully_contained() {
         let obj = stub();
