@@ -229,8 +229,8 @@ fn mmap_fixed_noreplace_fresh_addr_succeeds() {
     // mapping at exactly that address.
     let anchor = anon_rw(4096);
     let target = anchor + 0x0020_0000; // 2 MiB away — comfortably outside anchor
-    // Sanity: target range must be a hole. If something is squatting there,
-    // use a larger offset.
+                                       // Sanity: target range must be a hole. If something is squatting there,
+                                       // use a larger offset.
     {
         let aspace = vibix::task::current_address_space();
         let guard = aspace.read();
