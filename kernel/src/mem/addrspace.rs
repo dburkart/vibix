@@ -718,6 +718,12 @@ pub enum ForkError {
     /// allocation needed to build the child's PML4. The child is rolled
     /// back automatically before this error is returned.
     OutOfMemory,
+    /// A page's refcount was already pinned at `u16::MAX` when the fork
+    /// tried to acquire a new reference for the child PTE. Honouring the
+    /// fork would require silently under-counting (a UAF on the
+    /// `u16::MAX`-th drop), so we refuse instead. The child is rolled
+    /// back automatically before this error is returned.
+    RefcountSaturated,
 }
 
 /// Clone the address space for a child task (fork CoW).
@@ -733,9 +739,10 @@ pub enum ForkError {
 /// responsible for calling `flusher.finish()` after this returns to
 /// flush stale parent TLB entries.
 ///
-/// On `Err(ForkError::OutOfMemory)` the child is dropped cleanly
-/// (its partially-built PTEs are unmapped and frame refcounts are
-/// decremented by `Drop for AddressSpace`) before the error is returned.
+/// On `Err(ForkError::OutOfMemory)` or `Err(ForkError::RefcountSaturated)`
+/// the child is dropped cleanly (its partially-built PTEs are unmapped
+/// and frame refcounts are decremented by `Drop for AddressSpace`)
+/// before the error is returned.
 #[cfg(target_os = "none")]
 impl AddressSpace {
     pub fn fork_address_space(
@@ -828,8 +835,11 @@ impl AddressSpace {
                     match share {
                         Share::Private => {
                             let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
-                            // Acquire child PTE reference.
-                            refcount::inc_refcount(phys);
+                            // Acquire child PTE reference. A saturated slot
+                            // means the caller would have to accept an
+                            // under-approximation — refuse the fork instead.
+                            refcount::try_inc_refcount(phys)
+                                .map_err(|_| ForkError::RefcountSaturated)?;
                             if let Err(_) = paging::map_existing_in_pml4(
                                 child.page_table,
                                 page,
@@ -840,23 +850,22 @@ impl AddressSpace {
                                 refcount::dec_refcount(phys);
                                 return Err(ForkError::OutOfMemory);
                             }
-                            // W-strip parent PTE: unmap (old PTE reference now
-                            // floating), release the old reference, then acquire
-                            // a fresh reference for the new read-only parent PTE.
+                            // W-strip parent PTE: unmap then remap read-only
+                            // to the same frame. The parent's reference stays
+                            // attached to the frame across the swap — no
+                            // put/inc churn, which also sidesteps a saturation
+                            // hazard on the re-acquire.
                             let _ = paging::unmap_in_pml4(self.page_table, page);
-                            // Release the old parent PTE's reference that was
-                            // acquired by AnonObject::fault when the page was
-                            // first demand-faulted.
-                            crate::mem::frame::put(phys);
-                            // Acquire reference for the new parent PTE.
-                            refcount::inc_refcount(phys);
                             if let Err(_) = paging::map_existing_in_pml4(
                                 self.page_table,
                                 page,
                                 pte_frame,
                                 ro_flags,
                             ) {
-                                // Roll back the new parent PTE increment.
+                                // The parent PTE is now gone and the frame's
+                                // refcount still carries the (now floating)
+                                // parent reference. Release it so the frame
+                                // can be reclaimed when the child drops.
                                 refcount::dec_refcount(phys);
                                 return Err(ForkError::OutOfMemory);
                             }
@@ -864,7 +873,8 @@ impl AddressSpace {
                         }
                         Share::Shared => {
                             // Shared mapping: child gets same frame + flags.
-                            refcount::inc_refcount(phys);
+                            refcount::try_inc_refcount(phys)
+                                .map_err(|_| ForkError::RefcountSaturated)?;
                             if let Err(_) = paging::map_existing_in_pml4(
                                 child.page_table,
                                 page,
