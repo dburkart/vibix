@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   build         — cargo-build the kernel for x86_64-unknown-none
+//!   initrd        — build target/rootfs.tar (minimal USTAR rootfs tarball)
 //!   iso           — build, fetch Limine, produce target/vibix.iso
 //!   run           — iso, then boot under QEMU with serial-stdio
 //!   test          — run host unit tests + QEMU integration tests
@@ -114,11 +115,15 @@ fn main() -> R<()> {
         }
         "smoke" => smoke(&opts)?,
         "lint" => lint()?,
+        "initrd" => {
+            let path = ensure_initrd()?;
+            println!("→ initrd: {}", path.display());
+        }
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test] [--bench]"
+                "usage: cargo xtask [build|initrd|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test] [--bench]"
             );
             std::process::exit(2);
         }
@@ -441,6 +446,109 @@ fn embed_ksymtab(kernel: &Path) -> R<()> {
     Ok(())
 }
 
+fn initrd_path() -> PathBuf {
+    workspace_root().join("target").join("rootfs.tar")
+}
+
+/// Build one USTAR directory entry block (512 bytes).
+///
+/// USTAR format (IEEE 1003.1-1988):
+/// - bytes   0..100  name (NUL-padded)
+/// - bytes 100..108  mode (octal, NUL-terminated)
+/// - bytes 108..116  uid  (octal, NUL-terminated)
+/// - bytes 116..124  gid  (octal, NUL-terminated)
+/// - bytes 124..136  size (octal, NUL-terminated, 0 for directories)
+/// - bytes 136..148  mtime (octal, NUL-terminated, 0 = epoch)
+/// - bytes 148..156  checksum (6 octal digits + NUL + space)
+/// - byte  156       typeflag ('5' = directory)
+/// - bytes 257..263  magic ("ustar\0")
+/// - bytes 263..265  version ("00")
+fn ustar_dir_block(name: &str) -> [u8; 512] {
+    let mut block = [0u8; 512];
+
+    // name field (bytes 0..100)
+    let name_bytes = name.as_bytes();
+    let copy_len = name_bytes.len().min(99);
+    block[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+    // mode: 0755 for directories
+    block[100..107].copy_from_slice(b"0000755");
+
+    // uid / gid: both 0
+    block[108..115].copy_from_slice(b"0000000");
+    block[116..123].copy_from_slice(b"0000000");
+
+    // size: 0 (11 octal digits + NUL)
+    block[124..135].copy_from_slice(b"00000000000");
+
+    // mtime: 0 (epoch)
+    block[136..147].copy_from_slice(b"00000000000");
+
+    // typeflag: '5' = directory
+    block[156] = b'5';
+
+    // USTAR magic and version
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+
+    // Checksum: sum of all bytes treating the checksum field (148..156) as spaces.
+    // Write the result as a 6-digit octal number followed by NUL then space.
+    let sum: u32 = block
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if (148..156).contains(&i) {
+                0x20u32
+            } else {
+                b as u32
+            }
+        })
+        .sum();
+    let chk = format!("{sum:06o}\0 ");
+    block[148..156].copy_from_slice(chk.as_bytes());
+
+    block
+}
+
+/// Build the minimal rootfs USTAR tarball at `target/rootfs.tar`.
+///
+/// The tarball contains four empty directory entries required by RFC 0002
+/// §Initialization order:
+///   - `dev/`   — mount point for devfs
+///   - `tmp/`   — mount point for ramfs
+///   - `bin/`   — conventional userspace binary directory stub
+///   - `etc/`   — conventional configuration directory stub
+///
+/// The tarball ends with two 512-byte all-zero blocks per the USTAR spec.
+/// Total size: 6 × 512 = 3072 bytes (deterministic, used for idempotency).
+fn ensure_initrd() -> R<PathBuf> {
+    let path = initrd_path();
+
+    // The archive size is deterministic: 4 directory entries + 2 end blocks.
+    const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/"];
+    const EXPECTED_SIZE: u64 = ((DIRS.len() + 2) * 512) as u64;
+
+    let needs_write = match fs::metadata(&path) {
+        Ok(m) => m.len() != EXPECTED_SIZE,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut data: Vec<u8> = Vec::with_capacity(EXPECTED_SIZE as usize);
+        for &dir in DIRS {
+            data.extend_from_slice(&ustar_dir_block(dir));
+        }
+        // Two 512-byte zero blocks mark end-of-archive.
+        data.extend_from_slice(&[0u8; 1024]);
+        fs::write(&path, &data)?;
+    }
+
+    Ok(path)
+}
+
 fn ensure_limine() -> R<PathBuf> {
     let root = workspace_root().join("build").join("limine");
     if root.join("limine-bios.sys").exists() {
@@ -465,6 +573,7 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let limine = ensure_limine()?;
     let userspace_init = build_userspace_init()?;
     let userspace_hello = build_userspace_hello()?;
+    let initrd = ensure_initrd()?;
     let iso_root = workspace_root().join("build").join(staging);
     let _ = fs::remove_dir_all(&iso_root);
     fs::create_dir_all(iso_root.join("boot/limine"))?;
@@ -473,6 +582,7 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     fs::copy(kernel, iso_root.join("boot/vibix"))?;
     fs::copy(userspace_init, iso_root.join("boot/userspace_init.elf"))?;
     fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
+    fs::copy(&initrd, iso_root.join("boot/rootfs.tar"))?;
     fs::copy(
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),
@@ -808,6 +918,44 @@ fn check(status: ExitStatus) -> R<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn ustar_dir_block_checksum_valid() {
+        let block = ustar_dir_block("dev/");
+        // USTAR magic present
+        assert_eq!(&block[257..262], b"ustar");
+        // typeflag is directory
+        assert_eq!(block[156], b'5');
+        // Parse stored checksum (6-digit octal string at bytes 148..154)
+        let chk_str = std::str::from_utf8(&block[148..154]).unwrap();
+        let stored: u32 = u32::from_str_radix(chk_str.trim(), 8).unwrap();
+        // Recompute treating checksum field as spaces
+        let computed: u32 = block
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                if (148..156).contains(&i) {
+                    0x20u32
+                } else {
+                    b as u32
+                }
+            })
+            .sum();
+        assert_eq!(computed, stored);
+    }
+
+    #[test]
+    fn ensure_initrd_creates_valid_archive() {
+        let path = ensure_initrd().expect("ensure_initrd failed");
+        assert!(path.exists());
+        let data = fs::read(&path).unwrap();
+        // 4 dir entries + 2 end-of-archive blocks
+        assert_eq!(data.len(), 6 * 512);
+        // Last 1024 bytes are the end-of-archive marker (all zeros)
+        assert!(data[4 * 512..].iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn demangles_legacy_rust_symbol() {
         let out = format!(
