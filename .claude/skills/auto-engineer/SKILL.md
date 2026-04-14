@@ -87,15 +87,26 @@ git checkout -b <branch>   # m<N>-<slug> or <verb>-<slug>
 
 Then rename the tmux window so the human glancing at the terminal can see which
 issue this cycle is on. `<slug>` is the same short slug used in the branch name
-(3–4 words, kebab-case). Uses an OSC 2 escape written directly to `/dev/tty` so
-it bypasses Claude's Bash-tool stdout capture and reaches the underlying pty —
-tmux then intercepts the sequence and renames the window. Works from both the
-host and inside the auto-engineer Docker container. `scripts/auto-engineer.sh`
-disables `automatic-rename` on the launching window so tmux doesn't overwrite
-the name on the next tick.
+(3–4 words, kebab-case).
+
+The mechanism differs by environment because Claude's Bash tool has no
+controlling terminal, so neither OSC 2 escapes nor `/dev/tty` writes can reach
+the host tmux pane from inside the container:
+
+- **Inside the container**: write the slug to `$VIBIX_AE_SLUG_FILE` (set by
+  `scripts/auto-engineer.sh` to a bind-mounted path). A poller on the host tails
+  that file and runs `tmux rename-window "AE -> <slug>"` against the host tmux.
+- **On the host (no container)**: call `tmux rename-window` directly.
+- **Outside tmux entirely**: no-op.
+
+Unified command:
 
 ```sh
-printf '\033]2;AE -> <slug>\033\\' > /dev/tty 2>/dev/null || true
+if [ -n "${VIBIX_AE_SLUG_FILE:-}" ]; then
+    printf '%s' "<slug>" > "$VIBIX_AE_SLUG_FILE"
+elif [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux rename-window "AE -> <slug>"
+fi
 ```
 
 ### 2. Delegate planning to a sub-agent
