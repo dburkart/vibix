@@ -747,6 +747,13 @@ mod tests {
         archive
     }
 
+    /// Leak a `Vec<u8>` into a `&'static [u8]` so it can be passed as
+    /// `MountSource::Static` in tests. The memory is intentionally never freed
+    /// (test process lifetime).
+    fn leak_archive(v: Vec<u8>) -> &'static [u8] {
+        alloc::boxed::Box::leak(v.into_boxed_slice())
+    }
+
     #[test]
     fn parse_checksum_roundtrip() {
         let h = make_header(b"x", 0, b'0', b"", 0o644);
@@ -755,13 +762,10 @@ mod tests {
 
     #[test]
     fn mount_and_lookup() {
-        let archive = build_archive();
+        let archive = leak_archive(build_archive());
         let fs = TarFs::new();
         let sb = fs
-            .mount(
-                MountSource::Static(archive.as_slice()),
-                MountFlags::default(),
-            )
+            .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
 
         let root = sb.root.get().expect("root").clone();
@@ -786,13 +790,10 @@ mod tests {
 
     #[test]
     fn read_file_contents() {
-        let archive = build_archive();
+        let archive = leak_archive(build_archive());
         let fs = TarFs::new();
         let sb = fs
-            .mount(
-                MountSource::Static(archive.as_slice()),
-                MountFlags::default(),
-            )
+            .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -826,13 +827,10 @@ mod tests {
 
     #[test]
     fn readlink_returns_target() {
-        let archive = build_archive();
+        let archive = leak_archive(build_archive());
         let fs = TarFs::new();
         let sb = fs
-            .mount(
-                MountSource::Static(archive.as_slice()),
-                MountFlags::default(),
-            )
+            .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -846,13 +844,10 @@ mod tests {
 
     #[test]
     fn getdents_enumerates_children() {
-        let archive = build_archive();
+        let archive = leak_archive(build_archive());
         let fs = TarFs::new();
         let sb = fs
-            .mount(
-                MountSource::Static(archive.as_slice()),
-                MountFlags::default(),
-            )
+            .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
         let root = sb.root.get().unwrap().clone();
         let a = root.ops.lookup(&root, b"a").unwrap();
@@ -894,7 +889,7 @@ mod tests {
 
         let fs = TarFs::new();
         let r = fs.mount(
-            MountSource::Static(archive.as_slice()),
+            MountSource::Static(leak_archive(archive)),
             MountFlags::default(),
         );
         assert!(r.is_err());
