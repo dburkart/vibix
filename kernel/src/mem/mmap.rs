@@ -410,10 +410,12 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
 /// Only `MADV_DONTNEED` on `MAP_PRIVATE | MAP_ANONYMOUS` regions is
 /// implemented.  All other advice values are silently accepted (no-op).
 ///
-/// `MADV_DONTNEED` drops the PTE for each faulted page in the range,
-/// decrementing its refcount.  On next access the fault handler allocates a
-/// fresh zero-filled frame — giving "as if freshly mapped" semantics.  The
-/// VMA records are preserved so subsequent accesses do not SIGSEGV.
+/// `MADV_DONTNEED` drops the PTE for each faulted page in the range and
+/// evicts the backing-object cache entry, releasing both references to the
+/// physical frame so it is reclaimed.  On next access the fault handler
+/// allocates a fresh zero-filled frame — giving Linux-compatible
+/// zero-on-next-touch semantics.  VMA records are preserved so subsequent
+/// accesses do not SIGSEGV.
 pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     let advice = advice as i32;
 
@@ -433,20 +435,23 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     let pml4 = aspace.page_table_frame();
 
     // For each present PTE in the range: unmap and release the PTE's frame
-    // reference.  The VMA and AnonObject cache entry both persist — the cache
-    // entry still holds its own reference, so the frame's refcount goes from
-    // 2 (cache + PTE) down to 1 (cache only).  A subsequent fault calls
-    // AnonObject::fault, which finds the cached frame and re-increments.
-    //
-    // To get true zero-on-next-touch semantics the cache entry would also
-    // need to be evicted; that requires a `VmObject::forget_pages` extension
-    // tracked in a follow-up issue.
+    // reference, then evict the backing-object cache entry so the frame's
+    // refcount reaches zero and it is reclaimed.  A subsequent fault calls
+    // AnonObject::fault, sees no cached frame, and allocates a fresh
+    // zero-filled page — giving Linux-compatible zero-on-next-touch semantics.
     let mut va = addr;
     while va < end {
         if let Ok(page) = Page::<Size4KiB>::from_start_address(VirtAddr::new(va)) {
             if let Ok(phys_frame) = paging::unmap_in_pml4(pml4, page) {
+                // Release the PTE's reference.
                 frame::put(phys_frame.start_address().as_u64());
             }
+        }
+        // Evict the cache entry so the backing object releases its reference
+        // and a future fault sees a fresh zero-filled page.
+        if let Some(vma) = aspace.vmas.find(va as usize) {
+            let obj_offset = vma.object_offset + (va as usize - vma.start);
+            vma.object.evict_page(obj_offset);
         }
         va += FRAME_SIZE;
     }

@@ -76,6 +76,18 @@ pub trait VmObject: Send + Sync {
         let _ = offset;
         None
     }
+
+    /// Evict the cache entry for `offset` (page-aligned bytes into this
+    /// object), releasing the cache's own frame reference so the physical
+    /// frame can be reclaimed and a subsequent [`fault`] obtains a fresh
+    /// zero-filled page.
+    ///
+    /// The default no-op is correct for objects that do not cache frames
+    /// (future file-backed objects). `AnonObject` overrides this to
+    /// implement `MADV_DONTNEED` zero-on-next-touch semantics.
+    fn evict_page(&self, offset: usize) {
+        let _ = offset;
+    }
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is
@@ -162,6 +174,13 @@ impl VmObject for AnonObject {
     fn frame_at(&self, offset: usize) -> Option<u64> {
         let idx = offset / (crate::mem::FRAME_SIZE as usize);
         self.inner.lock().frames.get(&idx).copied()
+    }
+
+    fn evict_page(&self, offset: usize) {
+        let idx = offset / (FRAME_SIZE as usize);
+        if let Some(phys) = self.inner.lock().frames.remove(&idx) {
+            release_frame(phys);
+        }
     }
 }
 
