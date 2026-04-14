@@ -106,11 +106,18 @@ pub const EOVERFLOW: i64 = -75;
 
 /// Per-process file-descriptor array.
 ///
-/// `slots[fd]` is `Some(Arc<FileDescription>)` when `fd` is open, `None`
+/// Each open slot holds `(description, fd_flags)`:
+/// - `description` — the shared open-file description (backend + access mode).
+/// - `fd_flags` — **per-fd** flags, currently only `O_CLOEXEC` / `FD_CLOEXEC`.
+///   These must NOT live on `FileDescription` because `dup()` clones the
+///   `Arc<FileDescription>`, but POSIX requires `dup()`-created fds to start
+///   with `FD_CLOEXEC` cleared.
+///
+/// `slots[fd]` is `Some((Arc<FileDescription>, u32))` when `fd` is open, `None`
 /// otherwise. The array grows lazily; unallocated entries past the current
 /// length are implicitly closed.
 pub struct FileDescTable {
-    slots: Vec<Option<Arc<FileDescription>>>,
+    slots: Vec<Option<(Arc<FileDescription>, u32)>>,
 }
 
 impl FileDescTable {
@@ -127,18 +134,27 @@ impl FileDescTable {
         stderr: Arc<dyn FileBackend>,
     ) -> Self {
         let mut t = Self::new();
-        t.slots.push(Some(Arc::new(FileDescription {
-            backend: stdin,
-            flags: flags::O_RDONLY,
-        })));
-        t.slots.push(Some(Arc::new(FileDescription {
-            backend: stdout,
-            flags: flags::O_WRONLY,
-        })));
-        t.slots.push(Some(Arc::new(FileDescription {
-            backend: stderr,
-            flags: flags::O_WRONLY,
-        })));
+        t.slots.push(Some((
+            Arc::new(FileDescription {
+                backend: stdin,
+                flags: flags::O_RDONLY,
+            }),
+            0,
+        )));
+        t.slots.push(Some((
+            Arc::new(FileDescription {
+                backend: stdout,
+                flags: flags::O_WRONLY,
+            }),
+            0,
+        )));
+        t.slots.push(Some((
+            Arc::new(FileDescription {
+                backend: stderr,
+                flags: flags::O_WRONLY,
+            }),
+            0,
+        )));
         t
     }
 
@@ -153,11 +169,16 @@ impl FileDescTable {
         }
     }
 
-    /// Close every fd marked `O_CLOEXEC`. Called by the `exec()` path.
+    /// Close every fd whose per-fd `FD_CLOEXEC` flag is set. Called by the
+    /// `exec()` path.
+    ///
+    /// `FD_CLOEXEC` is a per-fd attribute stored in the slot's `fd_flags`,
+    /// not in `FileDescription.flags`, so `dup()`-created fds (which share
+    /// the same `Arc<FileDescription>`) are not affected.
     pub fn close_cloexec(&mut self) {
         for slot in self.slots.iter_mut() {
-            if let Some(d) = slot {
-                if d.flags & flags::O_CLOEXEC != 0 {
+            if let Some((_, fd_flags)) = slot {
+                if *fd_flags & flags::O_CLOEXEC != 0 {
                     *slot = None;
                 }
             }
@@ -166,11 +187,19 @@ impl FileDescTable {
 
     /// Allocate the lowest free fd slot and return its number.
     ///
+    /// `fd_flags` holds per-fd flags (e.g. `O_CLOEXEC`). These are stored
+    /// separately from `FileDescription.flags` so that `dup()` can clear
+    /// `FD_CLOEXEC` on the new fd without affecting the original.
+    ///
     /// Returns `EMFILE` if all `MAX_FD` slots are occupied.
-    pub fn alloc_fd(&mut self, desc: Arc<FileDescription>) -> Result<u32, i64> {
+    pub fn alloc_fd_with_flags(
+        &mut self,
+        desc: Arc<FileDescription>,
+        fd_flags: u32,
+    ) -> Result<u32, i64> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(desc);
+                *slot = Some((desc, fd_flags));
                 return Ok(i as u32);
             }
         }
@@ -178,8 +207,14 @@ impl FileDescTable {
             return Err(EMFILE);
         }
         let fd = self.slots.len() as u32;
-        self.slots.push(Some(desc));
+        self.slots.push(Some((desc, fd_flags)));
         Ok(fd)
+    }
+
+    /// Allocate with no per-fd flags. Convenience wrapper for callers that
+    /// do not need `O_CLOEXEC` on the new fd.
+    pub fn alloc_fd(&mut self, desc: Arc<FileDescription>) -> Result<u32, i64> {
+        self.alloc_fd_with_flags(desc, 0)
     }
 
     /// Release fd `fd`. Returns `EBADF` if the fd was not open.
@@ -198,7 +233,7 @@ impl FileDescTable {
         self.slots
             .get(fd as usize)
             .and_then(Option::as_ref)
-            .map(|d| d.backend.clone())
+            .map(|(d, _)| d.backend.clone())
             .ok_or(EBADF)
     }
 
@@ -214,14 +249,18 @@ impl FileDescTable {
         self.slots
             .get(fd as usize)
             .and_then(Option::as_ref)
-            .cloned()
+            .map(|(d, _)| d.clone())
             .ok_or(EBADF)
     }
 
     /// Duplicate `oldfd` to the lowest free fd. Returns the new fd number.
+    ///
+    /// The new fd starts with `FD_CLOEXEC` cleared, as required by POSIX
+    /// (dup-created fds do not inherit the close-on-exec flag).
     pub fn dup(&mut self, oldfd: u32) -> Result<u32, i64> {
         let desc = self.get_desc(oldfd)?;
-        self.alloc_fd(desc)
+        // fd_flags = 0: new fd has FD_CLOEXEC cleared (POSIX dup semantics).
+        self.alloc_fd_with_flags(desc, 0)
     }
 
     /// Make `newfd` an alias for `oldfd`'s description. Returns `newfd`.
@@ -232,6 +271,8 @@ impl FileDescTable {
     ///   reassignment (POSIX `dup2` semantics).
     /// - Returns `EBADF` if `oldfd` is not open.
     /// - Returns `EINVAL` if `newfd >= MAX_FD`.
+    ///
+    /// The new fd starts with `FD_CLOEXEC` cleared (POSIX `dup2` semantics).
     pub fn dup2(&mut self, oldfd: u32, newfd: u32) -> Result<u32, i64> {
         if newfd as usize >= MAX_FD {
             return Err(EINVAL);
@@ -246,7 +287,8 @@ impl FileDescTable {
         while self.slots.len() <= newfd as usize {
             self.slots.push(None);
         }
-        self.slots[newfd as usize] = Some(desc);
+        // fd_flags = 0: new fd has FD_CLOEXEC cleared (POSIX dup2 semantics).
+        self.slots[newfd as usize] = Some((desc, 0));
         Ok(newfd)
     }
 }
@@ -464,17 +506,32 @@ mod tests {
     #[test]
     fn close_cloexec_only_closes_flagged() {
         let mut t = make_table();
-        let cloexec_desc = Arc::new(FileDescription {
-            backend: null(),
-            flags: flags::O_CLOEXEC,
-        });
-        t.alloc_fd(cloexec_desc).unwrap(); // fd 3, flagged
+        // Allocate fd 3 with FD_CLOEXEC set in per-fd flags (not in FileDescription.flags).
+        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC).unwrap();
+        // Allocate fd 4 without FD_CLOEXEC.
+        t.alloc_fd(null_desc()).unwrap();
         t.close_cloexec();
-        // fd 3 (O_CLOEXEC) should be gone
+        // fd 3 (FD_CLOEXEC set) should be gone.
         assert_eq!(t.get(3).err(), Some(EBADF));
-        // fd 0/1/2 (not O_CLOEXEC) should survive
+        // fd 4 (no FD_CLOEXEC) should survive.
+        assert!(t.get(4).is_ok());
+        // fd 0/1/2 (stdio, no FD_CLOEXEC) should survive.
         assert!(t.get(0).is_ok());
         assert!(t.get(1).is_ok());
         assert!(t.get(2).is_ok());
+    }
+
+    #[test]
+    fn dup_clears_cloexec() {
+        let mut t = make_table();
+        // Open fd 3 with FD_CLOEXEC set.
+        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC).unwrap();
+        // dup(3) → fd 4; the dup'd fd must NOT inherit FD_CLOEXEC.
+        let new_fd = t.dup(3).unwrap();
+        assert_eq!(new_fd, 4);
+        // After close_cloexec: fd 3 closed, fd 4 survives.
+        t.close_cloexec();
+        assert_eq!(t.get(3).err(), Some(EBADF));
+        assert!(t.get(4).is_ok());
     }
 }

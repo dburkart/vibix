@@ -162,11 +162,11 @@ fn clone_for_fork_independent() {
 /// close_cloexec() closes O_CLOEXEC fds and leaves others intact.
 fn close_cloexec() {
     let mut t = make_table();
-    let flagged = Arc::new(FileDescription {
-        backend: null(),
-        flags: flags::O_CLOEXEC,
-    });
-    let fd = t.alloc_fd(flagged).unwrap();
+    // FD_CLOEXEC is a per-fd flag — pass it via alloc_fd_with_flags, NOT
+    // via FileDescription.flags (which only holds access-mode bits).
+    let fd = t
+        .alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC)
+        .unwrap();
     assert_eq!(fd, 3);
     t.close_cloexec();
     assert_eq!(
