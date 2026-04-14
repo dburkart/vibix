@@ -78,6 +78,9 @@ pub fn step(state: &mut State, b: u8) -> Option<Event> {
             *state = State::Csi;
             None
         }
+        // A fresh ESC mid-recovery restarts parsing rather than
+        // dropping the new introducer along with the stale one.
+        (State::Esc, 0x1b) => None,
         (State::Esc, _) => {
             // Bare ESC followed by something that isn't the CSI
             // introducer: drop and resync.
@@ -93,6 +96,13 @@ pub fn step(state: &mut State, b: u8) -> Option<Event> {
 /// param / intermediate / final classification in one place.
 fn csi_byte(state: &mut State, b: u8) -> Option<Event> {
     match b {
+        // A fresh ESC inside a CSI body abandons the in-progress
+        // sequence and starts a new one — the next byte is treated as
+        // the introducer.
+        0x1b => {
+            *state = State::Esc;
+            None
+        }
         // Parameter or intermediate byte: keep accumulating. Upgrades
         // the state to `CsiParam` so future callers can tell a "plain"
         // CSI from a parameterised one without re-scanning.
@@ -200,6 +210,27 @@ mod tests {
         assert_eq!(feed(&mut s, b"\x1b[1\x07"), Vec::<Event>::new());
         assert_eq!(s, State::Ground);
         assert_eq!(feed(&mut s, b"\x1b[B"), vec![Event::Csi(CsiFinal::Down)],);
+    }
+
+    #[test]
+    fn fresh_esc_after_bare_esc_starts_new_sequence() {
+        // `ESC ESC [ A` should dispatch Up, not lose the second ESC
+        // along with the first as "bare ESC + non-introducer".
+        let mut s = State::default();
+        assert_eq!(feed(&mut s, b"\x1b\x1b[A"), vec![Event::Csi(CsiFinal::Up)],);
+        assert_eq!(s, State::Ground);
+    }
+
+    #[test]
+    fn fresh_esc_inside_csi_starts_new_sequence() {
+        // `ESC [ 1 ESC [ A` should dispatch Up: the new ESC abandons
+        // the in-progress CSI and re-enters Esc so `[ A` completes.
+        let mut s = State::default();
+        assert_eq!(
+            feed(&mut s, b"\x1b[1\x1b[A"),
+            vec![Event::Csi(CsiFinal::Up)],
+        );
+        assert_eq!(s, State::Ground);
     }
 
     #[test]
