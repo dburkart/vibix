@@ -532,6 +532,9 @@ fn ustar_header_block(name: &str, typeflag: u8, mode: u16, size: u64) -> [u8; 51
 ///     required by RFC 0002 §Initialization order.
 ///   - `etc/init/` — nested directory exercising multi-level path resolution
 ///     (issue #85).
+///   - `etc/hostname` — top-level regular file whose content (`b"vibix\n"`)
+///     is asserted by `kernel/tests/rootfs_module.rs` to prove the tar
+///     payload survives end-to-end through `MountSource::RamdiskModule`.
 ///   - `etc/init/hello.txt` — nested regular file whose presence proves the
 ///     full `path_walk` chain resolves `/etc/init/hello.txt` end-to-end.
 ///
@@ -540,10 +543,12 @@ fn ensure_initrd() -> R<PathBuf> {
     let path = initrd_path();
 
     const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/", "etc/init/"];
+    const HOSTNAME_FILE: &str = "etc/hostname";
+    const HOSTNAME_PAYLOAD: &[u8] = b"vibix\n";
     const NESTED_FILE: &str = "etc/init/hello.txt";
     const NESTED_PAYLOAD: &[u8] = b"nested\n";
-    // DIRS headers + 1 file header + 1 padded data block + 2 end blocks.
-    const EXPECTED_SIZE: u64 = ((DIRS.len() + 1 + 1 + 2) * 512) as u64;
+    // DIRS headers + 2 file headers + 2 padded data blocks + 2 end blocks.
+    const EXPECTED_SIZE: u64 = ((DIRS.len() + 2 + 2 + 2) * 512) as u64;
 
     let needs_write = match fs::metadata(&path) {
         Ok(m) => m.len() != EXPECTED_SIZE,
@@ -558,6 +563,13 @@ fn ensure_initrd() -> R<PathBuf> {
         for &dir in DIRS {
             data.extend_from_slice(&ustar_dir_block(dir));
         }
+        data.extend_from_slice(&ustar_file_block(
+            HOSTNAME_FILE,
+            HOSTNAME_PAYLOAD.len() as u64,
+        ));
+        let mut hostname_block = [0u8; 512];
+        hostname_block[..HOSTNAME_PAYLOAD.len()].copy_from_slice(HOSTNAME_PAYLOAD);
+        data.extend_from_slice(&hostname_block);
         data.extend_from_slice(&ustar_file_block(NESTED_FILE, NESTED_PAYLOAD.len() as u64));
         let mut payload_block = [0u8; 512];
         payload_block[..NESTED_PAYLOAD.len()].copy_from_slice(NESTED_PAYLOAD);
