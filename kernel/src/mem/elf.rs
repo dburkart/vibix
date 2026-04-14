@@ -16,6 +16,13 @@ const PF_W: u32 = 1 << 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 
+/// Path suffix the Limine config publishes for the PID 1 init ELF.
+/// Module lookup uses `ends_with` so an absolute-path prefix won't
+/// break matching. Keeping the string in one place prevents drift
+/// between the byte-scan and ELF-summary helpers.
+#[cfg(target_os = "none")]
+const USERSPACE_INIT_MODULE_SUFFIX: &[u8] = b"/boot/userspace_init.elf";
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64Ehdr {
@@ -193,7 +200,7 @@ pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
     let file = resp
         .modules()
         .iter()
-        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_init.elf"))?;
+        .find(|f| f.path().to_bytes().ends_with(USERSPACE_INIT_MODULE_SUFFIX))?;
     let base = file.addr();
     let size = file.size() as usize;
     // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
@@ -224,7 +231,7 @@ pub(crate) fn first_loaded_module_elf_summary() -> Option<(VirtAddr, usize)> {
     let file = resp
         .modules()
         .iter()
-        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_init.elf"))?;
+        .find(|f| f.path().to_bytes().ends_with(USERSPACE_INIT_MODULE_SUFFIX))?;
     let base = file.addr();
     let size = file.size() as usize;
     if size < core::mem::size_of::<Elf64Ehdr>() {
