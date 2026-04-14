@@ -54,20 +54,19 @@ struct TarNode {
 pub struct TarSuper {
     fs_id: u64,
     nodes: Vec<TarNode>,
-    base: *const u8,
-    len: usize,
+    /// The backing archive bytes. Held as a `'static` slice so all
+    /// inode data (offsets into this buffer) remains valid for the
+    /// kernel's lifetime without raw-pointer bookkeeping.
+    archive: &'static [u8],
     /// Back-reference to the owning `TarFs` so `unmount` can clear the
     /// `mounted` latch. `Weak` breaks the `TarFs → Arc<SuperBlock> →
     /// TarSuper → TarFs` cycle.
     owner: Weak<TarFs>,
 }
 
-unsafe impl Send for TarSuper {}
-unsafe impl Sync for TarSuper {}
-
 impl TarSuper {
     fn slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.base, self.len) }
+        self.archive
     }
 
     fn node(&self, ino: u64) -> Result<&TarNode, i64> {
@@ -92,7 +91,7 @@ impl SuperOps for TarSuper {
         Ok(StatFs {
             f_type: 0x7461_7266, // 'tarf'
             f_bsize: BLOCK as u64,
-            f_blocks: (self.len / BLOCK) as u64,
+            f_blocks: (self.archive.len() / BLOCK) as u64,
             f_bfree: 0,
             f_bavail: 0,
             f_files: self.nodes.len().saturating_sub(1) as u64,
@@ -621,8 +620,8 @@ fn install_symlink(nodes: &mut Vec<TarNode>, entry: &RawEntry<'_>) -> Result<(),
 ///
 /// Constructed once per kernel boot and handed to `mount_table::mount`.
 /// The archive source is supplied via [`MountSource::Static`] for
-/// test fixtures and [`MountSource::RamdiskModule`] for the live
-/// kernel (wiring in #240).
+/// test fixtures and [`MountSource::RamdiskModule`] for live boot
+/// (wired from `vfs::init::find_rootfs_module`).
 pub struct TarFs {
     mounted: AtomicBool,
     /// Self-reference. Populated by [`TarFs::new_arc`] so the
@@ -654,13 +653,10 @@ impl FileSystem for TarFs {
         // Validate source and parse the archive *before* taking the
         // single-mount latch. An invalid source or malformed archive
         // must not burn the TarFs instance — see issue #274.
-        let (base, len): (*const u8, usize) = match source {
-            MountSource::Static(bytes) => (bytes.as_ptr(), bytes.len()),
-            MountSource::RamdiskModule(p, n) => (p, n),
+        let bytes: &[u8] = match source {
+            MountSource::Static(b) | MountSource::RamdiskModule(b) => b,
             _ => return Err(EINVAL),
         };
-
-        let bytes = unsafe { core::slice::from_raw_parts(base, len) };
         let nodes = build_nodes(bytes)?;
 
         // Parsing succeeded — claim the single-mount latch.
@@ -675,8 +671,7 @@ impl FileSystem for TarFs {
         let super_ops: Arc<TarSuper> = Arc::new(TarSuper {
             fs_id: alloc_fs_id().0,
             nodes,
-            base,
-            len,
+            archive: bytes,
             owner: self.self_ref.clone(),
         });
 

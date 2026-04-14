@@ -26,12 +26,13 @@ pub enum MountSource<'a> {
     Path(&'a [u8]),
     /// Static byte slice with 'static lifetime (initrd tarball).
     Static(&'static [u8]),
-    /// Raw pointer + length from a Limine ramdisk module. The bytes
-    /// are expected to live for the kernel's lifetime. Non-`Send`
-    /// because the pointer is only meaningful on the mount thread;
-    /// the driver copies the `(ptr, len)` pair into its own state
-    /// under its own safety contract.
-    RamdiskModule(*const u8, usize),
+    /// Byte slice backed by a Limine ramdisk module. The caller is
+    /// responsible for converting the bootloader's raw pointer + length
+    /// into a `&'static [u8]` via an `unsafe` block at the callsite
+    /// (see `vfs::init::find_rootfs_module`). Kept distinct from
+    /// [`Static`](Self::Static) so logging/tracing can tell apart test
+    /// fixtures from live boot modules.
+    RamdiskModule(&'static [u8]),
 }
 
 impl core::fmt::Debug for MountSource<'_> {
@@ -40,11 +41,9 @@ impl core::fmt::Debug for MountSource<'_> {
             MountSource::None => f.write_str("None"),
             MountSource::Path(p) => f.debug_tuple("Path").field(p).finish(),
             MountSource::Static(s) => f.debug_tuple("Static").field(&s.len()).finish(),
-            MountSource::RamdiskModule(ptr, len) => f
-                .debug_tuple("RamdiskModule")
-                .field(&(*ptr as usize))
-                .field(len)
-                .finish(),
+            MountSource::RamdiskModule(s) => {
+                f.debug_tuple("RamdiskModule").field(&s.len()).finish()
+            }
         }
     }
 }
