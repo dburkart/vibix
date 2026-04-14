@@ -193,7 +193,7 @@ pub fn fork_current_task(
             child_fd,
             parent_cwd,
         )
-    };
+    }?;
     let child_id = child.id;
     let child_box = Box::new(child);
     let new_prio = child_box.priority;

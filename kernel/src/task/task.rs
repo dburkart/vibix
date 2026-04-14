@@ -330,7 +330,7 @@ impl Task {
         child_cr3: PhysFrame<Size4KiB>,
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
         child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
-    ) -> Self {
+    ) -> Result<Self, crate::mem::addrspace::ForkError> {
         // Allocate a fresh guard+stack slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
         let guard_base = slot_va;
@@ -340,14 +340,17 @@ impl Task {
             .expect("forked task stack base must be page aligned");
         let stack_page_count = (STACK_SIZE / 4096) as u64;
         let mut flusher = crate::mem::tlb::Flusher::new_active();
-        paging::map_range(
+        // Propagate map_range failure (typically frame-allocator exhaustion)
+        // as ForkError::OutOfMemory so fork() returns -ENOMEM instead of
+        // panicking the kernel under memory pressure.
+        let map_result = paging::map_range(
             VirtAddr::new(stack_base as u64),
             stack_page_count,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
             &mut flusher,
-        )
-        .expect("failed to map forked task stack");
+        );
         flusher.finish();
+        map_result.map_err(|_| crate::mem::addrspace::ForkError::OutOfMemory)?;
 
         let top = stack_base + STACK_SIZE;
 
@@ -377,7 +380,7 @@ impl Task {
             core::ptr::copy_nonoverlapping(parent_fpu, &mut *fpu as *mut _, 1);
         }
 
-        Self {
+        Ok(Self {
             id,
             guard_base,
             rsp,
@@ -395,6 +398,6 @@ impl Task {
             // so it doesn't clobber the parent's saved SYSCALL context on the
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.
             syscall_stack_top: (stack_base + STACK_SIZE) as u64,
-        }
+        })
     }
 }
