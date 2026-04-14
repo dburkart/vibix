@@ -66,15 +66,20 @@ pub use kernel_side::*;
 #[cfg(target_os = "none")]
 mod kernel_side {
     use super::RingBuffer;
+    use crate::sync::IrqLock;
     use core::sync::atomic::{AtomicU64, Ordering};
     use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
     use spin::{Lazy, Mutex};
-    use x86_64::instructions::interrupts::{self, without_interrupts};
+    use x86_64::instructions::interrupts;
 
     /// Scancodes land here from the keyboard ISR. Sized at 128: a human
     /// typist can't overflow it, and firmware key-repeat bursts are well
     /// under that between consumer polls.
-    static SCANCODES: Mutex<RingBuffer<u8, 128>> = Mutex::new(RingBuffer::new());
+    ///
+    /// [`IrqLock`] because the keyboard ISR pushes while task context
+    /// pops — a plain `spin::Mutex` would deadlock if the IRQ landed on
+    /// the same CPU during a consumer's pop.
+    static SCANCODES: IrqLock<RingBuffer<u8, 128>> = IrqLock::new(RingBuffer::new());
 
     /// Count of scancodes dropped because the ring was full when the ISR
     /// tried to push. Surface via `scancode_overflows()`; a non-zero
@@ -98,7 +103,7 @@ mod kernel_side {
     }
 
     pub fn try_read_scancode() -> Option<u8> {
-        without_interrupts(|| SCANCODES.lock().pop())
+        SCANCODES.lock().pop()
     }
 
     /// Non-blocking counterpart to [`read_key`]. Drains any queued
