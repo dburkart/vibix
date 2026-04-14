@@ -167,8 +167,12 @@ fn hello_read_through_vfs() {
         .file_ops
         .read(&of, &mut buf, 0)
         .expect("FileOps::read /hello");
-    assert_eq!(n, 6, "must read exactly 6 bytes");
-    assert_eq!(&buf[..6], b"Hello\n", "contents must match");
+    if n != 6 || &buf[..6] != b"Hello\n" {
+        panic!(
+            "vfs_hello: expected /hello == b\"Hello\\n\", got n={n}, bytes={:?}",
+            &buf[..core::cmp::min(n, buf.len())]
+        );
+    }
 
     // Keep Arc chain alive through the end of the test.
     drop(fs);
