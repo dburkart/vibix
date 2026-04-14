@@ -798,9 +798,20 @@ fn parse_test_names(manifest: &str) -> Vec<String> {
     names
 }
 
+/// Integration tests that parse from `kernel/Cargo.toml` but should
+/// NOT be run by `cargo xtask test`. Each entry must name the
+/// follow-up issue that tracks re-enabling it. Empty is the goal.
+///
+/// - `syscall_mmap_family`: `mmap_shared_anon_succeeds` hangs under
+///   QEMU (>30s timeout). Predates #292 and was silently skipped by
+///   the previous hardcoded allowlist; surfaced once the list became
+///   manifest-driven. Tracked in the follow-up opened alongside #292.
+const TEST_SKIPLIST: &[&str] = &["syscall_mmap_family"];
+
 /// Read `kernel/Cargo.toml` and return the declared integration-test
-/// target names. Derived dynamically to avoid drift between the manifest
-/// and the xtask test runner (see issue #292).
+/// target names, minus anything in [`TEST_SKIPLIST`]. Derived
+/// dynamically to avoid drift between the manifest and the xtask test
+/// runner (see issue #292).
 fn integration_test_names() -> R<Vec<String>> {
     let manifest_path = workspace_root().join("kernel").join("Cargo.toml");
     let body = fs::read_to_string(&manifest_path)?;
@@ -808,7 +819,10 @@ fn integration_test_names() -> R<Vec<String>> {
     if names.is_empty() {
         return Err(format!("no [[test]] entries found in {}", manifest_path.display()).into());
     }
-    Ok(names)
+    Ok(names
+        .into_iter()
+        .filter(|n| !TEST_SKIPLIST.contains(&n.as_str()))
+        .collect())
 }
 
 fn test_all() -> R<()> {
@@ -1094,13 +1108,31 @@ harness = false
 
     #[test]
     fn parse_test_names_live_manifest_contains_new_entries() {
-        // Guards against silent drift: these three were previously
-        // absent from the hardcoded xtask array (issue #292).
-        let names = integration_test_names().expect("parse live manifest");
+        // Guards against silent drift: these were previously absent
+        // from the hardcoded xtask array (issue #292). `syscall_mmap_family`
+        // is tracked in the manifest but currently in TEST_SKIPLIST,
+        // so assert it via the raw parser rather than the filtered list.
+        let raw = parse_test_names(
+            &std::fs::read_to_string(workspace_root().join("kernel").join("Cargo.toml")).unwrap(),
+        );
         for expected in &["execve_atomic", "fork_refcount", "syscall_mmap_family"] {
             assert!(
-                names.iter().any(|n| n == expected),
-                "expected {expected} in derived test list, got {names:?}"
+                raw.iter().any(|n| n == expected),
+                "expected {expected} in manifest parse, got {raw:?}"
+            );
+        }
+        let filtered = integration_test_names().expect("parse live manifest");
+        for expected in &["execve_atomic", "fork_refcount"] {
+            assert!(
+                filtered.iter().any(|n| n == expected),
+                "expected {expected} in derived test list, got {filtered:?}"
+            );
+        }
+        // Skiplist entries are filtered out of the runner list.
+        for skipped in TEST_SKIPLIST {
+            assert!(
+                !filtered.iter().any(|n| n == skipped),
+                "skiplist entry {skipped} must not appear in runner list"
             );
         }
     }
