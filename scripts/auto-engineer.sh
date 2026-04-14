@@ -73,6 +73,18 @@ else
     )
 fi
 
+# If we're inside tmux, disable automatic-rename on the current window for the
+# duration of the container run so the container's OSC 2 escapes (emitted by
+# auto-engineer to label the window "AE -> <slug>") aren't immediately
+# overwritten by tmux's pane_current_command heuristic. Restore on exit.
+restore_tmux_rename=""
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    prev="$(tmux show-window-options -v automatic-rename 2>/dev/null || echo on)"
+    tmux set-window-option automatic-rename off >/dev/null 2>&1 || true
+    restore_tmux_rename="$prev"
+    trap 'tmux set-window-option automatic-rename "$restore_tmux_rename" >/dev/null 2>&1 || true' EXIT
+fi
+
 docker run --rm -it \
     ${docker_sec_opts[@]+"${docker_sec_opts[@]}"} \
     "${claude_vol_opts[@]}" \

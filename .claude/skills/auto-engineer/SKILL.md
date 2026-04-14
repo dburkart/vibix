@@ -85,6 +85,17 @@ git checkout main && git pull
 git checkout -b <branch>   # m<N>-<slug> or <verb>-<slug>
 ```
 
+Then rename the tmux window so the human glancing at the terminal can see which
+issue this cycle is on. `<slug>` is the same short slug used in the branch name
+(3–4 words, kebab-case). Uses an OSC 2 escape so it works both on the host and
+from inside the auto-engineer Docker container — tmux intercepts the sequence
+from the pane's stdout and renames the window (requires tmux's default
+`allow-rename on`). No-op outside tmux.
+
+```sh
+printf '\033]2;AE -> <slug>\033\\'
+```
+
 ### 2. Delegate planning to a sub-agent
 
 Use the `Agent` tool with `subagent_type: "Plan"`. Pass the full issue body, its label list, and any linked issues you fetched. Ask for:
