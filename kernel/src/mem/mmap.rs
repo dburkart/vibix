@@ -448,10 +448,15 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
             }
         }
         // Evict the cache entry so the backing object releases its reference
-        // and a future fault sees a fresh zero-filled page.
+        // and a future fault sees a fresh zero-filled page.  Only safe for
+        // Share::Private: for Share::Shared the AnonObject is shared across
+        // fork children; evicting the entry would silently desynchronise
+        // their views of the mapping.
         if let Some(vma) = aspace.vmas.find(va as usize) {
-            let obj_offset = vma.object_offset + (va as usize - vma.start);
-            vma.object.evict_page(obj_offset);
+            if vma.share == Share::Private {
+                let obj_offset = vma.object_offset + (va as usize - vma.start);
+                vma.object.evict_page(obj_offset);
+            }
         }
         va += FRAME_SIZE;
     }
