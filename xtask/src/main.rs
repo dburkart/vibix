@@ -723,7 +723,11 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         Ok(out)
     });
 
-    std::thread::sleep(Duration::from_secs(4));
+    // Wait long enough for the fork+exec+wait round-trip to complete.
+    // 4 s was sufficient before multi-process support; CI runners are
+    // slower than local QEMU, so 8 s gives the init process time to fork,
+    // exec the hello binary, and collect the exit status before we kill.
+    std::thread::sleep(Duration::from_secs(8));
     // Kill QEMU so the reader thread can drain and return.
     let _ = Command::new("kill").arg(pid.to_string()).status();
 
