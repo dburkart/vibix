@@ -207,7 +207,9 @@ pub trait FileOps: Send + Sync {
         Err(EINVAL_OP)
     }
     fn write(&self, _f: &OpenFile, _buf: &[u8], _off: u64) -> Result<usize, i64> {
-        Err(EINVAL_OP)
+        // Read-only filesystems keep this default; signal "write not
+        // permitted" rather than "bad argument".
+        Err(EPERM)
     }
     fn seek(&self, _f: &OpenFile, _whence: Whence, _off: i64) -> Result<u64, i64> {
         Err(ESPIPE)

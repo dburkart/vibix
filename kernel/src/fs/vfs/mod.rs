@@ -80,13 +80,28 @@ pub struct Timespec {
 
 /// Caller credentials consulted by [`InodeOps::permission`].
 ///
-/// Ownership fields default to `0` (root) so kernel-internal callers
-/// that don't have a userspace task context can skip supplying one.
-#[derive(Clone, Debug, Default)]
+/// `Default` is deliberately not implemented: a default-constructed
+/// `Credential` would be uid 0, which `default_permission` treats as
+/// the root bypass — that would let any caller who reaches for
+/// `Credential::default()` accidentally elevate. Construct via
+/// [`Credential::kernel`] (root) or by setting fields explicitly.
+#[derive(Clone, Debug)]
 pub struct Credential {
     pub uid: u32,
     pub gid: u32,
     pub groups: Vec<u32>,
+}
+
+impl Credential {
+    /// Kernel-internal credential: root. Use only from kernel code
+    /// paths that are not acting on behalf of a userspace task.
+    pub fn kernel() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        }
+    }
 }
 
 /// Access modes checked against `InodeMeta.mode` by

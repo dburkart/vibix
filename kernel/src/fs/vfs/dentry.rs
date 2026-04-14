@@ -120,10 +120,11 @@ impl Dentry {
     }
 
     /// Construct the root dentry: self-parenting via `Arc::new_cyclic`.
-    /// The name is empty (roots don't have a component name).
+    /// Roots have no path-component name; `DString` rejects `/` so we
+    /// use `.` as the sentinel that always passes validation.
     pub fn new_root(inode: Arc<Inode>) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| Self {
-            name: DString::try_from_bytes(b"/").unwrap_or_else(|_| unreachable!("'/' is valid")),
+            name: DString::try_from_bytes(b".").unwrap_or_else(|_| unreachable!("'.' is valid")),
             parent: weak_self.clone(),
             inode: BlockingRwLock::new(Some(inode)),
             mount: BlockingRwLock::new(None),
