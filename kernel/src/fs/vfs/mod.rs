@@ -49,6 +49,7 @@ pub mod dentry;
 pub mod inode;
 pub mod open_file;
 pub mod ops;
+pub mod path_walk;
 pub mod super_block;
 
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
@@ -57,6 +58,9 @@ pub use open_file::OpenFile;
 pub use ops::{
     default_permission, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat,
     StatFs, SuperOps, Whence,
+};
+pub use path_walk::{
+    path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
 
