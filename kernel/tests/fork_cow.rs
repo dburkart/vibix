@@ -54,6 +54,10 @@ fn run_tests() {
             &(fork_cow_prefaulted_pages_w_stripped as fn()),
         ),
         ("fork_cow_no_frame_leak", &(fork_cow_no_frame_leak as fn())),
+        (
+            "fork_isolation_unfaulted_page",
+            &(fork_isolation_unfaulted_page as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -120,9 +124,11 @@ fn fork_cow_vma_tree_is_cloned() {
     assert_eq!(pvma.start, cvma.start);
     assert_eq!(pvma.end, cvma.end);
     assert_eq!(pvma.share, cvma.share);
+    // Private VMAs get an independent backing object after #188 fix — the
+    // child's AnonObject is a fresh empty clone, not an Arc::clone.
     assert!(
-        core::ptr::addr_eq(Arc::as_ptr(&pvma.object), Arc::as_ptr(&cvma.object),),
-        "child object should be Arc::clone of parent's"
+        !core::ptr::addr_eq(Arc::as_ptr(&pvma.object), Arc::as_ptr(&cvma.object)),
+        "Private VMA child object must be a distinct AnonObject, not an Arc::clone"
     );
     drop(parent);
     drop(child);
@@ -195,4 +201,66 @@ fn fork_cow_no_frame_leak() {
         "frame leak: baseline={baseline}, after={after}, delta={}",
         baseline as isize - after as isize,
     );
+}
+
+/// Verify that pages not faulted before fork get **distinct** physical
+/// frames in parent and child after the fork (#188).
+///
+/// Setup: prefault page 0 only. Fork. Then demand-fault page 1 in the
+/// child and again in the parent. The two physical addresses must differ —
+/// confirming that each side's `AnonObject` allocates independently.
+fn fork_isolation_unfaulted_page() {
+    let mut parent = make_parent_aspace();
+
+    // Prefault page 0 so the W-strip path in fork_address_space runs,
+    // but leave page 1 unfaulted.
+    prefault_page(&parent, 0);
+
+    let mut flusher = Flusher::new_active();
+    let child = parent
+        .fork_address_space(&mut flusher)
+        .expect("fork_address_space failed");
+    flusher.finish();
+
+    // Demand-fault page 1 in the child by calling the child VMA's object.
+    let child_phys = {
+        let vma = child.find(FORK_VA).expect("child vma missing");
+        let child_obj = Arc::clone(&vma.object);
+        let phys = child_obj
+            .fault(1 * 4096, Access::Write)
+            .expect("child fault failed");
+        let va = FORK_VA + 4096;
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+            .expect("page-aligned VA");
+        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
+        let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
+        paging::map_existing_in_pml4(child.page_table_frame(), page, frame, flags)
+            .expect("child map_existing failed");
+        phys
+    };
+
+    // Demand-fault page 1 in the parent.
+    let parent_phys = {
+        let vma = parent.find(FORK_VA).expect("parent vma missing");
+        let parent_obj = Arc::clone(&vma.object);
+        let phys = parent_obj
+            .fault(1 * 4096, Access::Write)
+            .expect("parent fault failed");
+        let va = FORK_VA + 4096;
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+            .expect("page-aligned VA");
+        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
+        let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
+        paging::map_existing_in_pml4(parent.page_table_frame(), page, frame, flags)
+            .expect("parent map_existing failed");
+        phys
+    };
+
+    assert_ne!(
+        child_phys, parent_phys,
+        "parent and child must get distinct frames for unfaulted page (issue #188)"
+    );
+
+    drop(parent);
+    drop(child);
 }

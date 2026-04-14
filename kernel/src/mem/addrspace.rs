@@ -109,7 +109,8 @@ impl AddressSpace {
     ///
     /// # Panics
     ///
-    /// Panics if called before `mem::paging::init`.
+    /// Panics if called before `mem::paging::init` or if the frame
+    /// allocator is exhausted.
     #[cfg(target_os = "none")]
     pub fn new_empty() -> Self {
         let page_table = crate::mem::paging::new_task_pml4();
@@ -126,6 +127,28 @@ impl AddressSpace {
             vm_pages: 0,
             bootstrap: false,
         }
+    }
+
+    /// Fallible variant of [`new_empty`]: returns `Err(ForkError::OutOfMemory)`
+    /// when the frame allocator cannot satisfy the PML4 allocation, instead
+    /// of panicking. Used by `fork_address_space` so frame exhaustion during
+    /// fork is handled gracefully.
+    #[cfg(target_os = "none")]
+    pub fn try_new_empty() -> Result<Self, ForkError> {
+        let page_table = crate::mem::paging::try_new_task_pml4().ok_or(ForkError::OutOfMemory)?;
+        let mmap_base = VirtAddr::new(0x0000_0000_4000_0000);
+        let brk_start = mmap_base;
+        Ok(Self {
+            page_table,
+            vmas: VmaTree::new(),
+            mmap_base,
+            brk_start,
+            brk_cur: brk_start,
+            brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
+            rss_pages: 0,
+            vm_pages: 0,
+            bootstrap: false,
+        })
     }
 
     /// Test-only constructor: build an `AddressSpace` without touching
@@ -230,7 +253,7 @@ impl AddressSpace {
         use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 
         // Allocate child PML4 + copy kernel upper half.
-        let mut child = AddressSpace::new_empty();
+        let mut child = AddressSpace::try_new_empty()?;
         // Inherit brk/mmap layout from parent.
         child.mmap_base = self.mmap_base;
         child.brk_start = self.brk_start;
@@ -272,14 +295,23 @@ impl AddressSpace {
             let end = *end;
             let object_offset = *object_offset;
 
-            // Insert VMA into child.
+            // Insert VMA into child with an appropriate backing object.
+            // For Private VMAs, clone_private() returns a fresh empty
+            // AnonObject so post-fork demand faults on unfaulted pages
+            // allocate independent frames in parent and child. For Shared
+            // VMAs, Arc::clone is correct — both sides intentionally share
+            // the same backing frames.
+            let child_object = match share {
+                Share::Private => object.clone_private(),
+                Share::Shared => Arc::clone(object),
+            };
             let child_vma = VmaEntry::new(
                 start,
                 end,
                 prot_user,
                 prot_pte,
                 share,
-                Arc::clone(object),
+                child_object,
                 object_offset,
             );
             child.vmas.insert(child_vma);
