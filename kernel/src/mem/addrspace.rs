@@ -272,13 +272,22 @@ impl AddressSpace {
         if new_brk_raw >= USER_VA_END {
             return self.brk_cur.as_u64(); // rounded up into non-canonical range
         }
-        // Construct the page-aligned address used for VMA extent decisions.
-        let new_brk = VirtAddr::new(new_brk_raw);
         // Linux stores the EXACT requested address in mm->brk (not the
         // page-aligned value), so glibc/musl sbrk tracking is correct.
         let exact_brk = VirtAddr::new(addr);
 
-        if new_brk > self.brk_max || new_brk < self.brk_start {
+        // Validate exact address against brk_start BEFORE page-rounding.
+        // A value in (brk_start - PAGE, brk_start) rounds UP to brk_start and
+        // would otherwise pass the page-aligned lower-bound check, then write
+        // an exact brk_cur below the heap base.
+        if exact_brk < self.brk_start {
+            return self.brk_cur.as_u64();
+        }
+
+        // Construct the page-aligned address used for VMA extent decisions.
+        let new_brk = VirtAddr::new(new_brk_raw);
+
+        if new_brk > self.brk_max {
             return self.brk_cur.as_u64();
         }
         // No page-mapping change needed if we stay inside the same page.
@@ -346,6 +355,7 @@ impl AddressSpace {
                     unsafe {
                         crate::mem::paging::KernelFrameAllocator.deallocate_frame(frame);
                     }
+                    self.rss_pages = self.rss_pages.saturating_sub(1);
                 }
                 va += 4096;
             }
