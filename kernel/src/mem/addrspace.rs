@@ -954,9 +954,9 @@ impl AddressSpace {
 /// the live kernel PML4 and its lower half is empty.
 ///
 /// Runs from whatever context drops the last `Arc` — today that's the
-/// `preempt_tick` reaper (timer ISR, IRQs masked). The reclaim path is
-/// lock-free apart from the `HHDM_OFFSET` mutex, which is set once at
-/// boot and only briefly read here, so it cannot deadlock the ISR.
+/// dedicated reaper kernel task spawned by `task::init`, which runs
+/// with IRQs enabled. Taking the `HHDM_OFFSET` mutex and the kernel
+/// frame allocator lock from here is therefore unconditionally safe.
 ///
 #[cfg(target_os = "none")]
 impl Drop for AddressSpace {

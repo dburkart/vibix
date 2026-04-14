@@ -126,9 +126,9 @@ fn wait_for_worker() {
         if WORKER_DONE.load(Ordering::SeqCst) == 1 {
             // Worker hit `task::exit`, but the actual reap (and the
             // `Drop for AddressSpace` that releases its frames) happens
-            // on the next `preempt_tick` that drains `pending_exit`.
-            // At 100 Hz, 10 `hlt` cycles ≈ 100 ms — ample slack for the
-            // timer ISR to fire and run the reaper.
+            // when the reaper task runs and drains `REAPER_VICTIMS`.
+            // At 100 Hz, 10 `hlt` cycles ≈ 100 ms — ample slack for a
+            // tick to rotate to the reaper.
             for _ in 0..10 {
                 x86_64::instructions::hlt();
             }

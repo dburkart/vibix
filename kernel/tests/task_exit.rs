@@ -60,19 +60,21 @@ fn exit_worker() -> ! {
 }
 
 fn exit_removes_task() {
-    // Baseline: only the bootstrap task is live.
+    // Baseline: bootstrap task + dedicated reaper kernel task spawned
+    // by `task::init`. Capture the count rather than pinning it to a
+    // literal so this test survives future task::init additions.
     let mut baseline = 0usize;
     task::for_each_task(|_| baseline += 1);
-    assert_eq!(baseline, 1, "unexpected tasks before spawn");
 
     EXIT_REACHED.store(0, Ordering::SeqCst);
     task::spawn(exit_worker);
 
-    // Wait for the worker to run and then be reaped. One tick (10 ms)
-    // is enough to reap; give it generous slack.
+    // Wait for the worker to run and then be reaped. The reaper is
+    // itself a task, so reclaim requires the reaper getting CPU time
+    // after the worker's `task::exit` — give it generous slack.
     for _ in 0..50 {
         if EXIT_REACHED.load(Ordering::SeqCst) == 1 {
-            // Extra ticks so pending_exit drains through preempt_tick.
+            // Extra ticks so the reaper drains REAPER_VICTIMS.
             for _ in 0..10 {
                 x86_64::instructions::hlt();
             }
@@ -107,6 +109,9 @@ fn exit_loop_no_leak() {
     // a clean reap survives.
     const ITERATIONS: usize = 64;
 
+    let mut baseline = 0usize;
+    task::for_each_task(|_| baseline += 1);
+
     for i in 0..ITERATIONS {
         EXIT_REACHED.store(0, Ordering::SeqCst);
         task::spawn(exit_worker);
@@ -128,7 +133,7 @@ fn exit_loop_no_leak() {
 
     let mut live = 0usize;
     task::for_each_task(|_| live += 1);
-    assert_eq!(live, 1, "tasks leaking across exit loop");
+    assert_eq!(live, baseline, "tasks leaking across exit loop");
 }
 
 // Lower-half VA in an L4 entry the bootstrap PML4 leaves untouched, so
@@ -165,8 +170,8 @@ fn wait_for_fault_worker() {
     for _ in 0..200 {
         if FAULT_WORKER_DONE.load(Ordering::SeqCst) == 1 {
             // Reap (and the Drop for AddressSpace that releases its
-            // intermediate page-table frames) lands on the next
-            // preempt_tick that drains pending_exit.
+            // intermediate page-table frames) lands when the reaper
+            // task gets CPU time and drains REAPER_VICTIMS.
             for _ in 0..10 {
                 x86_64::instructions::hlt();
             }

@@ -38,9 +38,12 @@ mod switch;
 mod task;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use core::sync::atomic::Ordering;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
+
+use crate::sync::WaitQueue;
 
 pub use priority::{
     clamp_priority, nice_from_priority, priority_from_nice, AFFINITY_ALL, DEFAULT_PRIORITY,
@@ -61,6 +64,21 @@ pub(crate) const DEFAULT_SLICE_MS: u32 = 10;
 
 static SCHED: Lazy<Mutex<Scheduler>> = Lazy::new(|| Mutex::new(Scheduler::new()));
 
+/// Victims produced by [`exit`] waiting for the reaper task to reclaim
+/// them. Holds the `Box<Task>` so the task's stack, address space, and
+/// FPU area stay pinned until the reaper runs in task context — where
+/// it is safe to take the blocking frame-allocator and HHDM locks.
+///
+/// Uses a plain `spin::Mutex` (not `BlockingMutex`) so `exit` can push
+/// a victim with IRQs masked without risking a park. The critical
+/// section is a single `push_back`, the only other accessor is the
+/// reaper's drain, and contention is bounded by the exit rate.
+static REAPER_VICTIMS: Mutex<VecDeque<Box<Task>>> = Mutex::new(VecDeque::new());
+
+/// Waitqueue the reaper kernel task parks on. `exit` notifies after
+/// queuing the victim; the reaper drains the queue on every wake.
+static REAPER_WQ: WaitQueue = WaitQueue::new();
+
 /// Install the bootstrap task wrapping the currently-running thread.
 /// Must be called exactly once, before any [`spawn`].
 pub fn init() {
@@ -68,6 +86,10 @@ pub fn init() {
     assert!(sched.current.is_none(), "task::init called twice");
     sched.current = Some(Box::new(Task::bootstrap()));
     drop(sched);
+    // Spawn the reaper before any other task is created. Running at
+    // DEFAULT_PRIORITY is sufficient — it only wakes when a victim
+    // exists, and exit latency is not on any hot path.
+    spawn(reaper_loop);
     serial_println!("tasks: scheduler online");
 }
 
@@ -675,13 +697,16 @@ pub fn current_growsdown_lookup(
 }
 
 /// Terminate the currently-running task. Reclaims the task's mapped
-/// stack pages, VMA-backed frames, and PML4 frame on the next
-/// scheduler tick, then drops the `Box<Task>`.
+/// stack pages, VMA-backed frames, and PML4 frame in the reaper kernel
+/// task (spawned by [`init`]), then drops the `Box<Task>`.
 ///
-/// The actual reclaim runs from [`preempt_tick`] rather than here
-/// because it unmaps the very stack we're executing on — we have to
-/// context-switch away first. The exiting task is parked in
-/// `Scheduler::pending_exit` for the next tick to reap.
+/// The actual reclaim runs from [`reaper_loop`] in task context rather
+/// than inline here because it unmaps the very stack we're executing
+/// on — we have to context-switch away first — and because the
+/// reclaim path takes `BlockingMutex` locks (kernel frame allocator,
+/// HHDM mapping state) which would deadlock if held from the timer
+/// ISR. The exiting task is queued in [`REAPER_VICTIMS`] and the
+/// reaper is notified before we context-switch away.
 ///
 /// The stack VA slot (`NEXT_STACK_VA`'s bump-allocated range) is *not*
 /// reclaimed — that would require a free-list on `NEXT_STACK_VA`
@@ -720,15 +745,20 @@ pub fn exit() -> ! {
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
         let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
-        // Enqueue the doomed task; the next `preempt_tick` drains the
-        // whole queue. Back-to-back exits between ticks just append.
-        sched.pending_exit.push_back(prev);
-        let prev_ref = sched.pending_exit.back_mut().unwrap();
+        // Enqueue the doomed task for the reaper task to drain in its
+        // own context. We drop SCHED before touching REAPER_VICTIMS /
+        // REAPER_WQ to keep the lock order SCHED -> REAPER_VICTIMS and
+        // SCHED -> WaitQueue.inner consistent with the rest of the
+        // task module.
+        let mut victims = REAPER_VICTIMS.lock();
+        victims.push_back(prev);
+        let prev_ref = victims.back_mut().unwrap();
         // SAFETY: `prev_ref` is a stable `Box<Task>` in the queue tail.
-        // We never push in front of it (push_back only) and never
-        // reap it until a later tick, so the heap location remains
-        // valid for this context_switch's single write.
+        // We only push_back and the reaper only drains by taking the
+        // whole queue — the heap location remains valid through this
+        // `context_switch`'s single write to `prev.rsp`.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
+        drop(victims);
         (
             prev_rsp_ptr,
             next_rsp,
@@ -737,6 +767,10 @@ pub fn exit() -> ! {
             next_syscall_top,
         )
     };
+    // Poke the reaper before we switch away. `notify_all` takes
+    // `WaitQueue.inner` then `SCHED` (via `task::wake`); SCHED was
+    // already dropped above, so this is safe.
+    REAPER_WQ.notify_all();
     // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
     // a stable heap location, next_cr3 is a valid per-task PML4,
     // next_fpu_ptr points into a Box<FpuArea> pinned by the scheduler.
@@ -755,7 +789,7 @@ pub fn exit() -> ! {
 }
 
 /// Reclaim the stack pages of a task that called [`exit`], then drop
-/// the `Box<Task>`. Called from [`preempt_tick`] on a stack that is
+/// the `Box<Task>`. Called from [`reaper_loop`] on a stack that is
 /// *not* the victim's — the victim already context-switched away, so
 /// unmapping its stack is safe.
 ///
@@ -773,11 +807,13 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     // that entry is aliased into every per-task PML4, so unmapping via
     // the victim's PML4 propagates to every PML4.
     //
-    // We deliberately route through `unmap_and_free_in_pml4` (temporary
-    // mapper) rather than `unmap_and_free` (global `MAPPER` lock):
-    // `reap_pending` runs inside `preempt_tick`, a timer ISR. If the
-    // interrupted task held `MAPPER`, spinning on it here would
-    // deadlock with IRQs masked.
+    // We route through `unmap_and_free_in_pml4` (temporary mapper)
+    // rather than `unmap_and_free` (global `MAPPER` lock) so the
+    // reaper can reclaim a victim whose last pre-exit state left it
+    // holding `MAPPER`. Even though the reaper now runs in task
+    // context with IRQs enabled (and so could legally park), staying
+    // on the temporary-mapper path keeps this routine deadlock-free
+    // regardless of what locks the victim happened to be holding.
     let stack_base = victim.stack_base();
     if stack_base != 0 {
         for i in 0..victim.stack_page_count() {
@@ -804,6 +840,29 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     drop(victim);
 }
 
+/// The reaper kernel task. Parks on [`REAPER_WQ`] until [`exit`]
+/// queues a victim, then drains the whole queue and reclaims each
+/// task's resources via [`reap_pending`].
+///
+/// Running the reclaim path here — in task context, IRQs enabled —
+/// instead of in `preempt_tick` means we can safely take the
+/// `BlockingMutex`-protected kernel frame allocator and the HHDM
+/// mapping state. The previous ISR-based path would deadlock if the
+/// timer fired while another task held either lock.
+///
+/// Takes the whole queue in a single `mem::take` so the reaper's
+/// reclaim loop runs with no lock held, allowing further `exit`s to
+/// enqueue against `REAPER_VICTIMS` concurrently.
+fn reaper_loop() -> ! {
+    loop {
+        REAPER_WQ.wait_while(|| REAPER_VICTIMS.lock().is_empty());
+        let drained: VecDeque<Box<Task>> = core::mem::take(&mut *REAPER_VICTIMS.lock());
+        for victim in drained {
+            reap_pending(victim);
+        }
+    }
+}
+
 /// Called from the timer ISR after `notify_eoi`. Decrements the
 /// current task's slice; if it's exhausted and there's another task
 /// ready, rotates and context-switches. Bails on lock contention so
@@ -822,19 +881,6 @@ pub fn preempt_tick() {
     let Some(mut sched) = SCHED.try_lock() else {
         return;
     };
-
-    // Reap any task that called `task::exit` on a prior tick, before
-    // touching the ready bank — keeps this tick's rotation consistent
-    // and bounds reap latency to one tick per exit. Multiple exits
-    // between ticks drain here in FIFO order.
-    while let Some(victim) = sched.pending_exit.pop_front() {
-        drop(sched);
-        reap_pending(victim);
-        let Some(s) = SCHED.try_lock() else {
-            return;
-        };
-        sched = s;
-    }
 
     // No task::init yet (or a non-task integration test) — nothing to
     // preempt. Forces Lazy init, but that's allocation-free.
