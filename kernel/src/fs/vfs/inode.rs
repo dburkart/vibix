@@ -98,6 +98,16 @@ impl Inode {
     }
 }
 
+/// Defer eviction so we never call `evict_inode` from inside another
+/// VFS lock. The drop fires from contexts like a parent dentry's
+/// children-map mutation, where calling back into the FS could
+/// re-enter sibling locks. See `super::gc_queue` for the drain sites.
+impl Drop for Inode {
+    fn drop(&mut self) {
+        super::gc_queue::enqueue(self.sb.clone(), self.ino);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
