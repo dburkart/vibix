@@ -203,12 +203,27 @@ fn fork_cow_no_frame_leak() {
     );
 }
 
+/// Demand-fault `page_index` into `aspace`, install the resulting PTE, and
+/// return the physical address. Used by `fork_isolation_unfaulted_page` to
+/// trigger demand faults in parent and child independently after a fork.
+fn demand_fault_and_map(aspace: &AddressSpace, page_index: usize) -> u64 {
+    let vma = aspace.find(FORK_VA).expect("vma missing");
+    let obj = Arc::clone(&vma.object);
+    let phys = obj
+        .fault(page_index * 4096, Access::Write)
+        .expect("VmObject::fault failed");
+    let va = FORK_VA + page_index * 4096;
+    let page =
+        Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64)).expect("page-aligned VA");
+    let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
+    let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
+    paging::map_existing_in_pml4(aspace.page_table_frame(), page, frame, flags)
+        .expect("map_existing_in_pml4 failed");
+    phys
+}
+
 /// Verify that pages not faulted before fork get **distinct** physical
 /// frames in parent and child after the fork (#188).
-///
-/// Setup: prefault page 0 only. Fork. Then demand-fault page 1 in the
-/// child and again in the parent. The two physical addresses must differ —
-/// confirming that each side's `AnonObject` allocates independently.
 fn fork_isolation_unfaulted_page() {
     let mut parent = make_parent_aspace();
 
@@ -222,39 +237,8 @@ fn fork_isolation_unfaulted_page() {
         .expect("fork_address_space failed");
     flusher.finish();
 
-    // Demand-fault page 1 in the child by calling the child VMA's object.
-    let child_phys = {
-        let vma = child.find(FORK_VA).expect("child vma missing");
-        let child_obj = Arc::clone(&vma.object);
-        let phys = child_obj
-            .fault(1 * 4096, Access::Write)
-            .expect("child fault failed");
-        let va = FORK_VA + 4096;
-        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
-            .expect("page-aligned VA");
-        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
-        let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
-        paging::map_existing_in_pml4(child.page_table_frame(), page, frame, flags)
-            .expect("child map_existing failed");
-        phys
-    };
-
-    // Demand-fault page 1 in the parent.
-    let parent_phys = {
-        let vma = parent.find(FORK_VA).expect("parent vma missing");
-        let parent_obj = Arc::clone(&vma.object);
-        let phys = parent_obj
-            .fault(1 * 4096, Access::Write)
-            .expect("parent fault failed");
-        let va = FORK_VA + 4096;
-        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
-            .expect("page-aligned VA");
-        let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
-        let flags = PageTableFlags::from_bits_truncate(prot_pte_rw());
-        paging::map_existing_in_pml4(parent.page_table_frame(), page, frame, flags)
-            .expect("parent map_existing failed");
-        phys
-    };
+    let child_phys = demand_fault_and_map(&child, 1);
+    let parent_phys = demand_fault_and_map(&parent, 1);
 
     assert_ne!(
         child_phys, parent_phys,

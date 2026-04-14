@@ -113,20 +113,7 @@ impl AddressSpace {
     /// allocator is exhausted.
     #[cfg(target_os = "none")]
     pub fn new_empty() -> Self {
-        let page_table = crate::mem::paging::new_task_pml4();
-        let mmap_base = VirtAddr::new(0x0000_0000_4000_0000);
-        let brk_start = mmap_base;
-        Self {
-            page_table,
-            vmas: VmaTree::new(),
-            mmap_base,
-            brk_start,
-            brk_cur: brk_start,
-            brk_max: VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD),
-            rss_pages: 0,
-            vm_pages: 0,
-            bootstrap: false,
-        }
+        Self::try_new_empty().expect("frame allocator exhausted during AddressSpace::new_empty")
     }
 
     /// Fallible variant of [`new_empty`]: returns `Err(ForkError::OutOfMemory)`
@@ -295,12 +282,7 @@ impl AddressSpace {
             let end = *end;
             let object_offset = *object_offset;
 
-            // Insert VMA into child with an appropriate backing object.
-            // For Private VMAs, clone_private() returns a fresh empty
-            // AnonObject so post-fork demand faults on unfaulted pages
-            // allocate independent frames in parent and child. For Shared
-            // VMAs, Arc::clone is correct — both sides intentionally share
-            // the same backing frames.
+            // Private VMAs get an independent empty cache; Shared VMAs alias the same frames.
             let child_object = match share {
                 Share::Private => object.clone_private(),
                 Share::Shared => Arc::clone(object),
