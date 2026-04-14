@@ -87,13 +87,15 @@ git checkout -b <branch>   # m<N>-<slug> or <verb>-<slug>
 
 Then rename the tmux window so the human glancing at the terminal can see which
 issue this cycle is on. `<slug>` is the same short slug used in the branch name
-(3–4 words, kebab-case). Uses an OSC 2 escape so it works both on the host and
-from inside the auto-engineer Docker container — tmux intercepts the sequence
-from the pane's stdout and renames the window (requires tmux's default
-`allow-rename on`). No-op outside tmux.
+(3–4 words, kebab-case). Uses an OSC 2 escape written directly to `/dev/tty` so
+it bypasses Claude's Bash-tool stdout capture and reaches the underlying pty —
+tmux then intercepts the sequence and renames the window. Works from both the
+host and inside the auto-engineer Docker container. `scripts/auto-engineer.sh`
+disables `automatic-rename` on the launching window so tmux doesn't overwrite
+the name on the next tick.
 
 ```sh
-printf '\033]2;AE -> <slug>\033\\'
+printf '\033]2;AE -> <slug>\033\\' > /dev/tty 2>/dev/null || true
 ```
 
 ### 2. Delegate planning to a sub-agent
