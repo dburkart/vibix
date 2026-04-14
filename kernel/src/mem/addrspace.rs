@@ -212,6 +212,188 @@ impl AddressSpace {
         self.brk_max = VirtAddr::new(mmap_base.as_u64() - DEFAULT_BRK_GUARD);
     }
 
+    /// Set the heap base to `image_end` (the page-aligned address one byte
+    /// past the last `PT_LOAD` segment). Called after `load_user_elf_with_vmas`
+    /// so that `sys_brk` starts the heap immediately after the ELF image
+    /// rather than at the arbitrary `mmap_base` placeholder.
+    ///
+    /// If `image_end > brk_max` (e.g. an extremely large ELF), the heap window
+    /// would be zero-sized or inverted, so the call is a no-op — callers should
+    /// handle this by falling back to the existing brk_start.
+    pub fn set_brk_start(&mut self, image_end: VirtAddr) {
+        if image_end > self.brk_max {
+            // Heap window would be empty; leave the existing placeholder.
+            return;
+        }
+        self.brk_start = image_end;
+        self.brk_cur = image_end;
+        // brk_max stays at mmap_base − DEFAULT_BRK_GUARD.
+    }
+
+    /// Implement the `brk(2)` contract (Linux-compatible):
+    ///
+    /// - `addr == 0`: return the current break without moving it.
+    /// - `addr > brk_max`: heap limit exceeded — return current break unchanged.
+    /// - `addr < brk_start`: cannot shrink below heap base — return unchanged.
+    /// - Otherwise: grow or shrink the heap and return the new break.
+    ///
+    /// The heap is maintained as a **single** anonymous-private VMA
+    /// `[brk_start, brk_cur)` with an unbounded `AnonObject` backing.
+    /// On grow the existing VMA is replaced with a larger one (same
+    /// `AnonObject` Arc so already-faulted frames are preserved). On shrink,
+    /// the old PTEs in the freed range are unmapped and the VMA is replaced
+    /// with a smaller one.
+    ///
+    /// Returns the new (or unchanged) break address. No errno is set on
+    /// failure — returning the old break is the POSIX failure signal.
+    #[cfg(target_os = "none")]
+    pub fn sys_brk(&mut self, addr: u64) -> u64 {
+        use crate::mem::vmatree::{Share, Vma};
+        use crate::mem::vmobject::{AnonObject, VmObject};
+        use alloc::sync::Arc;
+        use x86_64::structures::paging::{PageTableFlags, Size4KiB};
+        use x86_64::VirtAddr;
+
+        if addr == 0 {
+            return self.brk_cur.as_u64();
+        }
+
+        // Reject non-canonical addresses and overflow before constructing
+        // VirtAddr — VirtAddr::new panics on non-canonical values.
+        // USER_VA_END is the first non-canonical lower-half address.
+        if addr >= USER_VA_END {
+            return self.brk_cur.as_u64();
+        }
+        // Overflow-safe page-align upward.
+        let new_brk_raw = match addr.checked_add(4095) {
+            Some(v) => v & !4095,
+            None => return self.brk_cur.as_u64(), // would overflow u64
+        };
+        if new_brk_raw >= USER_VA_END {
+            return self.brk_cur.as_u64(); // rounded up into non-canonical range
+        }
+        // Linux stores the EXACT requested address in mm->brk (not the
+        // page-aligned value), so glibc/musl sbrk tracking is correct.
+        let exact_brk = VirtAddr::new(addr);
+
+        // Validate exact address against brk_start BEFORE page-rounding.
+        // A value in (brk_start - PAGE, brk_start) rounds UP to brk_start and
+        // would otherwise pass the page-aligned lower-bound check, then write
+        // an exact brk_cur below the heap base.
+        if exact_brk < self.brk_start {
+            return self.brk_cur.as_u64();
+        }
+
+        // Construct the page-aligned address used for VMA extent decisions.
+        let new_brk = VirtAddr::new(new_brk_raw);
+
+        if new_brk > self.brk_max {
+            return self.brk_cur.as_u64();
+        }
+        // No page-mapping change needed if we stay inside the same page.
+        let old_brk_page = VirtAddr::new((self.brk_cur.as_u64() + 4095) & !4095);
+        if new_brk == old_brk_page {
+            self.brk_cur = exact_brk;
+            return exact_brk.as_u64();
+        }
+
+        // Use page-aligned values for VMA extent decisions; store the exact
+        // requested address in brk_cur (Linux semantics: mm->brk is exact).
+        let old_brk = old_brk_page; // page-aligned old break
+        let brk_start = self.brk_start;
+        let brk_start_usize = brk_start.as_u64() as usize;
+
+        let heap_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        if new_brk > old_brk {
+            // Grow: remove existing heap VMA (if any), keep its AnonObject,
+            // then reinsert with a larger end. New pages are demand-faulted.
+            let obj: Arc<dyn VmObject> = if old_brk > brk_start {
+                // There is already a heap VMA — clone its AnonObject so the
+                // already-faulted frames are not freed when we remove the VMA.
+                let old = self
+                    .vmas
+                    .remove_exact(brk_start_usize)
+                    .expect("heap VMA missing despite brk_cur > brk_start");
+                self.vm_pages -= (old_brk - brk_start) as usize / 4096;
+                let arc = Arc::clone(&old.object);
+                drop(old);
+                arc
+            } else {
+                // First brk call — create a fresh unbounded AnonObject.
+                AnonObject::new(None)
+            };
+
+            let vma = Vma::new(
+                brk_start_usize,
+                new_brk.as_u64() as usize,
+                0x3, // PROT_READ|WRITE
+                heap_flags.bits(),
+                Share::Private,
+                obj,
+                0,
+            );
+            self.vmas.insert(vma);
+            self.vm_pages += (new_brk - brk_start) as usize / 4096;
+        } else {
+            // Shrink: free PTEs for [new_brk, old_brk), then reinsert a
+            // smaller VMA with the same AnonObject so its Drop path can
+            // release the cache frames when the process exits.
+            let pml4 = self.page_table;
+            let mut va = new_brk.as_u64() as usize;
+            while va < old_brk.as_u64() as usize {
+                use x86_64::structures::paging::{FrameDeallocator, Page};
+                let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
+                    .expect("page aligned");
+                if let Ok(frame) = crate::mem::paging::unmap_in_pml4(pml4, page) {
+                    // Release the PTE's reference. AnonObject still holds
+                    // the cache reference so the frame's refcount drops to
+                    // 1, not 0 — it will be freed by AnonObject::drop.
+                    unsafe {
+                        crate::mem::paging::KernelFrameAllocator.deallocate_frame(frame);
+                    }
+                    self.rss_pages = self.rss_pages.saturating_sub(1);
+                }
+                va += 4096;
+            }
+
+            if old_brk > brk_start {
+                let old = self
+                    .vmas
+                    .remove_exact(brk_start_usize)
+                    .expect("heap VMA missing despite brk_cur > brk_start");
+                self.vm_pages -= (old_brk - brk_start) as usize / 4096;
+                if new_brk > brk_start {
+                    let obj = Arc::clone(&old.object);
+                    // Trim the VmObject's frame cache for the freed range so
+                    // cached frames are released now rather than at exit.
+                    let from_page = (new_brk - brk_start) as usize / 4096;
+                    obj.truncate_from_page(from_page);
+                    drop(old);
+                    let vma = Vma::new(
+                        brk_start_usize,
+                        new_brk.as_u64() as usize,
+                        0x3,
+                        heap_flags.bits(),
+                        Share::Private,
+                        obj,
+                        0,
+                    );
+                    self.vmas.insert(vma);
+                    self.vm_pages += (new_brk - brk_start) as usize / 4096;
+                }
+            }
+        }
+
+        // Store the exact requested address per Linux mm->brk semantics;
+        // page-aligned values were used only to decide VMA extent changes.
+        self.brk_cur = exact_brk;
+        exact_brk.as_u64()
+    }
+
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours
     /// where possible. Panics if `vma` overlaps any existing entry —
     /// overlapping VMAs are a programmer error.
@@ -675,6 +857,26 @@ mod tests {
         let aspace = AddressSpace::new_for_test(0x4000_0000);
         assert_eq!(aspace.brk_start, aspace.brk_cur);
         assert!(aspace.brk_max.as_u64() + DEFAULT_BRK_GUARD == aspace.mmap_base.as_u64());
+    }
+
+    #[test]
+    fn brk_constructor_sets_start_eq_cur() {
+        // new_for_test initialises brk_start == brk_cur == mmap_base.
+        // sys_brk(0) behaviour is only testable in QEMU (cfg=none); this
+        // test just verifies the constructor invariant.
+        let aspace = AddressSpace::new_for_test(0x4000_0000);
+        assert_eq!(aspace.brk_start, aspace.brk_cur);
+    }
+
+    #[test]
+    fn set_brk_start_advances_heap_base() {
+        let mut aspace = AddressSpace::new_for_test(0x4000_0000);
+        let img_end = x86_64::VirtAddr::new(0x0060_0000);
+        aspace.set_brk_start(img_end);
+        assert_eq!(aspace.brk_start, img_end);
+        assert_eq!(aspace.brk_cur, img_end);
+        // brk_max unchanged
+        assert!(aspace.brk_max.as_u64() < aspace.mmap_base.as_u64());
     }
 
     #[test]

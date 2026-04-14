@@ -63,6 +63,10 @@ pub fn launch(bytes: &[u8]) -> usize {
         image.segments
     );
 
+    // Set the heap base to immediately after the ELF image so sys_brk
+    // starts the heap at the right address.
+    aspace.set_brk_start(VirtAddr::new(image.image_end));
+
     // 3. Allocate and map the user stack, then add it as a VMA so fork
     //    copies it too.
     let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(USER_STACK_PAGE_VA));
