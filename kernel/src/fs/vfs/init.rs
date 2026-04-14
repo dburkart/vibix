@@ -37,7 +37,7 @@ use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::{alloc_fs_id, mount};
 use super::ops::{FileOps, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
 use super::super_block::{SbFlags, SuperBlock};
-use super::{DevFs, RamFs};
+use super::{DevFs, RamFs, TarFs};
 
 /// Global namespace root. Populated by [`init`]; `None` before the
 /// kernel has run boot-time VFS setup. Consumers who need to start a
@@ -64,6 +64,40 @@ pub fn init() {
 
     let bootstrap = bootstrap_target();
 
+    // On the bare-metal target, prefer tarfs-on-ramdisk-module for `/` per
+    // RFC 0002. Fall back to ramfs when the module is absent (host tests,
+    // early-boot without the ISO, or any future build that omits it).
+    #[cfg(target_os = "none")]
+    let root_edge = {
+        if let Some((ptr, len)) = find_rootfs_module() {
+            // SAFETY (inside tarfs): Limine places module payloads in
+            // EXECUTABLE_AND_MODULES memory, preserved for the kernel's
+            // lifetime. TarFs::mount() converts the raw pointer to a slice
+            // with an internal `unsafe` block.
+            let source = MountSource::RamdiskModule(ptr, len);
+            let edge = mount(
+                source,
+                &bootstrap,
+                TarFs::new_arc() as Arc<dyn super::ops::FileSystem>,
+                MountFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("vfs::init: mount tarfs / failed: errno={}", e));
+            crate::serial_println!("vfs: mounted tarfs at /");
+            edge
+        } else {
+            let edge = mount(
+                MountSource::None,
+                &bootstrap,
+                Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+                MountFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e));
+            crate::serial_println!("vfs: mounted ramfs at /");
+            edge
+        }
+    };
+
+    #[cfg(not(target_os = "none"))]
     let root_edge = mount(
         MountSource::None,
         &bootstrap,
@@ -74,7 +108,6 @@ pub fn init() {
 
     let root = root_edge.root_dentry.clone();
     ROOT_DENTRY.call_once(|| root.clone());
-    crate::serial_println!("vfs: mounted ramfs at /");
 
     mount_child(
         &root,
@@ -89,6 +122,18 @@ pub fn init() {
         Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
     );
     crate::serial_println!("vfs: mounted ramfs at /tmp");
+}
+
+/// Locate the rootfs tarball module from the Limine module response.
+/// Returns `(ptr, len)` if found, `None` otherwise.
+#[cfg(target_os = "none")]
+fn find_rootfs_module() -> Option<(*const u8, usize)> {
+    let resp = crate::boot::MODULE_REQUEST.get_response()?;
+    let file = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().to_bytes().ends_with(b"/boot/rootfs.tar"))?;
+    Some((file.addr(), file.size() as usize))
 }
 
 /// Create a subdirectory `name` under `parent`, wrap it in a fresh
