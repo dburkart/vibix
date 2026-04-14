@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 
 use alloc::sync::Arc;
 
-use vibix::fs::{FileBackend, FileDescription, FileDescTable, flags, EBADF};
+use vibix::fs::{flags, FileBackend, FileDescTable, FileDescription, EBADF};
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
@@ -45,7 +45,10 @@ fn run_tests() {
         ("alloc_close_roundtrip", &(alloc_close_roundtrip as fn())),
         ("dup_creates_alias", &(dup_creates_alias as fn())),
         ("dup2_replaces_slot", &(dup2_replaces_slot as fn())),
-        ("clone_for_fork_independent", &(clone_for_fork_independent as fn())),
+        (
+            "clone_for_fork_independent",
+            &(clone_for_fork_independent as fn()),
+        ),
         ("close_cloexec", &(close_cloexec as fn())),
         ("write_via_backend", &(write_via_backend as fn())),
     ];
@@ -62,14 +65,23 @@ fn run_tests() {
 
 struct NullBackend;
 impl FileBackend for NullBackend {
-    fn read(&self, _: &mut [u8]) -> Result<usize, i64> { Ok(0) }
-    fn write(&self, buf: &[u8]) -> Result<usize, i64> { Ok(buf.len()) }
+    fn read(&self, _: &mut [u8]) -> Result<usize, i64> {
+        Ok(0)
+    }
+    fn write(&self, buf: &[u8]) -> Result<usize, i64> {
+        Ok(buf.len())
+    }
 }
 
-fn null() -> Arc<dyn FileBackend> { Arc::new(NullBackend) }
+fn null() -> Arc<dyn FileBackend> {
+    Arc::new(NullBackend)
+}
 
 fn null_desc() -> Arc<FileDescription> {
-    Arc::new(FileDescription { backend: null(), flags: 0 })
+    Arc::new(FileDescription {
+        backend: null(),
+        flags: 0,
+    })
 }
 
 fn make_table() -> FileDescTable {
@@ -138,7 +150,10 @@ fn clone_for_fork_independent() {
     // Close fd 1 in parent; child must still have it.
     t.close_fd(1).unwrap();
     assert_eq!(t.get(1).err(), Some(EBADF));
-    assert!(child.get(1).is_ok(), "child's fd 1 must survive parent close");
+    assert!(
+        child.get(1).is_ok(),
+        "child's fd 1 must survive parent close"
+    );
     // Close fd 2 in child; parent must still have it.
     child.close_fd(2).unwrap();
     assert!(t.get(2).is_ok(), "parent's fd 2 must survive child close");
@@ -154,7 +169,11 @@ fn close_cloexec() {
     let fd = t.alloc_fd(flagged).unwrap();
     assert_eq!(fd, 3);
     t.close_cloexec();
-    assert_eq!(t.get(3).err(), Some(EBADF), "O_CLOEXEC fd must be closed after exec");
+    assert_eq!(
+        t.get(3).err(),
+        Some(EBADF),
+        "O_CLOEXEC fd must be closed after exec"
+    );
     assert!(t.get(0).is_ok(), "fd 0 must survive close_cloexec");
     assert!(t.get(1).is_ok(), "fd 1 must survive close_cloexec");
     assert!(t.get(2).is_ok(), "fd 2 must survive close_cloexec");

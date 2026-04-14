@@ -282,7 +282,6 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
     }
 }
 
-
 unsafe extern "C" {
     fn syscall_entry();
 }
