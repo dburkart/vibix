@@ -16,7 +16,7 @@ use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
 use vibix::fs::vfs::ops::Stat;
-use vibix::fs::{EBADF, EINVAL, ENOENT, ENOTDIR};
+use vibix::fs::{EBADF, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
 use vibix::{
@@ -79,6 +79,10 @@ fn run_tests() {
             "open_o_directory_on_nondir_enotdir",
             &(open_o_directory_on_nondir_enotdir as fn()),
         ),
+        (
+            "stat_enametoolong_on_overlong_path",
+            &(stat_enametoolong_on_overlong_path as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -123,7 +127,9 @@ fn install_user_staging_vma() {
 /// Copy a NUL-terminated path into the staging page at offset 0.
 fn stage_path(bytes: &[u8]) -> u64 {
     install_user_staging_vma();
-    assert!(bytes.len() < 128);
+    // Leave room for the staging page's `struct stat` half at +4096 so
+    // overlong-path tests (PATH_MAX = 4096) don't collide with it.
+    assert!(bytes.len() < 4096);
     unsafe {
         let dst = USER_PAGE_VA as *mut u8;
         for (i, b) in bytes.iter().enumerate() {
@@ -231,6 +237,30 @@ fn lstat_same_as_stat_on_dir() {
     let st2 = read_stat();
     assert_eq!(st1.st_ino, st2.st_ino);
     assert_eq!(st1.st_mode, st2.st_mode);
+}
+
+fn stat_enametoolong_on_overlong_path() {
+    // VFS PATH_MAX is 4096. A user path of 4097 non-NUL bytes means
+    // `copy_path_from_user` fills the whole kernel buffer (4096 + 1)
+    // without seeing a NUL and must return ENAMETOOLONG. Stage the path
+    // at page 4 of USER_PAGE_VA so it doesn't collide with the stat
+    // destination at page 1.
+    install_user_staging_vma();
+    const OVERLONG: usize = 4097;
+    let path_uva = (USER_PAGE_VA + 4 * 4096) as u64;
+    unsafe {
+        let dst = path_uva as *mut u8;
+        let mut i = 0;
+        while i < OVERLONG {
+            ptr::write_volatile(dst.add(i), b'a');
+            i += 1;
+        }
+        // Trailing NUL beyond PATH_MAX — the copy-in should stop with
+        // ENAMETOOLONG before ever reading this byte.
+        ptr::write_volatile(dst.add(OVERLONG), 0);
+    }
+    let r = unsafe { syscall_dispatch(SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
+    assert_eq!(r, ENAMETOOLONG, "expected ENAMETOOLONG, got {}", r);
 }
 
 fn open_o_directory_on_nondir_enotdir() {

@@ -19,11 +19,13 @@
 //! - `write_stat` for the userspace `struct stat` copy-out.
 
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::super::syscall::copy_path_from_user_pub;
 use super::super::uaccess;
 use crate::fs::vfs::ops::{meta_into_stat, Stat};
-use crate::fs::vfs::path_walk::{path_walk, LookupFlags, NameIdata};
+use crate::fs::vfs::path_walk::{path_walk, LookupFlags, NameIdata, PATH_MAX};
 use crate::fs::vfs::super_block::SbActiveGuard;
 use crate::fs::vfs::Credential;
 use crate::fs::vfs::{
@@ -44,9 +46,17 @@ pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 /// behind `dfd` (used by `fstatat(fd, "", &st, AT_EMPTY_PATH)`).
 pub const AT_EMPTY_PATH: u32 = 0x1000;
 
-/// Same bound as `sys_open`'s legacy buffer. Keeps a copy-in within a
-/// single kernel stack frame.
-const OPEN_PATH_MAX: usize = 128;
+/// Copy a user path into a heap buffer sized at `PATH_MAX + 1`. The
+/// `+1` lets `copy_path_from_user_pub` observe the terminating NUL
+/// within the buffer for paths of exactly `PATH_MAX` user bytes;
+/// anything longer returns `-ENAMETOOLONG`. A heap buffer avoids a
+/// 4 KiB stack frame on every VFS syscall.
+fn copy_user_path(path_uva: u64) -> Result<Vec<u8>, i64> {
+    let mut buf: Vec<u8> = vec![0u8; PATH_MAX + 1];
+    let n = unsafe { copy_path_from_user_pub(path_uva as usize, &mut buf) }?;
+    buf.truncate(n);
+    Ok(buf)
+}
 
 /// Resolve a user path to an `Arc<Inode>` via `path_walk`.
 ///
@@ -146,12 +156,11 @@ fn legacy_dev_backend(path: &[u8], flags: u64) -> Option<i64> {
 /// cwd / fd-rooted walks don't exist yet (#239).
 pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, _mode: u64) -> i64 {
     // 1. Copy the user path.
-    let mut buf = [0u8; OPEN_PATH_MAX];
-    let n = match copy_path_from_user_pub(path_uva as usize, &mut buf) {
-        Ok(n) => n,
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
         Err(e) => return e,
     };
-    let path = &buf[..n];
+    let path = buf.as_slice();
 
     // 2. Mutating create/truncate flags not supported in the read-path
     //    subset. Fail loudly so userspace gets a clear signal rather than
@@ -221,12 +230,11 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, _mode: u64) -
 /// `stat(path, *statbuf)` (follow=true) / `lstat(path, *statbuf)`
 /// (follow=false — `nofollow=true` here flips the sense).
 pub unsafe fn sys_stat_impl(path_uva: u64, statbuf_uva: u64, nofollow: bool) -> i64 {
-    let mut buf = [0u8; OPEN_PATH_MAX];
-    let n = match copy_path_from_user_pub(path_uva as usize, &mut buf) {
-        Ok(n) => n,
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
         Err(e) => return e,
     };
-    let path = &buf[..n];
+    let path = buf.as_slice();
 
     let (inode, _nd) = match resolve_inode(path, !nofollow) {
         Ok(v) => v,
@@ -270,12 +278,11 @@ pub unsafe fn sys_newfstatat_impl(dfd: i32, path_uva: u64, statbuf_uva: u64, fla
         return EINVAL;
     }
 
-    let mut buf = [0u8; OPEN_PATH_MAX];
-    let n = match copy_path_from_user_pub(path_uva as usize, &mut buf) {
-        Ok(n) => n,
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
         Err(e) => return e,
     };
-    let path = &buf[..n];
+    let path = buf.as_slice();
 
     // AT_EMPTY_PATH + empty path + real fd: stat the file behind dfd.
     // AT_FDCWD (-100) is not a valid fd for this purpose — reject it
