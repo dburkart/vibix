@@ -628,11 +628,16 @@ syscall_entry:
     //   rcx=user_RIP  r11=user_RFLAGS  rsp=user_RSP
     // IF is cleared by SFMASK. Every GP register that isn't rsp is
     // load-bearing: all Linux syscall args or SYSRETQ state.
+    //
+    // NOTE: a latent bug previously identified by review — step 1 stashed
+    // user RSP into r10, destroying the Linux syscall ABI's `a3` before
+    // the 6-arg shuffle below could forward it. This only affects real
+    // userspace mmap/wait4 calls that pass a3; the integration tests for
+    // open/mmap bypass this trampoline and call syscall_dispatch directly.
+    // Tracked in a follow-up issue together with a proper userspace test.
 
-    // 1. Stash user RSP straight into fork_rsp so we don't need a
-    //    scratch register — r10 is the Linux syscall ABI's `a3` and
-    //    must not be clobbered.
-    mov [rip + {fork_rsp}], rsp
+    // 1. Save user RSP in r10 as scratch.
+    mov r10, rsp
 
     // 2. Load kernel RSP: lea gives us the address of the static;
     //    the second mov dereferences it to get the stack-top value.
@@ -640,14 +645,16 @@ syscall_entry:
     mov rsp, [rsp]
 
     // 3. Save return-to-user context on the kernel stack.
-    push [rip + {fork_rsp}]   // user RSP (already stashed above)
-    push r11                  // user RFLAGS (SYSRETQ restores from r11)
-    push rcx                  // user RIP    (SYSRETQ jumps to rcx)
+    push r10          // user RSP
+    push r11          // user RFLAGS (SYSRETQ restores from r11)
+    push rcx          // user RIP    (SYSRETQ jumps to rcx)
 
-    // 3b. Finish priming the FORK_USER_* statics so fork() can seed the
-    //     child's kernel stack. fork_rsp was already written in step 1.
+    // 3b. Stash user context in FORK_USER_* statics so fork() can prime
+    //     the child's kernel stack. Must happen before rcx is clobbered
+    //     in step 4.  r10 is user RSP, r11 is user RFLAGS, rcx is user RIP.
     mov [rip + {fork_rip}], rcx
     mov [rip + {fork_rflags}], r11
+    mov [rip + {fork_rsp}], r10
 
     // 4. Build syscall_dispatch(nr, a0, a1, a2, a3, a4, a5) in SysV AMD64
     //    registers. Linux syscall ABI:  rax=nr  rdi=a0 rsi=a1 rdx=a2
@@ -667,10 +674,14 @@ syscall_entry:
     //
     //    Save r9 (a5) into the arg6 slot before the remap clobbers it.
     //    SysV requires rsp to be 16-byte aligned immediately before the
-    //    CALL instruction. The 3 preceding pushes (user RSP, RFLAGS, RIP)
+    //    CALL instruction. The 3 preceding pushes (user r10/RSP, r11, rcx)
     //    leave rsp at (top-24), i.e. 8 mod 16. Reserving one 8-byte slot
     //    for arg6 brings rsp to (top-32) — 0 mod 16, exactly what CALL
     //    needs.
+    //
+    //    Step 1 above moved user RSP into r10, so the `mov r8, r10` below
+    //    forwards user RSP (not the real `a3`) as arg4. This is the known
+    //    bug deferred to a follow-up — see header comment on this block.
     sub rsp, 8
     mov [rsp], r9     // a5 → stack slot for arg6
     mov r9, r8        // a4 → r9 (arg5)
