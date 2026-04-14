@@ -76,6 +76,32 @@ pub fn inc_refcount_in(slots: &[AtomicU16], phys: u64) -> u16 {
     }
 }
 
+/// Checked fetch-add of 1. Returns `Ok(prev)` on success or
+/// `Err(Saturated)` when the slot is already at `u16::MAX` and cannot
+/// be bumped. Unlike [`inc_refcount_in`] this never silently pins the
+/// slot: callers that cannot honour a saturated over-approximation
+/// (e.g. `fork_address_space`, which would otherwise UAF on the
+/// `u16::MAX`-th drop) use this variant and surface the saturation as
+/// a real error the way RFC 0001 specifies.
+pub fn try_inc_refcount_in(slots: &[AtomicU16], phys: u64) -> Result<u16, Saturated> {
+    let slot = page_refcount_in(slots, phys);
+    let mut cur = slot.load(Ordering::Relaxed);
+    loop {
+        if cur == u16::MAX {
+            return Err(Saturated);
+        }
+        match slot.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(prev) => return Ok(prev),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Returned by [`try_inc_refcount_in`] / [`try_inc_refcount`] when the
+/// slot is already pinned at `u16::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Saturated;
+
 /// Checked `fetch_sub(1, Release)`. Panics on underflow (refcount
 /// already zero). Returns the previous value; callers use
 /// `prev == 1` to detect "we just brought this frame to zero — it may
@@ -125,6 +151,13 @@ pub fn page_refcount(phys: u64) -> &'static AtomicU16 {
 #[cfg(target_os = "none")]
 pub fn inc_refcount(phys: u64) -> u16 {
     inc_refcount_in(&REFCOUNTS, phys)
+}
+
+/// Checked increment of the global slot for `phys`. See
+/// [`try_inc_refcount_in`] for semantics.
+#[cfg(target_os = "none")]
+pub fn try_inc_refcount(phys: u64) -> Result<u16, Saturated> {
+    try_inc_refcount_in(&REFCOUNTS, phys)
 }
 
 /// Checked decrement of the global slot for `phys`. See
@@ -194,6 +227,28 @@ mod tests {
         page_refcount_in(&t, 0x2000).store(u16::MAX - 1, Ordering::Relaxed);
         assert_eq!(inc_refcount_in(&t, 0x2000), u16::MAX - 1); // -> MAX
         assert_eq!(inc_refcount_in(&t, 0x2000), u16::MAX); // pinned
+        assert_eq!(
+            page_refcount_in(&t, 0x2000).load(Ordering::Relaxed),
+            u16::MAX,
+        );
+    }
+
+    #[test]
+    fn try_inc_succeeds_below_saturation() {
+        let t = mk(4);
+        init_on_alloc_in(&t, 0x1000);
+        assert_eq!(try_inc_refcount_in(&t, 0x1000), Ok(1)); // 1 -> 2
+        assert_eq!(try_inc_refcount_in(&t, 0x1000), Ok(2)); // 2 -> 3
+        assert_eq!(page_refcount_in(&t, 0x1000).load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn try_inc_errors_at_saturation_and_leaves_slot_pinned() {
+        let t = mk(4);
+        page_refcount_in(&t, 0x2000).store(u16::MAX - 1, Ordering::Relaxed);
+        assert_eq!(try_inc_refcount_in(&t, 0x2000), Ok(u16::MAX - 1)); // -> MAX
+        assert_eq!(try_inc_refcount_in(&t, 0x2000), Err(Saturated));
+        // Slot remains at MAX; checked variant did not corrupt it.
         assert_eq!(
             page_refcount_in(&t, 0x2000).load(Ordering::Relaxed),
             u16::MAX,
