@@ -741,8 +741,10 @@ pub enum ForkError {
 ///
 /// On `Err(ForkError::OutOfMemory)` or `Err(ForkError::RefcountSaturated)`
 /// the child is dropped cleanly (its partially-built PTEs are unmapped
-/// and frame refcounts are decremented by `Drop for AddressSpace`)
-/// before the error is returned.
+/// and frame refcounts are decremented by `Drop for AddressSpace`).
+/// Any parent PTEs that were already W-stripped before the failure are
+/// restored to their original flags so the parent is observable as
+/// unchanged after the error returns.
 #[cfg(target_os = "none")]
 impl AddressSpace {
     pub fn fork_address_space(
@@ -793,105 +795,145 @@ impl AddressSpace {
             })
             .collect();
 
-        for (start, end, prot_user, prot_pte, share, object, object_offset, vma_flags) in
-            &vma_snapshot
-        {
-            let prot_user = *prot_user;
-            let prot_pte = *prot_pte;
-            let share = *share;
-            let start = *start;
-            let end = *end;
-            let object_offset = *object_offset;
-            let vma_flags = *vma_flags;
+        // Parent PTEs we W-stripped during this fork. If any later
+        // iteration fails we walk this list to restore the original
+        // flags so the parent is observable as unchanged on error.
+        let mut stripped_parent: alloc::vec::Vec<(
+            Page<Size4KiB>,
+            x86_64::structures::paging::PhysFrame<Size4KiB>,
+            PageTableFlags,
+        )> = alloc::vec::Vec::new();
 
-            // Private VMAs get an independent empty cache; Shared VMAs alias the same frames.
-            let child_object = match share {
-                Share::Private => object.clone_private(),
-                Share::Shared => Arc::clone(object),
-            };
-            let mut child_vma = VmaEntry::new(
-                start,
-                end,
-                prot_user,
-                prot_pte,
-                share,
-                child_object,
-                object_offset,
-            );
-            child_vma.vma_flags = vma_flags; // preserve growsdown/guard flags
-            child.vmas.insert(child_vma);
-            child.vm_pages += (end - start) / 4096;
+        let result: Result<(), ForkError> = (|| {
+            for (start, end, prot_user, prot_pte, share, object, object_offset, vma_flags) in
+                &vma_snapshot
+            {
+                let prot_user = *prot_user;
+                let prot_pte = *prot_pte;
+                let share = *share;
+                let start = *start;
+                let end = *end;
+                let object_offset = *object_offset;
+                let vma_flags = *vma_flags;
 
-            let mut va = start;
-            while va < end {
-                let page = Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(va as u64))
-                    .expect("vma VA page-aligned");
+                // Private VMAs get an independent empty cache; Shared VMAs alias the same frames.
+                let child_object = match share {
+                    Share::Private => object.clone_private(),
+                    Share::Shared => Arc::clone(object),
+                };
+                let mut child_vma = VmaEntry::new(
+                    start,
+                    end,
+                    prot_user,
+                    prot_pte,
+                    share,
+                    child_object,
+                    object_offset,
+                );
+                child_vma.vma_flags = vma_flags; // preserve growsdown/guard flags
+                child.vmas.insert(child_vma);
+                child.vm_pages += (end - start) / 4096;
 
-                if let Some((pte_frame, pte_flags)) =
-                    paging::translate_in_pml4(self.page_table, x86_64::VirtAddr::new(va as u64))
-                {
-                    let phys = pte_frame.start_address().as_u64();
+                let mut va = start;
+                while va < end {
+                    let page =
+                        Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(va as u64))
+                            .expect("vma VA page-aligned");
 
-                    match share {
-                        Share::Private => {
-                            let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
-                            // Acquire child PTE reference. A saturated slot
-                            // means the caller would have to accept an
-                            // under-approximation — refuse the fork instead.
-                            refcount::try_inc_refcount(phys)
-                                .map_err(|_| ForkError::RefcountSaturated)?;
-                            if let Err(_) = paging::map_existing_in_pml4(
-                                child.page_table,
-                                page,
-                                pte_frame,
-                                ro_flags,
-                            ) {
-                                // Roll back the child PTE increment.
-                                refcount::dec_refcount(phys);
-                                return Err(ForkError::OutOfMemory);
+                    if let Some((pte_frame, pte_flags)) =
+                        paging::translate_in_pml4(self.page_table, x86_64::VirtAddr::new(va as u64))
+                    {
+                        let phys = pte_frame.start_address().as_u64();
+
+                        match share {
+                            Share::Private => {
+                                let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
+                                // Acquire child PTE reference. A saturated slot
+                                // means honouring the fork would require an
+                                // under-approximation — refuse instead.
+                                refcount::try_inc_refcount(phys)
+                                    .map_err(|_| ForkError::RefcountSaturated)?;
+                                if paging::map_existing_in_pml4(
+                                    child.page_table,
+                                    page,
+                                    pte_frame,
+                                    ro_flags,
+                                )
+                                .is_err()
+                                {
+                                    refcount::dec_refcount(phys);
+                                    return Err(ForkError::OutOfMemory);
+                                }
+                                // W-strip parent PTE: unmap then remap read-only
+                                // to the same frame. The parent's reference stays
+                                // attached across the swap, so no refcount churn.
+                                let _ = paging::unmap_in_pml4(self.page_table, page);
+                                if paging::map_existing_in_pml4(
+                                    self.page_table,
+                                    page,
+                                    pte_frame,
+                                    ro_flags,
+                                )
+                                .is_err()
+                                {
+                                    // Parent PTE is gone and its refcount slot
+                                    // is now floating; release so the frame can
+                                    // be reclaimed when the child drops.
+                                    refcount::dec_refcount(phys);
+                                    return Err(ForkError::OutOfMemory);
+                                }
+                                stripped_parent.push((page, pte_frame, pte_flags));
+                                flusher.invalidate(x86_64::VirtAddr::new(va as u64));
                             }
-                            // W-strip parent PTE: unmap then remap read-only
-                            // to the same frame. The parent's reference stays
-                            // attached to the frame across the swap — no
-                            // put/inc churn, which also sidesteps a saturation
-                            // hazard on the re-acquire.
-                            let _ = paging::unmap_in_pml4(self.page_table, page);
-                            if let Err(_) = paging::map_existing_in_pml4(
-                                self.page_table,
-                                page,
-                                pte_frame,
-                                ro_flags,
-                            ) {
-                                // The parent PTE is now gone and the frame's
-                                // refcount still carries the (now floating)
-                                // parent reference. Release it so the frame
-                                // can be reclaimed when the child drops.
-                                refcount::dec_refcount(phys);
-                                return Err(ForkError::OutOfMemory);
-                            }
-                            flusher.invalidate(x86_64::VirtAddr::new(va as u64));
-                        }
-                        Share::Shared => {
-                            // Shared mapping: child gets same frame + flags.
-                            refcount::try_inc_refcount(phys)
-                                .map_err(|_| ForkError::RefcountSaturated)?;
-                            if let Err(_) = paging::map_existing_in_pml4(
-                                child.page_table,
-                                page,
-                                pte_frame,
-                                pte_flags,
-                            ) {
-                                refcount::dec_refcount(phys);
-                                return Err(ForkError::OutOfMemory);
+                            Share::Shared => {
+                                // Shared mapping: child gets same frame + flags.
+                                refcount::try_inc_refcount(phys)
+                                    .map_err(|_| ForkError::RefcountSaturated)?;
+                                if paging::map_existing_in_pml4(
+                                    child.page_table,
+                                    page,
+                                    pte_frame,
+                                    pte_flags,
+                                )
+                                .is_err()
+                                {
+                                    refcount::dec_refcount(phys);
+                                    return Err(ForkError::OutOfMemory);
+                                }
                             }
                         }
                     }
-                }
-                // Pages not yet faulted in have no PTE; child will demand-fault
-                // them independently.
+                    // Pages not yet faulted in have no PTE; child will
+                    // demand-fault them independently.
 
-                va += 4096;
+                    va += 4096;
+                }
             }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            // Restore every parent PTE we W-stripped so the parent is
+            // unchanged from the caller's perspective. Uses the original
+            // flags captured at the time of the strip. unmap_in_pml4 +
+            // map_existing_in_pml4 is the same sequence used on entry;
+            // failure here would leave the parent unmapped at that VA,
+            // which we can't meaningfully repair — log-and-continue so
+            // the remaining restores still run, and the child drop still
+            // balances refcounts.
+            for (page, frame, orig_flags) in &stripped_parent {
+                let _ = paging::unmap_in_pml4(self.page_table, *page);
+                if paging::map_existing_in_pml4(self.page_table, *page, *frame, *orig_flags)
+                    .is_err()
+                {
+                    // Parent PTE is gone, but the refcount slot still
+                    // carries the now-floating reference. Release it so
+                    // the frame can be reclaimed once the child drops.
+                    refcount::dec_refcount(frame.start_address().as_u64());
+                }
+                flusher.invalidate(page.start_address());
+            }
+            return Err(e);
         }
 
         Ok(child)

@@ -54,6 +54,10 @@ fn run_tests() {
             "fork_saturated_parent_survives",
             &(fork_saturated_parent_survives as fn()),
         ),
+        (
+            "fork_late_saturation_restores_earlier_pte",
+            &(fork_late_saturation_restores_earlier_pte as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -63,7 +67,7 @@ fn run_tests() {
 }
 
 const FORK_VA: usize = 0x0000_5000_0000_0000;
-const FORK_PAGES: usize = 1;
+const FORK_PAGES: usize = 2;
 
 fn prot_pte_rw() -> u64 {
     (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE).bits()
@@ -197,5 +201,48 @@ fn fork_saturated_parent_survives() {
     assert_eq!(pte_frame.start_address().as_u64(), phys);
 
     unbump_refcount(phys, delta);
+    drop(parent);
+}
+
+/// Prefault two pages, pin page 1's refcount at MAX but leave page 0
+/// nominal. Fork must fail at page 1, and after the error the parent's
+/// page 0 PTE must still be WRITABLE (rolled back from the mid-walk
+/// W-strip). Prevents the "late fork failure leaves earlier parent
+/// pages W-stripped" regression flagged on #254.
+fn fork_late_saturation_restores_earlier_pte() {
+    let mut parent = make_aspace(Share::Private);
+    let phys0 = prefault_page(&parent, 0);
+    let phys1 = prefault_page(&parent, 1);
+    let delta1 = bump_refcount_to(phys1, u16::MAX);
+
+    let mut flusher = Flusher::new_active();
+    let result = parent.fork_address_space(&mut flusher);
+    flusher.finish();
+    match result {
+        Err(ForkError::RefcountSaturated) => {}
+        Err(other) => panic!("expected RefcountSaturated, got {other:?}"),
+        Ok(_) => panic!("fork must fail on mid-walk saturation"),
+    }
+
+    // Page 0 PTE must be restored to writable (the rollback path).
+    let (frame0, flags0) =
+        paging::translate_in_pml4(parent.page_table_frame(), VirtAddr::new(FORK_VA as u64))
+            .expect("parent page 0 PTE lost after rollback");
+    assert_eq!(frame0.start_address().as_u64(), phys0);
+    assert!(
+        flags0.contains(PageTableFlags::WRITABLE),
+        "parent page 0 must remain WRITABLE after a mid-walk fork rollback",
+    );
+
+    // Page 1 PTE must still be present and unchanged.
+    let (frame1, flags1) = paging::translate_in_pml4(
+        parent.page_table_frame(),
+        VirtAddr::new((FORK_VA + 4096) as u64),
+    )
+    .expect("parent page 1 PTE lost after rollback");
+    assert_eq!(frame1.start_address().as_u64(), phys1);
+    assert!(flags1.contains(PageTableFlags::WRITABLE));
+
+    unbump_refcount(phys1, delta1);
     drop(parent);
 }
