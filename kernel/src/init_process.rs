@@ -127,7 +127,10 @@ fn init_ring3_entry() -> ! {
 
     let pml4_frame = init_aspace.read().page_table_frame();
 
-    crate::task::replace_current_address_space(init_aspace, pml4_frame);
+    // Replace the task's address space, keeping the old Arc alive until after
+    // the CR3 switch so the old PML4 frame stays valid for any IRQs that fire
+    // in the gap between the assignment and the write to CR3.
+    let _old_aspace = crate::task::replace_current_address_space(init_aspace, pml4_frame);
 
     // Switch to the init process's address space.
     unsafe {
@@ -136,6 +139,8 @@ fn init_ring3_entry() -> ! {
             x86_64::registers::control::Cr3Flags::empty(),
         );
     }
+    // _old_aspace is dropped here — after CR3 switch, safe to free the old PML4.
+    drop(_old_aspace);
     serial_println!("init: switched to process PML4");
 
     // Configure TSS.rsp[0] and SYSCALL_KERNEL_RSP to use this task's OWN

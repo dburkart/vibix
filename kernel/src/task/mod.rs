@@ -542,8 +542,10 @@ pub fn update_current_cr3(
 }
 
 /// Replace the current task's address space and CR3 with a pre-built
-/// `AddressSpace`. The old (empty) address space that `Task::new_with_priority`
-/// allocated is dropped, freeing its PML4 frame.
+/// `AddressSpace`. Returns the *old* `Arc` so the caller can drop it **after**
+/// the CPU's CR3 has been switched away — dropping it here would free the
+/// old PML4 frame while it is still the active page table root, creating a
+/// use-after-free if an interrupt fires in the gap.
 ///
 /// Called from `init_ring3_entry` to install the address space that was
 /// prepared in `init_process::launch` (which includes ELF VMA entries and
@@ -551,15 +553,15 @@ pub fn update_current_cr3(
 pub fn replace_current_address_space(
     aspace: alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>>,
     cr3: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
-) {
+) -> alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>> {
     let mut sched = SCHED.lock();
     let current = sched
         .current
         .as_mut()
         .expect("replace_current_address_space: no running task");
-    // The old address_space Arc is dropped here, which frees the empty PML4.
-    current.address_space = aspace;
+    let old = core::mem::replace(&mut current.address_space, aspace);
     current.cr3 = cr3;
+    old // caller must drop this AFTER switching CR3
 }
 
 /// Prepare the current task to run in ring-3: configure TSS.rsp[0] and

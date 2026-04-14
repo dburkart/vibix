@@ -102,11 +102,14 @@ fork_child_sysret:
     //
     // SYSRETQ: rcx → RIP, r11 → RFLAGS, CS/SS switched to ring-3 selectors.
     //
-    // sti: IF was cleared by SFMASK on the parent's SYSCALL entry (which
-    // forked us). Re-enable interrupts so the child can be preempted.
-    sti
+    // Do NOT sti here: rbx already holds the parent's saved RFLAGS which
+    // includes IF=1 (user mode runs with interrupts enabled). SYSRETQ
+    // restores RFLAGS from r11, so IF is re-enabled atomically when the CPU
+    // transitions to ring-3. An explicit sti before the RSP switch would
+    // allow an IRQ to fire with a kernel-mode CS but a user-mode RSP,
+    // corrupting the user stack.
     mov rcx, r12      // user RIP
-    mov r11, rbx      // user RFLAGS
+    mov r11, rbx      // user RFLAGS (IF=1 → interrupts re-enabled by SYSRETQ)
     xor eax, eax      // return 0 — fork() child path
     mov rsp, rbp      // restore user RSP (switch stack before SYSRETQ)
     sysretq

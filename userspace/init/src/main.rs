@@ -55,7 +55,17 @@ pub extern "C" fn _start() -> ! {
                 options(nostack, preserves_flags),
             );
         }
-        // execve only returns on failure — spin.
+        // execve only returns on failure — exit with an error code.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") 60u64, // exit
+                in("rdi") 1u64,  // status 1 (exec failed)
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
         loop {
             core::hint::spin_loop();
         }
