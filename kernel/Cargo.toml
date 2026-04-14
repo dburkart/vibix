@@ -183,3 +183,7 @@ harness = false
 [[test]]
 name = "syscall_mmap_family"
 harness = false
+
+[[test]]
+name = "vfs_backend"
+harness = false

@@ -677,6 +677,7 @@ fn test_all() -> R<()> {
         "fd_table",
         "syscall_open_mmap",
         "vm_integration",
+        "vfs_backend",
     ] {
         cmd.arg("--test").arg(t);
     }

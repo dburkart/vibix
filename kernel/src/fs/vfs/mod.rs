@@ -45,6 +45,7 @@
 
 use alloc::vec::Vec;
 
+pub mod backend;
 pub mod dentry;
 pub mod gc_queue;
 pub mod inode;
@@ -55,6 +56,7 @@ pub mod path_walk;
 pub mod ramfs;
 pub mod super_block;
 
+pub use backend::VfsBackend;
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
@@ -204,6 +206,7 @@ const _: () = {
     assert_send_sync::<Dentry>();
     assert_send_sync::<MountEdge>();
     assert_send_sync::<OpenFile>();
+    assert_send_sync::<VfsBackend>();
 };
 
 #[cfg(test)]
