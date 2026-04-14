@@ -25,7 +25,7 @@ use super::super::syscall::copy_path_from_user_pub;
 use super::super::uaccess;
 use crate::fs::vfs::dentry::{DFlags, Dentry};
 use crate::fs::vfs::ops::{meta_into_stat, Stat};
-use crate::fs::vfs::path_walk::{path_walk, LookupFlags, NameIdata};
+use crate::fs::vfs::path_walk::{path_walk, LookupFlags, MountResolver, NameIdata};
 use crate::fs::vfs::super_block::SbActiveGuard;
 use crate::fs::vfs::Credential;
 use crate::fs::vfs::{
@@ -365,20 +365,44 @@ pub unsafe fn sys_getcwd(buf_uva: u64, len: u64) -> i64 {
     };
 
     // Walk the parent chain. We hold strong Arcs in `chain` to keep
-    // dentries alive while assembling the path string. Stop at:
-    //   - IS_ROOT dentry (the VFS namespace root), or
-    //   - a failed Weak upgrade (orphaned/disconnected dentry — treat as root).
+    // dentries alive while assembling the path string.
+    //
+    // Mount crossings: when we land on an `IS_ROOT` dentry, query
+    // `MOUNT_TABLE` for the edge whose `root_dentry` is this dentry. If
+    // found, the mountpoint in the parent FS is the next step upward and
+    // its name is what belongs in the path. If not found (we are at the
+    // VFS namespace root), stop.
     let mut chain: Vec<Arc<Dentry>> = Vec::new();
+    let resolver = GlobalMountResolver;
 
     let mut cur = cwd.clone();
     loop {
         if cur.flags.contains(DFlags::IS_ROOT) {
-            break;
-        }
-        chain.push(cur.clone());
-        match cur.parent.upgrade() {
-            Some(parent) => cur = parent,
-            None => break,
+            // Check if this is a mounted root (has a parent FS above it).
+            match resolver.mount_above(&cur) {
+                Some(edge) => {
+                    // Cross back up to the mountpoint in the parent FS.
+                    // The mountpoint's name is the directory name in the
+                    // parent (e.g. "dev" for /dev).
+                    match edge.mountpoint.upgrade() {
+                        Some(mp) => {
+                            chain.push(mp.clone());
+                            match mp.parent.upgrade() {
+                                Some(parent) => cur = parent,
+                                None => break,
+                            }
+                        }
+                        None => break, // mountpoint dropped — treat as root
+                    }
+                }
+                None => break, // namespace root — stop
+            }
+        } else {
+            chain.push(cur.clone());
+            match cur.parent.upgrade() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
         }
     }
 
