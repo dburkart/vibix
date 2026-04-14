@@ -34,6 +34,10 @@ fn run_tests() {
             "load_user_elf_rejects_upper_half",
             &(load_user_elf_rejects_upper_half as fn()),
         ),
+        (
+            "load_user_elf_rejects_segment_ending_at_user_va_end",
+            &(load_user_elf_rejects_segment_ending_at_user_va_end as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -119,4 +123,48 @@ fn load_user_elf_rejects_upper_half() {
         result
     );
     serial_println!("load_user_elf correctly rejected upper-half ELF");
+}
+
+fn load_user_elf_rejects_segment_ending_at_user_va_end() {
+    // PT_LOAD whose last byte (page-aligned) lands exactly at
+    // USER_VA_END = 0x0000_8000_0000_0000 — the first non-canonical
+    // lower-half address. `VirtAddr::new(image.image_end)` would
+    // panic if the loader reported it back to the caller, so the
+    // loader must reject at parse time.
+    const EHDR: usize = 64;
+    const PHDR: usize = 56;
+    let mut bytes = [0u8; EHDR + PHDR];
+
+    bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    bytes[4] = 2; // ELFCLASS64
+    bytes[5] = 1; // little-endian
+    bytes[6] = 1; // ELF version
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    bytes[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+                                                        // Entry inside the segment, canonical lower-half.
+    bytes[24..32].copy_from_slice(&0x0000_7fff_ffff_f000u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(EHDR as u64).to_le_bytes()); // e_phoff
+    bytes[52..54].copy_from_slice(&(EHDR as u16).to_le_bytes()); // e_ehsize
+    bytes[54..56].copy_from_slice(&(PHDR as u16).to_le_bytes()); // e_phentsize
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+
+    let p = EHDR;
+    bytes[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    bytes[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // R+X
+                                                              // p_vaddr = USER_VA_END - 0x1000, so page-aligned end == USER_VA_END.
+    bytes[p + 16..p + 24].copy_from_slice(&0x0000_7fff_ffff_f000u64.to_le_bytes());
+    bytes[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+
+    let pml4 = vibix::mem::paging::new_task_pml4();
+    let result = vibix::mem::loader::load_user_elf(&bytes, pml4);
+    assert!(
+        matches!(
+            result,
+            Err(vibix::mem::loader::LoadError::SegmentEndsAtUserVaEnd)
+        ),
+        "expected SegmentEndsAtUserVaEnd, got {:?}",
+        result
+    );
+    serial_println!("load_user_elf correctly rejected segment ending at USER_VA_END");
 }
