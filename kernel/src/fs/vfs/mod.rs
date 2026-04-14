@@ -45,6 +45,21 @@
 
 use alloc::vec::Vec;
 
+pub mod dentry;
+pub mod inode;
+pub mod ops;
+pub mod open_file;
+pub mod super_block;
+
+pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
+pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
+pub use ops::{
+    FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat, StatFs, SuperOps,
+    Whence, default_permission,
+};
+pub use open_file::OpenFile;
+pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
+
 /// POSIX-imposed cap on a single path component.
 pub const NAME_MAX: usize = 255;
 
@@ -157,6 +172,13 @@ const _: () = {
     assert_send_sync::<Credential>();
     assert_send_sync::<Access>();
     assert_send_sync::<DString>();
+    assert_send_sync::<SuperBlock>();
+    assert_send_sync::<Inode>();
+    assert_send_sync::<InodeMeta>();
+    assert_send_sync::<InodeState>();
+    assert_send_sync::<Dentry>();
+    assert_send_sync::<MountEdge>();
+    assert_send_sync::<OpenFile>();
 };
 
 #[cfg(test)]
