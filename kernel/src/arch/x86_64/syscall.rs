@@ -276,10 +276,23 @@ pub unsafe extern "C" fn syscall_dispatch(
             written as i64
         }
 
-        // open(path, flags, mode) — pre-VFS: only `/dev/stdin`,
-        // `/dev/stdout`, `/dev/stderr`, and `/dev/serial` resolve, all
-        // backed by `SerialBackend`. Any other path returns -ENOENT.
+        // open(path, flags, mode) — VFS-backed; see `sys_open`.
         OPEN => sys_open(a0, a1, a2),
+
+        // stat(path, *statbuf) — follow symlinks, then write `struct stat`.
+        4 => super::syscalls::vfs::sys_stat_impl(a0, a1, /* nofollow */ false),
+
+        // fstat(fd, *statbuf)
+        5 => super::syscalls::vfs::sys_fstat_impl(a0, a1),
+
+        // lstat(path, *statbuf) — like stat but don't follow a final symlink.
+        6 => super::syscalls::vfs::sys_stat_impl(a0, a1, /* nofollow */ true),
+
+        // openat(dfd, path, flags, mode)
+        257 => super::syscalls::vfs::sys_openat_impl(a0 as i32, a1, a2, a3),
+
+        // newfstatat(dfd, path, *statbuf, flags)
+        262 => super::syscalls::vfs::sys_newfstatat_impl(a0 as i32, a1, a2, a3 as u32),
 
         // mmap(addr, len, prot, flags, fd, off) — anon-private and
         // anon-shared with full MAP_FIXED / MAP_GROWSDOWN support. See
@@ -459,10 +472,6 @@ pub unsafe extern "C" fn syscall_dispatch(
     }
 }
 
-/// Maximum path length accepted by `sys_open`, including the terminating
-/// NUL. Matches the longest special path we handle today.
-const OPEN_PATH_MAX: usize = 128;
-
 /// Atomic execve body: stage the new image into a fresh `AddressSpace`
 /// and only commit it once the load has fully succeeded.
 ///
@@ -544,6 +553,17 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
     unsafe { jump_to_ring3(image.entry.as_u64(), crate::init_process::USER_STACK_TOP) }
 }
 
+/// Public wrapper around `copy_path_from_user` for use by the VFS
+/// syscall handlers in `super::syscalls::vfs`. Keeping one copy-in
+/// implementation guarantees every path syscall uses identical
+/// validation (user-range bound, NUL-termination, `ENAMETOOLONG`).
+pub(super) unsafe fn copy_path_from_user_pub(
+    uva: usize,
+    buf: &mut [u8],
+) -> Result<usize, i64> {
+    copy_path_from_user(uva, buf)
+}
+
 /// Copy a NUL-terminated path from user VA `uva` into `buf`. Returns
 /// the slice (without the NUL) on success, or a negative errno on
 /// failure. Mirrors Linux `strncpy_from_user` semantics: short path →
@@ -568,48 +588,15 @@ unsafe fn copy_path_from_user(uva: usize, buf: &mut [u8]) -> Result<usize, i64> 
     Err(crate::fs::ENAMETOOLONG)
 }
 
-/// `open(path, flags, mode)` — pre-VFS stub.
+/// `open(path, flags, mode)` — VFS-backed `open`.
 ///
-/// Resolves only the four special device paths listed below, each
-/// backed by `SerialBackend`. Any other path returns `-ENOENT` so that
-/// userspace gets the real "no such file" signal rather than `-ENOSYS`.
-/// `mode` is accepted but unused (there is nothing to create yet).
-unsafe fn sys_open(path_uva: u64, flags: u64, _mode: u64) -> i64 {
-    use crate::fs::{flags as oflags, FileBackend, FileDescription, SerialBackend, ENOENT};
-    use alloc::sync::Arc;
-
-    let mut buf = [0u8; OPEN_PATH_MAX];
-    let n = match copy_path_from_user(path_uva as usize, &mut buf) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    let path = &buf[..n];
-
-    let is_special = matches!(
-        path,
-        b"/dev/stdin" | b"/dev/stdout" | b"/dev/stderr" | b"/dev/serial"
-    );
-    if !is_special {
-        return ENOENT;
-    }
-
-    // Split caller flags: access mode goes into FileDescription.flags;
-    // O_CLOEXEC goes into the per-fd slot flags (so dup() can clear it
-    // without touching the shared description).
-    let access_flags = (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR);
-    let fd_flags = (flags as u32) & oflags::O_CLOEXEC;
-
-    let backend: Arc<dyn FileBackend> = Arc::new(SerialBackend);
-    let desc = Arc::new(FileDescription {
-        backend,
-        flags: access_flags,
-    });
-    let tbl = crate::task::current_fd_table();
-    let result = tbl.lock().alloc_fd_with_flags(desc, fd_flags);
-    match result {
-        Ok(fd) => fd as i64,
-        Err(e) => e,
-    }
+/// Equivalent to `openat(AT_FDCWD, path, flags, mode)`. Delegates to
+/// [`crate::arch::x86_64::syscalls::vfs::sys_openat_impl`]; see that
+/// function for the full semantics including the `/dev/{stdin,stdout,
+/// stderr,serial}` legacy-compat fallback for callers that open before
+/// `/dev/serial` has been wired into devfs.
+unsafe fn sys_open(path_uva: u64, flags: u64, mode: u64) -> i64 {
+    super::syscalls::vfs::sys_openat_impl(super::syscalls::vfs::AT_FDCWD, path_uva, flags, mode)
 }
 
 /// Build `prot_pte` from user-visible `prot_user` bits. `PROT_WRITE`
@@ -945,6 +932,9 @@ pub mod syscall_nr {
     pub const LSEEK: u64 = 8;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
+    pub const STAT: u64 = 4;
+    pub const LSTAT: u64 = 6;
+    pub const NEWFSTATAT: u64 = 262;
 }
 
 #[cfg(test)]
@@ -977,9 +967,12 @@ mod tests {
 
         // Filesystem
         assert_eq!(syscall_nr::OPEN, 2, "SYS_open must be 2");
+        assert_eq!(syscall_nr::STAT, 4, "SYS_stat must be 4");
         assert_eq!(syscall_nr::FSTAT, 5, "SYS_fstat must be 5");
+        assert_eq!(syscall_nr::LSTAT, 6, "SYS_lstat must be 6");
         assert_eq!(syscall_nr::GETDENTS64, 217, "SYS_getdents64 must be 217");
         assert_eq!(syscall_nr::OPENAT, 257, "SYS_openat must be 257");
+        assert_eq!(syscall_nr::NEWFSTATAT, 262, "SYS_newfstatat must be 262");
 
         // Signals
         assert_eq!(syscall_nr::SIGRETURN, 15, "SYS_rt_sigreturn must be 15");
