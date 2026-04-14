@@ -201,9 +201,7 @@ fn make_cow_parent() -> AddressSpace {
 fn demand_fault(aspace: &AddressSpace) -> u64 {
     let vma = aspace.find(FORK_VA).expect("vma missing");
     let obj = Arc::clone(&vma.object);
-    let phys = obj
-        .fault(0, Access::Write)
-        .expect("VmObject::fault failed");
+    let phys = obj.fault(0, Access::Write).expect("VmObject::fault failed");
     let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(FORK_VA as u64))
         .expect("page-aligned VA");
     let frame = PhysFrame::from_start_address(PhysAddr::new(phys)).expect("frame-aligned phys");
