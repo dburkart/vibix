@@ -33,7 +33,7 @@ use crate::mem::addrspace::AddressSpace;
 use crate::mem::paging;
 
 use super::priority::{AFFINITY_ALL, DEFAULT_PRIORITY};
-use super::switch::task_entry_trampoline;
+use super::switch::{fork_child_sysret, task_entry_trampoline};
 use super::DEFAULT_SLICE_MS;
 
 /// Scheduling state of a [`Task`].
@@ -134,6 +134,19 @@ pub(super) struct Task {
     /// can be shared across threads in the same process (clone(2)-style)
     /// and cloned cheaply for fork() and exec() paths.
     pub fd_table: Arc<Mutex<FileDescTable>>,
+
+    /// Top of this task's dedicated SYSCALL kernel stack (set when this
+    /// task runs in ring-3 and needs its own syscall entry point).
+    ///
+    /// `0` means "use the global `INIT_KERNEL_STACK`" — correct for
+    /// purely-kernel tasks that never execute SYSCALL from ring-3, and
+    /// for the init task before `init_ring3_entry` initialises it.
+    ///
+    /// Set to `guard_base + GUARD_SIZE + STACK_SIZE` for user-space
+    /// tasks. The preempt / block paths update `SYSCALL_KERNEL_RSP` to
+    /// this value whenever they switch into this task so that ring-3
+    /// syscalls land on the right per-task stack.
+    pub syscall_stack_top: u64,
 }
 
 impl Task {
@@ -163,6 +176,7 @@ impl Task {
             // at that moment.
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
+            syscall_stack_top: 0,
         }
     }
 
@@ -251,6 +265,7 @@ impl Task {
             address_space: Arc::new(RwLock::new(address_space)),
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
+            syscall_stack_top: 0, // kernel-only task — no ring-3 syscall stack needed yet
         }
     }
 
@@ -280,5 +295,95 @@ impl Task {
     /// Always returns `false` for the bootstrap task (`guard_base == 0`).
     pub fn is_guard_hit(&self, addr: usize) -> bool {
         self.guard_base != 0 && addr >= self.guard_base && addr < self.guard_base + GUARD_SIZE
+    }
+
+    /// Build a new task that is a fork child. On first scheduling the task
+    /// returns to ring-3 via `fork_child_sysret` with rax=0 (the child's
+    /// fork() return value).
+    ///
+    /// `user_rip`, `user_rflags`, and `user_rsp` are the saved ring-3
+    /// register context from the parent's SYSCALL entry.
+    /// `parent_fpu` is the parent's current FPU save area (copied verbatim
+    /// so the child inherits the same floating-point state at fork time).
+    /// `parent_priority` / `parent_affinity` are copied directly.
+    ///
+    /// # Safety
+    /// `parent_fpu` must be a valid, aligned `FpuArea` that remains live
+    /// for the duration of this call (the FPU copy happens before return).
+    pub unsafe fn new_forked(
+        user_rip: u64,
+        user_rflags: u64,
+        user_rsp: u64,
+        parent_priority: u8,
+        parent_affinity: u64,
+        parent_fpu: *const crate::arch::x86_64::fpu::FpuArea,
+        child_address_space: alloc::sync::Arc<spin::RwLock<AddressSpace>>,
+        child_cr3: PhysFrame<Size4KiB>,
+        child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
+    ) -> Self {
+        // Allocate a fresh guard+stack slot.
+        let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
+        let guard_base = slot_va;
+        let stack_base = slot_va + GUARD_SIZE;
+
+        Page::<Size4KiB>::from_start_address(VirtAddr::new(stack_base as u64))
+            .expect("forked task stack base must be page aligned");
+        let stack_page_count = (STACK_SIZE / 4096) as u64;
+        let mut flusher = crate::mem::tlb::Flusher::new_active();
+        paging::map_range(
+            VirtAddr::new(stack_base as u64),
+            stack_page_count,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+            &mut flusher,
+        )
+        .expect("failed to map forked task stack");
+        flusher.finish();
+
+        let top = stack_base + STACK_SIZE;
+
+        // Prime the stack so context_switch restores:
+        //   r15=0, r14=0, r13=0,
+        //   r12 = user_rip    → rcx for SYSRETQ
+        //   rbp = user_rsp    → rsp before SYSRETQ
+        //   rbx = user_rflags → r11 for SYSRETQ
+        //   ret = fork_child_sysret
+        let rsp = top - 7 * 8;
+        let slots = rsp as *mut usize;
+        unsafe {
+            slots.add(0).write(0); // r15
+            slots.add(1).write(0); // r14
+            slots.add(2).write(0); // r13
+            slots.add(3).write(user_rip as usize); // r12 → rcx
+            slots.add(4).write(user_rsp as usize); // rbp → rsp
+            slots.add(5).write(user_rflags as usize); // rbx → r11
+            slots.add(6).write(fork_child_sysret as *const () as usize); // ret
+        }
+
+        let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+
+        // Copy the parent's FPU state into a fresh area.
+        let mut fpu = FpuArea::new_initialized();
+        unsafe {
+            core::ptr::copy_nonoverlapping(parent_fpu, &mut *fpu as *mut _, 1);
+        }
+
+        Self {
+            id,
+            guard_base,
+            rsp,
+            slice_remaining_ms: DEFAULT_SLICE_MS,
+            state: TaskState::Ready,
+            wake_pending: AtomicBool::new(false),
+            priority: parent_priority,
+            affinity: parent_affinity,
+            cr3: child_cr3,
+            address_space: child_address_space,
+            fpu,
+            fd_table: child_fd_table,
+            // The child task runs in ring-3; it needs its own SYSCALL stack
+            // so it doesn't clobber the parent's saved SYSCALL context on the
+            // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.
+            syscall_stack_top: (stack_base + STACK_SIZE) as u64,
+        }
     }
 }

@@ -88,6 +88,117 @@ pub fn spawn_with_priority(entry: fn() -> !, priority: u8) {
     maybe_preempt_current_for_priority(&mut sched, new_prio);
 }
 
+/// Like [`spawn`] but returns the newly-assigned task ID.
+/// Used by `init_process::launch` to register PID 1 with the correct ID.
+pub fn spawn_and_get_id(entry: fn() -> !) -> usize {
+    let task = Box::new(Task::new_with_priority(entry, DEFAULT_PRIORITY));
+    let id = task.id;
+    let new_prio = task.priority;
+    let mut sched = SCHED.lock();
+    sched.push_ready(task);
+    maybe_preempt_current_for_priority(&mut sched, new_prio);
+    id
+}
+
+/// Clone the current task's address space and fd table for a fork child,
+/// allocate a new kernel stack, push the child onto the ready queue, and
+/// return the child's task ID.
+///
+/// `user_rip`, `user_rflags`, `user_rsp` are the ring-3 register state
+/// saved by the SYSCALL entry before invoking `syscall_dispatch`.
+pub fn fork_current_task(
+    user_rip: u64,
+    user_rflags: u64,
+    user_rsp: u64,
+) -> Result<usize, crate::mem::addrspace::ForkError> {
+    use alloc::sync::Arc;
+    use spin::{Mutex, RwLock};
+
+    // Snapshot everything needed from the current task while holding
+    // SCHED, then release it before calling fork_address_space.
+    let (parent_address_space, parent_fd_table, parent_priority, parent_affinity, parent_fpu_ptr) = {
+        let sched = SCHED.lock();
+        let cur = sched
+            .current
+            .as_ref()
+            .expect("fork_current_task: no running task");
+        (
+            Arc::clone(&cur.address_space),
+            Arc::clone(&cur.fd_table),
+            cur.priority,
+            cur.affinity,
+            // SAFETY: the parent Task is the currently-running task and stays
+            // alive in SCHED for the duration of this syscall. We only read
+            // the FPU area during the new_forked call below.
+            &*cur.fpu as *const crate::arch::x86_64::fpu::FpuArea,
+        )
+    };
+
+    // CoW-clone the address space (requires AddressSpace write lock).
+    let child_aspace = {
+        let mut tlb = crate::mem::tlb::Flusher::new_active();
+        let child = parent_address_space.write().fork_address_space(&mut tlb)?;
+        tlb.finish();
+        child
+    };
+    let child_cr3 = child_aspace.page_table_frame();
+    let child_aspace = Arc::new(RwLock::new(child_aspace));
+
+    // Clone the fd table (slot-independent, description-shared).
+    let child_fd = Arc::new(Mutex::new(parent_fd_table.lock().clone_for_fork()));
+
+    // SAFETY: parent_fpu_ptr was snapshotted while SCHED was held; the
+    // parent task is the currently-running task and cannot be removed while
+    // we are executing in its syscall context (single-CPU kernel).
+    let child = unsafe {
+        Task::new_forked(
+            user_rip,
+            user_rflags,
+            user_rsp,
+            parent_priority,
+            parent_affinity,
+            parent_fpu_ptr,
+            child_aspace,
+            child_cr3,
+            child_fd,
+        )
+    };
+    let child_id = child.id;
+    let child_box = Box::new(child);
+    let new_prio = child_box.priority;
+    let mut sched = SCHED.lock();
+    sched.push_ready(child_box);
+    maybe_preempt_current_for_priority(&mut sched, new_prio);
+    Ok(child_id)
+}
+
+/// Return the `Arc<RwLock<AddressSpace>>` of the currently-running task.
+/// Used by the exec() syscall to clear and reload the address space.
+///
+/// # Panics
+/// Panics if called before `task::init`.
+pub fn current_address_space() -> alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>>
+{
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .expect("current_address_space: no running task")
+        .address_space
+        .clone()
+}
+
+/// Return the CR3 frame of the currently-running task.
+pub fn current_cr3() -> x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>
+{
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .expect("current_cr3: no running task")
+        .cr3
+}
+
 /// Like [`spawn_with_priority`] but accepts a UNIX-style nice value
 /// (`-20..=19`). Wrapper for API ergonomics — mapping lives in
 /// [`priority_from_nice`].
@@ -430,6 +541,61 @@ pub fn update_current_cr3(
     current.cr3 = frame;
 }
 
+/// Replace the current task's address space and CR3 with a pre-built
+/// `AddressSpace`. Returns the *old* `Arc` so the caller can drop it **after**
+/// the CPU's CR3 has been switched away — dropping it here would free the
+/// old PML4 frame while it is still the active page table root, creating a
+/// use-after-free if an interrupt fires in the gap.
+///
+/// Called from `init_ring3_entry` to install the address space that was
+/// prepared in `init_process::launch` (which includes ELF VMA entries and
+/// a stack VMA so fork works correctly).
+pub fn replace_current_address_space(
+    aspace: alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>>,
+    cr3: x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>,
+) -> alloc::sync::Arc<spin::RwLock<crate::mem::addrspace::AddressSpace>> {
+    let mut sched = SCHED.lock();
+    let current = sched
+        .current
+        .as_mut()
+        .expect("replace_current_address_space: no running task");
+    let old = core::mem::replace(&mut current.address_space, aspace);
+    current.cr3 = cr3;
+    old // caller must drop this AFTER switching CR3
+}
+
+/// Prepare the current task to run in ring-3: configure TSS.rsp[0] and
+/// `SYSCALL_KERNEL_RSP` to point at the TOP of this task's own kernel stack
+/// so ring-3 syscalls and exceptions land on a per-task stack (not the shared
+/// `INIT_KERNEL_STACK`). Also records `syscall_stack_top` in the task so
+/// the preempt/block paths can restore it when context-switching back here.
+///
+/// Must be called from the task's kernel entry function (e.g.
+/// `init_ring3_entry`) *before* jumping to ring-3 with `jump_to_ring3`.
+pub fn arm_ring3_syscall_stack() {
+    use crate::arch::x86_64::gdt::set_tss_rsp0;
+    use crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP;
+    use core::sync::atomic::Ordering;
+    // GUARD_SIZE=4096 and STACK_SIZE=16*1024 from task.rs (private constants;
+    // replicated here to avoid visibility issues — must stay in sync with task.rs).
+    const GUARD_SIZE: usize = 4096;
+    const STACK_SIZE: usize = 16 * 1024;
+
+    let stack_top = {
+        let mut sched = SCHED.lock();
+        let current = sched
+            .current
+            .as_mut()
+            .expect("arm_ring3_syscall_stack: no running task");
+        let top = (current.guard_base + GUARD_SIZE + STACK_SIZE) as u64;
+        current.syscall_stack_top = top;
+        top
+    };
+    // Point the SYSCALL entry and IRQ entry stacks at the task's own stack.
+    SYSCALL_KERNEL_RSP.store(stack_top, Ordering::Relaxed);
+    set_tss_rsp0(stack_top);
+}
+
 /// Install a VMA on the currently-running task. The VMA is resolved
 /// lazily by the `#PF` handler on first touch of each page via
 /// [`VmObject::fault`].
@@ -505,7 +671,7 @@ pub fn current_vma_lookup(
 ///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
     interrupts::disable();
-    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_syscall_top) = {
         let mut sched = SCHED.lock();
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
@@ -530,6 +696,7 @@ pub fn exit() -> ! {
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
+        let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
         // Enqueue the doomed task; the next `preempt_tick` drains the
         // whole queue. Back-to-back exits between ticks just append.
         sched.pending_exit.push_back(prev);
@@ -539,7 +706,13 @@ pub fn exit() -> ! {
         // reap it until a later tick, so the heap location remains
         // valid for this context_switch's single write.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
-        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr)
+        (
+            prev_rsp_ptr,
+            next_rsp,
+            next_cr3,
+            next_fpu_ptr,
+            next_syscall_top,
+        )
     };
     // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
     // a stable heap location, next_cr3 is a valid per-task PML4,
@@ -547,6 +720,12 @@ pub fn exit() -> ! {
     // We intentionally skip `fpu::save` — the exiting task is doomed.
     unsafe {
         fpu::restore(&*next_fpu_ptr);
+        if next_syscall_top != 0 {
+            use core::sync::atomic::Ordering;
+            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
+                .store(next_syscall_top, Ordering::Relaxed);
+            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
+        }
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
     unreachable!("task::exit returned from context_switch");
@@ -685,6 +864,7 @@ pub fn preempt_tick() {
     // still hold the mutable borrow; we'll dereference it after the
     // lock is dropped.
     let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
+    let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
     sched.push_ready(prev);
     // The push above put `prev` at the back of its priority's queue;
     // retrieve the pointer through the bank to keep the Box-stability
@@ -711,6 +891,16 @@ pub fn preempt_tick() {
     unsafe {
         fpu::save(&mut *prev_fpu_ptr);
         fpu::restore(&*next_fpu_ptr);
+        // Update the SYSCALL/TSS stack pointer to the incoming task's
+        // own per-task kernel stack, if it has one. This prevents ring-3
+        // syscalls from the incoming task clobbering the shared INIT_KERNEL_STACK
+        // state of other tasks that are blocked mid-syscall.
+        if next_syscall_top != 0 {
+            use core::sync::atomic::Ordering;
+            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
+                .store(next_syscall_top, Ordering::Relaxed);
+            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
+        }
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 }
@@ -751,7 +941,7 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3) = {
+    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3, next_syscall_top) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -789,6 +979,7 @@ pub fn block_current() {
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
+        let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
         sched.parked.insert(prev_id, prev);
 
         let prev_ref = sched
@@ -803,7 +994,14 @@ pub fn block_current() {
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
 
-        (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3)
+        (
+            prev_rsp_ptr,
+            prev_fpu_ptr,
+            next_fpu_ptr,
+            next_rsp,
+            next_cr3,
+            next_syscall_top,
+        )
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
@@ -814,6 +1012,12 @@ pub fn block_current() {
     unsafe {
         fpu::save(&mut *prev_fpu_ptr);
         fpu::restore(&*next_fpu_ptr);
+        if next_syscall_top != 0 {
+            use core::sync::atomic::Ordering;
+            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
+                .store(next_syscall_top, Ordering::Relaxed);
+            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
+        }
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 

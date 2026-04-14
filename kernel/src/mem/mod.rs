@@ -44,6 +44,12 @@ static USERSPACE_MODULE_ELF_SUMMARY: Once<Option<(x86_64::VirtAddr, usize)>> = O
 #[cfg(target_os = "none")]
 static USERSPACE_MODULE_ELF_BYTES: Once<Option<&'static [u8]>> = Once::new();
 
+/// Cached bytes of the `userspace_hello.elf` Limine module, snapshotted during
+/// `init()` before BOOTLOADER_RECLAIMABLE is freed (same reason as
+/// `USERSPACE_MODULE_ELF_BYTES`).
+#[cfg(target_os = "none")]
+static USERSPACE_HELLO_ELF_BYTES: Once<Option<&'static [u8]>> = Once::new();
+
 /// 4 KiB. The only page size we care about right now.
 pub const FRAME_SIZE: u64 = 4096;
 
@@ -88,6 +94,7 @@ pub fn init() {
     // valid after reclaim; only Limine's response structs go away.
     USERSPACE_MODULE_ELF_BYTES.call_once(elf::first_loaded_module_bytes);
     USERSPACE_MODULE_ELF_SUMMARY.call_once(elf::first_loaded_module_elf_summary);
+    USERSPACE_HELLO_ELF_BYTES.call_once(elf::hello_module_bytes);
 
     heap::init();
     crate::arch::x86_64::ist_guard::install();
@@ -115,4 +122,12 @@ pub fn userspace_module_elf_summary() -> Option<(x86_64::VirtAddr, usize)> {
 #[cfg(target_os = "none")]
 pub fn userspace_module_elf_bytes() -> Option<&'static [u8]> {
     USERSPACE_MODULE_ELF_BYTES.get().copied().flatten()
+}
+
+/// Raw bytes of the `userspace_hello.elf` Limine module, snapshotted during
+/// `init()` before `BOOTLOADER_RECLAIMABLE` is freed. Returns `None` if the
+/// module was not included in the ISO.
+#[cfg(target_os = "none")]
+pub fn userspace_hello_elf_bytes() -> Option<&'static [u8]> {
+    USERSPACE_HELLO_ELF_BYTES.get().copied().flatten()
 }

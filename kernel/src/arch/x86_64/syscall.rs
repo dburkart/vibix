@@ -80,6 +80,20 @@ static mut INIT_KERNEL_STACK: AlignedStack = AlignedStack([0u8; 16 * 1024]);
 #[no_mangle]
 pub static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 
+/// Ring-3 RIP saved by the SYSCALL entry trampoline for use by fork().
+/// Stashed before argument registers are remapped, so it reflects the
+/// exact instruction the parent will resume at after fork() returns.
+#[no_mangle]
+pub static FORK_USER_RIP: AtomicU64 = AtomicU64::new(0);
+
+/// Ring-3 RFLAGS (saved from r11 by the CPU) for use by fork().
+#[no_mangle]
+pub static FORK_USER_RFLAGS: AtomicU64 = AtomicU64::new(0);
+
+/// Ring-3 RSP (saved before switching to kernel stack) for use by fork().
+#[no_mangle]
+pub static FORK_USER_RSP: AtomicU64 = AtomicU64::new(0);
+
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
 pub fn init() {
@@ -272,10 +286,150 @@ pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) ->
             }
         }
 
-        // exit(status) — PID 1 calling exit panics the kernel.
+        // fork() — clone the calling process; parent returns child PID, child returns 0.
+        57 => {
+            let user_rip = FORK_USER_RIP.load(Ordering::Relaxed);
+            let user_rflags = FORK_USER_RFLAGS.load(Ordering::Relaxed);
+            let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
+
+            let parent_pid = crate::process::current_pid();
+            if parent_pid == 0 {
+                return -1; // not a registered process
+            }
+
+            let child_task_id =
+                match crate::task::fork_current_task(user_rip, user_rflags, user_rsp) {
+                    Ok(id) => id,
+                    Err(_) => return -12, // ENOMEM
+                };
+            let child_pid = crate::process::register(child_task_id, parent_pid);
+            child_pid as i64
+        }
+
+        // execve(path, argv, envp) — path and argv/envp are ignored; the
+        // kernel loads the `userspace_hello.elf` ramdisk module into the
+        // current address space and jumps to ring-3. Never returns on
+        // success.
+        59 => {
+            let elf_bytes = match crate::mem::userspace_hello_elf_bytes() {
+                Some(b) => b,
+                None => return -8, // ENOEXEC — hello module not present
+            };
+
+            // Clear all user VMAs and reset the address space.
+            {
+                crate::task::current_address_space()
+                    .write()
+                    .clear_for_exec();
+            }
+
+            // Close O_CLOEXEC fds as POSIX requires on exec.
+            crate::task::current_fd_table().lock().close_cloexec();
+
+            // Load the new ELF with VMA tracking so AddressSpace::drop can
+            // reclaim the data frames when the exec'd process exits. Without
+            // VMA entries the leaf frames are orphaned permanently.
+            let pml4 = crate::task::current_cr3();
+            let aspace = crate::task::current_address_space();
+            let image = match crate::mem::loader::load_user_elf_with_vmas(
+                elf_bytes,
+                pml4,
+                &mut aspace.write(),
+            ) {
+                Ok(img) => img,
+                Err(_) => return -8, // ENOEXEC
+            };
+
+            // Map a fresh user stack page and register it as a VMA so the
+            // exec'd process's stack frame is also reclaimed on exit.
+            use crate::mem::vmatree::{Share, Vma};
+            use crate::mem::vmobject::{AnonObject, VmObject};
+            use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+            use x86_64::VirtAddr;
+            let stack_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE;
+            let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                crate::init_process::USER_STACK_PAGE_VA,
+            ));
+            let stack_frame = crate::mem::paging::map_in_pml4(pml4, stack_page, stack_flags)
+                .expect("exec: user stack mapping failed");
+
+            let stack_obj = AnonObject::new(Some(1));
+            stack_obj.insert_existing_frame(0, stack_frame.start_address().as_u64());
+            let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
+            let stack_vma = Vma::new(
+                stack_start,
+                stack_start + 4096,
+                0x3,
+                stack_flags.bits(),
+                Share::Private,
+                stack_obj as alloc::sync::Arc<dyn VmObject>,
+                0,
+            );
+            aspace.write().insert(stack_vma);
+
+            // Switch to the new image — never returns.
+            unsafe { jump_to_ring3(image.entry.as_u64(), crate::init_process::USER_STACK_TOP) }
+        }
+
+        // exit(status) — tear down the process and switch to the next task.
         60 => {
             let status = a0 as i32;
-            panic!("kernel panic: init exited with status {}", status);
+            let pid = crate::process::current_pid();
+            if pid != 0 {
+                crate::process::reparent_children(pid);
+                crate::process::mark_zombie(pid, status);
+            }
+            crate::task::exit();
+        }
+
+        // wait4(pid, *wstatus, options, *rusage) — wait for a child.
+        // options and rusage are ignored. `pid < 0` means any child.
+        61 => {
+            let target_pid = a0 as i32;
+            let wstatus_ptr = a1 as usize;
+            let parent_pid = crate::process::current_pid();
+
+            if parent_pid == 0 {
+                return -10; // ECHILD — not a registered process
+            }
+            if !crate::process::has_children(parent_pid) {
+                return -10; // ECHILD
+            }
+            // Validate status pointer early (zero means "don't write").
+            if wstatus_ptr != 0 {
+                if let Err(e) = uaccess::check_user_range(wstatus_ptr, 4) {
+                    return e.as_errno();
+                }
+            }
+
+            // Wait until a zombie child exists or no children remain.
+            // Snapshot EXIT_EVENT BEFORE the reap attempt so a child that
+            // exits in the gap between reap_child returning None and the
+            // wait_while park is not missed: if the event fires before snap
+            // is read, the condition (count == snap) is immediately false and
+            // wait_while returns at once, letting us loop back to reap.
+            loop {
+                let snap = crate::process::exit_event_count();
+                if let Some((child_pid, exit_status)) =
+                    crate::process::reap_child(parent_pid, target_pid)
+                {
+                    if wstatus_ptr != 0 {
+                        // Linux wait4: wstatus = (exit_code & 0xFF) << 8
+                        let encoded = ((exit_status & 0xFF) << 8) as u32;
+                        let _ = uaccess::copy_to_user(wstatus_ptr, &encoded.to_ne_bytes());
+                    }
+                    return child_pid as i64;
+                }
+                if !crate::process::has_children(parent_pid) {
+                    return -10; // ECHILD — last child was reaped by another path
+                }
+                // Park while no new exit event has occurred.
+                crate::process::CHILD_WAIT
+                    .wait_while(|| crate::process::exit_event_count() == snap);
+            }
         }
 
         _ => -38i64, // ENOSYS
@@ -311,6 +465,13 @@ syscall_entry:
     push r11          // user RFLAGS  (SYSRETQ restores RFLAGS from r11)
     push rcx          // user RIP     (SYSRETQ jumps to rcx)
 
+    // 3b. Stash user context in FORK_USER_* statics so fork() can prime
+    //     the child's kernel stack. Must happen before rcx is clobbered
+    //     in step 4.  r10 is user RSP, r11 is user RFLAGS, rcx is user RIP.
+    mov [rip + {fork_rip}], rcx
+    mov [rip + {fork_rflags}], r11
+    mov [rip + {fork_rsp}], r10
+
     // 4. Build syscall_dispatch(nr, a0, a1, a2) in SysV AMD64 registers.
     //    rcx is now free (user RIP is on the stack).
     mov rcx, rdx      // a2
@@ -334,4 +495,7 @@ syscall_entry:
     sysretq
     "#,
     kernel_rsp = sym SYSCALL_KERNEL_RSP,
+    fork_rip = sym FORK_USER_RIP,
+    fork_rflags = sym FORK_USER_RFLAGS,
+    fork_rsp = sym FORK_USER_RSP,
 );

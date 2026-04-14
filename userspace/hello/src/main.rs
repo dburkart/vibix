@@ -1,48 +1,52 @@
-//! Tiny userspace ELF payload for the ring-0 loader smoke test.
+//! Hello binary — the exec() target for the fork+exec+wait integration test.
 //!
-//! Runs with the kernel's descriptors still active (we don't yet have
-//! ring-3). The only contract is: write the "USRHELLO\n" marker to the
-//! COM1 serial port so `xtask smoke` can observe control transfer, then
-//! park via `hlt`.
+//! Loaded by the kernel's execve() syscall (nr=59) into the child process's
+//! address space. Writes a marker to stdout (serial fd 1) and exits with
+//! status 0 so the parent's waitpid() can verify the exit code.
+//!
+//! Uses the same Linux x86_64 syscall ABI as the init binary.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
 
-const COM1: u16 = 0x3F8;
-const MARKER: &[u8] = b"USRHELLO\n";
+const MSG: &[u8] = b"hello: hello from execed child\n";
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    for &b in MARKER {
-        unsafe {
-            // Spin on the THR-empty bit (LSR.5) so bytes don't get
-            // dropped if the UART isn't drained yet.
-            while (inb(COM1 + 5) & 0x20) == 0 {}
-            outb(COM1, b);
-        }
+    // write(1, MSG, MSG.len())
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 1u64,
+            in("rdi") 1u64,
+            in("rsi") MSG.as_ptr() as u64,
+            in("rdx") MSG.len() as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    // exit(0)
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 60u64,
+            in("rdi") 0u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
     }
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        core::hint::spin_loop();
     }
-}
-
-#[inline(always)]
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
-
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    val
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        core::hint::spin_loop();
     }
 }

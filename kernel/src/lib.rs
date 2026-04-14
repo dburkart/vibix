@@ -40,6 +40,8 @@ pub mod init_process;
 #[cfg(target_os = "none")]
 pub mod ksymtab;
 #[cfg(target_os = "none")]
+pub mod process;
+#[cfg(target_os = "none")]
 pub mod serial;
 #[cfg(target_os = "none")]
 pub mod shell;

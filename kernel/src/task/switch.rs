@@ -38,6 +38,16 @@ unsafe extern "C" {
     /// First-entry trampoline for a freshly primed task. The entry fn
     /// pointer is passed in `r12`; the trampoline just `call`s it.
     pub fn task_entry_trampoline();
+
+    /// First-entry trampoline for a fork child. Called by `context_switch`
+    /// when the child task is first scheduled. Callee-saved registers are
+    /// primed by `Task::new_forked` with the user-space context:
+    ///   r12 = user RIP  (→ rcx for SYSRETQ)
+    ///   rbp = user RSP  (→ rsp before SYSRETQ)
+    ///   rbx = user RFLAGS (→ r11 for SYSRETQ)
+    ///
+    /// Returns to ring-3 with rax=0 so the child sees 0 from fork().
+    pub fn fork_child_sysret();
 }
 
 global_asm!(
@@ -79,5 +89,29 @@ task_entry_trampoline:
     sti
     call r12
     ud2
+
+    .global fork_child_sysret
+fork_child_sysret:
+    // Called as the first instruction of a fork child after context_switch
+    // loads its primed kernel stack.
+    //
+    // Register state set by Task::new_forked priming:
+    //   r12 = user RIP   → loaded into rcx for SYSRETQ
+    //   rbp = user RSP   → loaded into rsp before SYSRETQ
+    //   rbx = user RFLAGS → loaded into r11 for SYSRETQ
+    //
+    // SYSRETQ: rcx → RIP, r11 → RFLAGS, CS/SS switched to ring-3 selectors.
+    //
+    // Do NOT sti here: rbx already holds the parent's saved RFLAGS which
+    // includes IF=1 (user mode runs with interrupts enabled). SYSRETQ
+    // restores RFLAGS from r11, so IF is re-enabled atomically when the CPU
+    // transitions to ring-3. An explicit sti before the RSP switch would
+    // allow an IRQ to fire with a kernel-mode CS but a user-mode RSP,
+    // corrupting the user stack.
+    mov rcx, r12      // user RIP
+    mov r11, rbx      // user RFLAGS (IF=1 → interrupts re-enabled by SYSRETQ)
+    xor eax, eax      // return 0 — fork() child path
+    mov rsp, rbp      // restore user RSP (switch stack before SYSRETQ)
+    sysretq
 "#
 );
