@@ -19,6 +19,15 @@ pub mod vfs;
 pub trait FileBackend: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64>;
     fn write(&self, buf: &[u8]) -> Result<usize, i64>;
+
+    /// Downcast to [`vfs::VfsBackend`] for fd-keyed syscalls that need the
+    /// underlying `OpenFile` (e.g. `fstat`, `fstatat` with `AT_EMPTY_PATH`).
+    /// Non-VFS backends (`SerialBackend`, test stubs) return `None` and
+    /// trigger the caller's `-EINVAL`/`-ENOTTY` path.
+    #[cfg(target_os = "none")]
+    fn as_vfs(&self) -> Option<&vfs::VfsBackend> {
+        None
+    }
 }
 
 /// Open-file flags. Values match the Linux x86_64 ABI exactly so userspace

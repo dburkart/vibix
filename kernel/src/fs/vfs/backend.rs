@@ -37,6 +37,10 @@ pub struct VfsBackend {
 }
 
 impl FileBackend for VfsBackend {
+    fn as_vfs(&self) -> Option<&VfsBackend> {
+        Some(self)
+    }
+
     /// Read up to `buf.len()` bytes from the current file offset.
     ///
     /// Advances the shared offset by the number of bytes actually read.

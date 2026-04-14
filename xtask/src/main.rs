@@ -807,6 +807,7 @@ fn test_all() -> R<()> {
         "smep_smap",
         "fd_table",
         "syscall_open_mmap",
+        "syscall_vfs",
         "vm_integration",
         "vfs_backend",
         "vfs_hello",

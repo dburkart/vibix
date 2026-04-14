@@ -7,6 +7,7 @@ pub mod interrupts;
 pub mod ist_guard;
 pub mod pic;
 pub mod syscall;
+pub mod syscalls;
 pub mod uaccess;
 
 /// Bring up arch-specific interrupt plumbing that doesn't depend on
