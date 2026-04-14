@@ -148,20 +148,16 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
     let mut segments = 0usize;
     let mut image_end = 0u64;
     let mut err: Option<LoadError> = None;
+    let mut partial_pages = 0u64;
     for seg in parsed.load_segments() {
         let seg_end = (seg.vaddr.as_u64() + seg.memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        // Reject before mapping: `image_end` is later fed to
-        // `VirtAddr::new` (set_brk_start, exec), which panics at
-        // USER_VA_END. Prior segments in the same ELF may already be
-        // mapped in `pml4` — the caller drops the partial PML4 on
-        // error, matching the existing MapFailed / SegmentNotLowerHalf
-        // paths.
         if seg_end >= USER_VA_END {
             err = Some(LoadError::SegmentEndsAtUserVaEnd);
             break;
         }
-        if let Err(e) = map_user_segment(bytes, seg, pml4) {
+        if let Err((e, mapped)) = map_user_segment(bytes, seg, pml4) {
             err = Some(e);
+            partial_pages = mapped;
             break;
         }
         if seg_end > image_end {
@@ -174,6 +170,13 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
     // CR3 yet at load time). The CR3 write in init_ring3_entry provides
     // the definitive TLB flush before entering user code.
     if let Some(e) = err {
+        // Release every leaf frame we installed in `pml4` before failing.
+        // Without this, frames in completed segments and any partial
+        // progress within the aborted segment would be leaked when the
+        // caller drops the staged AddressSpace — Drop walks `self.vmas`,
+        // which the `load_user_elf_with_vmas` caller hasn't populated
+        // yet.
+        unmap_partial_load(parsed, pml4, segments, partial_pages);
         return Err(e);
     }
 
@@ -182,6 +185,44 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         segments,
         image_end,
     })
+}
+
+/// Unmap and free every leaf frame installed by a partial
+/// [`load_user_elf`] run. `completed` is the number of PT_LOAD segments
+/// that were fully mapped; `partial_pages` is the number of pages of
+/// segment `completed` (0-indexed: the aborted segment) that had been
+/// mapped before its error. Unmapping an already-unmapped page is a
+/// no-op, matching the defensive pattern in `Drop for AddressSpace`.
+#[cfg(target_os = "none")]
+fn unmap_partial_load(
+    parsed: elf::ParsedElf<'_>,
+    pml4: PhysFrame<Size4KiB>,
+    completed: usize,
+    partial_pages: u64,
+) {
+    use x86_64::structures::paging::FrameDeallocator;
+    let mut alloc = paging::KernelFrameAllocator;
+    for (idx, seg) in parsed.load_segments().enumerate().take(completed + 1) {
+        let pages = if idx < completed {
+            seg.memsz.div_ceil(PAGE_SIZE)
+        } else {
+            partial_pages
+        };
+        for i in 0..pages {
+            let va = seg.vaddr + i * PAGE_SIZE;
+            let page = Page::<Size4KiB>::containing_address(va);
+            if let Ok(frame) = paging::unmap_in_pml4(pml4, page) {
+                // SAFETY: frame was just unmapped from `pml4`; no other
+                // mapping aliases it (the staged PML4 is not live and
+                // the loader holds the sole PTE reference, set to 1 by
+                // `KernelFrameAllocator::allocate_frame` via
+                // `frame::alloc`).
+                unsafe {
+                    alloc.deallocate_frame(frame);
+                }
+            }
+        }
+    }
 }
 
 /// Load `bytes` as a lower-half ELF into `pml4` AND register each
@@ -244,13 +285,17 @@ pub fn load_user_elf_with_vmas(
     Ok(image)
 }
 
+/// On error, returns the underlying `LoadError` along with the number of
+/// pages that had been successfully mapped into `pml4` before the error —
+/// the caller uses that count to unmap and free those frames on the
+/// failure path.
 fn map_user_segment(
     bytes: &[u8],
     seg: elf::LoadSegment,
     pml4: PhysFrame<Size4KiB>,
-) -> Result<(), LoadError> {
+) -> Result<(), (LoadError, u64)> {
     if seg.vaddr.as_u64() >= UPPER_HALF_START {
-        return Err(LoadError::SegmentNotLowerHalf);
+        return Err((LoadError::SegmentNotLowerHalf, 0));
     }
     // Reject segments whose virtual range overflows or crosses the
     // lower-half ceiling. Without this check, a large `p_memsz` could
@@ -262,10 +307,10 @@ fn map_user_segment(
         .checked_add(seg.memsz)
         .map_or(true, |end| end > UPPER_HALF_START)
     {
-        return Err(LoadError::SegmentNotLowerHalf);
+        return Err((LoadError::SegmentNotLowerHalf, 0));
     }
     if seg.vaddr.as_u64() & (PAGE_SIZE - 1) != 0 {
-        return Err(LoadError::SegmentNotPageAligned);
+        return Err((LoadError::SegmentNotPageAligned, 0));
     }
 
     let file_end = seg.file_offset + seg.filesz;
@@ -278,12 +323,17 @@ fn map_user_segment(
     // ring-3 code can actually reach the pages.
     let flags = seg.flags | PageTableFlags::USER_ACCESSIBLE;
 
+    let mut mapped = 0u64;
     for i in 0..page_count {
         let va = seg.vaddr + i * PAGE_SIZE;
         let page = Page::<Size4KiB>::containing_address(va);
         // map_in_pml4 allocates a fresh zeroed frame and installs it in
         // pml4 (not the global kernel mapper).
-        let frame = paging::map_in_pml4(pml4, page, flags).map_err(LoadError::MapFailed)?;
+        let frame = match paging::map_in_pml4(pml4, page, flags) {
+            Ok(f) => f,
+            Err(e) => return Err((LoadError::MapFailed(e), mapped)),
+        };
+        mapped += 1;
 
         // Fill file content through the HHDM window.
         let dst_base = hhdm + frame.start_address().as_u64();

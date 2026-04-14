@@ -814,6 +814,7 @@ fn test_all() -> R<()> {
         "task_exit",
         "addrspace",
         "addrspace_drop",
+        "exec_atomic_partial_load",
         "fork_cow",
         "tlb_flusher",
         "smep_smap",
