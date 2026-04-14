@@ -18,16 +18,59 @@ pub trait FileBackend: Send + Sync {
     fn write(&self, buf: &[u8]) -> Result<usize, i64>;
 }
 
-/// Open-file flags (subset of Linux oflags).
+/// Open-file flags. Values match the Linux x86_64 ABI exactly so userspace
+/// binaries built against Linux headers link against vibix without shims.
+///
+/// The canonical table lives in `docs/RFC/0002-virtual-filesystem.md`
+/// §Kernel–Userspace Interface. Each constant below carries a `0o…` octal
+/// literal in the same form Linux uses in `<asm-generic/fcntl.h>`.
 pub mod flags {
-    /// Open for reading only.
-    pub const O_RDONLY: u32 = 0;
+    /// Open for reading only. (Access-mode bits occupy the low two bits.)
+    pub const O_RDONLY: u32 = 0o0;
     /// Open for writing only.
-    pub const O_WRONLY: u32 = 1;
+    pub const O_WRONLY: u32 = 0o1;
     /// Open for reading and writing.
-    pub const O_RDWR: u32 = 2;
+    pub const O_RDWR: u32 = 0o2;
+    /// Mask for the two low access-mode bits.
+    pub const O_ACCMODE: u32 = 0o3;
+    /// Create the file if it does not exist.
+    pub const O_CREAT: u32 = 0o100;
+    /// With `O_CREAT`: fail with `EEXIST` if the file already exists.
+    pub const O_EXCL: u32 = 0o200;
+    /// Truncate a regular file to zero length on open.
+    pub const O_TRUNC: u32 = 0o1000;
+    /// Write offset is seeked to end-of-file atomically before each write.
+    pub const O_APPEND: u32 = 0o2000;
+    /// Non-blocking I/O on fifos, sockets, and character devices.
+    pub const O_NONBLOCK: u32 = 0o4000;
+    /// Require the resolved path to refer to a directory (`ENOTDIR` if not).
+    pub const O_DIRECTORY: u32 = 0o200000;
+    /// Do not follow a symlink in the final path component (`ELOOP`).
+    pub const O_NOFOLLOW: u32 = 0o400000;
     /// Close this fd on the next `exec()`.
-    pub const O_CLOEXEC: u32 = 1 << 19;
+    pub const O_CLOEXEC: u32 = 0o2000000;
+    /// Open a stat-only fd (no I/O permitted).
+    pub const O_PATH: u32 = 0o10000000;
+    /// Create an unnamed temporary file (defined for Linux ABI parity; not
+    /// yet honored by `sys_open`, which currently masks unsupported bits).
+    pub const O_TMPFILE: u32 = 0o20200000;
+
+    // Compile-time pins against the Linux x86_64 numeric values. If any of
+    // these change the syscall ABI silently diverges, so we fail to build.
+    const _: () = assert!(O_RDONLY == 0);
+    const _: () = assert!(O_WRONLY == 1);
+    const _: () = assert!(O_RDWR == 2);
+    const _: () = assert!(O_ACCMODE == 3);
+    const _: () = assert!(O_CREAT == 0x40);
+    const _: () = assert!(O_EXCL == 0x80);
+    const _: () = assert!(O_TRUNC == 0x200);
+    const _: () = assert!(O_APPEND == 0x400);
+    const _: () = assert!(O_NONBLOCK == 0x800);
+    const _: () = assert!(O_DIRECTORY == 0x10000);
+    const _: () = assert!(O_NOFOLLOW == 0x20000);
+    const _: () = assert!(O_CLOEXEC == 0x80000);
+    const _: () = assert!(O_PATH == 0x200000);
+    const _: () = assert!(O_TMPFILE == 0x410000);
 }
 
 /// Kernel-side open-file description.
@@ -411,6 +454,34 @@ mod tests {
         // Close fd 2 in child; parent should still have it
         child.close_fd(2).unwrap();
         assert!(t.get(2).is_ok());
+    }
+
+    #[test]
+    fn o_flag_numeric_values_match_linux() {
+        use flags::*;
+        // (constant, decimal, hex, octal-as-decimal) — all three widely-cited
+        // Linux x86_64 representations. Any drift here breaks the ABI.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            (O_RDONLY, 0, 0x0, 0o0),
+            (O_WRONLY, 1, 0x1, 0o1),
+            (O_RDWR, 2, 0x2, 0o2),
+            (O_ACCMODE, 3, 0x3, 0o3),
+            (O_CREAT, 64, 0x40, 0o100),
+            (O_EXCL, 128, 0x80, 0o200),
+            (O_TRUNC, 512, 0x200, 0o1000),
+            (O_APPEND, 1024, 0x400, 0o2000),
+            (O_NONBLOCK, 2048, 0x800, 0o4000),
+            (O_DIRECTORY, 65536, 0x10000, 0o200000),
+            (O_NOFOLLOW, 131072, 0x20000, 0o400000),
+            (O_CLOEXEC, 524288, 0x80000, 0o2000000),
+            (O_PATH, 2097152, 0x200000, 0o10000000),
+            (O_TMPFILE, 4259840, 0x410000, 0o20200000),
+        ];
+        for &(v, dec, hex, oct) in cases {
+            assert_eq!(v, dec);
+            assert_eq!(v, hex);
+            assert_eq!(v, oct);
+        }
     }
 
     #[test]
