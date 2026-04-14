@@ -28,7 +28,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 use super::super_block::SuperBlock;
-use super::FsId;
 
 /// Soft cap on the inline ring portion of the queue. Past this we
 /// spill into a heap `VecDeque` rather than panic or leak — the cost
@@ -125,8 +124,6 @@ pub fn gc_drain_for(sb: &Arc<SuperBlock>) {
     for entry in to_evict {
         let _ = sb.ops.evict_inode(entry.ino);
     }
-    let _ = target;
-    let _: FsId = sb.fs_id;
 }
 
 /// Number of pending entries. For tests and metrics; not for control
