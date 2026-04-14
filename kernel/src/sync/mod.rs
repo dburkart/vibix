@@ -12,6 +12,14 @@
 //! - [`BlockingMutex`] — mutual exclusion that doesn't burn CPU under
 //!   contention. Interface mirrors `spin::Mutex`; drop-in for any
 //!   critical section that might be held across a scheduling point.
+//! - [`BlockingRwLock`] — multi-reader / single-writer sleeping lock.
+//!   Use when readers dominate and a short-lived writer can't afford
+//!   to spin. Writers get priority over newly-arriving readers, so
+//!   they aren't starved under reader churn.
+//! - [`Semaphore`] — counting semaphore with `acquire` / `release`.
+//!   Reach for this when the resource is a budget rather than a
+//!   single critical section (e.g. VFS `ChildState::Loading`
+//!   deduplicating a first-lookup-of-a-name).
 //! - [`WaitQueue`] — primitive building block. Tasks call
 //!   [`WaitQueue::wait_while`] with a condition; wakers call
 //!   [`WaitQueue::notify_one`] / [`notify_all`] after changing state
@@ -57,8 +65,12 @@
 
 pub mod mpmc;
 pub mod mutex;
+pub mod rwlock;
+pub mod semaphore;
 pub mod spsc;
 pub mod waitqueue;
 
 pub use mutex::{BlockingMutex, MutexGuard};
+pub use rwlock::{BlockingRwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use semaphore::Semaphore;
 pub use waitqueue::WaitQueue;
