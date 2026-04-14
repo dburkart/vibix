@@ -19,7 +19,6 @@
 //! - `write_stat` for the userspace `struct stat` copy-out.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use super::super::syscall::copy_path_from_user_pub;
@@ -31,7 +30,9 @@ use crate::fs::vfs::Credential;
 use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
-use crate::fs::{flags as oflags, FileBackend, FileDescription, EBADF, EINVAL, ENOENT, ENOTDIR};
+use crate::fs::{
+    flags as oflags, FileBackend, FileDescription, EBADF, EINVAL, ENOENT, ENOMEM, ENOTDIR,
+};
 
 /// Linux x86_64 value of the "use the current working directory"
 /// sentinel for `*at` syscalls. Sign-extended as an `i32`, negative,
@@ -51,8 +52,15 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 /// within the buffer for paths of exactly `PATH_MAX` user bytes;
 /// anything longer returns `-ENAMETOOLONG`. A heap buffer avoids a
 /// 4 KiB stack frame on every VFS syscall.
+///
+/// Uses fallible allocation (`try_reserve_exact`) so a heap-pressure
+/// situation surfaces as `-ENOMEM` to userspace instead of tripping
+/// the kernel-wide `panic = "abort"` handler — a user syscall must
+/// never be a DoS vector against the kernel.
 fn copy_user_path(path_uva: u64) -> Result<Vec<u8>, i64> {
-    let mut buf: Vec<u8> = vec![0u8; PATH_MAX + 1];
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(PATH_MAX + 1).map_err(|_| ENOMEM)?;
+    buf.resize(PATH_MAX + 1, 0u8);
     let n = unsafe { copy_path_from_user_pub(path_uva as usize, &mut buf) }?;
     buf.truncate(n);
     Ok(buf)
