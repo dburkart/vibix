@@ -12,6 +12,38 @@
 //! - rdi = arg0,  rsi = arg1,  rdx = arg2,  r10 = arg3
 //! - rcx and r11 are clobbered by SYSCALL/SYSRET
 //! - Return value in rax
+//!
+//! ## Syscall numbers and argument layout (pinned — do not renumber)
+//!
+//! These must stay in sync with the `match nr` arms in
+//! `kernel/src/arch/x86_64/syscall.rs`.  A mismatch silently breaks
+//! this binary (wrong arm executes or -ENOSYS is returned) and will
+//! show up as missing smoke markers.  See issue #278.
+//!
+//! | Number | Name    | rdi          | rsi          | rdx     | r10     |
+//! |--------|---------|--------------|--------------|---------|---------|
+//! |      1 | write   | fd           | buf ptr      | len     | —       |
+//! |     57 | fork    | —            | —            | —       | —       |
+//! |     59 | execve  | path (0=ok)  | argv (0=ok)  | envp    | —       |
+//! |     60 | exit    | status       | —            | —       | —       |
+//! |     61 | wait4   | pid          | *wstatus     | options | *rusage |
+//!
+//! ### fork() invariants
+//! The kernel reads `FORK_USER_RIP`, `FORK_USER_RFLAGS`, `FORK_USER_RSP`
+//! from the SYSCALL entry trampoline before `syscall_dispatch(57, ...)` is
+//! called.  Those statics are set by inline assembly in the entry path and
+//! hold the saved userspace register values.  The child task resumes at
+//! the SYSRET return address with rax=0; the parent gets the child PID.
+//!
+//! ### execve() invariants
+//! The kernel ignores path/argv/envp (rdi/rsi/rdx) for now: it loads the
+//! second Limine ramdisk module unconditionally.  If no second module is
+//! present, execve returns -ENOEXEC.  On success, the call never returns.
+//!
+//! ### wait4() invariants
+//! Blocks on a WaitQueue until a zombie child is reaped.  wstatus is a
+//! kernel-mapped userspace pointer; the low 8 bits hold the child's exit
+//! code.  Returns the reaped child PID on success, -ECHILD if no children.
 
 #![no_std]
 #![no_main]
