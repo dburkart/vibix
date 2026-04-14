@@ -192,9 +192,10 @@ pub unsafe extern "C" fn syscall_dispatch(
     a4: u64,
     a5: u64,
 ) -> i64 {
+    use syscall_nr::*;
     match nr {
         // read(fd, buf, len) — non-blocking; returns -EAGAIN if no data.
-        0 => {
+        READ => {
             let fd = a0 as u32;
             let buf_va = a1 as usize;
             let len = a2 as usize;
@@ -228,7 +229,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // write(fd, buf, len) — routes through the per-process fd table.
-        1 => {
+        WRITE => {
             let fd = a0 as u32;
             let buf_va = a1 as usize;
             let len = a2 as usize;
@@ -278,24 +279,24 @@ pub unsafe extern "C" fn syscall_dispatch(
         // open(path, flags, mode) — pre-VFS: only `/dev/stdin`,
         // `/dev/stdout`, `/dev/stderr`, and `/dev/serial` resolve, all
         // backed by `SerialBackend`. Any other path returns -ENOENT.
-        2 => sys_open(a0, a1, a2),
+        OPEN => sys_open(a0, a1, a2),
 
         // mmap(addr, len, prot, flags, fd, off) — anon-private and
         // anon-shared with full MAP_FIXED / MAP_GROWSDOWN support. See
         // `sys_mmap` for full validation.
-        9 => sys_mmap(a0, a1, a2, a3, a4, a5),
+        MMAP => sys_mmap(a0, a1, a2, a3, a4, a5),
 
         // mprotect(addr, len, prot)
-        10 => sys_mprotect(a0, a1, a2),
+        MPROTECT => sys_mprotect(a0, a1, a2),
 
         // munmap(addr, len)
-        11 => sys_munmap(a0, a1),
+        MUNMAP => sys_munmap(a0, a1),
 
         // madvise(addr, len, advice)
-        28 => sys_madvise(a0, a1, a2),
+        MADVISE => sys_madvise(a0, a1, a2),
 
         // close(fd)
-        3 => {
+        CLOSE => {
             let fd = a0 as u32;
             let tbl = crate::task::current_fd_table();
             let result = tbl.lock().close_fd(fd);
@@ -330,13 +331,13 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // brk(addr) — set the program break; returns the new break on success
         // or the current (unchanged) break on failure.
-        12 => {
+        BRK => {
             let addr = a0;
             crate::task::current_address_space().write().sys_brk(addr) as i64
         }
 
         // fork() — clone the calling process; parent returns child PID, child returns 0.
-        57 => {
+        FORK => {
             let user_rip = FORK_USER_RIP.load(Ordering::Relaxed);
             let user_rflags = FORK_USER_RFLAGS.load(Ordering::Relaxed);
             let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
@@ -360,7 +361,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         // freshly-staged address space and atomically swaps it in on
         // success. On failure the old address space is preserved so the
         // caller continues running and observes the `-ENOEXEC` return.
-        59 => {
+        EXECVE => {
             let elf_bytes = match crate::mem::userspace_hello_elf_bytes() {
                 Some(b) => b,
                 None => return -8, // ENOEXEC — hello module not present
@@ -372,7 +373,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // exit(status) — tear down the process and switch to the next task.
-        60 => {
+        EXIT => {
             let status = a0 as i32;
             let pid = crate::process::current_pid();
             if pid != 0 {
@@ -384,7 +385,7 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // wait4(pid, *wstatus, options, *rusage) — wait for a child.
         // options and rusage are ignored. `pid < 0` means any child.
-        61 => {
+        WAIT4 => {
             let target_pid = a0 as i32;
             let wstatus_ptr = a1 as usize;
             let parent_pid = crate::process::current_pid();
@@ -430,10 +431,10 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // sigaction(sig, act, oldact) — register or query signal handler.
-        13 => crate::signal::sys_sigaction(a0, a1, a2),
+        SIGACTION => crate::signal::sys_sigaction(a0, a1, a2),
 
         // sigprocmask(how, set, oldset) — update signal mask.
-        14 => crate::signal::sys_sigprocmask(a0, a1, a2),
+        SIGPROCMASK => crate::signal::sys_sigprocmask(a0, a1, a2),
 
         // sigreturn() — restore context from signal frame.
         // The user RSP at syscall entry (saved by the trampoline in
@@ -441,7 +442,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         // We restore the saved [rip, rflags, rsp] and stash them in
         // FORK_USER_* so check_and_deliver_signals can apply them to
         // the kernel-stack-saved context before SYSRETQ.
-        15 => {
+        SIGRETURN => {
             let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
             let restored = crate::signal::sys_sigreturn(user_rsp);
             FORK_USER_RIP.store(restored.rip, Ordering::Relaxed);
@@ -452,7 +453,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // kill(pid, sig) — send signal to process.
-        62 => crate::signal::sys_kill(a0, a1),
+        KILL => crate::signal::sys_kill(a0, a1),
 
         _ => -38i64, // ENOSYS
     }
