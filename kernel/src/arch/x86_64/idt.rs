@@ -223,6 +223,45 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         }
     }
 
+    // Growsdown stack extension: if the fault address is just below a
+    // VMA_GROWSDOWN VMA and within the allowed gap, extend the VMA by one
+    // page and install the demand-page frame (same path as a normal miss).
+    // Note: grow_stack always installs the VMA at `vma_start - 4096`, not at
+    // cr2, so we must map the PTE to that VMA page — not to addr_u64. When
+    // cr2 is 2+ pages below vma_start (allowed by the 256-page guard gap),
+    // mapping at cr2 would create an orphaned PTE with no VMA backing.
+    if let Some((object, offset, prot_pte, new_vma_start)) =
+        crate::task::current_growsdown_lookup(addr_u64 as usize)
+    {
+        use crate::mem::vmobject::Access;
+        use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+        use x86_64::{PhysAddr, VirtAddr};
+
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(new_vma_start as u64))
+            .expect("#PF growsdown: new_vma_start not page-aligned");
+        let active = x86_64::registers::control::Cr3::read().0;
+        let pte_flags = PageTableFlags::from_bits_truncate(prot_pte);
+        match object.fault(offset, Access::Write) {
+            Ok(phys) => {
+                let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
+                    .expect("#PF growsdown: VmObject returned unaligned phys");
+                match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        #[cfg(target_os = "none")]
+                        crate::mem::refcount::dec_refcount(phys);
+                        serial_println!("#PF growsdown map failed addr={:#x}: {:?}", addr_u64, e)
+                    }
+                }
+            }
+            Err(e) => serial_println!(
+                "#PF growsdown VmObject::fault failed addr={:#x}: {:?}",
+                addr_u64,
+                e
+            ),
+        }
+    }
+
     // Check whether the fault address lands inside a kernel task's guard
     // page — if so, this is a stack overflow, not a generic fault.
     if let Some(task_id) = crate::task::find_stack_overflow(addr_u64 as usize) {

@@ -41,13 +41,25 @@ pub enum Share {
     Shared,
 }
 
+/// VMA behaviour flags (stored in `Vma::vma_flags`).
+pub type VmaFlags = u32;
+
+/// The VMA grows downward (stack). A page-fault one page below
+/// `vma.start` triggers an automatic one-page extension instead of a
+/// SIGSEGV.
+pub const VMA_GROWSDOWN: VmaFlags = 1 << 0;
+
+/// Read-only guard region below a growsdown stack. Any fault into this
+/// VMA unconditionally produces a SIGSEGV (stack-overflow sentinel).
+pub const VMA_STACK_GUARD: VmaFlags = 1 << 1;
+
 /// One virtual-memory area: half-open `[start, end)` byte range backed
 /// by `object` at `object_offset`, with user-visible protection
 /// `prot_user` and cached PTE flags `prot_pte`.
 ///
 /// `#[repr(C)]` so the layout is stable enough for eventual inspection
-/// by a debugger / introspection tool; `_lock_seq` is the reserved
-/// future-work slot for per-VMA seqlock ordering.
+/// by a debugger / introspection tool. `vma_flags` carries behaviour
+/// bits (`VMA_GROWSDOWN`, `VMA_STACK_GUARD`).
 #[repr(C)]
 pub struct Vma {
     pub start: usize,
@@ -57,7 +69,7 @@ pub struct Vma {
     pub share: Share,
     pub object: Arc<dyn VmObject>,
     pub object_offset: usize,
-    pub _lock_seq: u32,
+    pub vma_flags: VmaFlags,
 }
 
 impl Vma {
@@ -93,7 +105,7 @@ impl Vma {
             share,
             object,
             object_offset,
-            _lock_seq: 0,
+            vma_flags: 0,
         }
     }
 
@@ -115,6 +127,7 @@ impl Vma {
             && self.prot_user == other.prot_user
             && self.prot_pte == other.prot_pte
             && self.share == other.share
+            && self.vma_flags == other.vma_flags
             && Arc::ptr_eq(&self.object, &other.object)
             && self.object_offset + self.len() == other.object_offset
     }
@@ -143,7 +156,7 @@ impl Vma {
             share: self.share,
             object: Arc::clone(&self.object),
             object_offset: self.object_offset,
-            _lock_seq: 0,
+            vma_flags: self.vma_flags, // preserve behaviour flags on split
         };
         let right = Vma {
             start: addr,
@@ -153,7 +166,7 @@ impl Vma {
             share: self.share,
             object: self.object,
             object_offset: self.object_offset + delta,
-            _lock_seq: 0,
+            vma_flags: self.vma_flags, // preserve behaviour flags on split
         };
         (left, right)
     }
@@ -382,6 +395,43 @@ impl VmaTree {
     /// that does not split bordering VMAs.
     pub fn remove_exact(&mut self, start: usize) -> Option<Vma> {
         self.map.remove(&start)
+    }
+
+    /// Return a reference to the VMA whose `start` is the smallest value
+    /// strictly greater than `addr`, or `None` if no such VMA exists.
+    /// Used by the growsdown resolver to find the VMA that should be
+    /// extended downward when a below-start fault fires.
+    pub fn find_above(&self, addr: usize) -> Option<&Vma> {
+        self.map.range((addr + 1)..).next().map(|(_, v)| v)
+    }
+
+    /// Return a reference to the last VMA whose start is < `addr`, if any.
+    pub fn last_below(&self, addr: usize) -> Option<&Vma> {
+        self.map.range(..addr).next_back().map(|(_, v)| v)
+    }
+
+    /// Walk upward from `vma_start` through contiguous `VMA_GROWSDOWN`
+    /// fragments and return the `end` of the topmost one. This is the fixed
+    /// stack ceiling (USER_STACK_TOP) regardless of how many single-page
+    /// fragments have been inserted below the original VMA by `grow_stack`.
+    ///
+    /// Starts at the VMA keyed by `vma_start`, then follows each VMA whose
+    /// `start` equals the previous `end` and which carries `VMA_GROWSDOWN`.
+    /// Returns `vma_start + PAGE_SIZE` as a safe fallback if the key is not
+    /// found (should not happen in practice).
+    pub fn growsdown_stack_top(&self, vma_start: usize) -> usize {
+        let mut top = match self.map.get(&vma_start) {
+            Some(v) => v.end,
+            None => return vma_start + 4096,
+        };
+        // Each newly inserted growsdown fragment is adjacent (end == next.start).
+        loop {
+            match self.map.get(&top) {
+                Some(v) if v.vma_flags & VMA_GROWSDOWN != 0 => top = v.end,
+                _ => break,
+            }
+        }
+        top
     }
 
     fn assert_no_overlap(&self, start: usize, end: usize) {
