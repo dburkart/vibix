@@ -109,12 +109,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
 /// task has no process table entry (e.g. the bootstrap kernel task).
 pub fn current_pid() -> u32 {
     let task_id = crate::task::current_id();
-    TABLE
-        .lock()
-        .pid_of
-        .get(&task_id)
-        .copied()
-        .unwrap_or(0)
+    TABLE.lock().pid_of.get(&task_id).copied().unwrap_or(0)
 }
 
 /// Mark `pid` as a zombie with `exit_status`, then wake any parents

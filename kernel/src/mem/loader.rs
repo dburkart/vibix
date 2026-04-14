@@ -159,8 +159,8 @@ pub fn load_user_elf_with_vmas(
     pml4: PhysFrame<Size4KiB>,
     address_space: &mut super::addrspace::AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
-    use super::vmobject::{AnonObject, VmObject};
     use super::vmatree::{Share, Vma};
+    use super::vmobject::{AnonObject, VmObject};
     use x86_64::VirtAddr;
 
     let image = load_user_elf(bytes, pml4)?;
@@ -186,10 +186,17 @@ pub fn load_user_elf_with_vmas(
             }
         }
 
-        let prot_pte = (seg.flags
-            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
-            .bits();
-        let vma = Vma::new(start, end, 0x3, prot_pte, Share::Private, obj as Arc<dyn VmObject>, 0);
+        let prot_pte =
+            (seg.flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits();
+        let vma = Vma::new(
+            start,
+            end,
+            0x3,
+            prot_pte,
+            Share::Private,
+            obj as Arc<dyn VmObject>,
+            0,
+        );
         address_space.insert(vma);
     }
 

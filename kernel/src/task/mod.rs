@@ -137,9 +137,7 @@ pub fn fork_current_task(
     // CoW-clone the address space (requires AddressSpace write lock).
     let child_aspace = {
         let mut tlb = crate::mem::tlb::Flusher::new_active();
-        let child = parent_address_space
-            .write()
-            .fork_address_space(&mut tlb)?;
+        let child = parent_address_space.write().fork_address_space(&mut tlb)?;
         tlb.finish();
         child
     };
@@ -706,7 +704,13 @@ pub fn exit() -> ! {
         // reap it until a later tick, so the heap location remains
         // valid for this context_switch's single write.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
-        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_syscall_top)
+        (
+            prev_rsp_ptr,
+            next_rsp,
+            next_cr3,
+            next_fpu_ptr,
+            next_syscall_top,
+        )
     };
     // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
     // a stable heap location, next_cr3 is a valid per-task PML4,
