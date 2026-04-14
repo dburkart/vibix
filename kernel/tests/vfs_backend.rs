@@ -236,9 +236,11 @@ fn close_cloexec_drops_vfs_backend() {
     let mut t = FileDescTable::new();
     let cloexec_desc = Arc::new(FileDescription {
         backend: cloexec_backend,
-        flags: flags::O_CLOEXEC,
+        flags: 0,
     });
-    let cloexec_fd = t.alloc_fd(cloexec_desc).expect("alloc cloexec fd");
+    let cloexec_fd = t
+        .alloc_fd_with_flags(cloexec_desc, flags::O_CLOEXEC)
+        .expect("alloc cloexec fd");
 
     // A non-cloexec VfsBackend fd must survive exec.
     let of2 = make_open_file(0);
