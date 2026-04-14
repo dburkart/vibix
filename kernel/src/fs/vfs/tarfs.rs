@@ -91,7 +91,7 @@ impl SuperOps for TarSuper {
             f_blocks: (self.len / BLOCK) as u64,
             f_bfree: 0,
             f_bavail: 0,
-            f_files: self.nodes.len() as u64,
+            f_files: self.nodes.len().saturating_sub(1) as u64,
             f_ffree: 0,
             f_namelen: super::NAME_MAX as u64,
         })
@@ -214,8 +214,10 @@ impl FileOps for TarFileOps {
             if out + reclen > buf.len() {
                 break;
             }
+            let entry = &mut buf[out..out + reclen];
+            entry.fill(0);
             write_dirent(
-                &mut buf[out..out + reclen],
+                entry,
                 child_ino,
                 (idx as u64) + 1,
                 reclen as u16,
@@ -244,7 +246,7 @@ fn write_dirent(out: &mut [u8], ino: u64, off: u64, reclen: u16, dtype: u8, name
     out[18] = dtype;
     out[19..19 + name.len()].copy_from_slice(name);
     out[19 + name.len()] = 0;
-    // Padding bytes are already zeroed by caller.
+    // Tail padding is zeroed by the caller (entry.fill(0)) before this call.
 }
 
 fn dtype_of(kind: InodeKind) -> u8 {
