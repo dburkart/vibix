@@ -263,7 +263,10 @@ impl InodeOps for RamfsInode {
             .unwrap()
             .insert(key, child.clone());
         // Parent gains a back-link from the new subdir's "..".
-        dir.meta.write().nlink = dir.meta.read().nlink.saturating_add(1);
+        {
+            let mut meta = dir.meta.write();
+            meta.nlink = meta.nlink.saturating_add(1);
+        }
         Ok(child)
     }
 
@@ -323,7 +326,10 @@ impl InodeOps for RamfsInode {
         }
         child.state.lock().unlinked = true;
         // Parent loses the ".." link from the removed subdir.
-        dir.meta.write().nlink = dir.meta.read().nlink.saturating_sub(1);
+        {
+            let mut meta = dir.meta.write();
+            meta.nlink = meta.nlink.saturating_sub(1);
+        }
         Ok(())
     }
 
@@ -350,6 +356,10 @@ impl InodeOps for RamfsInode {
 
         if same_dir {
             let _guard = old_dir.dir_rwsem.write();
+            // Renaming to the same name is always a successful no-op.
+            if old_key == new_key {
+                return Ok(());
+            }
             let mut body = self.body.lock();
             let children = match &mut *body {
                 RamfsBody::Dir { children } => children,
@@ -417,18 +427,36 @@ impl InodeOps for RamfsInode {
                 let mut nb = new_body_arc.lock();
                 match &mut *nb {
                     RamfsBody::Dir { children } => {
-                        // Handle displaced target.
-                        if let Some(displaced) = children.remove(&new_key) {
-                            let new_nlink = {
-                                let mut m = displaced.meta.write();
-                                m.nlink = m.nlink.saturating_sub(1);
-                                m.nlink
-                            };
-                            if new_nlink == 0 {
+                        // Validate and handle displaced target (mirror same-dir checks).
+                        if let Some(existing) = children.get(&new_key).cloned() {
+                            if existing.kind == InodeKind::Dir {
+                                if moving.kind != InodeKind::Dir {
+                                    return Err(EISDIR);
+                                }
+                                let ex_body_arc = body_of_ops(&existing.ops);
+                                let ex_body = ex_body_arc.lock();
+                                if let RamfsBody::Dir { children: c } = &*ex_body {
+                                    if !c.is_empty() {
+                                        return Err(ENOTEMPTY);
+                                    }
+                                }
+                                drop(ex_body);
+                                let displaced = children.remove(&new_key).unwrap();
+                                displaced.meta.write().nlink = 0;
                                 displaced.state.lock().unlinked = true;
-                                if displaced.kind == InodeKind::Dir {
-                                    new_dir.meta.write().nlink =
-                                        new_dir.meta.read().nlink.saturating_sub(1);
+                                let mut meta = new_dir.meta.write();
+                                meta.nlink = meta.nlink.saturating_sub(1);
+                            } else if moving.kind == InodeKind::Dir {
+                                return Err(ENOTDIR);
+                            } else {
+                                let displaced = children.remove(&new_key).unwrap();
+                                let new_nlink = {
+                                    let mut m = displaced.meta.write();
+                                    m.nlink = m.nlink.saturating_sub(1);
+                                    m.nlink
+                                };
+                                if new_nlink == 0 {
+                                    displaced.state.lock().unlinked = true;
                                 }
                             }
                         }
@@ -447,8 +475,14 @@ impl InodeOps for RamfsInode {
 
             // Adjust parent nlinks for moved subdirectory.
             if moving.kind == InodeKind::Dir {
-                old_dir.meta.write().nlink = old_dir.meta.read().nlink.saturating_sub(1);
-                new_dir.meta.write().nlink = new_dir.meta.read().nlink.saturating_add(1);
+                {
+                    let mut meta = old_dir.meta.write();
+                    meta.nlink = meta.nlink.saturating_sub(1);
+                }
+                {
+                    let mut meta = new_dir.meta.write();
+                    meta.nlink = meta.nlink.saturating_add(1);
+                }
             }
             let _ = first_is_old; // used only for documentation
         }
@@ -458,6 +492,12 @@ impl InodeOps for RamfsInode {
     fn link(&self, dir: &Inode, name: &[u8], target: &Inode) -> Result<(), i64> {
         if target.kind == InodeKind::Dir {
             return Err(EPERM);
+        }
+        // Reject cross-superblock hardlinks before inode-table lookup.
+        let dir_sb = dir.sb.upgrade().ok_or(ENOENT)?;
+        let target_sb = target.sb.upgrade().ok_or(ENOENT)?;
+        if !Arc::ptr_eq(&dir_sb, &target_sb) {
+            return Err(EXDEV);
         }
         let _guard = dir.dir_rwsem.write();
         let key = DString::try_from_bytes(name)?;
@@ -478,7 +518,10 @@ impl InodeOps for RamfsInode {
             .as_dir_mut()
             .unwrap()
             .insert(key, inode_arc);
-        target.meta.write().nlink = target.meta.read().nlink.saturating_add(1);
+        {
+            let mut meta = target.meta.write();
+            meta.nlink = meta.nlink.saturating_add(1);
+        }
         Ok(())
     }
 
