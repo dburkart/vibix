@@ -31,7 +31,7 @@ pub mod flags {
     pub const O_WRONLY: u32 = 0o1;
     /// Open for reading and writing.
     pub const O_RDWR: u32 = 0o2;
-    /// Mask for the three access-mode bits.
+    /// Mask for the two low access-mode bits.
     pub const O_ACCMODE: u32 = 0o3;
     /// Create the file if it does not exist.
     pub const O_CREAT: u32 = 0o100;
@@ -51,7 +51,8 @@ pub mod flags {
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// Open a stat-only fd (no I/O permitted).
     pub const O_PATH: u32 = 0o10000000;
-    /// Create an unnamed temporary file (currently rejected with `EINVAL`).
+    /// Create an unnamed temporary file (defined for Linux ABI parity; not
+    /// yet honored by `sys_open`, which currently masks unsupported bits).
     pub const O_TMPFILE: u32 = 0o20200000;
 
     // Compile-time pins against the Linux x86_64 numeric values. If any of
