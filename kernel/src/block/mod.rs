@@ -4,9 +4,10 @@
 //! at boot. Today that's virtio-blk only; further backends would plug in
 //! the same way.
 //!
-//! Issue #43 step 1: expose `read(lba, buf)` against the first detected
-//! virtio-blk device. No writes, no caching, no interrupts — synchronous
-//! polled I/O only.
+//! Exposes synchronous polled `read(lba, buf)` and `write(lba, buf)`
+//! against the first detected virtio-blk device. No caching, no
+//! interrupts — polled I/O only (issue #81 added the write path on top
+//! of the original step-1 read-only driver from #43).
 
 #[cfg(any(test, target_os = "none"))]
 pub mod virtio_blk;
@@ -43,6 +44,17 @@ pub fn init() {
 #[cfg(target_os = "none")]
 pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     virtio_blk::read(lba, buf)
+}
+
+/// Write `buf.len() / 512` sectors from `buf` starting at `lba`.
+///
+/// Same shape as [`read`]: `buf.len()` must be a non-zero multiple of
+/// [`SECTOR_SIZE`] and must not exceed a single 4 KiB page (the bounce
+/// buffer cap). Blocks on a polled spin-wait until the device reports
+/// completion or the poll budget elapses.
+#[cfg(target_os = "none")]
+pub fn write(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
+    virtio_blk::write(lba, buf)
 }
 
 /// `true` once a backend has completed bring-up.

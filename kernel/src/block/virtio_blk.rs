@@ -91,6 +91,8 @@ const STATUS_FAILED: u8 = 128;
 /// `type` values in the block request header.
 #[cfg(target_os = "none")]
 const VIRTIO_BLK_T_IN: u32 = 0;
+#[cfg(target_os = "none")]
+const VIRTIO_BLK_T_OUT: u32 = 1;
 
 /// `flags` bits in a virtqueue descriptor.
 #[cfg(target_os = "none")]
@@ -390,62 +392,32 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     }
     let mut guard = DEVICE.lock();
     let dev = guard.as_mut().ok_or(BlkError::NotInitialized)?;
-
-    // Per-request scratch: header + status byte + page-aligned data
-    // bounce buffer, sitting in the heap (HHDM-backed, so translate
-    // works identically to the queue).
-    let header = VirtioBlkReqHeader {
-        ty: VIRTIO_BLK_T_IN,
-        reserved: 0,
-        sector: lba,
+    let scratch = match unsafe { Scratch::alloc() } {
+        Some(s) => s,
+        None => return Err(BlkError::DeviceError),
     };
-    let header_layout = Layout::from_size_align(size_of::<VirtioBlkReqHeader>(), 8).unwrap();
-    let status_layout = Layout::from_size_align(1, 1).unwrap();
-    let data_layout = Layout::from_size_align(4096, 4096).unwrap();
-    // SAFETY: all layouts are valid and non-zero-sized.
-    let header_ptr = unsafe { alloc_zeroed(header_layout) } as *mut VirtioBlkReqHeader;
-    let status_ptr = unsafe { alloc_zeroed(status_layout) };
-    let data_ptr = unsafe { alloc_zeroed(data_layout) };
-    assert!(!header_ptr.is_null() && !status_ptr.is_null() && !data_ptr.is_null());
-    // SAFETY: just allocated, exclusive.
     unsafe {
-        ptr::write(header_ptr, header);
+        scratch.write_header(VIRTIO_BLK_T_IN, lba);
     }
-
-    let header_pa = paging::translate(x86_64::VirtAddr::new(header_ptr as u64))
-        .expect("virtio_blk: header not mapped")
-        .as_u64();
-    let data_pa = paging::translate(x86_64::VirtAddr::new(data_ptr as u64))
-        .expect("virtio_blk: data not mapped")
-        .as_u64();
-    let status_pa = paging::translate(x86_64::VirtAddr::new(status_ptr as u64))
-        .expect("virtio_blk: status not mapped")
-        .as_u64();
-
-    let result = unsafe { submit_and_wait(dev, header_pa, data_pa, buf.len() as u32, status_pa) };
-    // The device is only still looking at our buffers if submit_and_wait
-    // timed out — on any completed status (Ok or DeviceError) it's safe
-    // to free. Timeout deliberately leaks to avoid freeing memory the
-    // device may still DMA into.
+    let result = unsafe { submit_and_wait(dev, &scratch, buf.len() as u32, IoDir::Read) };
     match result {
         Ok(()) => {
-            // SAFETY: data_ptr points to a live 4 KiB allocation.
+            // SAFETY: data_ptr points to a live 4 KiB allocation the device
+            // filled via DMA; the matching ACQUIRE fence inside
+            // submit_and_wait has already synchronized those writes.
             unsafe {
-                ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), buf.len());
-            }
-            unsafe {
-                dealloc(header_ptr as *mut u8, header_layout);
-                dealloc(status_ptr, status_layout);
-                dealloc(data_ptr, data_layout);
+                ptr::copy_nonoverlapping(scratch.data_ptr, buf.as_mut_ptr(), buf.len());
+                scratch.dealloc();
             }
             Ok(())
         }
-        Err(BlkError::Timeout) => Err(BlkError::Timeout),
+        Err(BlkError::Timeout) => {
+            // Deliberately leak on timeout: the device may still DMA.
+            Err(BlkError::Timeout)
+        }
         Err(e) => {
             unsafe {
-                dealloc(header_ptr as *mut u8, header_layout);
-                dealloc(status_ptr, status_layout);
-                dealloc(data_ptr, data_layout);
+                scratch.dealloc();
             }
             Err(e)
         }
@@ -453,25 +425,167 @@ pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
 }
 
 #[cfg(target_os = "none")]
+pub fn write(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
+    if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        return Err(BlkError::BadAlign);
+    }
+    if buf.len() > 4096 {
+        return Err(BlkError::BadAlign);
+    }
+    let mut guard = DEVICE.lock();
+    let dev = guard.as_mut().ok_or(BlkError::NotInitialized)?;
+    let scratch = match unsafe { Scratch::alloc() } {
+        Some(s) => s,
+        None => return Err(BlkError::DeviceError),
+    };
+    unsafe {
+        scratch.write_header(VIRTIO_BLK_T_OUT, lba);
+        // Stage the payload into the bounce buffer before submission;
+        // the device will read from it as a RO descriptor.
+        ptr::copy_nonoverlapping(buf.as_ptr(), scratch.data_ptr, buf.len());
+    }
+    let result = unsafe { submit_and_wait(dev, &scratch, buf.len() as u32, IoDir::Write) };
+    match result {
+        Ok(()) => {
+            unsafe {
+                scratch.dealloc();
+            }
+            Ok(())
+        }
+        Err(BlkError::Timeout) => Err(BlkError::Timeout),
+        Err(e) => {
+            unsafe {
+                scratch.dealloc();
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Direction of a single virtio-blk I/O request. Controls whether the
+/// data descriptor carries `VIRTQ_DESC_F_WRITE` (read: device writes the
+/// buffer) or not (write: device reads the buffer).
+#[cfg(target_os = "none")]
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum IoDir {
+    Read,
+    Write,
+}
+
+/// Per-request scratch: header + status byte + page-aligned data bounce
+/// buffer, all HHDM-backed so `paging::translate` resolves them the same
+/// way as the queue.
+#[cfg(target_os = "none")]
+struct Scratch {
+    header_ptr: *mut VirtioBlkReqHeader,
+    status_ptr: *mut u8,
+    data_ptr: *mut u8,
+    header_pa: u64,
+    status_pa: u64,
+    data_pa: u64,
+}
+
+#[cfg(target_os = "none")]
+impl Scratch {
+    const HEADER_LAYOUT: Layout = match Layout::from_size_align(size_of::<VirtioBlkReqHeader>(), 8)
+    {
+        Ok(l) => l,
+        Err(_) => panic!("virtio_blk: bad header layout"),
+    };
+    const STATUS_LAYOUT: Layout = match Layout::from_size_align(1, 1) {
+        Ok(l) => l,
+        Err(_) => panic!("virtio_blk: bad status layout"),
+    };
+    const DATA_LAYOUT: Layout = match Layout::from_size_align(4096, 4096) {
+        Ok(l) => l,
+        Err(_) => panic!("virtio_blk: bad data layout"),
+    };
+
+    /// Allocate all three regions and translate their virtual addresses
+    /// to physical. Returns `None` if any allocation fails.
+    ///
+    /// SAFETY: caller must arrange for exactly one `dealloc()` per
+    /// non-timeout completion; on timeout the memory must be leaked
+    /// because the device may still DMA into it.
+    unsafe fn alloc() -> Option<Self> {
+        let header_ptr = alloc_zeroed(Self::HEADER_LAYOUT) as *mut VirtioBlkReqHeader;
+        if header_ptr.is_null() {
+            return None;
+        }
+        let status_ptr = alloc_zeroed(Self::STATUS_LAYOUT);
+        if status_ptr.is_null() {
+            dealloc(header_ptr as *mut u8, Self::HEADER_LAYOUT);
+            return None;
+        }
+        let data_ptr = alloc_zeroed(Self::DATA_LAYOUT);
+        if data_ptr.is_null() {
+            dealloc(header_ptr as *mut u8, Self::HEADER_LAYOUT);
+            dealloc(status_ptr, Self::STATUS_LAYOUT);
+            return None;
+        }
+        let header_pa = paging::translate(x86_64::VirtAddr::new(header_ptr as u64))
+            .expect("virtio_blk: header not mapped")
+            .as_u64();
+        let status_pa = paging::translate(x86_64::VirtAddr::new(status_ptr as u64))
+            .expect("virtio_blk: status not mapped")
+            .as_u64();
+        let data_pa = paging::translate(x86_64::VirtAddr::new(data_ptr as u64))
+            .expect("virtio_blk: data not mapped")
+            .as_u64();
+        Some(Scratch {
+            header_ptr,
+            status_ptr,
+            data_ptr,
+            header_pa,
+            status_pa,
+            data_pa,
+        })
+    }
+
+    unsafe fn write_header(&self, ty: u32, sector: u64) {
+        ptr::write(
+            self.header_ptr,
+            VirtioBlkReqHeader {
+                ty,
+                reserved: 0,
+                sector,
+            },
+        );
+    }
+
+    unsafe fn dealloc(&self) {
+        dealloc(self.header_ptr as *mut u8, Self::HEADER_LAYOUT);
+        dealloc(self.status_ptr, Self::STATUS_LAYOUT);
+        dealloc(self.data_ptr, Self::DATA_LAYOUT);
+    }
+}
+
+#[cfg(target_os = "none")]
 unsafe fn submit_and_wait(
     dev: &mut BlkDevice,
-    header_pa: u64,
-    buf_pa: u64,
+    scratch: &Scratch,
     buf_len: u32,
-    status_pa: u64,
+    dir: IoDir,
 ) -> Result<(), BlkError> {
     let qsz = dev.queue_size as u16;
     let slot = dev.avail_idx % qsz;
     let desc_base = dev.queue_base.add(dev.layout.desc_off) as *mut VirtqDesc;
 
-    // Three descriptors: header (RO), data (WO), status (WO).
+    // Three descriptors: header (RO), data (RO for write, WO for read),
+    // status (WO). The F_WRITE flag in virtio descriptors marks
+    // *device-writable* memory — so reads set it on the data descriptor
+    // and writes clear it.
     let d0 = slot;
     let d1 = (slot + 1) % qsz;
     let d2 = (slot + 2) % qsz;
+    let data_flags = match dir {
+        IoDir::Read => VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+        IoDir::Write => VIRTQ_DESC_F_NEXT,
+    };
     ptr::write_volatile(
         desc_base.add(d0 as usize),
         VirtqDesc {
-            addr: header_pa,
+            addr: scratch.header_pa,
             len: size_of::<VirtioBlkReqHeader>() as u32,
             flags: VIRTQ_DESC_F_NEXT,
             next: d1,
@@ -480,16 +594,16 @@ unsafe fn submit_and_wait(
     ptr::write_volatile(
         desc_base.add(d1 as usize),
         VirtqDesc {
-            addr: buf_pa,
+            addr: scratch.data_pa,
             len: buf_len,
-            flags: VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            flags: data_flags,
             next: d2,
         },
     );
     ptr::write_volatile(
         desc_base.add(d2 as usize),
         VirtqDesc {
-            addr: status_pa,
+            addr: scratch.status_pa,
             len: 1,
             flags: VIRTQ_DESC_F_WRITE,
             next: 0,
@@ -519,8 +633,9 @@ unsafe fn submit_and_wait(
         if used_idx == expected {
             dev.last_used_idx = used_idx;
             // Status byte: 0 = OK, 1 = IOERR, 2 = UNSUPP.
-            let status =
-                ptr::read_volatile((paging::hhdm_offset().as_u64() + status_pa) as *const u8);
+            let status = ptr::read_volatile(
+                (paging::hhdm_offset().as_u64() + scratch.status_pa) as *const u8,
+            );
             return if status == 0 {
                 Ok(())
             } else {
@@ -614,6 +729,22 @@ mod tests {
     fn negotiate_accepts_nothing() {
         assert_eq!(negotiate(0xFFFF_FFFF_FFFF_FFFF), 0);
         assert_eq!(negotiate(0), 0);
+    }
+
+    // Pin the virtio-blk request-type wire values. VIRTIO_BLK_T_IN = 0 and
+    // VIRTIO_BLK_T_OUT = 1 are the legacy spec (§5.2.5) values the device
+    // looks for; silently changing them would send every request down the
+    // wrong code path on the device side.
+    #[test]
+    fn request_type_wire_values() {
+        // Values live inside a `cfg(target_os = "none")` block, so repeat
+        // the constants here to keep the assertion visible to the host
+        // test build.
+        const T_IN: u32 = 0;
+        const T_OUT: u32 = 1;
+        assert_eq!(T_IN, 0);
+        assert_eq!(T_OUT, 1);
+        assert_ne!(T_IN, T_OUT);
     }
 
     #[test]
