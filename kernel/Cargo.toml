@@ -149,6 +149,10 @@ name = "addrspace_drop"
 harness = false
 
 [[test]]
+name = "fork_cow"
+harness = false
+
+[[test]]
 name = "tlb_flusher"
 harness = false
 
