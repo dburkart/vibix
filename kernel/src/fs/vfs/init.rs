@@ -9,10 +9,10 @@
 //! | `/dev`     | devfs  | synthesised                   |
 //! | `/tmp`     | ramfs  | synthesised                   |
 //!
-//! The RFC names tarfs-on-a-ramdisk-module as the long-term backing
-//! for `/`, but the boot ISO does not yet ship a rootfs tarball, so
-//! ramfs is mounted there for now. Once a tar module lands, swap the
-//! `/` backing to [`TarFs`] with `MountSource::RamdiskModule`.
+//! On bare-metal, if a `rootfs.tar` module is present in the Limine
+//! config, TarFs is mounted at `/` instead of RamFs. `/dev` and `/tmp`
+//! are always overlaid with DevFs/RamFs respectively; their mountpoint
+//! dentries use synthetic bootstrap inodes when the root FS is read-only.
 //!
 //! ## Bootstrap: where does the namespace root come from?
 //!
@@ -138,6 +138,11 @@ fn find_rootfs_module() -> Option<(*const u8, usize)> {
 
 /// Create a subdirectory `name` under `parent`, wrap it in a fresh
 /// dentry, and mount `fs` onto it. Panics on any step's failure.
+///
+/// When the parent filesystem is read-only (EROFS), `mkdir` will fail.
+/// In that case a synthetic bootstrap inode is used as the mountpoint —
+/// the mounted FS's own root takes over immediately, so the synthetic
+/// inode is never visible to callers.
 fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSystem>) {
     let parent_inode = parent
         .inode
@@ -146,16 +151,43 @@ fn mount_child(parent: &Arc<Dentry>, name: &[u8], fs: Arc<dyn super::ops::FileSy
         .cloned()
         .unwrap_or_else(|| panic!("vfs::init: parent dentry is negative"));
 
-    let child_inode = parent_inode
-        .ops
-        .mkdir(&parent_inode, name, 0o755)
-        .unwrap_or_else(|e| {
-            panic!(
-                "vfs::init: mkdir {:?} under / failed: errno={}",
-                core::str::from_utf8(name).unwrap_or("<non-utf8>"),
-                e
-            )
-        });
+    // Attempt to create the directory in the parent FS. Falls back to a
+    // synthetic inode when the parent is read-only (EROFS = -30).
+    let child_inode = match parent_inode.ops.mkdir(&parent_inode, name, 0o755) {
+        Ok(inode) => inode,
+        Err(-30) => {
+            // Parent is read-only (e.g. TarFs at /). Synthesise a
+            // bootstrap placeholder — the mounted child FS's root
+            // dentry takes over immediately and the synthetic inode
+            // is never reachable through the mounted namespace.
+            let stub_sb = Arc::new(SuperBlock::new(
+                alloc_fs_id(),
+                Arc::new(BootstrapSuperOps) as Arc<dyn SuperOps>,
+                "mountpoint-stub",
+                4096,
+                SbFlags::default(),
+            ));
+            let stub_inode = Arc::new(Inode::new(
+                1,
+                Arc::downgrade(&stub_sb),
+                Arc::new(BootstrapInodeOps) as Arc<dyn InodeOps>,
+                Arc::new(BootstrapFileOps) as Arc<dyn FileOps>,
+                InodeKind::Dir,
+                InodeMeta {
+                    mode: 0o755,
+                    nlink: 2,
+                    ..Default::default()
+                },
+            ));
+            core::mem::forget(stub_sb);
+            stub_inode
+        }
+        Err(e) => panic!(
+            "vfs::init: mkdir {:?} under / failed: errno={}",
+            core::str::from_utf8(name).unwrap_or("<non-utf8>"),
+            e
+        ),
+    };
 
     let child_dname =
         super::DString::try_from_bytes(name).unwrap_or_else(|_| panic!("vfs::init: invalid dname"));
