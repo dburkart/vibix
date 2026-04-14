@@ -26,7 +26,7 @@ jobs:
           fetch-depth: 50   # enough history to see recent momentum
 
       - name: Run Claude Code — propose up to 5 next issues
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@1c8b699d43e9bfed42b48ef15da85d89bab70960 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           additional_permissions: |
