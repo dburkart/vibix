@@ -216,7 +216,15 @@ impl AddressSpace {
     /// past the last `PT_LOAD` segment). Called after `load_user_elf_with_vmas`
     /// so that `sys_brk` starts the heap immediately after the ELF image
     /// rather than at the arbitrary `mmap_base` placeholder.
+    ///
+    /// If `image_end > brk_max` (e.g. an extremely large ELF), the heap window
+    /// would be zero-sized or inverted, so the call is a no-op — callers should
+    /// handle this by falling back to the existing brk_start.
     pub fn set_brk_start(&mut self, image_end: VirtAddr) {
+        if image_end > self.brk_max {
+            // Heap window would be empty; leave the existing placeholder.
+            return;
+        }
         self.brk_start = image_end;
         self.brk_cur = image_end;
         // brk_max stays at mmap_base − DEFAULT_BRK_GUARD.
@@ -250,18 +258,39 @@ impl AddressSpace {
             return self.brk_cur.as_u64();
         }
 
-        // Page-align upward to match Linux semantics.
-        let new_brk_raw = (addr + 4095) & !4095;
+        // Reject non-canonical addresses and overflow before constructing
+        // VirtAddr — VirtAddr::new panics on non-canonical values.
+        // USER_VA_END is the first non-canonical lower-half address.
+        if addr >= USER_VA_END {
+            return self.brk_cur.as_u64();
+        }
+        // Overflow-safe page-align upward.
+        let new_brk_raw = match addr.checked_add(4095) {
+            Some(v) => v & !4095,
+            None => return self.brk_cur.as_u64(), // would overflow u64
+        };
+        if new_brk_raw >= USER_VA_END {
+            return self.brk_cur.as_u64(); // rounded up into non-canonical range
+        }
+        // Construct the page-aligned address used for VMA extent decisions.
         let new_brk = VirtAddr::new(new_brk_raw);
+        // Linux stores the EXACT requested address in mm->brk (not the
+        // page-aligned value), so glibc/musl sbrk tracking is correct.
+        let exact_brk = VirtAddr::new(addr);
 
         if new_brk > self.brk_max || new_brk < self.brk_start {
             return self.brk_cur.as_u64();
         }
-        if new_brk == self.brk_cur {
-            return self.brk_cur.as_u64();
+        // No page-mapping change needed if we stay inside the same page.
+        let old_brk_page = VirtAddr::new((self.brk_cur.as_u64() + 4095) & !4095);
+        if new_brk == old_brk_page {
+            self.brk_cur = exact_brk;
+            return exact_brk.as_u64();
         }
 
-        let old_brk = self.brk_cur;
+        // Use page-aligned values for VMA extent decisions; store the exact
+        // requested address in brk_cur (Linux semantics: mm->brk is exact).
+        let old_brk = old_brk_page; // page-aligned old break
         let brk_start = self.brk_start;
         let brk_start_usize = brk_start.as_u64() as usize;
 
@@ -329,6 +358,10 @@ impl AddressSpace {
                 self.vm_pages -= (old_brk - brk_start) as usize / 4096;
                 if new_brk > brk_start {
                     let obj = Arc::clone(&old.object);
+                    // Trim the VmObject's frame cache for the freed range so
+                    // cached frames are released now rather than at exit.
+                    let from_page = (new_brk - brk_start) as usize / 4096;
+                    obj.truncate_from_page(from_page);
                     drop(old);
                     let vma = Vma::new(
                         brk_start_usize,
@@ -345,8 +378,10 @@ impl AddressSpace {
             }
         }
 
-        self.brk_cur = new_brk;
-        new_brk.as_u64()
+        // Store the exact requested address per Linux mm->brk semantics;
+        // page-aligned values were used only to decide VMA extent changes.
+        self.brk_cur = exact_brk;
+        exact_brk.as_u64()
     }
 
     /// Insert `vma` into the VMA tree, merging with adjacent neighbours
@@ -786,13 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn brk_zero_returns_current_break() {
+    fn brk_constructor_sets_start_eq_cur() {
+        // new_for_test initialises brk_start == brk_cur == mmap_base.
+        // sys_brk(0) behaviour is only testable in QEMU (cfg=none); this
+        // test just verifies the constructor invariant.
         let aspace = AddressSpace::new_for_test(0x4000_0000);
-        // Before any brk, brk_cur == brk_start == mmap_base.
-        let r = aspace.brk_cur.as_u64();
-        // sys_brk is #[cfg(target_os = "none")] — just test set_brk_start.
         assert_eq!(aspace.brk_start, aspace.brk_cur);
-        let _ = r;
     }
 
     #[test]
