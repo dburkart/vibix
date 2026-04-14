@@ -767,6 +767,54 @@ fn test_runner(kernel: &Path) -> R<()> {
     }
 }
 
+/// Parse `[[test]]` target names from a `Cargo.toml` body, preserving
+/// declaration order. Assumes each `[[test]]` block is followed by a
+/// `name = "<ident>"` line before the next `[`-prefixed header. Blank
+/// lines and comments between the header and the `name` key are
+/// tolerated; inline comments on the `name` line itself are not.
+fn parse_test_names(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_test = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_test = trimmed == "[[test]]";
+            continue;
+        }
+        if !in_test {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let val = rest.trim();
+                if let Some(inner) = val.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    names.push(inner.to_string());
+                    in_test = false;
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Read `kernel/Cargo.toml` and return the declared integration-test
+/// target names. Derived dynamically to avoid drift between the manifest
+/// and the xtask test runner (see issue #292).
+fn integration_test_names() -> R<Vec<String>> {
+    let manifest_path = workspace_root().join("kernel").join("Cargo.toml");
+    let body = fs::read_to_string(&manifest_path)?;
+    let names = parse_test_names(&body);
+    if names.is_empty() {
+        return Err(format!(
+            "no [[test]] entries found in {}",
+            manifest_path.display()
+        )
+        .into());
+    }
+    Ok(names)
+}
+
 fn test_all() -> R<()> {
     // Host unit tests (--lib only; pure-logic modules).
     println!("→ host unit tests");
@@ -781,52 +829,17 @@ fn test_all() -> R<()> {
     // also try to build the lib's no_std test harness (which would
     // require std). Cargo's runner config invokes us back as
     // `test-runner <binary>` per compiled test.
+    //
+    // The test list is derived from `kernel/Cargo.toml` `[[test]]`
+    // entries so adding a new integration test in the manifest
+    // automatically wires it into `cargo xtask test` (issue #292).
     println!("→ integration tests under QEMU");
+    let tests = integration_test_names()?;
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
         .args(["test", "--package", "vibix"])
         .args(KERNEL_BUILD_STD_ARGS);
-    for t in [
-        "basic_boot",
-        "heap_alloc",
-        "heap_grow",
-        "should_panic",
-        "timer_tick",
-        "paging",
-        "tasks",
-        "preempt",
-        "pml4_switch",
-        "apic_online",
-        "backtrace",
-        "page_fault",
-        "blocking_sync",
-        "shell_smoke",
-        "priority",
-        "per_task_cr3",
-        "demand_paging",
-        "userspace_module",
-        "userspace_loader",
-        "sleep",
-        "pci_enum",
-        "serial_rx",
-        "cow_vma",
-        "fpu_context_switch",
-        "fork_fpu_inherit",
-        "task_exit",
-        "addrspace",
-        "addrspace_drop",
-        "exec_atomic_partial_load",
-        "fork_cow",
-        "tlb_flusher",
-        "smep_smap",
-        "fd_table",
-        "syscall_open_mmap",
-        "syscall_vfs",
-        "vm_integration",
-        "vfs_backend",
-        "vfs_hello",
-        "rootfs_module",
-    ] {
+    for t in &tests {
         cmd.arg("--test").arg(t);
     }
     check(cmd.status()?)?;
@@ -1037,5 +1050,62 @@ mod tests {
             format!("{:#}", rustc_demangle::demangle("memcpy")),
             "memcpy"
         );
+    }
+
+    #[test]
+    fn parse_test_names_extracts_declared_order() {
+        let manifest = r#"
+[package]
+name = "vibix"
+
+[[bin]]
+name = "vibix"
+
+[[test]]
+name = "basic_boot"
+harness = false
+
+[[test]]
+name = "heap_alloc"
+harness = false
+
+[[test]]
+name = "should_panic"
+harness = false
+"#;
+        assert_eq!(
+            parse_test_names(manifest),
+            vec!["basic_boot", "heap_alloc", "should_panic"]
+        );
+    }
+
+    #[test]
+    fn parse_test_names_ignores_bin_and_bench_names() {
+        let manifest = r#"
+[[bin]]
+name = "vibix"
+path = "src/main.rs"
+
+[[bench]]
+name = "my_bench"
+
+[[test]]
+name = "only_this"
+harness = false
+"#;
+        assert_eq!(parse_test_names(manifest), vec!["only_this"]);
+    }
+
+    #[test]
+    fn parse_test_names_live_manifest_contains_new_entries() {
+        // Guards against silent drift: these three were previously
+        // absent from the hardcoded xtask array (issue #292).
+        let names = integration_test_names().expect("parse live manifest");
+        for expected in &["execve_atomic", "fork_refcount", "syscall_mmap_family"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "expected {expected} in derived test list, got {names:?}"
+            );
+        }
     }
 }
