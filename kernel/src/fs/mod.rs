@@ -9,6 +9,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+#[cfg(target_os = "none")]
 pub mod vfs;
 
 /// I/O dispatch interface for a single open file description.
