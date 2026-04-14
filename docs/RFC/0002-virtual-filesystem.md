@@ -168,6 +168,27 @@ FileBackend`; everything below it is the VFS. We do **not** break the
 existing `FileBackend` trait — `SerialBackend` keeps working for stdio
 before any mount is set up.
 
+### Synchronization primitives introduced by this RFC
+
+The VFS needs a blocking, reader-writer lock (tasks that cannot acquire
+a write immediately must park on the waitqueue and yield, not spin).
+Today `kernel/src/sync/` ships `BlockingMutex` and a spin-only
+`spin::RwLock`. This RFC adds `BlockingRwLock<T>` alongside
+`BlockingMutex` and a small `Semaphore` primitive used by
+`ChildState::Loading`. They are preconditions of the implementation
+roadmap — the first roadmap item lands them before any VFS type that
+uses them (addresses OS-B8). Their contract:
+
+- `BlockingRwLock<T>` — reader-writer lock with the same park/wake path
+  as `BlockingMutex`. Multiple readers, single writer, no reader
+  upgrade, no writer starvation policy stronger than FIFO on the
+  waitqueue. Safe to drop with waiters (wakes them).
+- `Semaphore` — counting semaphore with `acquire`/`release`. Used only
+  by `ChildState::Loading` to serialize first-lookup-of-a-name.
+
+Both are non-reentrant: a task that already holds the lock must not
+re-acquire it, matching the rest of `kernel/src/sync/`.
+
 ### Key Data Structures
 
 All three object types live in `kernel/src/fs/vfs/`. They are `Send +
@@ -473,7 +494,7 @@ mount(source: MountSource, target_path: &str, fs_type: &str,
     let edge = Arc::new(MountEdge {
         mountpoint:  Arc::downgrade(&target_nd.dentry),
         super_block: sb.clone(),
-        root_dentry: sb.root.get().unwrap().primary_dentry(),
+        root_dentry: sb.root.get().ok_or(EIO)?.primary_dentry(),
         flags,
     });
 
@@ -488,38 +509,62 @@ mount(source: MountSource, target_path: &str, fs_type: &str,
 unmount(target_path: &str, flags: MountFlags) -> Result<(), i64>:
     let target_nd = path_walk(target_path, LF::NOAUTO_MOUNT_CROSS)?;
 
-    // All state changes below happen under MOUNT_TABLE.write() to make
-    // install/uninstall and the open-file check a single atomic bracket.
-    let mut mt = MOUNT_TABLE.write();
+    // Phase A (under MOUNT_TABLE.write()): set the drain flag and decide
+    // busy-or-proceed. This is a short critical section — no FS-driver
+    // code runs here. Once the edge is marked draining and (for the
+    // non-force case) open_files == 0, we remove the edge from the
+    // visibility set so no new path walk can reach it.
+    let edge = {
+        let mut mt = MOUNT_TABLE.write();
+        let edge = mt.iter()
+            .find(|e| Arc::ptr_eq(&e.root_dentry, &target_nd.dentry))
+            .cloned().ok_or(EINVAL)?;
 
-    let edge = mt.iter()
-        .find(|e| Arc::ptr_eq(&e.root_dentry, &target_nd.dentry))
-        .cloned().ok_or(EINVAL)?;
+        // 1) Set draining first. sys_open's commit-then-validate dance
+        //    (see below) means every thread that has incremented
+        //    open_files has already passed the draining check; any
+        //    thread that has not yet incremented open_files will see
+        //    draining=true and bail.
+        edge.super_block.draining.store(true, Ordering::SeqCst);
 
-    // 1) Set draining: any sys_open after this point sees sb.draining
-    //    and returns ENOENT/EIO; see sys_open below.
-    edge.super_block.draining.store(true, Ordering::SeqCst);
+        // 2) SeqCst fence via the store above pairs with the fence in
+        //    sys_open; now loading open_files gives a stable answer.
+        if !flags.contains(MNT_FORCE)
+            && edge.super_block.open_files.load(Ordering::SeqCst) > 0
+        {
+            // Revert the drain flag — abort cleanly, edge stays visible.
+            edge.super_block.draining.store(false, Ordering::SeqCst);
+            return Err(EBUSY);
+        }
 
-    // 2) Now it is safe to count open files and decide.
-    if !flags.contains(MNT_FORCE)
-        && edge.super_block.open_files.load(Ordering::SeqCst) > 0
-    {
-        // Revert the drain flag — abort cleanly.
-        edge.super_block.draining.store(false, Ordering::SeqCst);
-        return Err(EBUSY);
-    }
+        // 3) Make the edge invisible to path walk while still holding
+        //    MOUNT_TABLE.write(). Any path walk that started earlier
+        //    either holds a strong Arc<MountEdge> (pinned for its
+        //    duration) or will re-observe a table that no longer
+        //    contains this edge on its next MOUNT_TABLE.read().
+        let mp = edge.mountpoint.upgrade().ok_or_else(|| {
+            // Failed to anchor; undo drain and bail without mutating
+            // the table — the mountpoint dentry was evicted under us.
+            edge.super_block.draining.store(false, Ordering::SeqCst);
+            ESTALE
+        })?;
+        *mp.mount.write() = None;
+        mt.retain(|e| !Arc::ptr_eq(e, &edge));
+        edge
+    };
+    // MOUNT_TABLE.write() dropped here. Phase B below runs with NO
+    // VFS locks held — gc_drain_for and SuperOps::unmount may freely
+    // re-enter the VFS (e.g., flushing child inodes through the
+    // eviction path). This preserves the lock-class ordering that
+    // places MOUNT_TABLE innermost (addresses OS-B7). The edge is
+    // already gone from the visibility set, so re-entrant path walks
+    // from within unmount see a consistent "unmounted" table.
 
-    // 3) Drain any pending Inode drops queued by the GC path so
-    //    SuperOps::unmount sees a quiescent SB.
+    // 4) Drain any Inode drops the GC queue accumulated; then run the
+    //    FS-driver-specific teardown. At this point open_files == 0
+    //    (non-force case) or the caller accepted the force semantics.
     vfs::gc_drain_for(&edge.super_block);
-
     edge.super_block.ops.unmount()?;
-
-    // 4) Both mutations still under MOUNT_TABLE.write() — atomic
-    //    from any concurrent path_walk's perspective.
-    let mp = edge.mountpoint.upgrade().ok_or(ESTALE)?;
-    *mp.mount.write() = None;
-    mt.retain(|e| !Arc::ptr_eq(e, &edge));
     Ok(())
 ```
 
@@ -923,8 +968,31 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
     let sb = inode.sb.upgrade().ok_or(ESTALE)?;      // no unwrap
 
     // 3. SB barriers (§Security: NOSUID/NOEXEC/NODEV are enforced here
-    //    and at mmap/exec; draining blocks opens on an unmounting SB).
-    if sb.draining.load(Ordering::SeqCst) { return Err(ENOENT); }
+    //    and at mmap/exec). Commit-then-validate sequence for the
+    //    unmount barrier (addresses Sec-B1' / OS-B5'):
+    //
+    //      (a) fetch_add(open_files) — publishes our intent
+    //      (b) SeqCst fence (implicit in fetch_add with SeqCst ordering)
+    //      (c) load(draining) — if set, unmount already won the race,
+    //          decrement and bail with ENOENT
+    //      (d) every FS-mutating step after this point sees a non-zero
+    //          open_files count, so concurrent unmount in Phase A
+    //          returns EBUSY (non-force) before it can toggle draining.
+    //
+    // The reverse sequence in sys_umount (store(draining); load(
+    // open_files)) plus SeqCst ordering on both sides means at least
+    // one of the two parties always observes the other's store — no
+    // window exists where both see "all clear".
+    sb.open_files.fetch_add(1, Ordering::SeqCst);
+    if sb.draining.load(Ordering::SeqCst) {
+        sb.open_files.fetch_sub(1, Ordering::SeqCst);
+        return Err(ENOENT);
+    }
+    // From this point, an error path MUST decrement open_files before
+    // returning. We centralize that in a small RAII guard in real
+    // code; here the pseudocode spells it out.
+    let _open_guard = OpenGuard(&sb); // dec on drop
+
     check_sb_mount_flags(&sb, flags, &inode)?;       // Sec-B1
 
     // 4. O_* preconditions (US-B3):
@@ -949,8 +1017,9 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
     }
 
     // 6. Build the OpenFile. Pinning the SB here is what makes
-    //    OS-B6 safe: the Inode can never outlive its SB.
-    sb.open_files.fetch_add(1, Ordering::SeqCst);
+    //    OS-B6 safe: the Inode can never outlive its SB. Hand
+    //    ownership of the open_files increment over to the OpenFile
+    //    by forgetting the guard.
     let of = Arc::new(OpenFile {
         dentry:  nd.dentry.clone(),
         inode:   inode.clone(),
@@ -959,7 +1028,8 @@ fn sys_open(path: &CStr, flags: u32, mode: u32) -> Result<i32, i64> {
         ops:     inode.file_ops.clone(),
         sb:      sb.clone(),
     });
-    // OpenFile::Drop decrements sb.open_files.
+    core::mem::forget(_open_guard);
+    // OpenFile::Drop is responsible for the matching fetch_sub.
 
     let backend: Arc<dyn FileBackend> = Arc::new(VfsBackend { open_file: of });
     let fd_table = current_task().fd_table();
@@ -1341,6 +1411,11 @@ implementers don't re-litigate them:
 Ordered dependency-first. Each item is independently landable and
 testable. Rough size estimates in parentheses.
 
+- [ ] Add `BlockingRwLock<T>` and `Semaphore` to `kernel/src/sync/`,
+      sharing the parking/waitqueue path with `BlockingMutex`. Host
+      unit tests: multi-reader / single-writer exclusion, FIFO wake
+      order, drop-with-waiters correctness. This lands before any VFS
+      code that uses them. (~300 LOC)
 - [ ] Add the core VFS types (`SuperBlock`, `Inode`, `Dentry`,
       `MountEdge`, `OpenFile`) and the four operation traits,
       including `dir_rwsem` on `Inode`, `rename_mutex` on `SuperBlock`,
