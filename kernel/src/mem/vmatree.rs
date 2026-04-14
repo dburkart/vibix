@@ -409,21 +409,28 @@ impl VmaTree {
         self.map.range(..addr).next_back().map(|(_, v)| v)
     }
 
-    /// Re-key VMA at `old_start` to `new_start`, leaving all other fields
-    /// unchanged. Used by `grow_stack` to extend a growsdown VMA downward.
-    /// Panics if `old_start` is not present or `new_start` is already
-    /// occupied.
-    pub fn rekey_start(&mut self, old_start: usize, new_start: usize) {
-        let mut vma = self
-            .map
-            .remove(&old_start)
-            .expect("rekey_start: old_start not found");
-        vma.start = new_start;
-        assert!(
-            !self.map.contains_key(&new_start),
-            "rekey_start: new_start {new_start:#x} already occupied"
-        );
-        self.map.insert(new_start, vma);
+    /// Walk upward from `vma_start` through contiguous `VMA_GROWSDOWN`
+    /// fragments and return the `end` of the topmost one. This is the fixed
+    /// stack ceiling (USER_STACK_TOP) regardless of how many single-page
+    /// fragments have been inserted below the original VMA by `grow_stack`.
+    ///
+    /// Starts at the VMA keyed by `vma_start`, then follows each VMA whose
+    /// `start` equals the previous `end` and which carries `VMA_GROWSDOWN`.
+    /// Returns `vma_start + PAGE_SIZE` as a safe fallback if the key is not
+    /// found (should not happen in practice).
+    pub fn growsdown_stack_top(&self, vma_start: usize) -> usize {
+        let mut top = match self.map.get(&vma_start) {
+            Some(v) => v.end,
+            None => return vma_start + 4096,
+        };
+        // Each newly inserted growsdown fragment is adjacent (end == next.start).
+        loop {
+            match self.map.get(&top) {
+                Some(v) if v.vma_flags & VMA_GROWSDOWN != 0 => top = v.end,
+                _ => break,
+            }
+        }
+        top
     }
 
     fn assert_no_overlap(&self, start: usize, end: usize) {

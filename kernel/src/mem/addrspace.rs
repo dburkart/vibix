@@ -428,8 +428,14 @@ impl AddressSpace {
             return None;
         }
         let vma_start = above.start;
-        let stack_top = above.end as u64;
         let prot_pte = above.prot_pte;
+
+        // Walk upward through contiguous VMA_GROWSDOWN fragments to find the
+        // true (fixed) stack top. After multiple growths, `find_above` returns
+        // the lowest single-page fragment whose `.end` is only one page above
+        // its own start — not USER_STACK_TOP. The original stack VMA (or the
+        // highest fragment) holds the real ceiling.
+        let stack_top = self.vmas.growsdown_stack_top(vma_start) as u64;
 
         let result = check_growsdown(
             cr2 as u64,

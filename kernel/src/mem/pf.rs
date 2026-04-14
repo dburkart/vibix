@@ -152,8 +152,12 @@ pub fn check_growsdown(
         return GrowResult::Segv;
     }
 
-    // Page-align the new VMA start: the lowest page containing cr2.
-    let new_start = cr2_page;
+    // Grow by exactly one page: always extend from the current VMA start,
+    // not from cr2. `cr2_page` is only used for the gap-distance check above.
+    let new_start = match vma_start.checked_sub(4096) {
+        Some(s) => s,
+        None => return GrowResult::Segv,
+    };
 
     // RLIMIT_STACK: the total committed size must not exceed the limit.
     if stack_top - new_start > rlimit {
@@ -194,14 +198,16 @@ mod growsdown_tests {
 
     #[test]
     fn gap_at_limit_grows() {
-        let cr2 = START - GAP * 4096; // exactly 256 pages below
-        let result = check_growsdown(cr2, START, TOP, RLIMIT, GAP);
-        // Only grows if RLIMIT allows it.
-        if TOP - (cr2 & !0xFFF) <= RLIMIT {
-            assert!(matches!(result, GrowResult::Grow { .. }));
-        } else {
-            assert_eq!(result, GrowResult::Segv);
-        }
+        // cr2 exactly 256 pages below START — within the guard gap.
+        // grow_stack always extends exactly one page (START - 4096),
+        // regardless of how far below cr2 lands.
+        let cr2 = START - GAP * 4096;
+        assert_eq!(
+            check_growsdown(cr2, START, TOP, RLIMIT, GAP),
+            GrowResult::Grow {
+                new_start: START - 4096,
+            }
+        );
     }
 
     #[test]
