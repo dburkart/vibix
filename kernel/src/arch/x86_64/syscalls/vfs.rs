@@ -153,11 +153,15 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, _mode: u64) -
     };
     let path = &buf[..n];
 
-    // 2. O_CREAT not supported in this iteration. Fail loudly rather
-    //    than silently ignore — matches the O_EXCL defensive posture
-    //    in tarfs/ramfs today.
-    if (flags as u32) & oflags::O_CREAT != 0 {
-        return crate::fs::EACCES; // EPERM analogue: "creation not permitted yet"
+    // 2. Mutating create/truncate flags not supported in the read-path
+    //    subset. Fail loudly so userspace gets a clear signal rather than
+    //    a silent no-op.
+    let flags32 = flags as u32;
+    if flags32 & oflags::O_CREAT != 0 {
+        return crate::fs::EACCES;
+    }
+    if flags32 & oflags::O_TRUNC != 0 {
+        return crate::fs::EACCES;
     }
 
     // 3. Legacy /dev/{stdin,stdout,stderr,serial} fast path. Bypasses
@@ -234,6 +238,10 @@ pub unsafe fn sys_stat_impl(path_uva: u64, statbuf_uva: u64, nofollow: bool) -> 
 /// `fstat(fd, *statbuf)` — read `struct stat` of the file behind an
 /// already-open fd.
 pub unsafe fn sys_fstat_impl(fd_raw: u64, statbuf_uva: u64) -> i64 {
+    // Linux fd space fits in u32; values above that are always invalid.
+    if fd_raw > u32::MAX as u64 {
+        return EBADF;
+    }
     let fd = fd_raw as u32;
     let tbl = crate::task::current_fd_table();
     let backend = match tbl.lock().get(fd) {
@@ -269,8 +277,13 @@ pub unsafe fn sys_newfstatat_impl(dfd: i32, path_uva: u64, statbuf_uva: u64, fla
     };
     let path = &buf[..n];
 
-    // AT_EMPTY_PATH + empty path + fd: stat the file behind dfd.
+    // AT_EMPTY_PATH + empty path + real fd: stat the file behind dfd.
+    // AT_FDCWD (-100) is not a valid fd for this purpose — reject it
+    // until per-process cwd semantics land (#239).
     if flags & AT_EMPTY_PATH != 0 && path.is_empty() {
+        if dfd == AT_FDCWD {
+            return EINVAL;
+        }
         return sys_fstat_impl(dfd as u64, statbuf_uva);
     }
 
