@@ -96,9 +96,7 @@ mod tests {
         fn statfs(&self) -> Result<StatFs, i64> {
             Ok(StatFs::default())
         }
-        fn unmount(&self) -> Result<(), i64> {
-            Ok(())
-        }
+        fn unmount(&self) {}
     }
 
     /// A `FileOps` stub that fills `buf` with a repeated byte pattern on

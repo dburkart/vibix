@@ -88,9 +88,7 @@ impl SuperOps for StubSuperOps {
     fn statfs(&self) -> Result<StatFs, i64> {
         Ok(StatFs::default())
     }
-    fn unmount(&self) -> Result<(), i64> {
-        Ok(())
-    }
+    fn unmount(&self) {}
 }
 
 /// `FileOps` stub that fills read buffers with `fill_byte` and counts writes.
