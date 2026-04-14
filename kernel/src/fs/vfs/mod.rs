@@ -48,6 +48,7 @@ use alloc::vec::Vec;
 pub mod dentry;
 pub mod gc_queue;
 pub mod inode;
+pub mod mount_table;
 pub mod open_file;
 pub mod ops;
 pub mod path_walk;
@@ -61,6 +62,7 @@ pub use ops::{
     default_permission, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat,
     StatFs, SuperOps, Whence,
 };
+pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
 pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
