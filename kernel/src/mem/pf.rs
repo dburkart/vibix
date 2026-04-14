@@ -105,6 +105,139 @@ pub fn is_rsvd_fault(err: u64) -> bool {
     err & ERR_RSVD != 0
 }
 
+// ── Growsdown stack resolver ──────────────────────────────────────────────
+
+/// Default per-process stack size limit. glibc/musl honour this; the
+/// kernel enforces it here so a runaway recursion doesn't silently eat
+/// all of physical memory. Future work: expose via `setrlimit(RLIMIT_STACK)`.
+pub const DEFAULT_STACK_RLIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
+
+/// Maximum number of pages below the current VMA start that a single
+/// growsdown fault may bridge. Values larger than `stack_guard_gap`
+/// (256 pages = 1 MiB) are rejected to prevent controlled multi-page
+/// stack-pointer jumps from bypassing the guard.
+pub const STACK_GUARD_GAP_PAGES: u64 = 256;
+
+/// Outcome of [`check_growsdown`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum GrowResult {
+    /// Extend the VMA: the new start address is `new_start` (page-aligned).
+    Grow { new_start: u64 },
+    /// Reject the fault — deliver SIGSEGV.
+    Segv,
+}
+
+/// Pure logic for a growsdown stack fault.
+///
+/// # Arguments
+/// * `cr2`        — faulting virtual address (from `CR2`).
+/// * `vma_start`  — current start of the growsdown VMA.
+/// * `stack_top`  — highest address of the stack (fixed; the VMA end).
+/// * `rlimit`     — maximum stack size in bytes (default 8 MiB).
+/// * `guard_gap`  — maximum gap in pages allowed by a single fault.
+///
+/// Returns [`GrowResult::Grow`] if the extension is safe, or
+/// [`GrowResult::Segv`] if it should be rejected.
+pub fn check_growsdown(
+    cr2: u64,
+    vma_start: u64,
+    stack_top: u64,
+    rlimit: u64,
+    guard_gap_pages: u64,
+) -> GrowResult {
+    // The faulting address must be *below* the current VMA start.
+    // A fault inside [vma_start, vma_end) takes the normal demand-page
+    // path, not this one.
+    if cr2 >= vma_start {
+        return GrowResult::Segv;
+    }
+
+    // Gap from fault address to VMA start must be ≤ stack_guard_gap pages.
+    // Page-align cr2 down to compute how many pages below vma_start it lands.
+    let cr2_page = cr2 & !0xFFF;
+    let gap_pages = (vma_start - cr2_page) / 4096;
+    if gap_pages == 0 || gap_pages > guard_gap_pages {
+        return GrowResult::Segv;
+    }
+
+    // Grow by exactly one page: always extend from the current VMA start,
+    // not from cr2. `cr2_page` is only used for the gap-distance check above.
+    let new_start = match vma_start.checked_sub(4096) {
+        Some(s) => s,
+        None => return GrowResult::Segv,
+    };
+
+    // RLIMIT_STACK: the total committed size must not exceed the limit.
+    if stack_top - new_start > rlimit {
+        return GrowResult::Segv;
+    }
+
+    GrowResult::Grow { new_start }
+}
+
+#[cfg(test)]
+mod growsdown_tests {
+    use super::*;
+
+    const TOP: u64 = 0x8000_0000; // USER_STACK_TOP from init_process
+    const START: u64 = 0x7FFF_F000; // initial single page
+    const RLIMIT: u64 = DEFAULT_STACK_RLIMIT;
+    const GAP: u64 = STACK_GUARD_GAP_PAGES;
+
+    #[test]
+    fn fault_one_page_below_grows() {
+        let cr2 = START - 4096; // exactly one page below
+        assert_eq!(
+            check_growsdown(cr2, START, TOP, RLIMIT, GAP),
+            GrowResult::Grow {
+                new_start: START - 4096
+            }
+        );
+    }
+
+    #[test]
+    fn fault_inside_vma_is_segv() {
+        let cr2 = START + 8; // inside [START, TOP) — wrong path
+        assert_eq!(
+            check_growsdown(cr2, START, TOP, RLIMIT, GAP),
+            GrowResult::Segv
+        );
+    }
+
+    #[test]
+    fn gap_at_limit_grows() {
+        // cr2 exactly 256 pages below START — within the guard gap.
+        // grow_stack always extends exactly one page (START - 4096),
+        // regardless of how far below cr2 lands.
+        let cr2 = START - GAP * 4096;
+        assert_eq!(
+            check_growsdown(cr2, START, TOP, RLIMIT, GAP),
+            GrowResult::Grow {
+                new_start: START - 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn gap_beyond_limit_is_segv() {
+        let cr2 = START - (GAP + 1) * 4096; // 257 pages below
+        assert_eq!(
+            check_growsdown(cr2, START, TOP, RLIMIT, GAP),
+            GrowResult::Segv
+        );
+    }
+
+    #[test]
+    fn rlimit_exceeded_is_segv() {
+        // cr2 that would make the stack > 8 MiB
+        let cr2 = TOP - RLIMIT - 4096; // one page past the limit
+        assert_eq!(
+            check_growsdown(cr2, cr2 + 4096, TOP, RLIMIT, GAP),
+            GrowResult::Segv
+        );
+    }
+}
+
 /// True if the fault came from ring 0 against a *kernel* page (U/S=0).
 /// The RFC routes these to the existing kernel-fault diagnostic
 /// instead of the user-VM dispatch.

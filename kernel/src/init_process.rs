@@ -77,21 +77,47 @@ pub fn launch(bytes: &[u8]) -> usize {
     let stack_frame = paging::map_in_pml4(pml4, stack_page, stack_flags)
         .expect("init: user stack page allocation failed");
 
-    // Register the stack frame in an AnonObject so fork can track it.
+    // Register the pre-faulted stack frame in an AnonObject so fork
+    // tracks it. The VMA is marked VMA_GROWSDOWN; the #PF resolver
+    // inserts independent per-page VMAs below it as the stack grows.
+    use crate::mem::vmatree::{VMA_GROWSDOWN, VMA_STACK_GUARD};
     let stack_obj = AnonObject::new(Some(1));
     let stack_phys = stack_frame.start_address().as_u64();
     stack_obj.insert_existing_frame(0, stack_phys);
     let stack_start = USER_STACK_PAGE_VA as usize;
-    let stack_vma = Vma::new(
+    let mut stack_vma = Vma::new(
         stack_start,
-        stack_start + 4096,
+        USER_STACK_TOP as usize,
         0x3, // PROT_READ|WRITE
         stack_flags.bits(),
         Share::Private,
         stack_obj as Arc<dyn VmObject>,
         0,
     );
+    stack_vma.vma_flags = VMA_GROWSDOWN;
     aspace.insert(stack_vma);
+
+    // Guard VMA: one page immediately below the maximum stack extent
+    // (RLIMIT_STACK = 8 MiB below stack top). The guard must NOT be
+    // adjacent to the initial stack page — that would block all growth.
+    // Any fault past the RLIMIT boundary reaches the guard → SIGSEGV.
+    use crate::mem::pf::DEFAULT_STACK_RLIMIT;
+    let max_stack_bottom = (USER_STACK_TOP as u64)
+        .saturating_sub(DEFAULT_STACK_RLIMIT)
+        .saturating_sub(4096) as usize; // one guard page below the limit
+    let guard_top = max_stack_bottom + 4096;
+    let guard_obj = crate::mem::vmobject::AnonObject::new(Some(0));
+    let mut guard_vma = Vma::new(
+        max_stack_bottom,
+        guard_top,
+        0x0, // PROT_NONE
+        0,   // prot_pte: no PTE flags
+        Share::Private,
+        guard_obj,
+        0,
+    );
+    guard_vma.vma_flags = VMA_STACK_GUARD;
+    aspace.insert(guard_vma);
 
     serial_println!(
         "init: user stack at virt={:#x} top={:#x}",

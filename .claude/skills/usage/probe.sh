@@ -14,18 +14,29 @@ FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
 if [[ $FORCE -eq 0 && -f "$CACHE" ]]; then
-  age=$(( $(date +%s) - $(stat -c %Y "$CACHE" 2>/dev/null || echo 0) ))
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    mtime=$(stat -f %m "$CACHE" 2>/dev/null || echo 0)
+  else
+    mtime=$(stat -c %Y "$CACHE" 2>/dev/null || echo 0)
+  fi
+  age=$(( $(date +%s) - mtime ))
   if [[ $age -lt $TTL ]]; then
     cat "$CACHE"; exit 0
   fi
 fi
 
-CREDS="${HOME}/.claude/.credentials.json"
-[[ -r "$CREDS" ]] || { echo '{"error":"no-credentials"}'; exit 2; }
-
-TOK=$(python3 -c "import json,sys;print(json.load(open('$CREDS'))['claudeAiOauth']['accessToken'])" 2>/dev/null) || {
-  echo '{"error":"credentials-parse-failed"}'; exit 2;
-}
+# On macOS, the OAuth token lives in the Keychain; on Linux it's in .credentials.json
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  _keychain_json="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+  TOK=$(echo "$_keychain_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])" 2>/dev/null || true)
+  [[ -n "$TOK" ]] || { echo '{"error":"no-credentials"}'; exit 2; }
+else
+  CREDS="${HOME}/.claude/.credentials.json"
+  [[ -r "$CREDS" ]] || { echo '{"error":"no-credentials"}'; exit 2; }
+  TOK=$(python3 -c "import json,sys;print(json.load(open('$CREDS'))['claudeAiOauth']['accessToken'])" 2>/dev/null) || {
+    echo '{"error":"credentials-parse-failed"}'; exit 2;
+  }
+fi
 
 HDR=$(mktemp); BODY=$(mktemp)
 trap 'rm -f "$HDR" "$BODY"' EXIT
