@@ -772,12 +772,19 @@ fn test_runner(kernel: &Path) -> R<()> {
 /// `name = "<ident>"` line before the next `[`-prefixed header. Blank
 /// lines and comments between the header and the `name` key are
 /// tolerated; inline comments on the `name` line itself are not.
-fn parse_test_names(manifest: &str) -> Vec<String> {
+///
+/// Fails loudly if a `[[test]]` header is encountered without a parseable
+/// `name = "..."` key before the next section or end-of-file — the
+/// whole point of #292 is to avoid silently dropping tests.
+fn parse_test_names(manifest: &str) -> R<Vec<String>> {
     let mut names = Vec::new();
     let mut in_test = false;
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
+            if in_test {
+                return Err("[[test]] block ended without a parseable `name = \"...\"`".into());
+            }
             in_test = trimmed == "[[test]]";
             continue;
         }
@@ -795,7 +802,10 @@ fn parse_test_names(manifest: &str) -> Vec<String> {
             }
         }
     }
-    names
+    if in_test {
+        return Err("manifest ended inside a [[test]] block with no parseable `name`".into());
+    }
+    Ok(names)
 }
 
 /// Integration tests that parse from `kernel/Cargo.toml` but should
@@ -815,14 +825,22 @@ const TEST_SKIPLIST: &[&str] = &["syscall_mmap_family"];
 fn integration_test_names() -> R<Vec<String>> {
     let manifest_path = workspace_root().join("kernel").join("Cargo.toml");
     let body = fs::read_to_string(&manifest_path)?;
-    let names = parse_test_names(&body);
+    let names = parse_test_names(&body)?;
     if names.is_empty() {
         return Err(format!("no [[test]] entries found in {}", manifest_path.display()).into());
     }
-    Ok(names
+    let filtered: Vec<String> = names
         .into_iter()
         .filter(|n| !TEST_SKIPLIST.contains(&n.as_str()))
-        .collect())
+        .collect();
+    if filtered.is_empty() {
+        return Err(format!(
+            "every [[test]] entry in {} is in TEST_SKIPLIST — nothing to run",
+            manifest_path.display()
+        )
+        .into());
+    }
+    Ok(filtered)
 }
 
 fn test_all() -> R<()> {
@@ -1084,9 +1102,21 @@ name = "should_panic"
 harness = false
 "#;
         assert_eq!(
-            parse_test_names(manifest),
+            parse_test_names(manifest).unwrap(),
             vec!["basic_boot", "heap_alloc", "should_panic"]
         );
+    }
+
+    #[test]
+    fn parse_test_names_errors_on_unterminated_test_block() {
+        let manifest = r#"
+[[test]]
+harness = false
+
+[[bin]]
+name = "vibix"
+"#;
+        assert!(parse_test_names(manifest).is_err());
     }
 
     #[test]
@@ -1103,7 +1133,7 @@ name = "my_bench"
 name = "only_this"
 harness = false
 "#;
-        assert_eq!(parse_test_names(manifest), vec!["only_this"]);
+        assert_eq!(parse_test_names(manifest).unwrap(), vec!["only_this"]);
     }
 
     #[test]
@@ -1114,7 +1144,8 @@ harness = false
         // so assert it via the raw parser rather than the filtered list.
         let raw = parse_test_names(
             &std::fs::read_to_string(workspace_root().join("kernel").join("Cargo.toml")).unwrap(),
-        );
+        )
+        .unwrap();
         for expected in &["execve_atomic", "fork_refcount", "syscall_mmap_family"] {
             assert!(
                 raw.iter().any(|n| n == expected),
