@@ -49,10 +49,33 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Di
     docker_sec_opts+=(--security-opt label=disable)
 fi
 
+# On macOS, Docker Desktop runs containers in a Linux VM so host UIDs don't
+# map into the container. The OAuth token also lives in the macOS Keychain,
+# not in .claude.json, so we extract it and pass it via env var.
+claude_vol_opts=()
+if [ "$(uname -s)" = "Darwin" ]; then
+    _keychain_json="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+    CLAUDE_CODE_OAUTH_TOKEN="$(echo "$_keychain_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])" 2>/dev/null || true)"
+    if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        echo "error: could not read Claude OAuth token from Keychain — log in to Claude Code on the host first" >&2
+        exit 1
+    fi
+    claude_vol_opts+=(
+        -v "$HOME/.claude:/home/agent/.claude-host:ro"
+        -v "$HOME/.claude.json:/home/agent/.claude-host.json:ro"
+        -e CLAUDE_AUTH_STAGE=1
+        -e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN"
+    )
+else
+    claude_vol_opts+=(
+        -v "$HOME/.claude:/home/agent/.claude"
+        -v "$HOME/.claude.json:/home/agent/.claude.json"
+    )
+fi
+
 docker run --rm -it \
     ${docker_sec_opts[@]+"${docker_sec_opts[@]}"} \
-    -v "$HOME/.claude:/home/agent/.claude" \
-    -v "$HOME/.claude.json:/home/agent/.claude.json" \
+    "${claude_vol_opts[@]}" \
     -e GITHUB_TOKEN \
     -e ANTHROPIC_API_KEY \
     -e GIT_AUTHOR_NAME \
