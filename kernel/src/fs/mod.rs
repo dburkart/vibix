@@ -507,7 +507,8 @@ mod tests {
     fn close_cloexec_only_closes_flagged() {
         let mut t = make_table();
         // Allocate fd 3 with FD_CLOEXEC set in per-fd flags (not in FileDescription.flags).
-        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC).unwrap();
+        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC)
+            .unwrap();
         // Allocate fd 4 without FD_CLOEXEC.
         t.alloc_fd(null_desc()).unwrap();
         t.close_cloexec();
@@ -525,7 +526,8 @@ mod tests {
     fn dup_clears_cloexec() {
         let mut t = make_table();
         // Open fd 3 with FD_CLOEXEC set.
-        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC).unwrap();
+        t.alloc_fd_with_flags(null_desc(), flags::O_CLOEXEC)
+            .unwrap();
         // dup(3) → fd 4; the dup'd fd must NOT inherit FD_CLOEXEC.
         let new_fd = t.dup(3).unwrap();
         assert_eq!(new_fd, 4);
