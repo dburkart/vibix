@@ -1,7 +1,7 @@
 ---
 rfc: 0002
 title: Virtual Filesystem Layer
-status: In Review
+status: Accepted
 created: 2026-04-14
 ---
 
