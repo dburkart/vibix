@@ -826,6 +826,7 @@ fn test_all() -> R<()> {
         "vfs_backend",
         "vfs_hello",
         "rootfs_module",
+        "anon_fault_saturated",
     ] {
         cmd.arg("--test").arg(t);
     }
