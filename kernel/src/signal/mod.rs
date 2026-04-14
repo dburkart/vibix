@@ -122,7 +122,8 @@ pub enum DefaultAction {
 /// Return the default action for signal `sig` (1-indexed).
 pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
-        SIGCHLD | SIGCONT => DefaultAction::Continue,
+        SIGCHLD => DefaultAction::Ignore,
+        SIGCONT => DefaultAction::Continue,
         SIGSTOP | SIGTSTP => DefaultAction::Stop,
         SIGURG | 28 => DefaultAction::Ignore, // SIGWINCH=28, SIGURG=23
         _ => DefaultAction::Terminate,
@@ -315,17 +316,16 @@ pub unsafe fn sys_sigprocmask(how: u64, set_uva: u64, oldset_uva: u64) -> i64 {
     let task_id = crate::task::current_id();
     let result = crate::process::with_signal_state_for_task(task_id, |state| {
         // Read new mask from user if provided.
-        let new_mask = if set_uva != 0 {
+        let old_mask = if set_uva != 0 {
             let mut buf = [0u8; 8];
             if uaccess::copy_from_user(&mut buf, set_uva as usize).is_err() {
                 return -14i64; // EFAULT
             }
-            u64::from_ne_bytes(buf)
+            let new_mask = u64::from_ne_bytes(buf);
+            state.update_mask(how, new_mask)
         } else {
-            0
+            state.blocked
         };
-
-        let old_mask = state.update_mask(how, new_mask);
 
         if oldset_uva != 0 {
             if uaccess::copy_to_user(oldset_uva as usize, &old_mask.to_ne_bytes()).is_err() {
@@ -421,17 +421,18 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
 unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
     let task_id = crate::task::current_id();
 
-    let disp = crate::process::with_signal_state_for_task(task_id, |state| {
-        // While delivering, block this signal (equivalent to SA_NODEFER=off
-        // default: block the signal being delivered).
-        state.blocked |= sig_bit(sig);
-        state.dispositions[(sig - 1) as usize]
-    });
-
-    let disp = match disp {
-        Some(d) => d,
-        None => return,
-    };
+    // Capture the pre-delivery mask and block the signal in one lock window.
+    // The pre-delivery mask is what sigreturn must restore; capturing it before
+    // setting the block bit ensures uc_sigmask in the frame is correct.
+    let (disp, pre_block_mask) =
+        match crate::process::with_signal_state_for_task(task_id, |state| {
+            let pre = state.blocked;
+            state.blocked |= sig_bit(sig);
+            (state.dispositions[(sig - 1) as usize], pre)
+        }) {
+            Some(pair) => pair,
+            None => return,
+        };
 
     match disp {
         Disposition::Ignore => {
@@ -460,19 +461,24 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
         }
         Disposition::Handler(handler_va) => {
             // Push signal frame onto the user stack and redirect SYSRETQ.
-            let new_user_rsp =
-                match frame::push_signal_frame(ctx.user_rsp, sig, ctx.user_rip, ctx.user_rflags) {
-                    Ok(sp) => sp,
-                    Err(_) => {
-                        // Could not push the frame (bad user RSP) — terminate.
-                        let pid = crate::process::current_pid();
-                        if pid != 0 {
-                            crate::process::reparent_children(pid);
-                            crate::process::mark_zombie(pid, -(sig as i32));
-                        }
-                        crate::task::exit();
+            let new_user_rsp = match frame::push_signal_frame(
+                ctx.user_rsp,
+                sig,
+                ctx.user_rip,
+                ctx.user_rflags,
+                pre_block_mask,
+            ) {
+                Ok(sp) => sp,
+                Err(_) => {
+                    // Could not push the frame (bad user RSP) — terminate.
+                    let pid = crate::process::current_pid();
+                    if pid != 0 {
+                        crate::process::reparent_children(pid);
+                        crate::process::mark_zombie(pid, -(sig as i32));
                     }
-                };
+                    crate::task::exit();
+                }
+            };
             ctx.user_rip = handler_va;
             ctx.user_rsp = new_user_rsp;
             // Leave ctx.user_rflags as-is (handler sees caller's rflags).

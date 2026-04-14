@@ -102,10 +102,10 @@ pub struct RestoredRegs {
 /// Push a `SigFrame` onto the user stack at `user_rsp` and return the new
 /// (lower) user RSP.
 ///
-/// The frame is aligned to 16 bytes after subtraction (x86-64 ABI: RSP must
-/// be `0 mod 16` before the `CALL` that enters the handler; our trampoline's
-/// implicit `call` from `ret` in the handler makes this `8 mod 16` at handler
-/// entry — correct).
+/// The frame is aligned so that RSP is `8 mod 16` at handler entry (x86-64
+/// ABI: RSP must be `8 mod 16` at `CALL`/function entry; the handler
+/// receives control via the `pretcode` return-address slot, so no extra
+/// adjustment is needed).
 ///
 /// Returns `Ok(new_rsp)` or `Err(())` if the frame could not be written (bad
 /// user pointer).
@@ -117,23 +117,20 @@ pub unsafe fn push_signal_frame(
     sig: u8,
     saved_rip: u64,
     saved_rflags: u64,
+    saved_mask: u64,
 ) -> Result<u64, ()> {
     use crate::arch::x86_64::uaccess;
 
-    // Align the frame bottom to 16 bytes.
+    // Align the frame bottom to 16 bytes, then subtract 8 so that RSP is
+    // `8 mod 16` at handler entry (x86-64 ABI requirement at CALL).
     let frame_size = mem::size_of::<SigFrame>() as u64;
     let frame_top = user_rsp.checked_sub(frame_size).ok_or(())?;
-    let frame_addr = frame_top & !15u64; // align down
+    let frame_addr = (frame_top & !15u64).wrapping_sub(8);
 
     // Validate the user address range before writing.
     if uaccess::check_user_range(frame_addr as usize, frame_size as usize).is_err() {
         return Err(());
     }
-
-    // Get current signal mask from the process.
-    let task_id = crate::task::current_id();
-    let saved_mask =
-        crate::process::with_signal_state_for_task(task_id, |state| state.blocked).unwrap_or(0);
 
     // Build the frame in kernel memory, then copy it to user space.
     let mut frame = SigFrame {
@@ -191,10 +188,22 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
     uaccess::copy_from_user(frame_bytes, frame_addr as usize).map_err(|_| ())?;
     let frame = frame.assume_init();
 
+    let rip = frame.gregs[REG_RIP];
+    let rsp = frame.gregs[REG_RSP];
+
+    // Reject kernel-space RIP or RSP — a compromised frame must not redirect
+    // execution into the kernel.
+    if uaccess::check_user_range(rip as usize, 1).is_err() {
+        return Err(());
+    }
+    if uaccess::check_user_range(rsp as usize, 1).is_err() {
+        return Err(());
+    }
+
     Ok(RestoredRegs {
-        rip: frame.gregs[REG_RIP],
+        rip,
         rflags: frame.gregs[REG_EFLAGS],
-        rsp: frame.gregs[REG_RSP],
+        rsp,
         saved_mask: frame.uc_sigmask,
     })
 }

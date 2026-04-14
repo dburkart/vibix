@@ -211,8 +211,10 @@ pub fn update_task_id(pid: u32, new_task_id: usize) {
 /// `f` with a mutable reference to it.  Returns `None` if no process entry
 /// exists for the task.
 ///
-/// TABLE is held for the duration of `f`.  `f` must not call any function
-/// that tries to take TABLE again (lock-ordering).
+/// TABLE is released before `f` is called (the `Arc<Mutex<SignalState>>` is
+/// cloned out while TABLE is held, then locked independently).  `f` must not
+/// call any function that tries to take the signal `Mutex` a second time on
+/// the same task (re-entrancy).
 pub fn with_signal_state_for_task<R>(
     task_id: usize,
     f: impl FnOnce(&mut SignalState) -> R,
