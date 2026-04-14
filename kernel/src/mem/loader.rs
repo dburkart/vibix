@@ -263,8 +263,11 @@ pub fn load_user_elf_with_vmas(
             if let Some((frame, _)) = paging::translate_in_pml4(pml4, va) {
                 let phys = frame.start_address().as_u64();
                 // insert_existing_frame increments refcount by 1 for the
-                // cache reference. The PTE reference was set by load_user_elf.
-                obj.insert_existing_frame(i, phys);
+                // cache reference. The PTE reference was set by load_user_elf
+                // on a freshly-allocated frame (refcount 1), so saturation
+                // is statically impossible here.
+                obj.insert_existing_frame(i, phys)
+                    .expect("loader: freshly-mapped ELF frame cannot be saturated");
             }
         }
 

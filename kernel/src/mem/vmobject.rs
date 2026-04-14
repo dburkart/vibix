@@ -43,6 +43,12 @@ pub enum VmFault {
     /// file mapping being written). Unused today but reserved so the
     /// resolver has one shape to match against.
     ProtectionViolation,
+    /// The target frame's refcount is pinned at `u16::MAX`; adding
+    /// another reference would violate RFC 0001's exact-or-over
+    /// invariant and risk a UAF on the matching drop. Produced by the
+    /// cache-hit path in [`AnonObject::fault`] when the shared frame is
+    /// already maximally-referenced.
+    RefcountSaturated,
 }
 
 /// Polymorphic "what backs this VMA" trait. Lives behind
@@ -163,16 +169,28 @@ impl VmObject for AnonObject {
             // one reference; the cache entry holds a separate reference.
             // Balanced by `frame::put` in `AddressSpace::drop` when the
             // PTE is removed (or `cow_copy_and_remap` when CoW resolves it).
+            //
+            // Checked increment: if the slot is pinned at `u16::MAX`
+            // another shared fault would violate RFC 0001's
+            // exact-or-over invariant and UAF on the matching drop.
+            // Refuse the fault instead of publishing the new reference.
             #[cfg(target_os = "none")]
-            crate::mem::refcount::inc_refcount(frame);
+            crate::mem::refcount::try_inc_refcount(frame)
+                .map_err(|_| VmFault::RefcountSaturated)?;
             return Ok(frame);
         }
         let phys = alloc_zeroed_page()?;
         inner.frames.insert(idx, phys);
         // `alloc_zeroed_page` sets refcount=1 (the cache's reference).
         // Increment once more for the PTE mapping being installed by caller.
+        //
+        // Saturation is impossible here: the frame was just allocated and
+        // its refcount is 1. Use the checked variant for consistency with
+        // the cache-hit path and panic on the invariant violation rather
+        // than silently saturating.
         #[cfg(target_os = "none")]
-        crate::mem::refcount::inc_refcount(phys);
+        crate::mem::refcount::try_inc_refcount(phys)
+            .expect("freshly-allocated frame cannot be at u16::MAX");
         Ok(phys)
     }
 
@@ -229,11 +247,25 @@ impl AnonObject {
     ///
     /// The caller must ensure that `phys` already has a PTE reference
     /// (refcount ≥ 1). This method adds the cache reference on top.
-    pub fn insert_existing_frame(&self, idx: usize, phys: u64) {
+    ///
+    /// Returns `Err(Saturated)` if `phys`'s refcount is already pinned
+    /// at `u16::MAX`. On error the frame is **not** inserted into the
+    /// cache, so no orphan reference is published. Today every caller
+    /// passes a freshly-allocated frame whose refcount is 1, so the
+    /// error is unreachable in practice — the fallible signature makes
+    /// the RFC 0001 exact-or-over invariant statically enforced should
+    /// that ever change.
+    pub fn insert_existing_frame(
+        &self,
+        idx: usize,
+        phys: u64,
+    ) -> Result<(), crate::mem::refcount::Saturated> {
+        // Bump the cache's reference first: if the slot is saturated we
+        // return before touching the BTreeMap, so no dangling cache
+        // entry references a frame whose refcount we failed to claim.
+        crate::mem::refcount::try_inc_refcount(phys)?;
         self.inner.lock().frames.insert(idx, phys);
-        // Add the cache's reference. The PTE reference was set by the
-        // original allocator/mapper; we are adding one more here.
-        crate::mem::refcount::inc_refcount(phys);
+        Ok(())
     }
 
     /// Remove cached frames whose page index is in `[first, last)` and

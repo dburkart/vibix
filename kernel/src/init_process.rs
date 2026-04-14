@@ -83,7 +83,9 @@ pub fn launch(bytes: &[u8]) -> usize {
     use crate::mem::vmatree::{VMA_GROWSDOWN, VMA_STACK_GUARD};
     let stack_obj = AnonObject::new(Some(1));
     let stack_phys = stack_frame.start_address().as_u64();
-    stack_obj.insert_existing_frame(0, stack_phys);
+    stack_obj
+        .insert_existing_frame(0, stack_phys)
+        .expect("init: freshly-mapped user stack frame cannot be saturated");
     let stack_start = USER_STACK_PAGE_VA as usize;
     let mut stack_vma = Vma::new(
         stack_start,

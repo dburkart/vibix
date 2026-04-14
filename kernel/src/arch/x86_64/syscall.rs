@@ -526,7 +526,9 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
         crate::mem::paging::map_in_pml4(new_pml4, stack_page, stack_flags).map_err(|_| -12i64)?;
 
     let stack_obj = AnonObject::new(Some(1));
-    stack_obj.insert_existing_frame(0, stack_frame.start_address().as_u64());
+    stack_obj
+        .insert_existing_frame(0, stack_frame.start_address().as_u64())
+        .expect("execve: freshly-mapped user stack frame cannot be saturated");
     let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
     let stack_vma = Vma::new(
         stack_start,
