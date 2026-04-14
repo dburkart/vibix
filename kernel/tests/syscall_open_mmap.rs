@@ -266,14 +266,7 @@ fn mmap_rejects_nonzero_off() {
 fn mmap_fixed_returns_requested_va() {
     // MAP_FIXED is now supported (RFC 0001): returns the requested VA,
     // silently evicting any overlap.
-    let a = mmap(
-        0,
-        4096,
-        PROT_READ,
-        MAP_ANONYMOUS | MAP_PRIVATE,
-        -1,
-        0,
-    );
+    let a = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     assert!(a > 0);
     let r = mmap(
         a as u64,
