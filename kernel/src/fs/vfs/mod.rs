@@ -46,6 +46,7 @@
 use alloc::vec::Vec;
 
 pub mod dentry;
+pub mod devfs;
 pub mod gc_queue;
 pub mod inode;
 pub mod mount_table;
@@ -56,6 +57,7 @@ pub mod ramfs;
 pub mod super_block;
 
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
+pub use devfs::DevFs;
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
 pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
