@@ -430,6 +430,7 @@ impl AddressSpace {
         }
         let vma_start = above.start;
         let prot_pte = above.prot_pte;
+        let prot_user = above.prot_user;
 
         // Walk upward through contiguous VMA_GROWSDOWN fragments to find the
         // true (fixed) stack top. After multiple growths, `find_above` returns
@@ -472,7 +473,7 @@ impl AddressSpace {
         let mut new_vma = Vma::new(
             new_start,
             new_end,
-            0x3, // PROT_READ|WRITE
+            prot_user,
             prot_pte,
             Share::Private,
             alloc::sync::Arc::clone(&new_obj),
@@ -566,6 +567,7 @@ impl AddressSpace {
         child.brk_start = self.brk_start;
         child.brk_cur = self.brk_cur;
         child.brk_max = self.brk_max;
+        child.stack_rlimit = self.stack_rlimit;
 
         // Collect VMAs first (avoids borrow conflict when we later
         // mutate the child and call paging helpers on self.page_table).
