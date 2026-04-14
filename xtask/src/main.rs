@@ -985,10 +985,11 @@ mod tests {
         let path = ensure_initrd().expect("ensure_initrd failed");
         assert!(path.exists());
         let data = fs::read(&path).unwrap();
-        // 4 dir entries + 2 end-of-archive blocks
-        assert_eq!(data.len(), 6 * 512);
+        // 5 dir headers + 2 file headers + 2 padded file data blocks +
+        // 2 end-of-archive zero blocks = 11 * 512
+        assert_eq!(data.len(), 11 * 512);
         // Last 1024 bytes are the end-of-archive marker (all zeros)
-        assert!(data[4 * 512..].iter().all(|&b| b == 0));
+        assert!(data[data.len() - 1024..].iter().all(|&b| b == 0));
     }
 
     #[test]
