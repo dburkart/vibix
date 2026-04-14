@@ -55,6 +55,10 @@ fn run_tests() {
             &(mmap_requires_exactly_one_share as fn()),
         ),
         (
+            "mmap_unknown_flag_bits_einval",
+            &(mmap_unknown_flag_bits_einval as fn()),
+        ),
+        (
             "mmap_shared_anon_succeeds",
             &(mmap_shared_anon_succeeds as fn()),
         ),
@@ -160,6 +164,23 @@ fn mmap_requires_exactly_one_share() {
         0,
     );
     assert_eq!(r, EINVAL);
+}
+
+fn mmap_unknown_flag_bits_einval() {
+    // Any flag bit outside MAP_SHARED|PRIVATE|FIXED|FIXED_NOREPLACE|
+    // ANONYMOUS|GROWSDOWN|STACK must fail with EINVAL — silently
+    // accepting unknown bits (MAP_LOCKED, MAP_HUGETLB, …) gives callers
+    // a successful mapping with none of the requested semantics applied.
+    const UNKNOWN_FLAG: u32 = 1u32 << 31;
+    let r = mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | UNKNOWN_FLAG,
+        -1,
+        0,
+    );
+    assert_eq!(r, EINVAL, "expected EINVAL for unknown flag bit, got {}", r);
 }
 
 fn mmap_shared_anon_succeeds() {
