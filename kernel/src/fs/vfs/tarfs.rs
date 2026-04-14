@@ -969,6 +969,35 @@ mod tests {
             .expect("remount after unmount must succeed");
     }
 
+    /// A deep file entry whose intermediate directories are absent from
+    /// the archive must still be resolvable — `split_parent` auto-creates
+    /// the missing `a/` and `a/b/` directory nodes.
+    #[test]
+    fn implicit_parent_dirs_are_auto_created() {
+        let mut archive: Vec<u8> = Vec::new();
+        // Only a file entry; no explicit "a/" or "a/b/" headers.
+        archive.extend_from_slice(&make_header(b"a/b/c.txt", 3, b'0', b"", 0o644));
+        archive.extend_from_slice(&pad_block(b"hey"));
+        archive.extend_from_slice(&[0u8; BLOCK * 2]);
+
+        let fs = TarFs::new_arc();
+        let sb = fs
+            .mount(
+                MountSource::Static(leak_archive(archive)),
+                MountFlags::default(),
+            )
+            .expect("mount deep-file archive");
+
+        let root = sb.root.get().unwrap().clone();
+        let a = root.ops.lookup(&root, b"a").expect("auto-created a/");
+        assert_eq!(a.kind, InodeKind::Dir);
+        let b = a.ops.lookup(&a, b"b").expect("auto-created a/b/");
+        assert_eq!(b.kind, InodeKind::Dir);
+        let c = b.ops.lookup(&b, b"c.txt").expect("a/b/c.txt");
+        assert_eq!(c.kind, InodeKind::Reg);
+        assert_eq!(c.meta.read().size, 3);
+    }
+
     /// While a mount is live the latch must refuse a second mount.
     #[test]
     fn double_mount_returns_ebusy() {
