@@ -42,8 +42,9 @@
 //!
 //! ### wait4() invariants
 //! Blocks on a WaitQueue until a zombie child is reaped.  wstatus is a
-//! kernel-mapped userspace pointer; the low 8 bits hold the child's exit
-//! code.  Returns the reaped child PID on success, -ECHILD if no children.
+//! kernel-mapped userspace pointer; bits 8..15 hold the child's exit code
+//! (`(exit_status & 0xFF) << 8`).  Returns the reaped child PID on success,
+//! -ECHILD if no children.
 
 #![no_std]
 #![no_main]
