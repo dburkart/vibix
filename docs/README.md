@@ -18,6 +18,7 @@ sequence, and public API for its subsystem.
 | [input.md](input.md) | PS/2 keyboard and ring buffer | `kernel/src/input.rs` |
 | [tasks.md](tasks.md) | Preemptive scheduler + blocking primitives | `kernel/src/task/`, `kernel/src/sync/` |
 | [diagnostics.md](diagnostics.md) | klog ring, ksymtab, backtrace unwinder | `kernel/src/klog.rs`, `kernel/src/ksymtab.rs`, `kernel/src/arch/x86_64/backtrace.rs` |
+| *(see below)* | Virtual filesystem + per-process fd table | `kernel/src/fs/vfs/`, `kernel/src/fs/mod.rs` |
 
 ## Initialization Order
 
@@ -44,3 +45,23 @@ task::init()            — bootstrap task, scheduler online
 
 The framebuffer console is optional and initialized separately in `main.rs`
 immediately after `serial::init()`, before the shared `vibix::init()` call.
+
+## Filesystem
+
+The filesystem layer follows the classic vnode model (Kleiman, USENIX 1986),
+split across two directories:
+
+- `kernel/src/fs/vfs/` — the virtual filesystem core. Three refcounted
+  in-kernel objects (`SuperBlock`, `Inode`, `Dentry`) driven by four
+  dyn-dispatch traits (`FileSystem`, `SuperOps`, `InodeOps`, `FileOps`). A
+  mount table attaches superblocks at dentries; path resolution walks the
+  dentry tree across mount points and terminates at an `Arc<Inode>`.
+  Concrete filesystems (`ramfs`, `tarfs`, `devfs`) live beside `mod.rs` in
+  that directory and plug in by implementing the operation traits.
+- `kernel/src/fs/mod.rs` — the per-process fd table (`FileDescTable`) and
+  the `FileBackend` trait. This is a thin adapter: path-opened files flow
+  through `vfs::VfsBackend`; `SerialBackend` provides stdio on fds 0/1/2
+  without going through the VFS so console I/O works before any mount.
+
+See [RFC 0002](RFC/0002-virtual-filesystem.md) for the design rationale,
+object lifetimes, locking order, and roadmap.
