@@ -141,41 +141,31 @@ mod tests {
     #[test]
     fn printable_ascii_passthrough() {
         let mut s = State::default();
-        assert_eq!(feed(&mut s, b"hi!"), vec![
-            Event::Byte(b'h'),
-            Event::Byte(b'i'),
-            Event::Byte(b'!'),
-        ]);
+        assert_eq!(
+            feed(&mut s, b"hi!"),
+            vec![Event::Byte(b'h'), Event::Byte(b'i'), Event::Byte(b'!'),]
+        );
         assert_eq!(s, State::Ground);
     }
 
     #[test]
     fn plain_up_arrow_dispatches_up() {
         let mut s = State::default();
-        assert_eq!(
-            feed(&mut s, b"\x1b[A"),
-            vec![Event::Csi(CsiFinal::Up)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[A"), vec![Event::Csi(CsiFinal::Up)],);
         assert_eq!(s, State::Ground);
     }
 
     #[test]
     fn plain_down_arrow_dispatches_down() {
         let mut s = State::default();
-        assert_eq!(
-            feed(&mut s, b"\x1b[B"),
-            vec![Event::Csi(CsiFinal::Down)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[B"), vec![Event::Csi(CsiFinal::Down)],);
     }
 
     #[test]
     fn xterm_o_introducer_accepted() {
         // Some xterm modes use `ESC O A` for arrows.
         let mut s = State::default();
-        assert_eq!(
-            feed(&mut s, b"\x1bOA"),
-            vec![Event::Csi(CsiFinal::Up)],
-        );
+        assert_eq!(feed(&mut s, b"\x1bOA"), vec![Event::Csi(CsiFinal::Up)],);
     }
 
     #[test]
@@ -184,10 +174,7 @@ mod tests {
         // modified arrows onto the same final-byte classification as
         // plain arrows for now.
         let mut s = State::default();
-        assert_eq!(
-            feed(&mut s, b"\x1b[1;5A"),
-            vec![Event::Csi(CsiFinal::Up)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[1;5A"), vec![Event::Csi(CsiFinal::Up)],);
         assert_eq!(s, State::Ground);
     }
 
@@ -201,10 +188,7 @@ mod tests {
             feed(&mut s, b"\x1b[!p"),
             vec![Event::Csi(CsiFinal::Other(b'p'))],
         );
-        assert_eq!(
-            feed(&mut s, b"\x1b[A"),
-            vec![Event::Csi(CsiFinal::Up)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[A"), vec![Event::Csi(CsiFinal::Up)],);
     }
 
     #[test]
@@ -215,10 +199,7 @@ mod tests {
         let mut s = State::default();
         assert_eq!(feed(&mut s, b"\x1b[1\x07"), Vec::<Event>::new());
         assert_eq!(s, State::Ground);
-        assert_eq!(
-            feed(&mut s, b"\x1b[B"),
-            vec![Event::Csi(CsiFinal::Down)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[B"), vec![Event::Csi(CsiFinal::Down)],);
     }
 
     #[test]
@@ -245,14 +226,8 @@ mod tests {
     #[test]
     fn left_right_finals_classified() {
         let mut s = State::default();
-        assert_eq!(
-            feed(&mut s, b"\x1b[C"),
-            vec![Event::Csi(CsiFinal::Right)],
-        );
-        assert_eq!(
-            feed(&mut s, b"\x1b[D"),
-            vec![Event::Csi(CsiFinal::Left)],
-        );
+        assert_eq!(feed(&mut s, b"\x1b[C"), vec![Event::Csi(CsiFinal::Right)],);
+        assert_eq!(feed(&mut s, b"\x1b[D"), vec![Event::Csi(CsiFinal::Left)],);
     }
 
     #[test]
