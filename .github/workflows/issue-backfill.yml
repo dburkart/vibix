@@ -44,6 +44,9 @@ jobs:
             "Bash(head:*)"
             "Bash(gh issue list:*)"
             "Skill(file-issue)"
+            "mcp__github__search_issues"
+            "mcp__github__add_issue_comment"
+            "mcp__github__issue_write"
           prompt: |
             You are a technical project manager for the vibix kernel — a hobby OS kernel written in Rust.
 
