@@ -135,10 +135,7 @@ fn build_nested_archive() -> Vec<u8> {
     let mut archive: Vec<u8> = Vec::new();
     archive.extend_from_slice(&make_dir_header(b"etc/"));
     archive.extend_from_slice(&make_dir_header(b"etc/init/"));
-    archive.extend_from_slice(&make_header(
-        b"etc/init/hello.txt",
-        payload.len() as u64,
-    ));
+    archive.extend_from_slice(&make_header(b"etc/init/hello.txt", payload.len() as u64));
     archive.extend_from_slice(&pad_block(payload));
     archive.extend_from_slice(&[0u8; BLOCK * 2]);
     archive
@@ -211,8 +208,7 @@ fn hello_read_through_vfs() {
 }
 
 fn nested_read_through_vfs() {
-    let archive: &'static [u8] =
-        alloc::boxed::Box::leak(build_nested_archive().into_boxed_slice());
+    let archive: &'static [u8] = alloc::boxed::Box::leak(build_nested_archive().into_boxed_slice());
 
     let fs = TarFs::new_arc();
     let sb = fs
