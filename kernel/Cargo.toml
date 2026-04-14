@@ -153,6 +153,10 @@ name = "addrspace_drop"
 harness = false
 
 [[test]]
+name = "exec_atomic_partial_load"
+harness = false
+
+[[test]]
 name = "execve_atomic"
 harness = false
 
