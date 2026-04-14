@@ -341,74 +341,19 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // execve(path, argv, envp) — path and argv/envp are ignored; the
-        // kernel loads the `userspace_hello.elf` ramdisk module into the
-        // current address space and jumps to ring-3. Never returns on
-        // success.
+        // kernel loads the `userspace_hello.elf` ramdisk module into a
+        // freshly-staged address space and atomically swaps it in on
+        // success. On failure the old address space is preserved so the
+        // caller continues running and observes the `-ENOEXEC` return.
         59 => {
             let elf_bytes = match crate::mem::userspace_hello_elf_bytes() {
                 Some(b) => b,
                 None => return -8, // ENOEXEC — hello module not present
             };
-
-            // Clear all user VMAs and reset the address space.
-            {
-                crate::task::current_address_space()
-                    .write()
-                    .clear_for_exec();
+            match exec_atomic(elf_bytes) {
+                Ok(never) => match never {},
+                Err(e) => e,
             }
-
-            // Close O_CLOEXEC fds as POSIX requires on exec.
-            crate::task::current_fd_table().lock().close_cloexec();
-
-            // Load the new ELF with VMA tracking so AddressSpace::drop can
-            // reclaim the data frames when the exec'd process exits. Without
-            // VMA entries the leaf frames are orphaned permanently.
-            let pml4 = crate::task::current_cr3();
-            let aspace = crate::task::current_address_space();
-            let image = match crate::mem::loader::load_user_elf_with_vmas(
-                elf_bytes,
-                pml4,
-                &mut aspace.write(),
-            ) {
-                Ok(img) => img,
-                Err(_) => return -8, // ENOEXEC
-            };
-
-            // Set the heap base to immediately after the new ELF image.
-            use x86_64::VirtAddr;
-            aspace.write().set_brk_start(VirtAddr::new(image.image_end));
-
-            // Map a fresh user stack page and register it as a VMA so the
-            // exec'd process's stack frame is also reclaimed on exit.
-            use crate::mem::vmatree::{Share, Vma};
-            use crate::mem::vmobject::{AnonObject, VmObject};
-            use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
-            let stack_flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::NO_EXECUTE;
-            let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                crate::init_process::USER_STACK_PAGE_VA,
-            ));
-            let stack_frame = crate::mem::paging::map_in_pml4(pml4, stack_page, stack_flags)
-                .expect("exec: user stack mapping failed");
-
-            let stack_obj = AnonObject::new(Some(1));
-            stack_obj.insert_existing_frame(0, stack_frame.start_address().as_u64());
-            let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
-            let stack_vma = Vma::new(
-                stack_start,
-                stack_start + 4096,
-                0x3,
-                stack_flags.bits(),
-                Share::Private,
-                stack_obj as alloc::sync::Arc<dyn VmObject>,
-                0,
-            );
-            aspace.write().insert(stack_vma);
-
-            // Switch to the new image — never returns.
-            unsafe { jump_to_ring3(image.entry.as_u64(), crate::init_process::USER_STACK_TOP) }
         }
 
         // exit(status) — tear down the process and switch to the next task.
@@ -476,6 +421,87 @@ pub unsafe extern "C" fn syscall_dispatch(
 /// Maximum path length accepted by `sys_open`, including the terminating
 /// NUL. Matches the longest special path we handle today.
 const OPEN_PATH_MAX: usize = 128;
+
+/// Atomic execve body: stage the new image into a fresh `AddressSpace`
+/// and only commit it once the load has fully succeeded.
+///
+/// Returns `Err(-ENOEXEC)` (or `-ENOMEM`) on failure, leaving the
+/// caller's address space untouched so the syscall return lands on
+/// still-valid user code. Returns `Ok(_)` only by way of `jump_to_ring3`,
+/// which never returns; the `Infallible` ok variant lets the caller
+/// match exhaustively without a panic-on-unreachable arm.
+///
+/// The atomicity story: the new `AddressSpace` is built top-to-bottom
+/// in a separate PML4 (own `try_new_empty`). If anything before the
+/// CR3 swap fails, dropping the staged `AddressSpace` reclaims its
+/// PML4 + intermediate page tables. (Leaf data frames mapped by a
+/// partially-completed `load_user_elf` aren't tracked by the staged
+/// VMA list yet, so they leak on early-segment failure — small and
+/// bounded by ELF size; tracked separately as a follow-up.)
+#[cfg(target_os = "none")]
+pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
+    use crate::mem::addrspace::AddressSpace;
+    use crate::mem::vmatree::{Share, Vma};
+    use crate::mem::vmobject::{AnonObject, VmObject};
+    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+    use x86_64::VirtAddr;
+
+    // 1. Build a fresh AddressSpace with its own PML4.
+    let mut new_aspace = AddressSpace::try_new_empty().map_err(|_| -12i64)?;
+    let new_pml4 = new_aspace.page_table_frame();
+
+    // 2. Load the ELF into the new PML4 with VMA tracking. On Err the
+    //    staged AddressSpace drops at the `?` boundary, freeing its
+    //    page tables; the caller's address space is untouched.
+    let image = crate::mem::loader::load_user_elf_with_vmas(elf_bytes, new_pml4, &mut new_aspace)
+        .map_err(|_| -8i64)?;
+
+    new_aspace.set_brk_start(VirtAddr::new(image.image_end));
+
+    // 3. Map and register the user stack page in the staged space.
+    let stack_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+        crate::init_process::USER_STACK_PAGE_VA,
+    ));
+    let stack_frame =
+        crate::mem::paging::map_in_pml4(new_pml4, stack_page, stack_flags).map_err(|_| -12i64)?;
+
+    let stack_obj = AnonObject::new(Some(1));
+    stack_obj.insert_existing_frame(0, stack_frame.start_address().as_u64());
+    let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
+    let stack_vma = Vma::new(
+        stack_start,
+        stack_start + 4096,
+        0x3,
+        stack_flags.bits(),
+        Share::Private,
+        stack_obj as alloc::sync::Arc<dyn VmObject>,
+        0,
+    );
+    new_aspace.insert(stack_vma);
+
+    // 4. Commit. After this point we cannot fail back to the caller —
+    //    the old address space is still alive on the task until we
+    //    write CR3 and drop the returned Arc.
+    crate::task::current_fd_table().lock().close_cloexec();
+    let new_aspace_arc = alloc::sync::Arc::new(spin::RwLock::new(new_aspace));
+    let old_aspace = crate::task::replace_current_address_space(new_aspace_arc, new_pml4);
+
+    unsafe {
+        x86_64::registers::control::Cr3::write(
+            new_pml4,
+            x86_64::registers::control::Cr3Flags::empty(),
+        );
+    }
+    // Now safe to release the old PML4 + its frames.
+    drop(old_aspace);
+
+    // Never returns.
+    unsafe { jump_to_ring3(image.entry.as_u64(), crate::init_process::USER_STACK_TOP) }
+}
 
 /// Copy a NUL-terminated path from user VA `uva` into `buf`. Returns
 /// the slice (without the NUL) on success, or a negative errno on
