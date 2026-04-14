@@ -56,6 +56,10 @@ pub struct TarSuper {
     nodes: Vec<TarNode>,
     base: *const u8,
     len: usize,
+    /// Back-reference to the owning `TarFs` so `unmount` can clear the
+    /// `mounted` latch. `Weak` breaks the `TarFs → Arc<SuperBlock> →
+    /// TarSuper → TarFs` cycle.
+    owner: Weak<TarFs>,
 }
 
 unsafe impl Send for TarSuper {}
@@ -97,7 +101,14 @@ impl SuperOps for TarSuper {
         })
     }
 
-    fn unmount(&self) {}
+    fn unmount(&self) {
+        // Release the single-mount latch on the owning TarFs so a
+        // subsequent mount of the same instance can succeed. If the
+        // owner is already gone the latch is irrelevant.
+        if let Some(fs) = self.owner.upgrade() {
+            fs.mounted.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Shared `InodeOps` implementation for every tarfs inode. The
@@ -614,19 +625,23 @@ fn install_symlink(nodes: &mut Vec<TarNode>, entry: &RawEntry<'_>) -> Result<(),
 /// kernel (wiring in #240).
 pub struct TarFs {
     mounted: AtomicBool,
+    /// Self-reference. Populated by [`TarFs::new_arc`] so the
+    /// `TarSuper` produced by `mount` can hold a `Weak<TarFs>` and
+    /// clear `mounted` from `unmount` without a reference cycle.
+    self_ref: Weak<TarFs>,
 }
 
 impl TarFs {
-    pub const fn new() -> Self {
-        Self {
+    /// Construct a TarFs instance. `new_arc` is the canonical
+    /// constructor — the filesystem is designed to live inside an
+    /// `Arc` (registered with the mount table as `Arc<dyn FileSystem>`),
+    /// and the self-reference feeds the back-pointer in each
+    /// `TarSuper` so `unmount` can release the single-mount latch.
+    pub fn new_arc() -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
             mounted: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Default for TarFs {
-    fn default() -> Self {
-        Self::new()
+            self_ref: weak.clone(),
+        })
     }
 }
 
@@ -636,16 +651,9 @@ impl FileSystem for TarFs {
     }
 
     fn mount(&self, source: MountSource<'_>, _flags: MountFlags) -> Result<Arc<SuperBlock>, i64> {
-        // One mount instance per TarFs — ramdisk backing is bound to
-        // a single namespace root.
-        if self
-            .mounted
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(crate::fs::EBUSY);
-        }
-
+        // Validate source and parse the archive *before* taking the
+        // single-mount latch. An invalid source or malformed archive
+        // must not burn the TarFs instance — see issue #274.
         let (base, len): (*const u8, usize) = match source {
             MountSource::Static(bytes) => (bytes.as_ptr(), bytes.len()),
             MountSource::RamdiskModule(p, n) => (p, n),
@@ -655,11 +663,21 @@ impl FileSystem for TarFs {
         let bytes = unsafe { core::slice::from_raw_parts(base, len) };
         let nodes = build_nodes(bytes)?;
 
+        // Parsing succeeded — claim the single-mount latch.
+        if self
+            .mounted
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(crate::fs::EBUSY);
+        }
+
         let super_ops: Arc<TarSuper> = Arc::new(TarSuper {
             fs_id: alloc_fs_id().0,
             nodes,
             base,
             len,
+            owner: self.self_ref.clone(),
         });
 
         let sb = Arc::new(SuperBlock::new(
@@ -761,7 +779,7 @@ mod tests {
     #[test]
     fn mount_and_lookup() {
         let archive = leak_archive(build_archive());
-        let fs = TarFs::new();
+        let fs = TarFs::new_arc();
         let sb = fs
             .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
@@ -789,7 +807,7 @@ mod tests {
     #[test]
     fn read_file_contents() {
         let archive = leak_archive(build_archive());
-        let fs = TarFs::new();
+        let fs = TarFs::new_arc();
         let sb = fs
             .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
@@ -826,7 +844,7 @@ mod tests {
     #[test]
     fn readlink_returns_target() {
         let archive = leak_archive(build_archive());
-        let fs = TarFs::new();
+        let fs = TarFs::new_arc();
         let sb = fs
             .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
@@ -843,7 +861,7 @@ mod tests {
     #[test]
     fn getdents_enumerates_children() {
         let archive = leak_archive(build_archive());
-        let fs = TarFs::new();
+        let fs = TarFs::new_arc();
         let sb = fs
             .mount(MountSource::Static(archive), MountFlags::default())
             .expect("mount");
@@ -885,11 +903,83 @@ mod tests {
         archive.extend_from_slice(&hdr);
         archive.extend_from_slice(&[0u8; BLOCK * 2]);
 
-        let fs = TarFs::new();
+        let fs = TarFs::new_arc();
         let r = fs.mount(
             MountSource::Static(leak_archive(archive)),
             MountFlags::default(),
         );
         assert!(r.is_err());
+    }
+
+    /// A failed archive parse must not burn the `mounted` latch —
+    /// callers should be free to retry with a valid source.
+    #[test]
+    fn mount_failure_allows_remount() {
+        // Bad archive (same shape as `malformed_header_rejected`).
+        let mut bad = Vec::new();
+        let mut hdr = make_header(b"bad", 0, b'0', b"", 0o644);
+        hdr[124] = b'Z';
+        hdr[148..156].copy_from_slice(b"        ");
+        let sum: u64 = hdr.iter().map(|&b| b as u64).sum();
+        write_octal(&mut hdr[148..155], sum, 6);
+        hdr[155] = 0;
+        bad.extend_from_slice(&hdr);
+        bad.extend_from_slice(&[0u8; BLOCK * 2]);
+
+        let fs = TarFs::new_arc();
+        assert!(fs
+            .mount(
+                MountSource::Static(leak_archive(bad)),
+                MountFlags::default(),
+            )
+            .is_err());
+
+        // Retry with a good archive: must succeed.
+        let good = leak_archive(build_archive());
+        fs.mount(MountSource::Static(good), MountFlags::default())
+            .expect("remount after failed parse must succeed");
+    }
+
+    /// An unsupported `MountSource` variant must not burn the latch
+    /// either — validation happens before the CAS.
+    #[test]
+    fn wrong_source_variant_allows_remount() {
+        let fs = TarFs::new_arc();
+        // `MountSource::None` is not accepted by tarfs.
+        assert!(fs.mount(MountSource::None, MountFlags::default()).is_err());
+
+        let good = leak_archive(build_archive());
+        fs.mount(MountSource::Static(good), MountFlags::default())
+            .expect("remount after wrong source must succeed");
+    }
+
+    /// After `SuperOps::unmount` runs, the latch must be cleared so
+    /// the filesystem can be mounted again.
+    #[test]
+    fn unmount_allows_remount() {
+        let fs = TarFs::new_arc();
+        let archive = leak_archive(build_archive());
+        let sb = fs
+            .mount(MountSource::Static(archive), MountFlags::default())
+            .expect("first mount");
+        sb.ops.unmount();
+
+        let archive2 = leak_archive(build_archive());
+        fs.mount(MountSource::Static(archive2), MountFlags::default())
+            .expect("remount after unmount must succeed");
+    }
+
+    /// While a mount is live the latch must refuse a second mount.
+    #[test]
+    fn double_mount_returns_ebusy() {
+        let fs = TarFs::new_arc();
+        let archive = leak_archive(build_archive());
+        let _sb = fs
+            .mount(MountSource::Static(archive), MountFlags::default())
+            .expect("first mount");
+
+        let archive2 = leak_archive(build_archive());
+        let r = fs.mount(MountSource::Static(archive2), MountFlags::default());
+        assert_eq!(r.err(), Some(crate::fs::EBUSY));
     }
 }
