@@ -48,6 +48,24 @@
 //! queue (see `crate::input`'s keyboard ring) and let a kernel task
 //! drain it and call `notify_one` from task context.
 //!
+//! ## Picking a mutual-exclusion primitive
+//!
+//! - **ISR-reachable data** → [`IrqLock`]. Disables local IRQs for the
+//!   duration the guard is held, so a task-context holder can't be
+//!   interrupted by an ISR that also wants the lock (classic
+//!   deadlock-by-reentry). Mirrors Linux's `spin_lock_irqsave`.
+//! - **Task-context only** → plain `spin::Mutex`. Cheapest option; no
+//!   IF save/restore on every acquire. Any static guarded by a plain
+//!   `spin::Mutex` should carry a comment stating that invariant so a
+//!   future ISR path onto it doesn't silently introduce a deadlock.
+//! - **Held across a scheduling point** (`block_current`, `yield`,
+//!   any blocking-primitive acquire) → [`BlockingMutex`]. Spinning or
+//!   parking with IRQs masked would hang the kernel.
+//!
+//! For brief "mask IRQs around this read" patterns where a full
+//! [`IrqLock`] is overkill, [`without_interrupts`] re-exports
+//! `x86_64`'s closure form.
+//!
 //! ## Lock order
 //!
 //! The primitives here establish a strict acquisition order so that
@@ -63,6 +81,7 @@
 //! Nothing acquires `WaitQueue.inner` while already holding a data
 //! lock or `SCHED`, so the graph is a DAG.
 
+pub mod irqlock;
 pub mod mpmc;
 pub mod mutex;
 pub mod rwlock;
@@ -70,7 +89,11 @@ pub mod semaphore;
 pub mod spsc;
 pub mod waitqueue;
 
+pub use irqlock::{IrqLock, IrqLockGuard};
 pub use mutex::{BlockingMutex, MutexGuard};
 pub use rwlock::{BlockingRwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use semaphore::Semaphore;
 pub use waitqueue::WaitQueue;
+
+#[cfg(target_os = "none")]
+pub use x86_64::instructions::interrupts::without_interrupts;

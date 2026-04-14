@@ -8,7 +8,16 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, Once};
+use spin::Once;
+
+#[cfg(target_os = "none")]
+use crate::sync::IrqLock;
+
+// Host builds: `sync` is cfg-gated to `target_os = "none"`, so substitute
+// a plain `spin::Mutex` with the same interface for the WAKEUPS static
+// below. No ISR concurrency exists on host, so IF masking is moot.
+#[cfg(not(target_os = "none"))]
+use spin::Mutex as IrqLock;
 
 /// PIT oscillator frequency, in Hz. Divisor = this / desired Hz.
 #[cfg(target_os = "none")]
@@ -24,7 +33,13 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// may accumulate multiple task ids (unlikely at 100 Hz but cheap to
 /// support). Drained by `preempt_tick` each PIT IRQ; see
 /// `drain_expired`.
-static WAKEUPS: Mutex<BTreeMap<u64, Vec<usize>>> = Mutex::new(BTreeMap::new());
+///
+/// Reachable from both task context (`enqueue_wakeup`) and ISR
+/// context (`drain_expired` from the PIT handler), so it uses
+/// [`IrqLock`] to mask IRQs while held — a plain `spin::Mutex` would
+/// deadlock if the timer IRQ landed on the same CPU while a task
+/// held the lock.
+static WAKEUPS: IrqLock<BTreeMap<u64, Vec<usize>>> = IrqLock::new(BTreeMap::new());
 
 /// Calibrated TSC frequency in Hz. Set once by [`calibrate_tsc`]; left
 /// unset when `RDTSCP` is unavailable, in which case [`uptime_ns`]
