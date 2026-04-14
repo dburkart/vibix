@@ -833,12 +833,18 @@ fn test_all() -> R<()> {
 }
 
 fn smoke(opts: &BuildOpts) -> R<()> {
+    use std::collections::HashSet;
+    use std::io::BufRead as _;
+    use std::time::Instant;
+
     let iso = iso(opts)?;
     let disk = ensure_test_disk()?;
 
-    // We run QEMU with serial to stdio, capture output, then kill after
-    // a short delay — the kernel halts in hlt_loop forever.
-    let child = Command::new("qemu-system-x86_64")
+    // Boot QEMU with serial to stdio; stdout is piped so we can read it
+    // incrementally.  -no-shutdown keeps the kernel in hlt_loop forever
+    // (the kernel never calls isa-debug-exit), so we are responsible for
+    // killing the process once we are done.
+    let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M",
             "q35",
@@ -863,41 +869,55 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         .spawn()?;
 
     let pid = child.id();
-    let reader_handle = std::thread::spawn(move || -> std::io::Result<String> {
-        use std::io::Read;
-        let mut out = String::new();
-        if let Some(mut s) = child.stdout {
-            s.read_to_string(&mut out)?;
-        }
-        Ok(out)
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+
+    // Hard ceiling: a watchdog thread kills QEMU after 30 s so that a
+    // blocking read_line() on a stalled kernel cannot hang indefinitely.
+    const HARD_CAP: Duration = Duration::from_secs(30);
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(HARD_CAP);
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     });
 
-    // Wait long enough for the fork+exec+wait round-trip to complete.
-    // CI runners are significantly slower than local QEMU: the kernel
-    // boot alone takes ~7–8 s on the runner.  The fork+exec+wait
-    // sequence (including ELF load and context switch) adds several
-    // more seconds under load.  30 s gives ~20 s of headroom after
-    // boot for the full process lifecycle.  (Previously 15 s, which
-    // left only ~7 s and caused intermittent failures — see issue #278.)
-    std::thread::sleep(Duration::from_secs(30));
-    // Kill QEMU so the reader thread can drain and return.
-    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let deadline = Instant::now() + HARD_CAP;
+    let mut remaining: HashSet<&'static str> = SMOKE_MARKERS.iter().copied().collect();
+    let mut accumulated = String::new();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
 
-    let output = reader_handle
-        .join()
-        .map_err(|_| "reader thread panicked")??;
-
-    let mut missing = Vec::new();
-    for m in SMOKE_MARKERS {
-        if !output.contains(m) {
-            missing.push(*m);
+    // Read QEMU serial output one line at a time.  read_line() blocks until
+    // a newline arrives or the pipe closes (after kill).  We check for
+    // early exit after every line — typical runs complete in a few seconds.
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // pipe closed (QEMU killed by watchdog or exited)
+            Ok(_) => {
+                accumulated.push_str(&line);
+                remaining.retain(|m| !accumulated.contains(m));
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
-    if missing.is_empty() {
+
+    // Ensure QEMU is dead (idempotent if watchdog already fired).
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let _ = watchdog.join();
+    let _ = child.wait();
+
+    if remaining.is_empty() {
         println!("→ smoke: all {} markers present ✓", SMOKE_MARKERS.len());
         Ok(())
     } else {
-        eprintln!("--- captured serial ---\n{output}\n-----------------------");
+        let mut missing: Vec<&str> = remaining.into_iter().collect();
+        missing.sort_unstable();
+        eprintln!("--- captured serial ---\n{accumulated}\n-----------------------");
         Err(format!("smoke: missing markers {:?}", missing).into())
     }
 }
