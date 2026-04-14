@@ -22,7 +22,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::FileBackend;
+use crate::fs::{FileBackend, EOVERFLOW};
 
 use super::open_file::OpenFile;
 
@@ -45,7 +45,7 @@ impl FileBackend for VfsBackend {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
         let mut off = self.open_file.offset.lock();
         let n = self.open_file.ops.read(&self.open_file, buf, *off)?;
-        *off += n as u64;
+        *off = off.checked_add(n as u64).ok_or(EOVERFLOW)?;
         Ok(n)
     }
 
@@ -57,7 +57,7 @@ impl FileBackend for VfsBackend {
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
         let mut off = self.open_file.offset.lock();
         let n = self.open_file.ops.write(&self.open_file, buf, *off)?;
-        *off += n as u64;
+        *off = off.checked_add(n as u64).ok_or(EOVERFLOW)?;
         Ok(n)
     }
 }
