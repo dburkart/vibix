@@ -163,3 +163,7 @@ harness = false
 [[test]]
 name = "fd_table"
 harness = false
+
+[[test]]
+name = "syscall_open_mmap"
+harness = false
