@@ -88,6 +88,9 @@ jobs:
             "Bash(gh run view:*)"
             "Bash(gh issue list:*)"
             "Skill(file-issue)"
+            "mcp__github__search_issues"
+            "mcp__github__add_issue_comment"
+            "mcp__github__issue_write"
           prompt: |
             The CI build on the main branch of the vibix kernel repo just failed.
 
