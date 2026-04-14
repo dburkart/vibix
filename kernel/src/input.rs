@@ -82,11 +82,14 @@ mod kernel_side {
     /// may be desynced.
     static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
+    // MapLettersToUnicode translates Ctrl+A..Z to U+0001..U+001A, which
+    // is what the shell's line editor expects for Ctrl+C (0x03) and
+    // Ctrl+L (0x0C). Ignore would swallow those combos entirely.
     static KEYBOARD: Lazy<Mutex<Keyboard<Us104Key, ScancodeSet1>>> = Lazy::new(|| {
         Mutex::new(Keyboard::new(
             ScancodeSet1::new(),
             Us104Key,
-            HandleControl::Ignore,
+            HandleControl::MapLettersToUnicode,
         ))
     });
 
