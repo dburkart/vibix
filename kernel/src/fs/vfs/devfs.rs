@@ -253,9 +253,7 @@ impl SuperOps for DevfsSuperOps {
         })
     }
 
-    fn unmount(&self) -> Result<(), i64> {
-        Ok(())
-    }
+    fn unmount(&self) {}
 }
 
 // ---------------------------------------------------------------------------
