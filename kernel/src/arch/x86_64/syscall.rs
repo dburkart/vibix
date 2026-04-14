@@ -294,6 +294,12 @@ pub unsafe extern "C" fn syscall_dispatch(
         // newfstatat(dfd, path, *statbuf, flags)
         262 => super::syscalls::vfs::sys_newfstatat_impl(a0 as i32, a1, a2, a3 as u32),
 
+        // getcwd(buf, len) — copy cwd absolute path to user buffer.
+        GETCWD => super::syscalls::vfs::sys_getcwd(a0, a1),
+
+        // chdir(path) — set the per-process current working directory.
+        CHDIR => super::syscalls::vfs::sys_chdir(a0),
+
         // mmap(addr, len, prot, flags, fd, off) — anon-private and
         // anon-shared with full MAP_FIXED / MAP_GROWSDOWN support. See
         // `sys_mmap` for full validation.
@@ -932,6 +938,8 @@ pub mod syscall_nr {
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
     pub const NEWFSTATAT: u64 = 262;
+    pub const GETCWD: u64 = 79;
+    pub const CHDIR: u64 = 80;
 }
 
 #[cfg(test)]
@@ -970,6 +978,8 @@ mod tests {
         assert_eq!(syscall_nr::GETDENTS64, 217, "SYS_getdents64 must be 217");
         assert_eq!(syscall_nr::OPENAT, 257, "SYS_openat must be 257");
         assert_eq!(syscall_nr::NEWFSTATAT, 262, "SYS_newfstatat must be 262");
+        assert_eq!(syscall_nr::GETCWD, 79, "SYS_getcwd must be 79");
+        assert_eq!(syscall_nr::CHDIR, 80, "SYS_chdir must be 80");
 
         // Signals
         assert_eq!(syscall_nr::SIGRETURN, 15, "SYS_rt_sigreturn must be 15");

@@ -135,6 +135,13 @@ pub(super) struct Task {
     /// and cloned cheaply for fork() and exec() paths.
     pub fd_table: Arc<Mutex<FileDescTable>>,
 
+    /// Per-process current working directory. `None` means "use the VFS
+    /// root" — necessary for the bootstrap task and any kernel-only task
+    /// spawned before `vfs::init()` runs. `chdir` sets this to the
+    /// resolved dentry; `fork` copies it from the parent; `exec` preserves
+    /// it unchanged.
+    pub cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
+
     /// Top of this task's dedicated SYSCALL kernel stack (set when this
     /// task runs in ring-3 and needs its own syscall entry point).
     ///
@@ -176,6 +183,7 @@ impl Task {
             // at that moment.
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
+            cwd: None,
             syscall_stack_top: 0,
         }
     }
@@ -265,6 +273,7 @@ impl Task {
             address_space: Arc::new(RwLock::new(address_space)),
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
+            cwd: None,
             syscall_stack_top: 0, // kernel-only task — no ring-3 syscall stack needed yet
         }
     }
@@ -320,6 +329,7 @@ impl Task {
         child_address_space: alloc::sync::Arc<spin::RwLock<AddressSpace>>,
         child_cr3: PhysFrame<Size4KiB>,
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
+        child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
     ) -> Self {
         // Allocate a fresh guard+stack slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
@@ -380,6 +390,7 @@ impl Task {
             address_space: child_address_space,
             fpu,
             fd_table: child_fd_table,
+            cwd: child_cwd,
             // The child task runs in ring-3; it needs its own SYSCALL stack
             // so it doesn't clobber the parent's saved SYSCALL context on the
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.

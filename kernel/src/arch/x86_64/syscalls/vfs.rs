@@ -19,9 +19,11 @@
 //! - `write_stat` for the userspace `struct stat` copy-out.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::super::syscall::copy_path_from_user_pub;
 use super::super::uaccess;
+use crate::fs::vfs::dentry::{DFlags, Dentry};
 use crate::fs::vfs::ops::{meta_into_stat, Stat};
 use crate::fs::vfs::path_walk::{path_walk, LookupFlags, NameIdata};
 use crate::fs::vfs::super_block::SbActiveGuard;
@@ -30,6 +32,8 @@ use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
 use crate::fs::{flags as oflags, FileBackend, FileDescription, EBADF, EINVAL, ENOENT, ENOTDIR};
+
+const ENAMETOOLONG: i64 = -36;
 
 /// Linux x86_64 value of the "use the current working directory"
 /// sentinel for `*at` syscalls. Sign-extended as an `i32`, negative,
@@ -57,13 +61,22 @@ const OPEN_PATH_MAX: usize = 128;
 /// references keep the SB alive for the duration of the `getattr` call.
 fn resolve_inode(path: &[u8], follow: bool) -> Result<(Arc<Inode>, NameIdata), i64> {
     let root = vfs_root().ok_or(ENOENT)?;
+    // For relative paths, walk from the per-process cwd. For absolute
+    // paths, path_walk reseats at root on the first `/` component so
+    // the cwd argument is ignored — but we still pass root as cwd for
+    // absolute paths since that is the correct sentinel.
+    let cwd = if path.first() == Some(&b'/') {
+        root.clone()
+    } else {
+        crate::task::current_cwd().unwrap_or_else(|| root.clone())
+    };
     let mut flags = LookupFlags::default();
     if follow {
         flags = flags | LookupFlags::FOLLOW;
     } else {
         flags = flags | LookupFlags::NOFOLLOW;
     }
-    let mut nd = NameIdata::new(root.clone(), root, Credential::kernel(), flags)?;
+    let mut nd = NameIdata::new(root, cwd, Credential::kernel(), flags)?;
     path_walk(&mut nd, path, &GlobalMountResolver)?;
     let inode = nd.path.inode.clone();
     Ok((inode, nd))
@@ -298,4 +311,109 @@ pub unsafe fn sys_newfstatat_impl(dfd: i32, path_uva: u64, statbuf_uva: u64, fla
         Err(e) => return e,
     };
     stat_into_user(&inode, statbuf_uva)
+}
+
+/// `chdir(path)` — set the per-process current working directory.
+///
+/// Resolves `path` (following symlinks), checks the target is a
+/// directory, then stores its dentry as the task's cwd via
+/// [`crate::task::set_current_cwd`].
+pub unsafe fn sys_chdir(path_uva: u64) -> i64 {
+    let mut buf = [0u8; OPEN_PATH_MAX];
+    let n = match copy_path_from_user_pub(path_uva as usize, &mut buf) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let path = &buf[..n];
+
+    let (inode, nd) = match resolve_inode(path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if inode.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    crate::task::set_current_cwd(nd.path.dentry.clone());
+    0
+}
+
+/// `getcwd(buf, len)` — copy the absolute path of the current working
+/// directory into the user buffer.
+///
+/// Walks the dentry parent chain from the cwd (or VFS root if no cwd
+/// is set) up to the root, collecting component names, then assembles
+/// and copies out `"/component/…\0"`.
+///
+/// Returns the number of bytes written (including the terminating NUL)
+/// on success, or a negative errno:
+/// - `-ENOENT` if the VFS root is not yet initialised.
+/// - `-EINVAL` if `buf` is NULL or `len` is 0.
+/// - `-ENAMETOOLONG` if the path does not fit in `len` bytes.
+/// - `-EFAULT` if `buf` is not a valid user-space range.
+pub unsafe fn sys_getcwd(buf_uva: u64, len: u64) -> i64 {
+    if buf_uva == 0 || len == 0 {
+        return EINVAL;
+    }
+    let len = len as usize;
+
+    // Resolve the cwd: fall back to VFS root.
+    let cwd = match crate::task::current_cwd().or_else(vfs_root) {
+        Some(d) => d,
+        None => return ENOENT,
+    };
+
+    // Walk the parent chain. We hold strong Arcs in `chain` to keep
+    // dentries alive while assembling the path string. Stop at:
+    //   - IS_ROOT dentry (the VFS namespace root), or
+    //   - a failed Weak upgrade (orphaned/disconnected dentry — treat as root).
+    let mut chain: Vec<Arc<Dentry>> = Vec::new();
+
+    let mut cur = cwd.clone();
+    loop {
+        if cur.flags.contains(DFlags::IS_ROOT) {
+            break;
+        }
+        chain.push(cur.clone());
+        match cur.parent.upgrade() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+
+    // Build "/comp1/comp2/…\0".
+    // Total length: 1 ('/') + sum(name_len + 1 per component) + 1 (NUL).
+    // For root cwd the chain is empty → path is "/\0".
+    let mut path_len = 1usize; // leading '/'
+    for d in chain.iter().rev() {
+        path_len += d.name.as_bytes().len() + 1; // '/' + name
+    }
+    path_len += 1; // NUL
+
+    if path_len > len {
+        return ENAMETOOLONG;
+    }
+
+    if let Err(e) = uaccess::check_user_range(buf_uva as usize, path_len) {
+        return e.as_errno();
+    }
+
+    // Assemble into a kernel buffer.
+    let mut out: Vec<u8> = Vec::with_capacity(path_len);
+    // If cwd is root, chain is empty.
+    if chain.is_empty() {
+        out.push(b'/');
+    } else {
+        for d in chain.iter().rev() {
+            out.push(b'/');
+            out.extend_from_slice(d.name.as_bytes());
+        }
+    }
+    out.push(0); // NUL terminator
+
+    match uaccess::copy_to_user(buf_uva as usize, &out) {
+        Ok(()) => out.len() as i64,
+        Err(e) => e.as_errno(),
+    }
 }
