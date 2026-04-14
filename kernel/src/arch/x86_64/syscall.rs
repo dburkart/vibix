@@ -904,3 +904,75 @@ syscall_entry:
     fork_rflags = sym FORK_USER_RFLAGS,
     fork_rsp = sym FORK_USER_RSP,
 );
+
+/// Pinned Linux x86_64 syscall numbers used by `userspace/init`.
+///
+/// These are the numbers that appear in the `match nr` arms of
+/// `syscall_dispatch`. A mismatch between this table and the match arms
+/// will silently cause the wrong kernel operation to run (or -ENOSYS),
+/// which manifests in CI as missing smoke markers. See issue #278.
+pub mod syscall_nr {
+    pub const READ: u64 = 0;
+    pub const WRITE: u64 = 1;
+    pub const BRK: u64 = 12;
+    pub const FORK: u64 = 57;
+    pub const EXECVE: u64 = 59;
+    pub const EXIT: u64 = 60;
+    pub const WAIT4: u64 = 61;
+    pub const SIGACTION: u64 = 13;
+    pub const SIGPROCMASK: u64 = 14;
+    pub const KILL: u64 = 62;
+    pub const SIGRETURN: u64 = 15;
+    pub const MMAP: u64 = 9;
+    pub const MUNMAP: u64 = 11;
+    pub const MPROTECT: u64 = 10;
+    pub const MADVISE: u64 = 28;
+    pub const GETDENTS64: u64 = 217;
+    pub const OPEN: u64 = 2;
+    pub const OPENAT: u64 = 257;
+    pub const LSEEK: u64 = 8;
+    pub const CLOSE: u64 = 3;
+    pub const FSTAT: u64 = 5;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::syscall_nr;
+
+    /// Regression anchor for issue #278: changing any of these numbers
+    /// breaks `userspace/init` silently (wrong syscall arm executes).
+    /// Update both this table and the `match nr` arms atomically.
+    #[test]
+    fn syscall_numbers_match_linux_x86_64_abi() {
+        // POSIX-required process management syscalls
+        assert_eq!(syscall_nr::FORK, 57, "SYS_fork must be 57");
+        assert_eq!(syscall_nr::EXECVE, 59, "SYS_execve must be 59");
+        assert_eq!(syscall_nr::EXIT, 60, "SYS_exit must be 60");
+        assert_eq!(syscall_nr::WAIT4, 61, "SYS_wait4 must be 61");
+
+        // Basic I/O
+        assert_eq!(syscall_nr::READ, 0, "SYS_read must be 0");
+        assert_eq!(syscall_nr::WRITE, 1, "SYS_write must be 1");
+        assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
+        assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
+
+        // Memory management
+        assert_eq!(syscall_nr::MMAP, 9, "SYS_mmap must be 9");
+        assert_eq!(syscall_nr::MPROTECT, 10, "SYS_mprotect must be 10");
+        assert_eq!(syscall_nr::MUNMAP, 11, "SYS_munmap must be 11");
+        assert_eq!(syscall_nr::BRK, 12, "SYS_brk must be 12");
+        assert_eq!(syscall_nr::MADVISE, 28, "SYS_madvise must be 28");
+
+        // Filesystem
+        assert_eq!(syscall_nr::OPEN, 2, "SYS_open must be 2");
+        assert_eq!(syscall_nr::FSTAT, 5, "SYS_fstat must be 5");
+        assert_eq!(syscall_nr::GETDENTS64, 217, "SYS_getdents64 must be 217");
+        assert_eq!(syscall_nr::OPENAT, 257, "SYS_openat must be 257");
+
+        // Signals
+        assert_eq!(syscall_nr::SIGRETURN, 15, "SYS_rt_sigreturn must be 15");
+        assert_eq!(syscall_nr::SIGACTION, 13, "SYS_rt_sigaction must be 13");
+        assert_eq!(syscall_nr::SIGPROCMASK, 14, "SYS_rt_sigprocmask must be 14");
+        assert_eq!(syscall_nr::KILL, 62, "SYS_kill must be 62");
+    }
+}

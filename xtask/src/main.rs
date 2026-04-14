@@ -728,10 +728,12 @@ fn smoke(opts: &BuildOpts) -> R<()> {
 
     // Wait long enough for the fork+exec+wait round-trip to complete.
     // CI runners are significantly slower than local QEMU: the kernel
-    // boot alone takes ~7–8 s on the runner, leaving no time for the
-    // fork+exec+wait sequence inside an 8 s window. 15 s gives a
-    // comfortable margin for the full boot + process lifecycle.
-    std::thread::sleep(Duration::from_secs(15));
+    // boot alone takes ~7–8 s on the runner.  The fork+exec+wait
+    // sequence (including ELF load and context switch) adds several
+    // more seconds under load.  30 s gives ~20 s of headroom after
+    // boot for the full process lifecycle.  (Previously 15 s, which
+    // left only ~7 s and caused intermittent failures — see issue #278.)
+    std::thread::sleep(Duration::from_secs(30));
     // Kill QEMU so the reader thread can drain and return.
     let _ = Command::new("kill").arg(pid.to_string()).status();
 
