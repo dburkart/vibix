@@ -138,7 +138,7 @@ fn make_open_file(fill_byte: u8) -> Arc<OpenFile> {
         write_count: AtomicUsize::new(0),
     });
     let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
-    OpenFile::new(dentry, inode, file_ops, sb, 0, guard)
+    OpenFile::new(dentry, inode, file_ops, sb.clone(), 0, guard)
 }
 
 // ---------------------------------------------------------------------------

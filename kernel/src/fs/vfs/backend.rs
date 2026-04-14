@@ -139,7 +139,7 @@ mod tests {
         let dentry = Dentry::new_root(inode.clone());
         let file_ops: Arc<dyn FileOps> = Arc::new(CountingOps { fill_byte });
         let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
-        OpenFile::new(dentry, inode, file_ops, sb, 0, guard)
+        OpenFile::new(dentry, inode, file_ops, sb.clone(), 0, guard)
     }
 
     // -----------------------------------------------------------------------
