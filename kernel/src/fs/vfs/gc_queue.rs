@@ -29,9 +29,11 @@ use spin::Mutex;
 
 use super::super_block::SuperBlock;
 
-/// Soft cap on the inline ring portion of the queue. Past this we
-/// spill into a heap `VecDeque` rather than panic or leak — the cost
-/// of a transient allocation is preferable to losing eviction work.
+/// Threshold past which [`enqueue`] bumps [`GC_OVERFLOWS`] as a
+/// drain-pressure signal. The backing `VecDeque` itself is unbounded;
+/// this is a soft watermark for telemetry, not a hard cap. The
+/// per-CPU ring + spill design from RFC 0002 is deferred along with
+/// per-CPU infrastructure.
 const GC_RING_CAP: usize = 256;
 
 /// One pending eviction. `sb` is `Weak` so a queued entry doesn't keep
@@ -62,10 +64,32 @@ static GC_QUEUE: Mutex<GcRing> = Mutex::new(GcRing::new());
 /// [`GC_RING_CAP`]. Useful for spotting drain-pressure regressions.
 static GC_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
-/// Set while the global drainer is running. New `enqueue` calls (from
-/// `evict_inode` itself dropping more inodes) still succeed, and the
-/// drainer re-checks the queue after each eviction.
+/// Set while a drainer is running. Only one drainer may be active at a
+/// time — concurrent calls bail out, since the active drainer will
+/// pick up anything they would have processed. New `enqueue` calls
+/// (from `evict_inode` itself dropping more inodes) still succeed.
 static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// RAII handle that owns the "I am the active drainer" claim.
+/// `try_acquire` returns `None` if another drainer is already running;
+/// `Drop` releases the claim with `Release` ordering so the next
+/// drainer's acquire sees an empty queue.
+struct DrainGuard;
+
+impl DrainGuard {
+    fn try_acquire() -> Option<Self> {
+        DRAINING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| DrainGuard)
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        DRAINING.store(false, Ordering::Release);
+    }
+}
 
 /// Enqueue an inode for deferred eviction. Called from `Drop for
 /// Inode`; must not block, must not re-enter VFS locks, must not
@@ -86,11 +110,15 @@ fn pop_one() -> Option<GcEntry> {
 }
 
 /// Drain all pending evictions. Safe to call from any task-context
-/// site that holds no VFS locks. Re-entrant: an eviction that itself
-/// drops more inodes adds to the queue, and the loop picks them up on
-/// the next iteration.
+/// site that holds no VFS locks. Re-entrant within one task: an
+/// eviction that itself drops more inodes adds to the queue, and the
+/// loop picks them up on the next iteration. Concurrent callers from
+/// other tasks are no-ops — the active drainer will pick up their
+/// work too.
 pub fn gc_drain() {
-    DRAINING.store(true, Ordering::Release);
+    let Some(_guard) = DrainGuard::try_acquire() else {
+        return;
+    };
     while let Some(entry) = pop_one() {
         if let Some(sb) = entry.sb.upgrade() {
             // Errors from evict_inode are advisory — there's no
@@ -98,31 +126,39 @@ pub fn gc_drain() {
             let _ = sb.ops.evict_inode(entry.ino);
         }
     }
-    DRAINING.store(false, Ordering::Release);
 }
 
-/// Drain only entries whose SuperBlock matches `sb`. Used by
-/// `sys_umount` Phase B before calling `ops.unmount` so the FS sees
-/// no pending evictions.
+/// Drain entries whose SuperBlock matches `sb`. Used by `sys_umount`
+/// Phase B before calling `ops.unmount` so the FS sees no pending
+/// evictions for this mount.
 ///
-/// Walks the queue once, partitioning matched entries out. Unmatched
-/// entries are written back in original order.
+/// Loops until no matching entries remain — an `evict_inode` call may
+/// itself drop more inodes belonging to this same SB, and Phase B's
+/// contract is "queue is quiescent for `target` on return." Acquires
+/// the [`DrainGuard`] for the duration; falls back to spinning on the
+/// queue if another drainer is racing (the racing drainer doesn't
+/// know about the per-fs filter, so we still need our own pass).
 pub fn gc_drain_for(sb: &Arc<SuperBlock>) {
     let target = sb.fs_id;
-    let mut to_evict: VecDeque<GcEntry> = VecDeque::new();
-    {
-        let mut q = GC_QUEUE.lock();
-        let mut keep: VecDeque<GcEntry> = VecDeque::with_capacity(q.entries.len());
-        while let Some(entry) = q.entries.pop_front() {
-            match entry.sb.upgrade() {
-                Some(entry_sb) if entry_sb.fs_id == target => to_evict.push_back(entry),
-                _ => keep.push_back(entry),
+    loop {
+        let mut to_evict: VecDeque<GcEntry> = VecDeque::new();
+        {
+            let mut q = GC_QUEUE.lock();
+            let mut keep: VecDeque<GcEntry> = VecDeque::with_capacity(q.entries.len());
+            while let Some(entry) = q.entries.pop_front() {
+                match entry.sb.upgrade() {
+                    Some(entry_sb) if entry_sb.fs_id == target => to_evict.push_back(entry),
+                    _ => keep.push_back(entry),
+                }
             }
+            q.entries = keep;
         }
-        q.entries = keep;
-    }
-    for entry in to_evict {
-        let _ = sb.ops.evict_inode(entry.ino);
+        if to_evict.is_empty() {
+            return;
+        }
+        for entry in to_evict {
+            let _ = sb.ops.evict_inode(entry.ino);
+        }
     }
 }
 
@@ -297,6 +333,27 @@ mod tests {
             GC_RING_CAP + 5,
             "spill path must not lose entries"
         );
+    }
+
+    #[test]
+    fn drain_guard_excludes_concurrent_drainer() {
+        drain_static_queue();
+        // Acquire the guard manually to simulate an in-flight drainer.
+        let guard = DrainGuard::try_acquire().expect("first acquire");
+        // A second acquire while the first is held must fail.
+        assert!(DrainGuard::try_acquire().is_none());
+        // While the guard is held, gc_drain bails out without touching
+        // the queue — proves DRAINING is observed, not write-only.
+        let (sb, ops) = make_sb(500);
+        enqueue(Arc::downgrade(&sb), 7);
+        gc_drain();
+        assert_eq!(gc_pending_count(), 1);
+        assert_eq!(ops.evicted.load(Ordering::SeqCst), 0);
+        // Release and re-drain — now it goes through.
+        drop(guard);
+        gc_drain();
+        assert_eq!(gc_pending_count(), 0);
+        assert_eq!(ops.evicted.load(Ordering::SeqCst), 1);
     }
 
     #[test]
