@@ -33,6 +33,8 @@ const SYS_LSTAT: u64 = 6;
 const SYS_CLOSE: u64 = 3;
 const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_GETCWD: u64 = 79;
+const SYS_CHDIR: u64 = 80;
 
 const AT_FDCWD_U64: u64 = (-100i64) as u64;
 
@@ -78,6 +80,17 @@ fn run_tests() {
         (
             "open_o_directory_on_nondir_enotdir",
             &(open_o_directory_on_nondir_enotdir as fn()),
+        ),
+        ("getcwd_returns_root", &(getcwd_returns_root as fn())),
+        ("getcwd_enametoolong", &(getcwd_enametoolong as fn())),
+        ("chdir_changes_cwd", &(chdir_changes_cwd as fn())),
+        (
+            "chdir_rejects_non_directory",
+            &(chdir_rejects_non_directory as fn()),
+        ),
+        (
+            "chdir_enoent_on_missing",
+            &(chdir_enoent_on_missing as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -248,6 +261,94 @@ fn open_o_directory_on_nondir_enotdir() {
     assert_eq!(
         r, ENOTDIR,
         "O_DIRECTORY on char file must be ENOTDIR, got {}",
+        r
+    );
+}
+
+// --- getcwd / chdir tests ------------------------------------------------
+
+/// Staging area for getcwd output: second 4 KiB page of the user staging VA.
+fn cwdbuf_uva() -> u64 {
+    install_user_staging_vma();
+    (USER_PAGE_VA + 2 * 4096) as u64
+}
+
+fn getcwd_returns_root() {
+    // At boot, no chdir has been called, so cwd falls back to the VFS root.
+    // getcwd should return "/\0" (2 bytes), return value 2.
+    let r = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
+    assert!(r > 0, "getcwd should succeed, got {}", r);
+    let buf = cwdbuf_uva() as *const u8;
+    let first = unsafe { ptr::read_volatile(buf) };
+    assert_eq!(
+        first, b'/',
+        "getcwd result should start with '/', got {}",
+        first
+    );
+    let second = unsafe { ptr::read_volatile(buf.add(1)) };
+    assert_eq!(
+        second, 0,
+        "getcwd of root should be '/\\0' (second byte NUL), got {}",
+        second
+    );
+    assert_eq!(
+        r, 2,
+        "getcwd('/') should return 2 (length including NUL), got {}",
+        r
+    );
+}
+
+fn getcwd_enametoolong() {
+    // Buffer length 1 is too small for even "/\0" (needs 2).
+    let r = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 1, 0, 0, 0, 0) };
+    let enametoolong: i64 = -36;
+    assert_eq!(
+        r, enametoolong,
+        "getcwd with len=1 must return ENAMETOOLONG, got {}",
+        r
+    );
+}
+
+fn chdir_changes_cwd() {
+    // chdir to /dev (which is mounted as devfs) should succeed and
+    // cause getcwd to return "/dev\0".
+    let path = stage_path(b"/dev");
+    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    assert_eq!(r, 0, "chdir(\"/dev\") should succeed, got {}", r);
+
+    let r2 = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
+    assert!(r2 > 0, "getcwd after chdir should succeed, got {}", r2);
+
+    let expected = b"/dev\0";
+    let buf = cwdbuf_uva() as *const u8;
+    for (i, &b) in expected.iter().enumerate() {
+        let got = unsafe { ptr::read_volatile(buf.add(i)) };
+        assert_eq!(got, b, "getcwd byte[{}]: expected {}, got {}", i, b, got);
+    }
+
+    // Restore cwd to root for subsequent tests.
+    let root_path = stage_path(b"/");
+    let _ = unsafe { syscall_dispatch(SYS_CHDIR, root_path, 0, 0, 0, 0, 0) };
+}
+
+fn chdir_rejects_non_directory() {
+    // chdir to a non-directory (e.g. /dev/null is a char inode) must
+    // return ENOTDIR.
+    let path = stage_path(b"/dev/null");
+    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    assert_eq!(
+        r, ENOTDIR,
+        "chdir to non-dir must return ENOTDIR, got {}",
+        r
+    );
+}
+
+fn chdir_enoent_on_missing() {
+    let path = stage_path(b"/no-such-dir");
+    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    assert_eq!(
+        r, ENOENT,
+        "chdir to missing path must return ENOENT, got {}",
         r
     );
 }
