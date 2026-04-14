@@ -746,19 +746,20 @@ mod tests {
     }
 
     #[test]
-    fn unmap_range_spanning_hole_is_noop_on_gap() {
-        // Partial unmap over a range that spans a hole (i.e. some of the
-        // range has no VMA to unmap) must not panic and must leave
-        // surrounding VMAs intact in their original shape.
+    fn unmap_range_spanning_hole_trims_both_sides() {
+        // Partial unmap over a range that spans a hole (some of the
+        // range has no VMA to unmap) must not panic, must leave the
+        // hole alone, and must correctly trim the neighbouring VMAs
+        // whose edges the range does overlap.
         let obj = stub();
         let mut t = VmaTree::new();
-        t.insert(vma(0, K, RW, Arc::clone(&obj), 0));
-        t.insert(vma(4 * K, 5 * K, RW, Arc::clone(&obj), 0));
+        t.insert(vma(0, 2 * K, RW, Arc::clone(&obj), 0));
+        t.insert(vma(3 * K, 5 * K, RW, obj, 0));
         assert_eq!(t.len(), 2);
 
-        // Unmap across the gap; only the outer edges of the two VMAs
-        // are touched and neither extends into the gap, so both survive.
-        t.unmap_range(2 * K, 4 * K);
+        // Unmap [K, 4*K): the gap at [2*K, 3*K) is left alone; the
+        // left VMA trims to [0, K) and the right VMA trims to [4*K, 5*K).
+        t.unmap_range(K, 4 * K);
         assert_eq!(t.len(), 2);
         let mut it = t.iter();
         let a = it.next().unwrap();

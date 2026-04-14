@@ -115,12 +115,14 @@ fn brk_grow_shrink_query() {
 fn brk_past_max_returns_prior() {
     let mut aspace = make_brk_aspace();
     let initial = aspace.sys_brk(0);
-    // A brk request far past brk_max must be refused; the prior break
-    // is returned unchanged.
-    let got = aspace.sys_brk(u64::MAX - 4096);
+    // A canonical address above the opened brk window: this must hit
+    // the brk_max rejection path, not the address-sanity fast reject.
+    // brk_max is mmap_base - DEFAULT_BRK_GUARD, so mmap_base itself
+    // (0x4000_0000) is safely past it and still canonical.
+    let got = aspace.sys_brk(0x0000_0000_4000_0000);
     assert_eq!(
         got, initial,
-        "sys_brk past max must return the prior break unchanged"
+        "sys_brk past brk_max must return the prior break unchanged"
     );
     // A request below brk_start must also be refused.
     let got = aspace.sys_brk(1);
