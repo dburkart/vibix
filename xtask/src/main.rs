@@ -637,6 +637,7 @@ fn test_all() -> R<()> {
         "fork_cow",
         "tlb_flusher",
         "smep_smap",
+        "fd_table",
     ] {
         cmd.arg("--test").arg(t);
     }

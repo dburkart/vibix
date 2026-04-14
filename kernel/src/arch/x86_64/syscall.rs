@@ -157,79 +157,128 @@ use super::uaccess;
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
 /// interrupts disabled. User pointer arguments are validated and
-/// marshalled via `uaccess::copy_from_user` before any dereference.
+/// marshalled via `uaccess::copy_from_user` / `copy_to_user` before
+/// any dereference.
 #[no_mangle]
 pub unsafe extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     match nr {
-        // write(fd, buf, len) — fd=1 (stdout/stderr) → serial
-        1 => {
-            let fd = a0;
+        // read(fd, buf, len) — non-blocking; returns -EAGAIN if no data.
+        0 => {
+            let fd = a0 as u32;
             let buf_va = a1 as usize;
             let len = a2 as usize;
-            // Validate the whole `[buf_va, buf_va + len)` range up
-            // front regardless of fd, so a kernel-half or wrapping
-            // pointer returns -EFAULT even for unsupported fds.
-            // Zero-length writes skip the check (no pointer access).
+            if len == 0 {
+                return 0;
+            }
+            if let Err(e) = uaccess::check_user_range(buf_va, len) {
+                return e.as_errno();
+            }
+            // Get the backend without holding the fd-table lock during I/O.
+            let backend = {
+                let tbl = crate::task::current_fd_table();
+                let x = match tbl.lock().get(fd) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                x
+            };
+            // Read into a kernel bounce buffer, then copy to user.
+            let mut chunk = [0u8; 256];
+            let n = core::cmp::min(chunk.len(), len);
+            match backend.read(&mut chunk[..n]) {
+                Ok(nread) => match uaccess::copy_to_user(buf_va, &chunk[..nread]) {
+                    Ok(()) => nread as i64,
+                    Err(e) => e.as_errno(),
+                },
+                Err(e) => e,
+            }
+        }
+
+        // write(fd, buf, len) — routes through the per-process fd table.
+        1 => {
+            let fd = a0 as u32;
+            let buf_va = a1 as usize;
+            let len = a2 as usize;
+            // Validate user range up front so a bad pointer returns
+            // -EFAULT before any observable side-effect.
             if len > 0 {
                 if let Err(e) = uaccess::check_user_range(buf_va, len) {
                     return e.as_errno();
                 }
             }
-            if fd == 1 && len > 0 {
-                // Chunk through a small kernel-stack bounce buffer so the
-                // ring-0 access window stays short and bounded — a single
-                // STAC/CLAC bracket per chunk, not per byte.
-                let mut chunk = [0u8; 256];
-                let mut off = 0;
-                while off < len {
-                    let n = core::cmp::min(chunk.len(), len - off);
-                    match uaccess::copy_from_user(&mut chunk[..n], buf_va + off) {
-                        Ok(()) => {}
-                        Err(e) => return e.as_errno(),
-                    }
-                    for &b in &chunk[..n] {
-                        uart_putc(b);
-                    }
-                    off += n;
+            // Get the backend without holding the fd-table lock during I/O.
+            let backend = {
+                let tbl = crate::task::current_fd_table();
+                let x = match tbl.lock().get(fd) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                x
+            };
+            if len == 0 {
+                return 0;
+            }
+            // Chunk through a small kernel-stack bounce buffer.
+            let mut chunk = [0u8; 256];
+            let mut written = 0usize;
+            while written < len {
+                let n = core::cmp::min(chunk.len(), len - written);
+                match uaccess::copy_from_user(&mut chunk[..n], buf_va + written) {
+                    Ok(()) => {}
+                    Err(e) => return e.as_errno(),
+                }
+                match backend.write(&chunk[..n]) {
+                    Ok(nw) => written += nw,
+                    Err(e) => return e,
                 }
             }
-            len as i64
+            written as i64
         }
+
+        // open(path, flags, mode) — VFS not yet available; stub.
+        2 => -38i64, // ENOSYS
+
+        // close(fd)
+        3 => {
+            let fd = a0 as u32;
+            let tbl = crate::task::current_fd_table();
+            let result = tbl.lock().close_fd(fd);
+            match result {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+
+        // dup(oldfd)
+        32 => {
+            let oldfd = a0 as u32;
+            let tbl = crate::task::current_fd_table();
+            let result = tbl.lock().dup(oldfd);
+            match result {
+                Ok(newfd) => newfd as i64,
+                Err(e) => e,
+            }
+        }
+
+        // dup2(oldfd, newfd)
+        33 => {
+            let oldfd = a0 as u32;
+            let newfd = a1 as u32;
+            let tbl = crate::task::current_fd_table();
+            let result = tbl.lock().dup2(oldfd, newfd);
+            match result {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+
         // exit(status) — PID 1 calling exit panics the kernel.
         60 => {
             let status = a0 as i32;
             panic!("kernel panic: init exited with status {}", status);
         }
-        _ => -38i64, // ENOSYS
-    }
-}
 
-/// Write one byte to COM1 via port I/O, spinning until the transmitter
-/// holding register is empty.
-#[inline]
-fn uart_putc(b: u8) {
-    const COM1_DATA: u16 = 0x3F8;
-    const COM1_LSR: u16 = 0x3F8 + 5;
-    unsafe {
-        // Spin on THRE (bit 5 of LSR).
-        loop {
-            let lsr: u8;
-            core::arch::asm!(
-                "in al, dx",
-                out("al") lsr,
-                in("dx") COM1_LSR,
-                options(nomem, nostack, preserves_flags),
-            );
-            if lsr & 0x20 != 0 {
-                break;
-            }
-        }
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") COM1_DATA,
-            in("al") b,
-            options(nomem, nostack, preserves_flags),
-        );
+        _ => -38i64, // ENOSYS
     }
 }
 

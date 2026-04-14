@@ -22,12 +22,13 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::fpu::FpuArea;
+use crate::fs::FileDescTable;
 use crate::mem::addrspace::AddressSpace;
 use crate::mem::paging;
 
@@ -129,6 +130,10 @@ pub(super) struct Task {
     /// post-`fninit` canonical FPU state so a spawned task sees the
     /// same FPU starting conditions as the bootstrap thread.
     pub fpu: Box<FpuArea>,
+    /// Per-process file-descriptor table. Wrapped in `Arc<Mutex>` so it
+    /// can be shared across threads in the same process (clone(2)-style)
+    /// and cloned cheaply for fork() and exec() paths.
+    pub fd_table: Arc<Mutex<FileDescTable>>,
 }
 
 impl Task {
@@ -157,6 +162,7 @@ impl Task {
             // overwrite this buffer with whatever live FPU state exists
             // at that moment.
             fpu: FpuArea::new_initialized(),
+            fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
         }
     }
 
@@ -244,6 +250,7 @@ impl Task {
             cr3,
             address_space: Arc::new(RwLock::new(address_space)),
             fpu: FpuArea::new_initialized(),
+            fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
         }
     }
 

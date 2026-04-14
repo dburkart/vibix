@@ -203,6 +203,25 @@ pub fn set_affinity(id: usize, mask: u64) -> bool {
     found
 }
 
+/// Return the fd table of the currently-running task.
+///
+/// Briefly locks the scheduler to clone the `Arc`, then releases it.
+/// Callers that need to mutate the table should lock the returned
+/// `Arc<Mutex<FileDescTable>>` separately, *not* while holding any
+/// other lock whose ordering places it before `SCHED`.
+///
+/// # Panics
+/// Panics if called before [`init`].
+pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::fs::FileDescTable>> {
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .expect("current_fd_table: no running task")
+        .fd_table
+        .clone()
+}
+
 /// Return the current scheduling priority of the currently-running
 /// task. Useful for callers that want to spawn a helper at the same
 /// or adjusted priority.
