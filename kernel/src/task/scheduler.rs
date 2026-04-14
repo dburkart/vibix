@@ -18,6 +18,12 @@
 //! Blocked tasks are parked in `parked` (keyed by task id) and are
 //! invisible to the scheduling rotation. `task::wake(id)` migrates
 //! them back to `ready`.
+//!
+//! Task reclaim on `exit` lives *outside* this struct: `exit` queues
+//! the victim in `task::REAPER_VICTIMS` and wakes a dedicated reaper
+//! kernel task that runs in task context (IRQs enabled), so the
+//! reaper can safely take blocking locks like the kernel frame
+//! allocator.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -37,13 +43,6 @@ pub(super) struct Scheduler {
     /// Blocking primitives (see `crate::sync`) move tasks in and out
     /// of here via the task-level API.
     pub parked: BTreeMap<usize, Box<Task>>,
-    /// Tasks that have called `task::exit` and are awaiting reaping on
-    /// the next scheduler tick. FIFO: back-to-back exits between ticks
-    /// queue here rather than panicking. The reaper drains this on every
-    /// `preempt_tick` (so it executes on a stack that isn't about to be
-    /// unmapped) and drops each `Box<Task>` after reclaiming the stack
-    /// pages, VMA-backed frames, and PML4 frame.
-    pub pending_exit: VecDeque<Box<Task>>,
 }
 
 impl Scheduler {
@@ -52,7 +51,6 @@ impl Scheduler {
             current: None,
             ready: BTreeMap::new(),
             parked: BTreeMap::new(),
-            pending_exit: VecDeque::new(),
         }
     }
 
