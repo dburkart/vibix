@@ -112,6 +112,5 @@ jobs:
             - The commit SHA and message that introduced the failure
 
             Before filing, run:
-              gh issue list --state open --limit 20
-            and skip filing if an identical open CI-failure issue already exists for
-            this commit SHA.
+              gh issue list --state open --search "${{ github.sha }}"
+            and skip filing if an open issue for this exact commit SHA already exists.
