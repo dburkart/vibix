@@ -102,7 +102,11 @@ pub fn mount(
     }
 
     let sb: Arc<SuperBlock> = fs.mount(source, flags)?;
-    let root_inode = sb.root.get().cloned().unwrap_or_else(|| sb.ops.root_inode());
+    let root_inode = sb
+        .root
+        .get()
+        .cloned()
+        .unwrap_or_else(|| sb.ops.root_inode());
     let root_dentry = Dentry::new_root(root_inode);
     let edge = Arc::new(MountEdge {
         mountpoint: Arc::downgrade(target),
@@ -310,8 +314,13 @@ mod tests {
         drain_table();
         let target = make_dir_dentry();
         let fs = make_fs();
-        let edge = mount(MountSource::None, &target, fs.clone(), MountFlags::default())
-            .expect("mount");
+        let edge = mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
         assert!(target.mount.read().is_some());
         assert_eq!(MOUNT_TABLE.read().len(), 1);
         assert!(Arc::ptr_eq(
@@ -343,8 +352,13 @@ mod tests {
         drain_table();
         let target = make_dir_dentry();
         let fs = make_fs();
-        let edge = mount(MountSource::None, &target, fs.clone(), MountFlags::default())
-            .expect("mount");
+        let edge = mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
         // Pin the SB via SbActiveGuard, simulating an in-flight syscall.
         let _guard = SbActiveGuard::try_acquire(&edge.super_block).expect("guard");
 
@@ -362,8 +376,13 @@ mod tests {
         drain_table();
         let target = make_dir_dentry();
         let fs = make_fs();
-        let edge = mount(MountSource::None, &target, fs.clone(), MountFlags::default())
-            .expect("mount");
+        let edge = mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
         let _guard = SbActiveGuard::try_acquire(&edge.super_block).expect("guard");
         unmount(&target, UmountFlags::FORCE).expect("force unmount");
         assert!(target.mount.read().is_none());

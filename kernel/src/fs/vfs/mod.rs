@@ -57,12 +57,12 @@ pub mod super_block;
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
+pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
 pub use open_file::OpenFile;
 pub use ops::{
     default_permission, FileOps, FileSystem, InodeOps, MountSource, SetAttr, SetAttrMask, Stat,
     StatFs, SuperOps, Whence,
 };
-pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
 pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
