@@ -60,3 +60,58 @@ jobs:
 
       - name: cargo xtask build --release
         run: cargo xtask build --release
+
+  file-bug:
+    needs: test
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+
+      - name: File bug via Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --allowed-tools
+            "Bash(gh run view:*)"
+            "Bash(gh issue list:*)"
+            "Skill(file-issue)"
+          prompt: |
+            The CI build on the main branch of the vibix kernel repo just failed.
+
+            Workflow run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit SHA: ${{ github.sha }}
+            Commit message: ${{ github.event.head_commit.message }}
+            Actor: ${{ github.actor }}
+
+            Fetch the full failure details with:
+              gh run view ${{ github.run_id }} --log-failed
+
+            Then file exactly one bug issue via the `file-issue` skill (`/file-issue`).
+            Do NOT call `gh issue create` directly — use the skill so labels are applied
+            correctly per the prioritization playbook.
+
+            The issue must include:
+            - Title: "CI: main branch build failed — <short description of failing step>"
+            - Which job/step failed and the first error message from the log
+            - The workflow run URL above so it is easy to navigate to the logs
+            - The commit SHA and message that introduced the failure
+
+            Before filing, run:
+              gh issue list --state open --limit 20
+            and skip filing if an identical open CI-failure issue already exists for
+            this commit SHA.
