@@ -57,6 +57,28 @@ pub fn _print(args: fmt::Arguments) {
     let _ = COM1.lock().write_fmt(args);
 }
 
+/// Write an arbitrary byte slice to COM1, holding the mutex for the
+/// entire transfer.
+///
+/// Uses [`SerialPort::send_raw`] (THRE-spin per byte) inside
+/// `without_interrupts` so no IRQ can interleave bytes mid-string and
+/// the lock is never contended against the ISR RX path.
+///
+/// # Deadlock safety
+///
+/// `without_interrupts` blocks the IRQ4 serial ISR for the duration.
+/// No callee on the `SerialBackend::write` → `write_bytes` path calls
+/// `serial_println!` or re-acquires `COM1`, so there is no reentrancy
+/// hazard.
+pub(crate) fn write_bytes(buf: &[u8]) {
+    without_interrupts(|| {
+        let mut port = COM1.lock();
+        for &b in buf {
+            port.send_raw(b);
+        }
+    });
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => ($crate::serial::_print(format_args!($($arg)*)));

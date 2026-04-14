@@ -281,43 +281,12 @@ impl FileBackend for SerialBackend {
         Ok(buf.len())
     }
 
+    /// Write path acquires `COM1.lock()` inside `without_interrupts` via
+    /// `crate::serial::write_bytes`. No deadlock risk: this call chain
+    /// never calls `serial_println!` or re-enters the COM1 mutex.
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
-        serial_write_bytes(buf);
+        crate::serial::write_bytes(buf);
         Ok(buf.len())
-    }
-}
-
-/// Write `buf` to COM1, spinning on THRE for each byte.
-///
-/// Duplicates the inner loop from `arch::x86_64::syscall` so that the serial
-/// backend can be used from any context without going through the `Mutex`-
-/// protected `serial::_print` path (which would deadlock if a print is already
-/// in progress on the same CPU).
-#[cfg(target_os = "none")]
-fn serial_write_bytes(buf: &[u8]) {
-    const COM1_DATA: u16 = 0x3F8;
-    const COM1_LSR: u16 = 0x3F8 + 5;
-    for &b in buf {
-        unsafe {
-            loop {
-                let lsr: u8;
-                core::arch::asm!(
-                    "in al, dx",
-                    out("al") lsr,
-                    in("dx") COM1_LSR,
-                    options(nomem, nostack, preserves_flags),
-                );
-                if lsr & 0x20 != 0 {
-                    break;
-                }
-            }
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") COM1_DATA,
-                in("al") b,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
     }
 }
 
