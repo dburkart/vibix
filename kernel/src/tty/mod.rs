@@ -286,22 +286,17 @@ mod tests {
 
     #[test]
     fn passthrough_ldisc_appends_bytes_in_order() {
+        let ldisc = Arc::new(PassthroughLdisc::with_sink());
         let tty = Tty::with_driver(
             Arc::new(NullDriver),
-            Arc::new(PassthroughLdisc::with_sink()),
+            ldisc.clone() as Arc<dyn LineDiscipline>,
         );
-        let ldisc = tty.ldisc.clone();
         for b in b"hello" {
-            ldisc.receive_byte(&tty, *b);
+            tty.ldisc.receive_byte(&tty, *b);
         }
-        // Downcast via a concrete clone for test drain.
-        let probe = PassthroughLdisc::with_sink();
-        for b in b"hello" {
-            probe.receive_byte(&tty, *b);
-        }
-        assert_eq!(probe.drain_sink(), b"hello");
+        assert_eq!(ldisc.drain_sink(), b"hello");
         // Second drain after take yields empty.
-        assert!(probe.drain_sink().is_empty());
+        assert!(ldisc.drain_sink().is_empty());
     }
 
     #[test]
