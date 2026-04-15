@@ -282,6 +282,12 @@ const EPERM: i64 = -1;
 #[cfg(target_os = "none")]
 const ENOTTY: i64 = -25;
 
+/// Linux-internal "restart this syscall" sentinel. Not user-visible: the
+/// syscall trampoline either restarts the call transparently (SA_RESTART)
+/// or converts it to `EINTR` (-4). Until the trampoline lands (tracked as
+/// a follow-up to #434), callers translate this to `EINTR` directly.
+pub const KERN_ERESTARTSYS: i64 = -512;
+
 /// `TIOCSCTTY(force)` — acquire `tty` as the caller session's controlling
 /// terminal. Only a session leader may acquire a ctty. If `tty` already
 /// has a session, `force && is_root` steals it (clearing the old session's
@@ -400,6 +406,43 @@ pub fn tiocnotty_for(caller_pid: u32) -> i64 {
 #[cfg(target_os = "none")]
 pub fn acquire_ctty_on_open(caller_pid: u32, tty: &Arc<Tty>) -> bool {
     process::try_acquire_ctty_atomic(caller_pid, tty)
+}
+
+/// POSIX background-pgrp write gate for `write(tty, ...)`.
+///
+/// If `TOSTOP` is set in `tty.termios.c_lflag`, the tty has a foreground
+/// pgrp, and `caller_pid` is in a different pgrp, raise `SIGTTOU` on the
+/// caller's pgrp and return `Some(KERN_ERESTARTSYS)` — the caller (syscall
+/// path) either restarts the write or converts to `EINTR`. Returns `None`
+/// when the write should proceed: TOSTOP clear, no foreground pgrp, caller
+/// unattached (`pid == 0`) or caller pgrp matches.
+///
+/// The pgrp identity check loads `ctrl.pgrp_snapshot` (an `AtomicU32`)
+/// while briefly holding `ctrl.lock()`. The atomic load itself is
+/// lock-free; promoting it to a true `Tty`-level atomic so the gate
+/// could skip the lock entirely is a follow-up (see RFC 0003 §Lock
+/// order, fast path).
+#[cfg(target_os = "none")]
+pub fn tty_check_tostop(tty: &Tty, caller_pid: u32) -> Option<i64> {
+    if caller_pid == 0 {
+        return None;
+    }
+    if tty.termios.lock().c_lflag & termios::TOSTOP == 0 {
+        return None;
+    }
+    let fg = tty.ctrl.lock().pgrp_snapshot.load();
+    if fg == 0 {
+        return None;
+    }
+    let caller_pgrp = match process::pgrp_of(caller_pid) {
+        Some(p) => p,
+        None => return None,
+    };
+    if caller_pgrp == fg {
+        return None;
+    }
+    process::raise_signal_on_pgrp(caller_pgrp, crate::signal::SIGTTOU);
+    Some(KERN_ERESTARTSYS)
 }
 
 #[cfg(test)]

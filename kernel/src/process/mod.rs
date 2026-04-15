@@ -300,6 +300,30 @@ pub fn session_of(pid: u32) -> Option<SessionId> {
     TABLE.lock().by_pid.get(&pid).map(|e| e.session_id)
 }
 
+/// Process-group id of `pid`, if the entry exists.
+pub fn pgrp_of(pid: u32) -> Option<ProcessGroupId> {
+    TABLE.lock().by_pid.get(&pid).map(|e| e.pgrp_id)
+}
+
+/// Raise `sig` on every task whose process-group id matches `pgid`.
+/// Returns the number of tasks signaled. TABLE is released before the
+/// raise calls to preserve the TABLE → signal/WaitQueue lock order.
+pub fn raise_signal_on_pgrp(pgid: ProcessGroupId, sig: u8) -> usize {
+    let task_ids: alloc::vec::Vec<usize> = {
+        let t = TABLE.lock();
+        t.by_pid
+            .values()
+            .filter(|e| e.pgrp_id == pgid)
+            .map(|e| e.task_id)
+            .collect()
+    };
+    let n = task_ids.len();
+    for tid in task_ids {
+        crate::signal::raise_signal_on_task(tid, sig);
+    }
+    n
+}
+
 /// Whether `pid` is the session leader of its session
 /// (POSIX: `session_id == pid`).
 pub fn is_session_leader(pid: u32) -> bool {
