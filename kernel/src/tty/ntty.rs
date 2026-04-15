@@ -76,12 +76,19 @@ impl LineBuffer {
 
 /// Committed read ring. Readers (post-#374) drain this; ICANON commits
 /// whole lines at a time, raw mode pushes each byte directly.
+///
+/// `eof_at` records VEOF as a **positional boundary** rather than a
+/// sticky flag: the value is the number of bytes (counted from `head`)
+/// that precede the EOF marker, so `ab\x04cd\n` produces a ring of
+/// `abcd\n` with `eof_at = Some(2)` — the read path returns `ab`, then
+/// EOF, then `cd\n` on subsequent reads. A sticky bool would collapse
+/// this to "EOF happened somewhere" and lose the split.
 struct RawRing {
     buf: [u8; RAW_MAX],
     head: usize,
     tail: usize,
     len: usize,
-    eof: bool,
+    eof_at: Option<usize>,
 }
 
 impl RawRing {
@@ -91,7 +98,7 @@ impl RawRing {
             head: 0,
             tail: 0,
             len: 0,
-            eof: false,
+            eof_at: None,
         }
     }
 
@@ -106,8 +113,16 @@ impl RawRing {
         true
     }
 
+    /// Record EOF at the current tail position. An existing `eof_at`
+    /// is not overwritten — the earlier boundary is still pending for
+    /// the reader and must be honoured before a new one is recorded.
+    /// The later VEOF collapses into the existing boundary (matching
+    /// Linux's "two ^D with no data between" behaviour, where the
+    /// second VEOF is a no-op until the first has been consumed).
     fn set_eof(&mut self) {
-        self.eof = true;
+        if self.eof_at.is_none() {
+            self.eof_at = Some(self.len);
+        }
     }
 }
 
@@ -219,7 +234,7 @@ impl NTty {
     }
 
     #[cfg(test)]
-    fn snapshot(&self) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool) {
+    fn snapshot(&self) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, Option<usize>) {
         use alloc::vec::Vec;
         let st = self.state.lock();
         let line: Vec<u8> = st.line.buf[..st.line.len].to_vec();
@@ -229,7 +244,7 @@ impl NTty {
             raw.push(st.raw.buf[idx]);
             idx = (idx + 1) % RAW_MAX;
         }
-        (line, raw, st.raw.eof)
+        (line, raw, st.raw.eof_at)
     }
 }
 
@@ -358,10 +373,10 @@ mod tests {
         let t = termios_noncanon();
         let w = CountingWake::new();
         feed(&n, &t, &w, b"abc");
-        let (line, raw, eof) = n.snapshot();
+        let (line, raw, eof_at) = n.snapshot();
         assert_eq!(line, b"");
         assert_eq!(raw, b"abc");
-        assert!(!eof);
+        assert_eq!(eof_at, None);
         assert_eq!(w.count(), 3);
     }
 
@@ -371,10 +386,10 @@ mod tests {
         let t = Termios::sane();
         let w = CountingWake::new();
         feed(&n, &t, &w, b"hi\n");
-        let (line, raw, eof) = n.snapshot();
+        let (line, raw, eof_at) = n.snapshot();
         assert_eq!(line, b"");
         assert_eq!(raw, b"hi\n");
-        assert!(!eof);
+        assert_eq!(eof_at, None);
         assert_eq!(w.count(), 1);
     }
 
@@ -420,10 +435,11 @@ mod tests {
         let t = Termios::sane();
         let w = CountingWake::new();
         feed(&n, &t, &w, b"ab\x04");
-        let (line, raw, eof) = n.snapshot();
+        let (line, raw, eof_at) = n.snapshot();
         assert_eq!(line, b"");
         assert_eq!(raw, b"ab");
-        assert!(eof);
+        // EOF falls after the two committed bytes.
+        assert_eq!(eof_at, Some(2));
         assert_eq!(w.count(), 1);
     }
 
@@ -433,11 +449,30 @@ mod tests {
         let t = Termios::sane();
         let w = CountingWake::new();
         feed(&n, &t, &w, b"\x04");
-        let (line, raw, eof) = n.snapshot();
+        let (line, raw, eof_at) = n.snapshot();
         assert_eq!(line, b"");
         assert_eq!(raw, b"");
-        assert!(eof);
+        // EOF at position 0: the reader should see EOF immediately.
+        assert_eq!(eof_at, Some(0));
         assert_eq!(w.count(), 1);
+    }
+
+    #[test]
+    fn veof_between_lines_preserves_boundary() {
+        // Regression for the sticky-bool collapse: `ab\x04cd\n` must
+        // record EOF between `b` and `c`, not as "EOF somewhere in
+        // this stream". The first read should return `ab`, then EOF,
+        // then `cd\n` — impossible if `eof` were just a bool.
+        let n = NTty::new();
+        let t = Termios::sane();
+        let w = CountingWake::new();
+        feed(&n, &t, &w, b"ab\x04cd\n");
+        let (line, raw, eof_at) = n.snapshot();
+        assert_eq!(line, b"");
+        assert_eq!(raw, b"abcd\n");
+        assert_eq!(eof_at, Some(2));
+        // Two commits: one on VEOF, one on newline.
+        assert_eq!(w.count(), 2);
     }
 
     #[test]
