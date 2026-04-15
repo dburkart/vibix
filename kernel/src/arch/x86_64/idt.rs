@@ -267,6 +267,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         hang();
     }
 
+    // Ring-3 access violation fall-through: every path above that *could*
+    // legitimately resolve a user fault has either returned or fallen
+    // through with a diagnostic. A user-mode fault reaching here is an
+    // unrecoverable access violation (bad deref, write to a read-only
+    // page that isn't CoW-eligible, exec on NX, etc.) — deliver SIGSEGV
+    // with DefaultAction::Terminate. The helper calls `task::exit()`, so
+    // IRETQ never runs; the scheduler context-switches to the next task.
+    if cpl != 0 {
+        serial_println!(
+            "#PF ring-3 access violation addr={:#x} code={:?}",
+            addr_u64,
+            code,
+        );
+        unsafe { crate::signal::deliver_fault_signal_iret(crate::signal::SIGSEGV) };
+    }
+
     serial_println!(
         "EXCEPTION: #PF addr={:#x} code={:?}\n{:#?}",
         addr_u64,
