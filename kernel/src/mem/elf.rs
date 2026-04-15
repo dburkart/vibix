@@ -172,6 +172,39 @@ impl<'a> ParsedElf<'a> {
         VirtAddr::new(self.ehdr.e_entry)
     }
 
+    /// Virtual address of the main binary's program-header table.
+    ///
+    /// Derived by finding the PT_LOAD segment whose file range covers
+    /// `e_phoff`, then computing `p_vaddr + (e_phoff - p_offset)`. Returns `0`
+    /// if no PT_LOAD covers the phdr table offset (unusual ELF layouts).
+    pub(crate) fn phdr_vaddr(&self) -> u64 {
+        let phoff = self.ehdr.e_phoff;
+        for i in 0..self.phnum {
+            let off = i * core::mem::size_of::<Elf64Phdr>();
+            // SAFETY: phdr_bytes was bounds-checked during parse.
+            let ph = unsafe {
+                core::ptr::read_unaligned(self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>())
+            };
+            if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+                continue;
+            }
+            if phoff >= ph.p_offset && phoff < ph.p_offset + ph.p_filesz {
+                return ph.p_vaddr + (phoff - ph.p_offset);
+            }
+        }
+        0
+    }
+
+    /// Number of program-header entries (`e_phnum`).
+    pub(crate) fn phdr_count(&self) -> u16 {
+        self.ehdr.e_phnum
+    }
+
+    /// Size of each program-header entry (`e_phentsize`).
+    pub(crate) fn phdr_entsize(&self) -> u16 {
+        self.ehdr.e_phentsize
+    }
+
     /// Return the interpreter path from the PT_INTERP segment, if present.
     ///
     /// The returned slice is the null-terminated path string *without* the

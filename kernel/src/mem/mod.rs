@@ -15,6 +15,8 @@ pub mod refcount;
 pub mod tlb;
 
 #[cfg(any(target_os = "none", test))]
+pub(crate) mod auxv;
+#[cfg(any(target_os = "none", test))]
 pub(crate) mod elf;
 #[cfg(target_os = "none")]
 pub mod heap;

@@ -557,16 +557,27 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
     // Now safe to release the old PML4 + its frames.
     drop(old_aspace);
 
+    // Write the System V AMD64 initial stack layout (argc/argv/envp/auxv) into
+    // the new stack frame via the HHDM window, matching what init_process does.
+    // TODO: replace with RDRAND once a CSPRNG is wired up.
+    let stack_phys = stack_frame.start_address().as_u64();
+    let random_seed = image.entry.as_u64() ^ stack_phys;
+    let mut random_bytes = [0u8; 16];
+    for (i, b) in random_bytes.iter_mut().enumerate() {
+        *b = ((random_seed >> (i % 8 * 8)) & 0xFF) as u8;
+    }
+    let initial_rsp = crate::mem::auxv::write_initial_stack(
+        stack_phys,
+        crate::init_process::USER_STACK_PAGE_VA,
+        &image,
+        &random_bytes,
+    );
+
     // If the binary has a dynamic interpreter (PT_INTERP), jump to the
     // interpreter's entry point; otherwise jump directly to the binary's entry.
     let effective_entry = image.interp_entry.unwrap_or(image.entry);
     // Never returns.
-    unsafe {
-        jump_to_ring3(
-            effective_entry.as_u64(),
-            crate::init_process::USER_STACK_TOP,
-        )
-    }
+    unsafe { jump_to_ring3(effective_entry.as_u64(), initial_rsp) }
 }
 
 /// Public wrapper around `copy_path_from_user` for use by the VFS
