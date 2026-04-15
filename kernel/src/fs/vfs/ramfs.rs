@@ -605,11 +605,18 @@ impl InodeOps for RamfsInode {
     fn setattr(&self, inode: &Inode, attr: &SetAttr) -> Result<(), i64> {
         if attr.mask.contains(SetAttrMask::SIZE) {
             let mut body = self.body.lock();
-            if let RamfsBody::Reg { data } = &mut *body {
-                data.resize(attr.size as usize, 0);
+            match &mut *body {
+                RamfsBody::Reg { data } => {
+                    data.resize(attr.size as usize, 0);
+                }
+                RamfsBody::Dir { .. } => return Err(EISDIR),
+                RamfsBody::Sym { .. } => return Err(EINVAL),
             }
         }
         let mut meta = inode.meta.write();
+        if attr.mask.contains(SetAttrMask::SIZE) {
+            meta.size = attr.size;
+        }
         if attr.mask.contains(SetAttrMask::MODE) {
             meta.mode = attr.mode;
         }
@@ -1103,6 +1110,48 @@ mod tests {
         assert_eq!(a.meta.read().nlink, 3);
         a.ops.rmdir(&a, b"b").expect("rmdir b");
         assert_eq!(a.meta.read().nlink, 2);
+    }
+
+    #[test]
+    fn setattr_size_updates_meta_and_data() {
+        let sb = make_ramfs();
+        let root = root_of(&sb);
+        let child = root.ops.create(&root, b"f", 0o644).expect("create");
+        let file = open_inode(&sb, child.clone());
+        child
+            .file_ops
+            .write(&file, b"hello world", 0)
+            .expect("write");
+        assert_eq!(child.meta.read().size, 11);
+
+        let attr = SetAttr {
+            mask: SetAttrMask::SIZE,
+            size: 0,
+            ..SetAttr::default()
+        };
+        child.ops.setattr(&child, &attr).expect("truncate to 0");
+        assert_eq!(
+            child.meta.read().size,
+            0,
+            "setattr(SIZE=0) must update meta.size"
+        );
+        let mut buf = [0u8; 4];
+        let n = child.file_ops.read(&file, &mut buf, 0).expect("read");
+        assert_eq!(n, 0, "read after truncate sees empty file");
+    }
+
+    #[test]
+    fn setattr_size_on_dir_is_eisdir() {
+        let sb = make_ramfs();
+        let root = root_of(&sb);
+        root.ops.mkdir(&root, b"d", 0o755).expect("mkdir");
+        let d = root.ops.lookup(&root, b"d").expect("lookup");
+        let attr = SetAttr {
+            mask: SetAttrMask::SIZE,
+            size: 0,
+            ..SetAttr::default()
+        };
+        assert_eq!(d.ops.setattr(&d, &attr), Err(EISDIR));
     }
 
     #[test]
