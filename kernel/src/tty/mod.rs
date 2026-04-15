@@ -24,12 +24,17 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::poll::WaitQueue;
 #[cfg(target_os = "none")]
 use crate::sync::IrqLock;
+#[cfg(target_os = "none")]
+use spin::Lazy;
 use termios::Termios;
 
 // Host tests can't use IrqLock (it touches RFLAGS.IF) — fall back to a
 // plain spin mutex, which has the same external API for our purposes.
 #[cfg(all(test, not(target_os = "none")))]
 use spin::Mutex as IrqLock;
+
+#[cfg(target_os = "none")]
+use crate::process;
 
 /// POSIX session identifier. `0` is reserved for "no session" (bootstrap
 /// kernel tasks before the process table is populated).
@@ -245,6 +250,155 @@ impl Default for Tty {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The single system-wide console tty backing `/dev/{tty,console,serial,std*}`.
+/// A real multi-tty world (pty, serial[N], vt[N]) arrives with #374/#403 —
+/// until then every legacy `/dev/*` open refers to the same `Arc<Tty>` so
+/// session/pgrp identity is shared across fds as POSIX expects.
+#[cfg(target_os = "none")]
+pub static CONSOLE_TTY: Lazy<Arc<Tty>> = Lazy::new(|| Arc::new(Tty::new()));
+
+/// Return the shared console tty.
+#[cfg(target_os = "none")]
+pub fn console_tty() -> Arc<Tty> {
+    Arc::clone(&CONSOLE_TTY)
+}
+
+// ── Job-control ioctl helpers ─────────────────────────────────────────────
+//
+// Each `*_for` function takes the caller pid explicitly so host unit tests
+// can drive them without going through the scheduler. They return a POSIX
+// errno as `i64` (0 or positive on success), matching the `setsid_for` /
+// `setpgid_for` convention in `process::mod`.
+//
+// Lock order: TABLE (via `process::*`) → `tty.ctrl`. Every helper releases
+// TABLE before taking `tty.ctrl.lock()`. Do not invert.
+
+/// POSIX errno constants, shared with `process::mod`.
+#[cfg(target_os = "none")]
+const EPERM: i64 = -1;
+#[cfg(target_os = "none")]
+const ENOTTY: i64 = -25;
+
+/// `TIOCSCTTY(force)` — acquire `tty` as the caller session's controlling
+/// terminal. Only a session leader may acquire a ctty. If `tty` already
+/// has a session, `force && is_root` steals it (clearing the old session's
+/// ctty on every member).
+#[cfg(target_os = "none")]
+pub fn tiocsctty_for(caller_pid: u32, tty: &Arc<Tty>, force: bool, is_root: bool) -> i64 {
+    if caller_pid == 0 {
+        return EPERM;
+    }
+    if !process::is_session_leader(caller_pid) {
+        return EPERM;
+    }
+    if let Some(existing_tty) = process::ctty_of(caller_pid) {
+        if Arc::ptr_eq(&existing_tty, tty) {
+            return 0;
+        }
+        return EPERM;
+    }
+    let caller_sid = match process::session_of(caller_pid) {
+        Some(s) => s,
+        None => return EPERM,
+    };
+    if let Some(existing) = process::session_using_tty(tty) {
+        if existing == caller_sid {
+            return 0;
+        }
+        if !force || !is_root {
+            return EPERM;
+        }
+        process::clear_ctty_for_session(existing);
+    }
+    // Attach tty to the caller; pgrp snapshot mirrors caller's pgrp.
+    process::set_ctty(caller_pid, Some(Arc::clone(tty)));
+    let mut ctrl = tty.ctrl.lock();
+    ctrl.session = Some(caller_sid);
+    ctrl.set_pgrp(Some(caller_pid));
+    0
+}
+
+/// `TIOCSPGRP(pgid)` — set `pgid` as `tty`'s foreground pgrp. Caller must
+/// be in the same session as `tty`, and `pgid` must name an existing pgrp
+/// in that session.
+#[cfg(target_os = "none")]
+pub fn tiocspgrp_for(caller_pid: u32, tty: &Tty, pgid: ProcessGroupId) -> i64 {
+    if caller_pid == 0 {
+        return EPERM;
+    }
+    let tty_sid = match tty.ctrl.lock().session {
+        Some(s) => s,
+        None => return ENOTTY,
+    };
+    match process::session_of(caller_pid) {
+        Some(s) if s == tty_sid => {}
+        _ => return EPERM,
+    }
+    if !process::pgrp_is_in_session(pgid, tty_sid) {
+        return EPERM;
+    }
+    tty.ctrl.lock().set_pgrp(Some(pgid));
+    0
+}
+
+/// `TIOCGPGRP` — return `tty`'s foreground pgrp, or `ENOTTY` if none.
+#[cfg(target_os = "none")]
+pub fn tiocgpgrp_for(tty: &Tty) -> i64 {
+    match tty.ctrl.lock().pgrp {
+        Some(p) => p as i64,
+        None => ENOTTY,
+    }
+}
+
+/// `TIOCGSID` — return `tty`'s session id, or `ENOTTY` if none.
+#[cfg(target_os = "none")]
+pub fn tiocgsid_for(tty: &Tty) -> i64 {
+    match tty.ctrl.lock().session {
+        Some(s) => s as i64,
+        None => ENOTTY,
+    }
+}
+
+/// `TIOCNOTTY` — detach the caller's session from its controlling
+/// terminal. If the caller is the session leader, every session member
+/// loses its ctty and the tty's `session`/`pgrp` clear. Non-leaders only
+/// drop their own reference. Wait-queue wakeup for blocked readers/writers
+/// lands with #429/#430 — TODO below is deliberate.
+#[cfg(target_os = "none")]
+pub fn tiocnotty_for(caller_pid: u32) -> i64 {
+    if caller_pid == 0 {
+        return EPERM;
+    }
+    let tty = match process::ctty_of(caller_pid) {
+        Some(t) => t,
+        None => return ENOTTY,
+    };
+    if process::is_session_leader(caller_pid) {
+        let sid = match process::session_of(caller_pid) {
+            Some(s) => s,
+            None => return EPERM,
+        };
+        process::clear_ctty_for_session(sid);
+        let mut ctrl = tty.ctrl.lock();
+        ctrl.session = None;
+        ctrl.set_pgrp(None);
+        // TODO(#429/#430): wake blocked readers/writers once wait queues land.
+    } else {
+        process::set_ctty(caller_pid, None);
+    }
+    0
+}
+
+/// Open-path hook: `open(tty, !O_NOCTTY)` on a session leader with no
+/// existing ctty implicitly acquires `tty` as the ctty. No-op in every
+/// other case (non-leader, already-attached, or the tty already has a
+/// session). Returns `true` if a ctty was acquired. Errors are swallowed
+/// because this is a best-effort side-effect of `open`, not a gate on it.
+#[cfg(target_os = "none")]
+pub fn acquire_ctty_on_open(caller_pid: u32, tty: &Arc<Tty>) -> bool {
+    process::try_acquire_ctty_atomic(caller_pid, tty)
 }
 
 #[cfg(test)]

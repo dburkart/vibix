@@ -89,6 +89,14 @@ pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 
+// --- Job-control ioctl command numbers (Linux <asm-generic/ioctls.h>) -----
+
+pub const TIOCSCTTY: u32 = 0x540E;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
+pub const TIOCNOTTY: u32 = 0x5422;
+pub const TIOCGSID: u32 = 0x5429;
+
 impl Termios {
     /// A "sane" default termios suitable for an interactive console:
     /// canonical mode, echo on, input CR→NL, output NL→CRNL, signals
@@ -207,6 +215,11 @@ mod tests {
         assert_eq!(TCSETS, 0x5402);
         assert_eq!(TCSETSW, 0x5403);
         assert_eq!(TCSETSF, 0x5404);
+        assert_eq!(TIOCSCTTY, 0x540E);
+        assert_eq!(TIOCGPGRP, 0x540F);
+        assert_eq!(TIOCSPGRP, 0x5410);
+        assert_eq!(TIOCNOTTY, 0x5422);
+        assert_eq!(TIOCGSID, 0x5429);
     }
 
     #[test]

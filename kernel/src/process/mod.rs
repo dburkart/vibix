@@ -269,6 +269,121 @@ pub fn task_id_for_pid(pid: u32) -> Option<usize> {
 const EPERM: i64 = -1;
 const ESRCH: i64 = -3;
 const EINVAL: i64 = -22;
+const ENOTTY: i64 = -25;
+
+// ── Controlling-terminal accessors ─────────────────────────────────────────
+//
+// All cross-process inspection of `ProcessEntry.controlling_tty`, session,
+// and pgrp happens here so TABLE locking stays inside the process module.
+// The tty ioctl helpers in `crate::tty` call these and never take TABLE
+// directly — keeps the lock-ordering documentation (TABLE → `tty.ctrl`)
+// mechanically enforceable.
+
+/// Return the controlling tty of `pid`, if any.
+pub fn ctty_of(pid: u32) -> Option<Arc<Tty>> {
+    TABLE
+        .lock()
+        .by_pid
+        .get(&pid)
+        .and_then(|e| e.controlling_tty.clone())
+}
+
+/// Set (or clear) the controlling tty of `pid`.
+pub fn set_ctty(pid: u32, tty: Option<Arc<Tty>>) {
+    if let Some(e) = TABLE.lock().by_pid.get_mut(&pid) {
+        e.controlling_tty = tty;
+    }
+}
+
+/// Session id of `pid`, if the entry exists.
+pub fn session_of(pid: u32) -> Option<SessionId> {
+    TABLE.lock().by_pid.get(&pid).map(|e| e.session_id)
+}
+
+/// Whether `pid` is the session leader of its session
+/// (POSIX: `session_id == pid`).
+pub fn is_session_leader(pid: u32) -> bool {
+    TABLE
+        .lock()
+        .by_pid
+        .get(&pid)
+        .map(|e| e.session_id == pid)
+        .unwrap_or(false)
+}
+
+/// Whether `pgid` names an existing process group inside session `sid`.
+/// A pgrp exists iff some live entry has that `pgrp_id`; it's in `sid`
+/// iff that entry's `session_id == sid`.
+pub fn pgrp_is_in_session(pgid: ProcessGroupId, sid: SessionId) -> bool {
+    TABLE
+        .lock()
+        .by_pid
+        .values()
+        .any(|e| e.pgrp_id == pgid && e.session_id == sid)
+}
+
+/// If some session currently has `tty` as its controlling terminal,
+/// return that session id. Uses `Arc::ptr_eq` — tty Arcs propagate on
+/// fork via `Arc::clone`, so ptr-equality is sound.
+pub fn session_using_tty(tty: &Arc<Tty>) -> Option<SessionId> {
+    TABLE
+        .lock()
+        .by_pid
+        .values()
+        .find_map(|e| match &e.controlling_tty {
+            Some(t) if Arc::ptr_eq(t, tty) => Some(e.session_id),
+            _ => None,
+        })
+}
+
+/// Atomic ctty acquisition: check session-leader, no existing ctty, and
+/// `tty` unattached — if all hold, attach under a single TABLE → `tty.ctrl`
+/// critical section. Returns `true` if the attach happened.
+///
+/// The check-then-set pattern in the caller is TOCTOU-vulnerable otherwise:
+/// two leaders could each observe "no ctty / tty free" before either writes,
+/// and the resulting state would violate the one-ctty-per-session invariant.
+/// Collapsing everything into one critical section matches the documented
+/// lock order (TABLE → `tty.ctrl`) and keeps the invariant mechanically.
+pub fn try_acquire_ctty_atomic(pid: u32, tty: &Arc<Tty>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut t = TABLE.lock();
+    let Some(entry) = t.by_pid.get(&pid) else {
+        return false;
+    };
+    if entry.session_id != pid {
+        return false;
+    }
+    if entry.controlling_tty.is_some() {
+        return false;
+    }
+    let sid = entry.session_id;
+    let mut ctrl = tty.ctrl.lock();
+    if ctrl.session.is_some() {
+        return false;
+    }
+    t.by_pid.get_mut(&pid).unwrap().controlling_tty = Some(Arc::clone(tty));
+    ctrl.session = Some(sid);
+    ctrl.set_pgrp(Some(pid));
+    true
+}
+
+/// Clear the controlling tty on every member of `sid`. Returns the
+/// number of entries affected. Called by `TIOCNOTTY` on a session
+/// leader and by `TIOCSCTTY(force)` when stealing from an old session.
+pub fn clear_ctty_for_session(sid: SessionId) -> usize {
+    let mut t = TABLE.lock();
+    let mut n = 0;
+    for e in t.by_pid.values_mut() {
+        if e.session_id == sid && e.controlling_tty.is_some() {
+            e.controlling_tty = None;
+            n += 1;
+        }
+    }
+    n
+}
 
 /// Pure helper behind `setsid()` — see [`sys_setsid`]. Accepts the caller
 /// pid explicitly so host unit tests can drive it without going through
@@ -468,7 +583,16 @@ pub mod test_helpers {
         }
     }
 
+    /// Set session + pgrp on an existing entry from a test.
+    pub fn set_session_pgrp(pid: u32, session_id: SessionId, pgrp_id: ProcessGroupId) {
+        patch(pid, |e| {
+            e.session_id = session_id;
+            e.pgrp_id = pgrp_id;
+        });
+    }
+
     pub const EPERM_I64: i64 = EPERM;
     pub const ESRCH_I64: i64 = ESRCH;
     pub const EINVAL_I64: i64 = EINVAL;
+    pub const ENOTTY_I64: i64 = ENOTTY;
 }

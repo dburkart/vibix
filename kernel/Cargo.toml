@@ -239,3 +239,7 @@ harness = false
 [[test]]
 name = "session_syscalls"
 harness = false
+
+[[test]]
+name = "tty_jobctl_ioctls"
+harness = false
