@@ -150,7 +150,10 @@ shipping pipes and poll with a waitqueue convention that the TTY can't reuse.
   check if consumer is sleeping"). Linux uses `lock addl $0,(%rsp)` rather
   than MFENCE; we follow suit.
 - Cache line is 64 B on all x86-64 parts (CPUID leaf 1 EBX[15:8] × 8).
-  Head and tail indices live on separate `#[repr(align(64))]` cache lines.
+  Head and tail indices are each wrapped in a `CachePadded<T>` newtype
+  (`#[repr(C, align(64))] struct CachePadded<T>(pub T)`) so they occupy
+  separate 64-byte cache lines — `#[repr(align(64))]` is not valid as a
+  field attribute on stable Rust.
 - `rep movsb` with FSRM (CPUID.(EAX=7,ECX=0):EDX[4], Ice Lake+) is
   competitive with SIMD for short copies; pipe small-message traffic
   benefits. We expose a single `copy_to_user` / `copy_from_user` that
@@ -483,10 +486,38 @@ All sleepable/IRQ-safe locks touched by this subsystem have a total
 order. **Outer → inner**:
 
 1. `process.fd_table_lock`
-2. `pipe.ring.lock` *or* `tty.termios` *or* `tty.ctrl` *or* `ntty.state`
-   (these are mutually exclusive — no code path holds two of them at once)
+2a. `pipe.ring.lock` (pipe subsystem — never nested with any other level-2 lock)
+2b. `tty.ctrl` (job-control / session / pgrp state)
+2c. `tty.termios` (termios snapshot — TCSETS writers and ldisc readers)
+2d. `ntty.state` (N_TTY raw and canonical buffers)
 3. WaitQueue-internal lock (always innermost; never held across any
    other lock acquire)
+
+Within the TTY subsystem, the three level-2 TTY locks are **totally
+ordered** `2b → 2c → 2d`. A thread may hold `tty.ctrl` while acquiring
+`tty.termios`, and may hold `tty.termios` while acquiring `ntty.state`,
+but never the reverse. Specifically:
+
+- `NTty::receive_byte` acquires `tty.termios` (to read c_iflag / c_lflag
+  / c_cc), then for raw-mode bytes acquires `ntty.state` to push into
+  `state.raw`. Ordered `2c → 2d` — legal.
+- `sys_ioctl(TCSETS)` acquires `tty.termios` exclusively to write the
+  new termios; it never takes `ntty.state`. No inversion risk.
+- `NTty::read` acquires `tty.termios` (to read c_cc for line-commit
+  detection), then `ntty.state` to drain canonical lines. Same `2c → 2d`
+  order as `receive_byte` — legal.
+- `sys_ioctl(TIOCSPGRP)` and friends acquire `tty.ctrl` only.
+- Job-control signal generation on Ctrl-C / Ctrl-Z happens under
+  `tty.termios` (we already hold it for the ISIG check) and needs the
+  foreground pgrp from `tty.ctrl`. **Do not acquire `tty.ctrl` inside
+  `tty.termios`**; instead load `tty.ctrl.pgrp` into an atomic snapshot
+  (`AtomicPid`) at each ctty-acquire / `TIOCSPGRP` and read the
+  snapshot lock-free from the ldisc path. This preserves the `2b → 2c`
+  direction and avoids a second lock in the hot per-byte path.
+
+The pipe subsystem's level-2 lock (`pipe.ring.lock`) is never nested
+with any TTY level-2 lock — pipes and TTYs are disjoint fd types, and
+no syscall handler touches both in the same operation.
 
 Driver `.poll` methods MUST NOT acquire any lock at levels 1 or 2 — they
 may only take the level-3 WaitQueue lock (via `register`) and read
@@ -628,18 +659,35 @@ the UP development configuration but not a final design.
 #### TTY input path (ISR → ldisc → ring)
 
 ```
+// Per-TTY deferred byte ring: allocation-free, IRQ-safe.
+// Fixed-capacity (128 bytes) MPSC ring of plain `u8` — NOT a closure
+// queue. Storage is a `[CachePadded<AtomicU8>; 128]` + two atomic
+// indices embedded inside the TTY driver struct, reserved at driver
+// construction. Zero allocation on the ISR path.
+struct DeferredByteRing {
+    buf: CachePadded<[AtomicU8; 128]>,
+    head: CachePadded<AtomicUsize>,  // writer (ISR)
+    tail: CachePadded<AtomicUsize>,  // reader (soft-IRQ)
+}
+
 UART/PS-2 ISR:
-  byte = read_data_register()
-  if !deferred_call_queue.try_push(|| tty.driver.recv_byte(byte)):
-    // Bounded queue full: drop newest, increment drop counter,
-    // deassert RTS on UART if CRTSCTS is set.
+  byte = read_data_register()                 // port I/O, no alloc
+  if !tty.driver.rx_ring.try_push_u8(byte):   // lock-free, no alloc
+    // Bounded ring full: drop newest, increment drop counter,
+    // deassert RTS on UART if CRTSCTS is set (still just MMIO).
     tty.driver.isr_drop_count += 1
+    if tty.driver.crtscts && !tty.driver.rts_deasserted:
+        tty.driver.deassert_rts()             // MMIO write, no alloc
+        tty.driver.rts_deasserted = true
   eoi()
 
-Soft-IRQ worker:
-  drain deferred_call_queue
-  for each byte:
+Soft-IRQ worker (per-TTY, scheduled after ISR via the kernel's existing
+soft-IRQ plumbing — no closure is ever crossed between ISR and worker):
+  while let Some(byte) = tty.driver.rx_ring.pop_u8():
     tty.ldisc.receive_byte(tty, byte)
+  if tty.driver.rts_deasserted && tty.driver.rx_ring.free() > 96:
+    tty.driver.assert_rts()
+    tty.driver.rts_deasserted = false
 
 NTty::receive_byte(tty, b):
   t = tty.termios.lock()
@@ -657,7 +705,7 @@ NTty::receive_byte(tty, b):
     handle_canonical_byte(b)   // VERASE, VKILL, VEOF, line commit on '\n'
   else:
     state.raw.push(b)
-    tty.read_wait.wake_one()
+    tty.read_wait.wake_poll_then_one()  // all poll callbacks + one blocking reader
   if ECHO: queue_echo(b)
 ```
 
@@ -942,12 +990,19 @@ We expose the standard bit values verbatim:
 |---|---|---|
 | EAGAIN | pipe read/write | O_NONBLOCK with no data / no space |
 | EPIPE + SIGPIPE | pipe write | no readers |
-| EINTR | pipe/tty/poll | signal delivered during wait |
+| EINTR | pipe/tty/poll/FIFO open | signal delivered during wait, no SA_RESTART (restart otherwise) |
 | EIO | tty read | background read, pgrp orphaned |
-| ERESTARTSYS | tty write | background write, SIGTTOU delivered |
+| EINTR | tty write | background write, SIGTTOU delivered (restartable if SA_RESTART; `KERN_ERESTARTSYS` is kernel-internal only, translated at syscall-exit) |
 | ENOTTY | tty ioctl | fd is not a TTY |
 | EPERM | TIOCSPGRP/TIOCSCTTY | session/leader check failed |
 | EINVAL | poll | nfds exceeds limit |
+| EINVAL | pipe2 | unknown or unsupported bit in `flags` (`O_DIRECT` falls here for v1) |
+
+`ERESTARTSYS` is **never** returned to userspace. `KERN_ERESTARTSYS`
+is a kernel-internal sentinel only; the syscall trampoline translates it
+to either a `%rip` rewind (SA_RESTART restart) or `-EINTR` before
+returning to ring 3. Userspace observes `EINTR` where an older kernel
+would have leaked `ERESTARTSYS`.
 
 ## Security Considerations
 
@@ -975,11 +1030,16 @@ We expose the standard bit values verbatim:
   bytes because the ring invariant enforces `head ≤ tail` (wrapping).
 - **Wake-queue entry lifetime (TOCTOU).** The two-pass poll pattern requires
   `WaitQueue::register` to hold a lifetime that outlives the ISR wake path.
-  We implement wait entries as `Pin<&PollEntry>` stored in the `PollTable`
-  (stack-allocated where possible), with explicit cancellation in
-  `PollTable::drop`. A wait queue that fires after the `PollTable` has
-  dropped is a kernel bug — covered by a debug-assert on wake and a
-  unit test that exercises drop-before-wake.
+  Wait entries are `PollEntry` records owned by the `PollTable` (on the
+  polling thread's kernel stack); each entry holds an `Arc<WaitQueue>`
+  so the queue cannot be deallocated while an entry is registered on
+  it. `PollTable::drop` deregisters every entry from every queue under
+  the queue's internal lock, which serialises cancel-vs-fire: either
+  the ISR's `wake_poll_then_one` observes the entry and invokes its
+  callback, or `cancel` observes the entry and removes it — never both,
+  never neither. A close-during-poll race on the originating fd is
+  safe because POLLNVAL is produced from the fd-table lookup in Probe,
+  not from dereferencing the backing object.
 - **Race: reader-closed between probe and wait.** If a writer computes
   `readers > 0` during Probe, blocks, and the last reader closes during
   Wait, the reader's drop path must call `wr_wait.wake_all()` so the
@@ -1039,7 +1099,8 @@ We expose the standard bit values verbatim:
   bench (8 pipes, broadcast wake) shows ≥ 30% fewer schedule events with
   `deferral_ns = 100_000`. This is speculative pending measurement.
 - **Cache-line discipline.** `head` and `tail` on separate 64-byte lines
-  (enforced by `#[repr(align(64))]`). In the single-producer / single-
+  (enforced by the `CachePadded<T>` newtype wrapper). In the
+  single-producer / single-
   consumer case (one reader, one writer) on two cores, only two cache
   lines bounce per round-trip.
 - **Lock contention.** Pipe fast path takes one `IrqSafeMutex` for the
