@@ -43,6 +43,8 @@ use core::sync::atomic::Ordering;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::interrupts;
 
+use crate::sync::IrqLock;
+
 use crate::sync::WaitQueue;
 
 pub use priority::{
@@ -62,7 +64,7 @@ use crate::time::TICK_MS;
 /// single PIT tick — every tick is a rescheduling opportunity.
 pub(crate) const DEFAULT_SLICE_MS: u32 = 10;
 
-static SCHED: Lazy<Mutex<Scheduler>> = Lazy::new(|| Mutex::new(Scheduler::new()));
+static SCHED: Lazy<IrqLock<Scheduler>> = Lazy::new(|| IrqLock::new(Scheduler::new()));
 
 /// Victims produced by [`exit`] waiting for the reaper task to reclaim
 /// them. Holds the `Box<Task>` so the task's stack, address space, and
@@ -259,8 +261,6 @@ pub fn spawn_with_nice(entry: fn() -> !, nice: i8) {
 /// Returns `true` if a task with `id` was found, `false` otherwise.
 pub fn set_priority(id: usize, priority: u8) -> bool {
     let priority = clamp_priority(priority);
-    let was_on = interrupts::are_enabled();
-    interrupts::disable();
     let mut sched = SCHED.lock();
 
     let found = apply_priority(&mut sched, id, priority);
@@ -270,10 +270,6 @@ pub fn set_priority(id: usize, priority: u8) -> bool {
         preempt_if_higher_ready(&mut sched);
     }
 
-    drop(sched);
-    if was_on {
-        interrupts::enable();
-    }
     found
 }
 
@@ -287,8 +283,6 @@ pub fn set_nice(id: usize, nice: i8) -> bool {
 /// range. Returns the resulting nice value, or `None` if the id is
 /// unknown.
 pub fn adjust_nice(id: usize, delta: i8) -> Option<i8> {
-    let was_on = interrupts::are_enabled();
-    interrupts::disable();
     let mut sched = SCHED.lock();
 
     let current_prio = find_priority(&sched, id);
@@ -305,10 +299,6 @@ pub fn adjust_nice(id: usize, delta: i8) -> Option<i8> {
         preempt_if_higher_ready(&mut sched);
     }
 
-    drop(sched);
-    if was_on {
-        interrupts::enable();
-    }
     result
 }
 
@@ -322,8 +312,6 @@ pub fn set_affinity(id: usize, mask: u64) -> bool {
     if mask == 0 {
         return false;
     }
-    let was_on = interrupts::are_enabled();
-    interrupts::disable();
     let mut sched = SCHED.lock();
 
     let mut found = false;
@@ -351,10 +339,6 @@ pub fn set_affinity(id: usize, mask: u64) -> bool {
         }
     }
 
-    drop(sched);
-    if was_on {
-        interrupts::enable();
-    }
     found
 }
 
@@ -1149,16 +1133,8 @@ pub fn block_current() {
 /// A wake on an unknown id (task exited — which M6 doesn't have yet —
 /// or never existed) is silently ignored.
 pub fn wake(id: usize) {
-    let was_on = interrupts::are_enabled();
-    interrupts::disable();
-
     let mut sched = SCHED.lock();
     wake_in_sched(&mut sched, id);
-    drop(sched);
-
-    if was_on {
-        interrupts::enable();
-    }
 }
 
 /// Body of [`wake`] that operates on a caller-held scheduler lock.
