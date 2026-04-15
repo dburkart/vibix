@@ -416,8 +416,11 @@ pub fn acquire_ctty_on_open(caller_pid: u32, tty: &Arc<Tty>) -> bool {
 /// when the write should proceed: TOSTOP clear, no foreground pgrp, caller
 /// unattached (`pid == 0`) or caller pgrp matches.
 ///
-/// The pgrp identity check reads `ctrl.pgrp_snapshot` without taking
-/// `ctrl.lock()` (RFC 0003 §Lock order, fast path).
+/// The pgrp identity check loads `ctrl.pgrp_snapshot` (an `AtomicU32`)
+/// while briefly holding `ctrl.lock()`. The atomic load itself is
+/// lock-free; promoting it to a true `Tty`-level atomic so the gate
+/// could skip the lock entirely is a follow-up (see RFC 0003 §Lock
+/// order, fast path).
 #[cfg(target_os = "none")]
 pub fn tty_check_tostop(tty: &Tty, caller_pid: u32) -> Option<i64> {
     if caller_pid == 0 {
