@@ -7,7 +7,17 @@
 
 use spin::Mutex;
 
-use super::termios::{Termios, ICRNL, IGNCR, INLCR, ISTRIP};
+use super::termios::{
+    Termios, ECHO, ECHOE, ICRNL, IGNCR, INLCR, ISTRIP, OCRNL, ONLCR, OPOST, VERASE,
+};
+
+/// Byte sink used by the output path. `process_output` and `queue_echo`
+/// push transformed bytes into a sink rather than allocating a buffer so
+/// callers can target either a ring (future `DeferredByteRing` from #376)
+/// or a test-local `Vec<u8>`.
+pub trait OutSink {
+    fn push(&mut self, b: u8);
+}
 
 /// Interior N_TTY state. Guarded by lock class "2d" per RFC 0003 §Lock
 /// order. Kept a unit placeholder until the `DeferredByteRing` primitive
@@ -60,6 +70,50 @@ impl NTty {
         }
         Some(b)
     }
+
+    /// Apply `c_oflag` output transforms to `buf`, pushing each emitted
+    /// byte into `out`. With `OPOST` clear, every byte passes through
+    /// unchanged; with `OPOST` set, `ONLCR` remaps `\n` to `\r\n` and
+    /// `OCRNL` remaps `\r` to `\n`. Transforms are per-input-byte: a `\r`
+    /// rewritten to `\n` by OCRNL is not then re-expanded by ONLCR.
+    pub fn process_output(&self, termios: &Termios, buf: &[u8], out: &mut dyn OutSink) {
+        let oflag = termios.c_oflag;
+        if oflag & OPOST == 0 {
+            for &b in buf {
+                out.push(b);
+            }
+            return;
+        }
+        for &b in buf {
+            match b {
+                b'\n' if oflag & ONLCR != 0 => {
+                    out.push(b'\r');
+                    out.push(b'\n');
+                }
+                b'\r' if oflag & OCRNL != 0 => {
+                    out.push(b'\n');
+                }
+                _ => out.push(b),
+            }
+        }
+    }
+
+    /// Push one echoed character through the OPOST-aware output path.
+    ///
+    /// With `ECHO` clear, produces nothing. With `ECHOE` set and `c` equal
+    /// to `VERASE`, emits the visual-erase sequence `"\b \b"`. Otherwise
+    /// echoes `c` literally. All emitted bytes flow through
+    /// `process_output` so OPOST still governs the wire format.
+    pub fn queue_echo(&self, termios: &Termios, c: u8, out: &mut dyn OutSink) {
+        if termios.c_lflag & ECHO == 0 {
+            return;
+        }
+        if termios.c_lflag & ECHOE != 0 && c == termios.c_cc[VERASE] {
+            self.process_output(termios, &[0x08, b' ', 0x08], out);
+            return;
+        }
+        self.process_output(termios, &[c], out);
+    }
 }
 
 impl Default for NTty {
@@ -72,10 +126,29 @@ impl Default for NTty {
 mod tests {
     use super::*;
     use crate::tty::termios::Termios;
+    use alloc::vec::Vec;
+
+    impl OutSink for Vec<u8> {
+        fn push(&mut self, b: u8) {
+            Vec::push(self, b);
+        }
+    }
 
     fn termios_with(iflag: u32) -> Termios {
         let mut t = Termios::sane();
         t.c_iflag = iflag;
+        t
+    }
+
+    fn termios_with_oflag(oflag: u32) -> Termios {
+        let mut t = Termios::sane();
+        t.c_oflag = oflag;
+        t
+    }
+
+    fn termios_with_lflag(lflag: u32) -> Termios {
+        let mut t = Termios::sane();
+        t.c_lflag = lflag;
         t
     }
 
@@ -149,5 +222,95 @@ mod tests {
         let n = NTty::new();
         let t = termios_with(ISTRIP | IGNCR);
         assert_eq!(n.receive_byte(&t, 0x8D), None);
+    }
+
+    #[test]
+    fn opost_off_is_passthrough() {
+        let n = NTty::new();
+        let t = termios_with_oflag(ONLCR | OCRNL);
+        let mut out = Vec::new();
+        n.process_output(&t, b"a\nb\rc", &mut out);
+        assert_eq!(out, b"a\nb\rc");
+    }
+
+    #[test]
+    fn onlcr_maps_nl_to_crnl() {
+        let n = NTty::new();
+        let t = termios_with_oflag(OPOST | ONLCR);
+        let mut out = Vec::new();
+        n.process_output(&t, b"a\nb", &mut out);
+        assert_eq!(out, b"a\r\nb");
+    }
+
+    #[test]
+    fn ocrnl_maps_cr_to_nl() {
+        let n = NTty::new();
+        let t = termios_with_oflag(OPOST | OCRNL);
+        let mut out = Vec::new();
+        n.process_output(&t, b"\r", &mut out);
+        assert_eq!(out, b"\n");
+    }
+
+    #[test]
+    fn onlcr_plus_ocrnl_no_pingpong() {
+        // CR is rewritten to NL (not re-expanded to CRNL); the following
+        // NL is independently expanded to CRNL.
+        let n = NTty::new();
+        let t = termios_with_oflag(OPOST | ONLCR | OCRNL);
+        let mut out = Vec::new();
+        n.process_output(&t, b"\r\n", &mut out);
+        assert_eq!(out, b"\n\r\n");
+    }
+
+    #[test]
+    fn queue_echo_off_is_noop() {
+        let n = NTty::new();
+        let t = termios_with_lflag(0);
+        let mut out = Vec::new();
+        n.queue_echo(&t, b'a', &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn queue_echo_plain_char_via_opost() {
+        let mut t = Termios::sane();
+        t.c_oflag = OPOST | ONLCR;
+        t.c_lflag = ECHO;
+        let n = NTty::new();
+        let mut out = Vec::new();
+        n.queue_echo(&t, b'\n', &mut out);
+        assert_eq!(out, b"\r\n");
+    }
+
+    #[test]
+    fn queue_echo_erase_emits_bs_sp_bs() {
+        let mut t = Termios::sane();
+        t.c_oflag = 0;
+        t.c_lflag = ECHO | ECHOE;
+        let n = NTty::new();
+        let mut out = Vec::new();
+        n.queue_echo(&t, t.c_cc[VERASE], &mut out);
+        assert_eq!(out, &[0x08, b' ', 0x08]);
+    }
+
+    #[test]
+    fn queue_echo_echoe_without_echo_is_noop() {
+        let mut t = Termios::sane();
+        t.c_lflag = ECHOE;
+        let n = NTty::new();
+        let mut out = Vec::new();
+        n.queue_echo(&t, t.c_cc[VERASE], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn queue_echo_erase_without_echoe_echoes_literal() {
+        let mut t = Termios::sane();
+        t.c_oflag = 0;
+        t.c_lflag = ECHO;
+        let n = NTty::new();
+        let mut out = Vec::new();
+        n.queue_echo(&t, t.c_cc[VERASE], &mut out);
+        assert_eq!(out, &[0x7f]);
     }
 }
