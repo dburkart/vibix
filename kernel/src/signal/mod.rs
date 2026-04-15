@@ -257,6 +257,28 @@ pub fn raise_signal_on_pid(pid: u32, sig: u8) -> i64 {
     }
 }
 
+/// Send signal `sig` to every live member of process group `pgid`.
+///
+/// Returns the number of processes the signal was delivered to. `pgid == 0`
+/// yields `0`. `-EINVAL` (-22) for an out-of-range signal. Used by the
+/// N_TTY ISIG fast path (#431) — the caller reads
+/// `tty.ctrl.pgrp_snapshot` lock-free and passes the result here.
+pub fn send_to_pgrp(pgid: u32, sig: u8) -> i64 {
+    if sig > NSIG {
+        return -22; // EINVAL
+    }
+    if pgid == 0 {
+        return 0;
+    }
+    let mut delivered: i64 = 0;
+    crate::process::for_each_in_pgrp(pgid, |pid| {
+        if raise_signal_on_pid(pid, sig) == 0 {
+            delivered += 1;
+        }
+    });
+    delivered
+}
+
 // ── Syscall handlers ──────────────────────────────────────────────────────
 
 /// `sigaction(sig, act_uva, oldact_uva)` — register or query a signal
