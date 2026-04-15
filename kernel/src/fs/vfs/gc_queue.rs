@@ -183,6 +183,16 @@ mod tests {
     use crate::fs::vfs::{DString, Dentry, FsId};
     use core::sync::atomic::AtomicUsize;
 
+    // Serialise tests that touch the shared GC_QUEUE / GC_OVERFLOWS /
+    // DRAINING statics. Without this, `--test-threads > 1` interleaves
+    // the enqueue / gc_pending_count / evicted-counter assertions. Use
+    // `std::sync::Mutex` so a panic poisons rather than deadlocks.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// SuperOps stub that records evict_inode calls. Tests share the
     /// queue (it's static), so each test drains at start and end to
     /// stay isolated.
@@ -250,6 +260,7 @@ mod tests {
 
     #[test]
     fn enqueue_push_pop_fifo() {
+        let _g = test_guard();
         drain_static_queue();
         let (sb, _ops) = make_sb(101);
         enqueue(Arc::downgrade(&sb), 1);
@@ -265,6 +276,7 @@ mod tests {
 
     #[test]
     fn drop_inode_enqueues_not_inline() {
+        let _g = test_guard();
         drain_static_queue();
         let (sb, ops) = make_sb(102);
         let ino = make_inode(&sb, 42);
@@ -279,6 +291,7 @@ mod tests {
 
     #[test]
     fn nested_drop_under_parent_children_lock() {
+        let _g = test_guard();
         drain_static_queue();
         let (sb, _ops) = make_sb(103);
         let parent_ino = make_inode(&sb, 1);
@@ -298,6 +311,7 @@ mod tests {
 
     #[test]
     fn gc_drain_for_filters_by_fs_id() {
+        let _g = test_guard();
         drain_static_queue();
         let (sb_a, ops_a) = make_sb(200);
         let (sb_b, ops_b) = make_sb(201);
@@ -316,6 +330,7 @@ mod tests {
 
     #[test]
     fn overflow_counter_increments_past_cap() {
+        let _g = test_guard();
         drain_static_queue();
         let baseline = gc_overflow_count();
         let (sb, ops) = make_sb(300);
@@ -335,6 +350,7 @@ mod tests {
 
     #[test]
     fn drain_guard_excludes_concurrent_drainer() {
+        let _g = test_guard();
         drain_static_queue();
         // Acquire the guard manually to simulate an in-flight drainer.
         let guard = DrainGuard::try_acquire().expect("first acquire");
@@ -356,6 +372,7 @@ mod tests {
 
     #[test]
     fn weak_sb_dropped_entries_are_discarded() {
+        let _g = test_guard();
         drain_static_queue();
         let (sb, ops) = make_sb(400);
         let weak = Arc::downgrade(&sb);
