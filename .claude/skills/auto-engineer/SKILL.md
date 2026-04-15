@@ -77,10 +77,57 @@ the un-triaged tail for "easy" work and bypass the priority queue.
 
 If the candidate list is empty → **stop** (see Stopping below) with message *"no unblocked issues — auto-engineer idle."*
 
-Assign and branch per `docs/agent-playbooks/sdlc.md`:
+Assign the issue to yourself before anything else — this both signals ownership to other
+agents and is load-bearing for the split path below:
 
 ```sh
 gh issue edit <N> --add-assignee dburkart
+```
+
+#### 1a. Sanity-check issue size; split if too large
+
+Before branching, read the issue body and any linked context. If the work is genuinely too
+big to land cleanly in a single PR (multiple independent subsystems, >~500 LoC of real
+change, two or more distinct risk surfaces that each deserve their own review, or a design
+that needs to be staged behind feature gates), **split it** instead of attempting it.
+
+Heuristics for "too large" — any *one* is sufficient:
+- The natural plan has 3+ independent sub-tasks that could each land on their own PR
+  without the others.
+- Implementation touches two or more subsystems where a mistake in one would be hard to
+  bisect from the other.
+- The issue body already lists a multi-step checklist and no single step is the obvious
+  minimal starting point.
+- A `Plan` sub-agent (step 2) would return a roadmap rather than a patch plan.
+
+If not too large, skip to step 1b.
+
+If too large, do **all** of the following and then restart from the top of step 1 (fresh
+`gh issue list`, fresh selection) — do **not** proceed to step 2 with the original issue:
+
+1. Keep the assignment on the original issue (already set above) — it prevents other
+   agents from racing in while the split is in flight.
+2. Draft a decomposition: 2–5 concrete, independently-landable sub-tasks, dependency-first.
+3. File each sub-task via the `file-issue` skill. Each new issue must carry the parent's
+   `priority:*` label (the chunks inherit the parent's priority) plus the correct
+   `area:*` / `track:*` labels per `docs/agent-playbooks/prioritization.md`. Cross-link
+   each sub-issue's body back to the parent with `Follow-up of #<parent>`.
+4. Comment on the parent issue listing every new sub-issue number and a one-line summary
+   of its scope.
+5. Close the parent issue with reason `not planned` and a final comment:
+   *"Decomposed into #A, #B, #C — closing in favor of the sub-issues. Auto-engineer will
+   pick one of them on the next iteration."* Use `gh issue close <N> -r "not planned"`.
+6. Restart selection from step 1. The new sub-issues are now candidates; by priority rules
+   the highest-priority sub-task (tie-broken by lowest number) should be picked next.
+
+Do not plan or implement the split itself as a code change — splitting is an issue-tracker
+operation only.
+
+#### 1b. Branch
+
+Per `docs/agent-playbooks/sdlc.md`:
+
+```sh
 git checkout main && git pull
 git checkout -b <branch>   # m<N>-<slug> or <verb>-<slug>
 ```
