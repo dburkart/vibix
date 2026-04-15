@@ -243,3 +243,7 @@ harness = false
 [[test]]
 name = "tty_jobctl_ioctls"
 harness = false
+
+[[test]]
+name = "tty_tostop_sigttou"
+harness = false
