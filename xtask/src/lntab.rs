@@ -92,11 +92,19 @@ fn collect_rows(obj: &object::File<'_>) -> R<Vec<LnRow>> {
             let file = if let Some(f) = file_cache.get(&file_idx) {
                 f.clone()
             } else {
-                let file =
-                    resolve_file_path(&unit_ref, header, file_idx, &comp_dir).unwrap_or_default();
+                let Some(file) = resolve_file_path(&unit_ref, header, file_idx, &comp_dir) else {
+                    // Cache the negative result so we don't re-resolve every
+                    // row, but skip emitting the row — `at :<line>` output
+                    // is worse than just an unannotated frame.
+                    file_cache.insert(file_idx, String::new());
+                    continue;
+                };
                 file_cache.insert(file_idx, file.clone());
                 file
             };
+            if file.is_empty() {
+                continue;
+            }
 
             // Clamp line to u32; rustc never emits anything near this.
             let line_u32 = u32::try_from(line).unwrap_or(u32::MAX);
