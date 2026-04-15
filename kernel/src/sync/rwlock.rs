@@ -81,6 +81,15 @@ impl<T> BlockingRwLock<T> {
 }
 
 impl<T: ?Sized> BlockingRwLock<T> {
+    /// Number of tasks currently parked on this rwlock (readers or
+    /// writers waiting). Intended for test-harness synchronisation — a
+    /// driver can spin on `waiter_count() >= N` to confirm N workers
+    /// have actually enqueued before firing a release. Not appropriate
+    /// for production logic; the count can change the instant it's read.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.waiter_count()
+    }
+
     /// Try to acquire a shared (read) lock without parking.
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         let mut st = self.state.lock();

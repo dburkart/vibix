@@ -138,9 +138,7 @@ fn ch_producer() -> ! {
         tx.send(i).expect("producer: send returned Err");
     }
     CH_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn ch_consumer() -> ! {
@@ -150,9 +148,7 @@ fn ch_consumer() -> ! {
         CH_SUM.fetch_add(v as usize, Ordering::SeqCst);
     }
     CH_CONS_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn channel_ping_pong() {
@@ -225,9 +221,7 @@ fn mu_worker() -> ! {
         // Guard dropped at end of scope -> notify_one wakes a waiter.
     }
     MU_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mutex_contention() {
@@ -272,9 +266,7 @@ static WQ_WOKEN: AtomicUsize = AtomicUsize::new(0);
 fn wq_waiter() -> ! {
     WQ.wait_while(|| WQ_FLAG.load(Ordering::SeqCst) == 0);
     WQ_WOKEN.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn waitqueue_notify_all() {
@@ -328,9 +320,7 @@ fn spsc_close_rx_worker() -> ! {
     if rx.recv().is_none() {
         SPSC_CLOSE_RX_SAW_NONE.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn spsc_close_wakes_receiver() {
@@ -376,9 +366,7 @@ fn spsc_close_tx_worker() -> ! {
     if tx.send(2).is_err() {
         SPSC_CLOSE_TX_SAW_ERR.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn spsc_close_wakes_sender() {
@@ -439,9 +427,7 @@ fn mpmc_m2o_prod_a() -> ! {
         // top-level local.
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_m2o_prod_b() -> ! {
@@ -452,9 +438,7 @@ fn mpmc_m2o_prod_b() -> ! {
         }
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_m2o_prod_c() -> ! {
@@ -465,9 +449,7 @@ fn mpmc_m2o_prod_c() -> ! {
         }
     }
     MPMC_M2O_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_m2o_cons() -> ! {
@@ -478,9 +460,7 @@ fn mpmc_m2o_cons() -> ! {
         MPMC_M2O_SUM.fetch_add(v as usize, Ordering::SeqCst);
     }
     MPMC_M2O_CONS_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_many_to_one() {
@@ -563,9 +543,7 @@ fn mpmc_m2m_prod_a() -> ! {
         // we'd otherwise hold tx forever in the hlt loop.
     }
     MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_m2m_prod_b() -> ! {
@@ -576,9 +554,7 @@ fn mpmc_m2m_prod_b() -> ! {
         }
     }
     MPMC_M2M_PROD_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 // Each consumer drains until `recv` returns None (channel closed
@@ -590,9 +566,7 @@ fn mpmc_m2m_cons_a() -> ! {
         MPMC_M2M_RECEIVED.fetch_add(1, Ordering::SeqCst);
     }
     MPMC_M2M_CONS_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_m2m_cons_b() -> ! {
@@ -602,9 +576,7 @@ fn mpmc_m2m_cons_b() -> ! {
         MPMC_M2M_RECEIVED.fetch_add(1, Ordering::SeqCst);
     }
     MPMC_M2M_CONS_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_many_to_many() {
@@ -676,9 +648,7 @@ fn mpmc_close_rx_a() -> ! {
     if rx.recv().is_none() {
         MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_close_rx_b() -> ! {
@@ -686,9 +656,7 @@ fn mpmc_close_rx_b() -> ! {
     if rx.recv().is_none() {
         MPMC_CLOSE_RX_WOKEN.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_close_wakes_receivers() {
@@ -733,9 +701,7 @@ fn mpmc_close_tx_a() -> ! {
     if tx.send(2).is_err() {
         MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_close_tx_b() -> ! {
@@ -743,9 +709,7 @@ fn mpmc_close_tx_b() -> ! {
     if tx.send(3).is_err() {
         MPMC_CLOSE_TX_ERRS.fetch_add(1, Ordering::SeqCst);
     }
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn mpmc_close_wakes_senders() {
@@ -806,9 +770,7 @@ fn rw_reader_worker() -> ! {
     }
     RW_READ_LIVE.fetch_sub(1, Ordering::SeqCst);
     RW_READ_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn rwlock_concurrent_readers() {
@@ -859,9 +821,7 @@ fn rw_writer_worker() -> ! {
         *g += 1;
     }
     RW_WRITE_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn rwlock_writer_exclusion() {
@@ -915,9 +875,7 @@ fn rw_starve_writer() -> ! {
     *g += 1;
     drop(g);
     RW_STARVE_WRITER_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn rw_starve_reader() -> ! {
@@ -926,9 +884,7 @@ fn rw_starve_reader() -> ! {
     }
     let _g = RW_STARVE.read();
     RW_STARVE_READERS_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn rwlock_writer_not_starved() {
@@ -952,10 +908,17 @@ fn rwlock_writer_not_starved() {
     // writer should win the lock next (readers queue behind it due to
     // writer_waiting), complete, then readers drain.
     RW_STARVE_GO.store(1, Ordering::SeqCst);
-    // Give workers a chance to run and park inside their lock calls.
-    for _ in 0..20 {
-        x86_64::instructions::hlt();
-    }
+    // Wait until every worker has actually parked on the rwlock
+    // (1 writer + RW_STARVE_READERS). A fixed-hlt grace period was
+    // flaky under heavy CI load — workers sometimes hadn't reached
+    // `block_current` yet when the driver dropped its guard, so a
+    // notify_all found an empty waitqueue and the workers lost the
+    // wake. Polling `waiter_count` closes that window deterministically.
+    wait_for_parked(
+        || RW_STARVE.waiter_count(),
+        1 + RW_STARVE_READERS as usize,
+        4_000,
+    );
     drop(g);
 
     for _ in 0..4_000 {
@@ -1009,9 +972,7 @@ fn sem_worker() -> ! {
     SEM_LIVE.fetch_sub(1, Ordering::SeqCst);
     SEM_GATE.release();
     SEM_DONE.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn semaphore_permits_block() {
@@ -1060,9 +1021,7 @@ static SEM_WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn sem_wake_worker() -> ! {
     SEM_WAKE.acquire();
     SEM_WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
-    loop {
-        x86_64::instructions::hlt();
-    }
+    task::exit();
 }
 
 fn semaphore_release_wakes_one() {
