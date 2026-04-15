@@ -9,6 +9,7 @@
 //!   test-runner   — (internal) boot a pre-built test kernel ELF in QEMU
 //!   smoke         — boot the kernel and assert on expected serial markers
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
+//!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   clean         — remove build artifacts
 //!
 //! Flags (apply where sensible): --release, --fault-test, --panic-test
@@ -19,6 +20,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
+
+mod isr_audit;
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -116,6 +119,7 @@ fn main() -> R<()> {
         }
         "smoke" => smoke(&opts)?,
         "lint" => lint()?,
+        "isr-audit" => isr_audit::run(&workspace_root())?,
         "initrd" => {
             let path = ensure_initrd()?;
             println!("→ initrd: {}", path.display());
@@ -124,7 +128,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|smoke|lint|clean] [--release] [--fault-test] [--panic-test] [--bench]"
+                "usage: cargo xtask [build|initrd|iso|run|test|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench]"
             );
             std::process::exit(2);
         }
@@ -966,6 +970,9 @@ fn lint() -> R<()> {
             .args(["--all-targets", "--", "-D", "warnings"])
             .status()?,
     )?;
+
+    println!("→ isr-audit: scanning ISR-reachable files");
+    isr_audit::run(&workspace_root())?;
 
     Ok(())
 }
