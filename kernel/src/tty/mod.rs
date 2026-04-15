@@ -14,6 +14,7 @@
 //! See `docs/RFC/0003-pipes-poll-tty.md` for the design rationale.
 
 pub mod ntty;
+pub mod ps2;
 pub mod ring;
 pub mod termios;
 
