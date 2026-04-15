@@ -336,13 +336,52 @@ pub(crate) fn meta_into_stat(
     out.st_uid = meta.uid;
     out.st_gid = meta.gid;
     out.st_rdev = meta.rdev;
-    out.st_size = meta.size as i64;
+    // Saturate u64 → i64 for size/blocks. Real filesystems never report
+    // sizes above i64::MAX (Linux loff_t, ext4/btrfs on-disk limits are
+    // all u63-max or lower); any such value indicates a driver bug or
+    // corrupted metadata, and a huge positive st_size is more
+    // diagnosable for userspace than a silently-negated one.
+    out.st_size = meta.size.min(i64::MAX as u64) as i64;
     out.st_blksize = meta.blksize as i64;
-    out.st_blocks = meta.blocks as i64;
+    out.st_blocks = meta.blocks.min(i64::MAX as u64) as i64;
     out.st_atime = meta.atime.sec;
     out.st_atime_nsec = meta.atime.nsec as i64;
     out.st_mtime = meta.mtime.sec;
     out.st_mtime_nsec = meta.mtime.nsec as i64;
     out.st_ctime = meta.ctime.sec;
     out.st_ctime_nsec = meta.ctime.nsec as i64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_into_stat_saturates_u64_max_size_and_blocks() {
+        let meta = InodeMeta {
+            size: u64::MAX,
+            blocks: u64::MAX,
+            ..Default::default()
+        };
+        let mut st = Stat::default();
+        meta_into_stat(&meta, InodeKind::Reg, 1, 2, &mut st);
+        assert_eq!(st.st_size, i64::MAX);
+        assert_eq!(st.st_blocks, i64::MAX);
+        assert!(st.st_size >= 0 && st.st_blocks >= 0);
+    }
+
+    #[test]
+    fn meta_into_stat_preserves_in_range_size_and_blocks() {
+        let meta = InodeMeta {
+            size: 1_234_567,
+            blocks: 2_400,
+            blksize: 4096,
+            ..Default::default()
+        };
+        let mut st = Stat::default();
+        meta_into_stat(&meta, InodeKind::Reg, 1, 2, &mut st);
+        assert_eq!(st.st_size, 1_234_567);
+        assert_eq!(st.st_blocks, 2_400);
+        assert_eq!(st.st_blksize, 4096);
+    }
 }
