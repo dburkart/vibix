@@ -25,8 +25,42 @@ Read `docs/agent-playbooks/prioritization.md` before the issue-filing phase.
 |---|---|
 | `<topic>` | Required. Free-form OS topic (e.g. "virtual filesystem layer", "POSIX signals", "demand paging"). |
 | `--skip-research` | Optional flag. If set, skip Phase 1 and use the research brief already in the conversation. |
+| `--defense-cycles=<N>` | Optional override. Forces the Phase 5 cap to `1`, `2`, `3`, or `4`. Default: the skill chooses (see below). |
+| `--extra-archetypes=<list>` | Optional override. Comma-separated list of additional reviewer archetypes to spawn on top of whatever the skill chose. Each entry is either a name from the canonical list in `docs/agent-playbooks/rfc.md` or a free-form `name:focus` pair (e.g. `filesystem-engineer:on-disk layout, journaling, fsck semantics`). |
 
 If the topic is ambiguous or too broad, ask the user to narrow it before proceeding.
+
+### Scoping the review (skill decides, user overrides)
+
+Before Phase 1, the skill itself decides two things based on the topic's scope, and states
+both choices explicitly at the start of the run (e.g. *"Scoping: 2 defense cycles; adding
+`filesystem-engineer` archetype for on-disk layout review."*):
+
+1. **Defense-cycle cap** (1, 2, 3, or 4). Default heuristic:
+   - **1 cycle** — narrow, well-precedented change with a small design surface
+     (adding a syscall number, exposing an existing subsystem, a single new data structure).
+   - **2 cycles** — standard subsystem work (signals, paging, scheduling, a new filesystem,
+     a driver stack). This is the common case.
+   - **3 cycles** — cross-cutting or foundational redesign (scheduler rewrite, SMP, memory
+     manager overhaul, ABI changes that ripple through multiple subsystems).
+   - **4 cycles** — novel or original work with little direct precedent in existing kernels
+     (new abstractions, speculative designs, research-grade proposals where the design space
+     itself has to be defended as well as the specific choices).
+2. **Extra archetypes beyond the four defaults** (security researcher, OS engineer, user
+   space staff engineer, academic). Add an archetype only when the topic has a legitimate
+   specialist domain the defaults don't cover. Examples:
+   - `filesystem-engineer` — on-disk layout, journaling, fsck, crash consistency.
+   - `driver-engineer` — specific-hardware quirks, DMA, IRQ routing, device model fit.
+   - `performance-engineer` — hot-path latency, cache behavior, benchmark methodology.
+   - `toolchain-engineer` — relocations, dynamic linking, ABI stability, calling conventions.
+   - `real-time-engineer` — worst-case latency bounds, priority inversion, preemption model.
+   - `distributed-systems-engineer` — consensus, replication, partition-tolerance when the
+     topic touches clustering or multi-node state.
+   Zero extras is a legitimate choice; the four defaults cover most RFCs.
+
+If the user passed `--defense-cycles` or `--extra-archetypes`, those values override the
+skill's choice (`--extra-archetypes` is additive to whatever the skill chose, unless the
+user prefix-negates an entry with `-` to drop a default — but default dropping is rare).
 
 ## Cycle
 
@@ -170,9 +204,10 @@ mcp__github__create_pull_request(
 RFC <NNNN> proposes <1–2 sentence summary of the design>.
 
 This PR contains a design document only — no kernel code changes. The RFC will be
-reviewed by four archetype reviewers (security researcher, OS engineer, user space
-staff engineer, academic), revised until all blocking findings are addressed, then
-merged. Implementation issues will be filed from the roadmap section after merge.
+reviewed by the scoped archetype panel (the four defaults — security researcher, OS
+engineer, user space staff engineer, academic — plus any extras chosen for this topic),
+revised until all blocking findings are addressed, then merged. Implementation issues
+will be filed from the roadmap section after merge.
 
 ## RFC sections
 
@@ -188,8 +223,8 @@ merged. Implementation issues will be filed from the roadmap section after merge
 
 ## Test plan
 
-- [ ] All four archetype reviewers post a review comment.
-- [ ] All blocking findings are addressed in at most 2 defense cycles.
+- [ ] Every scoped archetype reviewer posts a review comment.
+- [ ] All blocking findings are addressed within the scoped defense-cycle cap.
 - [ ] RFC frontmatter updated to `status: Accepted` before merge.
 """
 )
@@ -202,7 +237,8 @@ push.
 
 ### Phase 4 — Peer review
 
-Spawn all four reviewer sub-agents **in parallel** using `Agent`
+Spawn **every archetype from the scoped panel** (the four defaults plus any extras chosen
+above) as reviewer sub-agents **in parallel** using `Agent`
 (`subagent_type: "general-purpose"`). Pass each:
 
 - The full RFC content (read the file and include it verbatim in the prompt).
@@ -248,8 +284,8 @@ RFC content:
 <RFC_CONTENT>
 ```
 
-After all four sub-agents complete, fetch the PR comments to confirm all four review
-comments were posted:
+After all reviewer sub-agents complete, fetch the PR comments to confirm every scoped
+archetype posted a review comment:
 
 ```
 mcp__github__pull_request_read(owner="dburkart", repo="vibix", pullNumber=<PR>)
@@ -259,7 +295,9 @@ mcp__github__pull_request_read(owner="dburkart", repo="vibix", pullNumber=<PR>)
 
 ### Phase 5 — Defense cycle
 
-This phase repeats up to **2 times**. Track the cycle count.
+This phase repeats up to **the scoped defense-cycle cap** (1, 2, 3, or 4 — chosen in the
+scoping step at the start of the run, or overridden by `--defense-cycles`). Track the
+cycle count against that cap.
 
 #### 5a. Collect blocking findings
 
@@ -302,14 +340,15 @@ the updated design. Their new `LGTM` or `CHANGES REQUESTED` supersedes the old o
 
 #### 5f. Check cycle count
 
-- Cycle 1 complete → re-evaluate blocking findings from the new reviews (return to 5a).
-- Cycle 2 complete with remaining blockers → **stop** (see Stopping).
+- Cycle `N` complete where `N < cap` → re-evaluate blocking findings from the new reviews
+  (return to 5a).
+- Cycle `N` complete where `N == cap` and blockers remain → **stop** (see Stopping).
 
 ---
 
 ### Phase 6 — Approval and merge
 
-All four archetypes have issued `LGTM`. Proceed:
+All scoped archetypes (the four defaults plus any extras) have issued `LGTM`. Proceed:
 
 1. Update `docs/RFC/<NNNN>-<kebab-slug>.md` frontmatter: `status: Accepted`.
 2. Update the **Open Questions** section: mark resolved ones answered, flag any
@@ -357,7 +396,7 @@ File all issues and report the full list of URLs to the user.
 
 ## Stopping
 
-If the defense cycle limit (2 cycles) is exhausted with remaining blocking findings:
+If the scoped defense-cycle cap is exhausted with remaining blocking findings:
 
 1. Update RFC frontmatter `status: Withdrawn`.
 2. Commit and push: `"rfc(<NNNN>): withdraw — unresolved blocking findings"`.
@@ -374,7 +413,7 @@ If the defense cycle limit (2 cycles) is exhausted with remaining blocking findi
 - Open a PR to `main` directly (all RFC PRs use `rfc/<NNNN>-<slug>` branches).
 - Skip the research phase unless `--skip-research` is explicitly set.
 - Write the RFC before the research brief is complete — synthesis before drafting.
-- Merge without all four archetypes posting `LGTM`.
+- Merge without every scoped archetype (the four defaults plus any extras) posting `LGTM`.
 - File implementation issues before the RFC is merged and `Accepted`.
 - Invent new `priority:*` or `area:*` labels when filing issues — update the
   prioritization playbook first.
