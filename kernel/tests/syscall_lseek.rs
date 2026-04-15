@@ -77,7 +77,10 @@ fn run_tests() {
             &(lseek_unknown_whence_einval as fn()),
         ),
         ("lseek_on_stdio_espipe", &(lseek_on_stdio_espipe as fn())),
-        ("lseek_on_closed_fd_ebadf", &(lseek_on_closed_fd_ebadf as fn())),
+        (
+            "lseek_on_closed_fd_ebadf",
+            &(lseek_on_closed_fd_ebadf as fn()),
+        ),
     ];
     for (name, t) in tests {
         serial_println!("syscall_lseek: {}", name);

@@ -99,11 +99,11 @@ mod tests {
     use crate::fs::vfs::dentry::Dentry;
     use crate::fs::vfs::inode::{Inode, InodeKind, InodeMeta};
     use crate::fs::vfs::open_file::OpenFile;
+    use crate::fs::vfs::ops::Whence;
     use crate::fs::vfs::ops::{FileOps, InodeOps, SetAttr, Stat, StatFs, SuperOps};
     use crate::fs::vfs::super_block::{SbActiveGuard, SbFlags, SuperBlock};
     use crate::fs::vfs::FsId;
     use crate::fs::{flags, FileDescTable, FileDescription, EINVAL, EOVERFLOW, ESPIPE};
-    use crate::fs::vfs::ops::Whence;
     use alloc::sync::Arc;
 
     // -----------------------------------------------------------------------
