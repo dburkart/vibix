@@ -327,7 +327,10 @@ fn strip_debug(kernel: &Path) -> R<()> {
 fn find_llvm_objcopy() -> Option<std::ffi::OsString> {
     // Ask rustc for its sysroot (e.g.
     // ~/.rustup/toolchains/nightly-aarch64-unknown-linux-gnu).
-    let output = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
