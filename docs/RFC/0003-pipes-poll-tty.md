@@ -193,13 +193,22 @@ pub const PIPE_BUF: usize = 4096;   // POSIX atomic-write bound
 /// and multiple writers (POSIX); the ring itself is protected by a
 /// single `IrqSafeMutex`, and the head/tail pair is also exposed as
 /// two `AtomicUsize` on separate cache lines for a lock-free poll.
+///
+/// The cache-line isolation is enforced with a wrapper newtype, since
+/// `#[repr(align(N))]` is only valid on type definitions, not struct
+/// fields. We reuse a `CachePadded<T>` following crossbeam-utils's pattern.
+#[repr(C, align(64))]
+pub struct CachePadded<T>(pub T);
+
 #[repr(C)]
 pub struct PipeRing {
     // Line 0: written by writer, read by writer + poll fast-path.
-    #[repr(align(64))] tail: AtomicUsize,
+    tail: CachePadded<AtomicUsize>,
     // Line 1: written by reader, read by reader + poll fast-path.
-    #[repr(align(64))] head: AtomicUsize,
-    // Bulk state.
+    head: CachePadded<AtomicUsize>,
+    // Bulk state. `buf` is heap-allocated and zero-initialised at
+    // pipe creation (`vec![0u8; PIPE_CAPACITY].into_boxed_slice()`)
+    // to prevent kernel-memory information disclosure.
     buf: Box<[UnsafeCell<u8>; PIPE_CAPACITY]>,
     lock: IrqSafeMutex<()>,
 }
@@ -208,15 +217,30 @@ pub struct Pipe {
     ring: PipeRing,
     rd_wait: WaitQueue,
     wr_wait: WaitQueue,
+    // readers/writers counts are mutated ONLY under `pipe.ring.lock` so
+    // the "last reader just closed" race described in §Security is
+    // impossible: a writer observes `readers` under the same lock it
+    // uses to copy bytes, so the EPIPE decision is consistent with
+    // the final ring state. The fields remain `AtomicUsize` so
+    // `pipe_poll` may read them lock-free via `Acquire`.
     readers: AtomicUsize,
     writers: AtomicUsize,
-    flags: AtomicU32,   // O_NONBLOCK, O_DIRECT (packet mode)
-    // Each record is (start, len); in packet mode this carries boundaries.
-    packets: IrqSafeMutex<Option<VecDeque<PacketHdr>>>,
+    // Packet-mode record list — inlined into the ring's lock-protected
+    // state to avoid a second mutex on the hot path (see §Lock order).
+    packets: Option<VecDeque<PacketHdr>>,  // guarded by `ring.lock`
 }
 
-pub struct PipeReadEnd(Arc<Pipe>);
-pub struct PipeWriteEnd(Arc<Pipe>);
+/// Per-fd flag state. Matches Linux: `O_NONBLOCK` is per-file-description,
+/// not per-pipe, so `dup2(a, b); fcntl(b, F_SETFL, O_NONBLOCK)` on one fd
+/// does not affect the other. `F_GETFL`/`F_SETFL` mutate this field only.
+pub struct PipeEnd {
+    pipe: Arc<Pipe>,
+    /// O_NONBLOCK | O_CLOEXEC | O_DIRECT (packet mode inherited at create).
+    flags: AtomicU32,
+}
+
+pub struct PipeReadEnd(PipeEnd);
+pub struct PipeWriteEnd(PipeEnd);
 ```
 
 Two fd backends (`PipeReadEnd`, `PipeWriteEnd`) share an `Arc<Pipe>`. On
@@ -266,10 +290,29 @@ enum PollMode {
 }
 
 struct PollEntry {
-    waitq: *const WaitQueue,   // back-pointer into pipe/tty
+    /// `Arc` keeps the WaitQueue (and transitively the Pipe/Tty) alive
+    /// until `PollTable::drop` runs `cancel_all`. This closes the
+    /// close-during-poll UAF: even if another thread `close()`s the fd
+    /// and drops the owning Arc, our reference keeps the queue valid
+    /// for the duration of the poll syscall.
+    waitq: Arc<WaitQueue>,
     token: WaitToken,          // handle for de-registration
 }
 ```
+
+**PollEntry lifetime rule.** A `PollEntry` holds an `Arc<WaitQueue>` for the
+lifetime of the `PollTable` that owns it. `close(2)` on a pipe or tty fd
+therefore cannot free the `WaitQueue` while any thread has a pending
+`sys_poll` registered against it. `PollTable::drop` calls `cancel_all()`
+which, under each queue's own IRQ-safe lock, unlinks every `WaitToken`
+before the Arc drops. The cancel-vs-fire race is resolved by the queue's
+internal lock: both `wake_one`/`wake_all` and `cancel` take it, so an
+ISR-side dispatch either completes before `cancel` or is suppressed by
+`cancel` removing the entry. `close` that races with an in-flight
+`recheck` observes the fd as closed (returns POLLNVAL without
+dereferencing any stale pointer) because fd resolution happens by table
+lookup on the *current* process fd table, not through any raw pointer in
+the `PollEntry`.
 
 Driver `.poll` methods register themselves exactly as in Linux:
 
@@ -280,6 +323,33 @@ fn poll(&self, pt: &mut PollTable) -> PollMask {
     self.current_mask()                 // READ_ONCE of the atomics
 }
 ```
+
+**Wait-latching invariant on the WaitQueue primitive.** `WaitQueue::register`
+returns a `WaitToken` and, critically, the semantics are: *any* `wake_one` or
+`wake_all` delivered after `register` returns and before the owning task
+parks in `sleep_until` must flip the task's wake-state such that
+`sleep_until` returns `Woken` *without sleeping*. This is the same
+`prepare_to_wait` + `schedule` discipline Linux uses
+(`include/linux/wait.h`). Without this property, the two-pass `recheck`
+would still admit a lost wakeup between the recheck and the park. The
+invariant is part of the `WaitQueue` contract and exercised by a unit
+test that fires a wake between `register` and `sleep_until`.
+
+**Formal invariant of the two-pass pattern (informal):** For every state
+transition *t* of a source (pipe bytes arriving, reader closing, termios
+change, …):
+
+- either *t* is published **before** the driver's `.poll` returns in the
+  Probe pass — in which case `scan` observes the readiness mask and the
+  syscall returns without waiting;
+- or *t* is published **after** the Wait-pass `register` call — in which
+  case *t*'s wake is delivered to a live `WaitToken` and reaches the
+  parked task (via the wait-latching rule above).
+
+There is no window in which *t* is neither observed nor delivered. This
+is the standard "publication with double-check" invariant; a lightweight
+TLA+ model over the two states `{registered, state_observed}` is
+deferred to Open Question #8.
 
 The **two-pass pattern** lives in the syscall body, not the driver:
 
@@ -338,11 +408,24 @@ pub trait LineDiscipline: Send + Sync {
 ```
 
 ```rust
-/// Termios bit layout matches Linux x86_64 ABI verbatim (see
-/// <asm-generic/termbits.h>): 4 × u32 flags + cc_t c_cc[NCCS] with
-/// NCCS = 19, c_line = 1 byte, ispeed/ospeed = u32. This is 36 bytes,
-/// and we preserve the Linux layout so a userspace built against Linux
-/// headers needs no shim.
+/// Termios layout. This matches Linux's kernel-side `struct termios2` /
+/// `ktermios`, NOT the userspace glibc `struct termios` from `<termios.h>`
+/// (which omits `c_ispeed`/`c_ospeed` unless `__USE_MISC` is set — they
+/// are populated via `TCGETS2`/`TCSETS2`, not the base `TCGETS`, on Linux).
+///
+/// We deliberately ship the termios2-shaped struct as vibix's canonical
+/// termios, and expose it through `TCGETS`/`TCSETS` directly. This is a
+/// documented deviation from strict Linux userspace-ABI compatibility:
+/// a program built against glibc's `<termios.h>` (the 36-byte shape
+/// without ispeed/ospeed) will read/write the first 36 bytes correctly
+/// and leave the baud-rate fields at zero. vibix's libc should provide
+/// a `struct termios` that *does* carry the ispeed/ospeed fields, and
+/// `cfsetispeed`/`cfsetospeed` operate on them directly (no speed-in-cflag
+/// back-compat dance). `TCGETS2`/`TCSETS2` are accepted as aliases for
+/// `TCGETS`/`TCSETS` to ease porting of Linux userspace.
+///
+/// c_line is retained as a 1-byte ldisc selector for Linux ABI shape;
+/// vibix currently supports only N_TTY (0).
 #[repr(C)]
 pub struct Termios {
     pub c_iflag: u32,
@@ -351,9 +434,11 @@ pub struct Termios {
     pub c_lflag: u32,
     pub c_line:  u8,
     pub c_cc:    [u8; 19],   // NCCS
-    pub c_ispeed: u32,
-    pub c_ospeed: u32,
+    pub c_ispeed: u32,       // default: B38400 (0x000f) on pipe creation
+    pub c_ospeed: u32,       // default: B38400
 }
+
+const _: () = assert!(core::mem::size_of::<Termios>() == 44);
 ```
 
 #### N_TTY
@@ -392,43 +477,163 @@ typical 1 or 2 lines in flight during interactive editing.
 
 ### Algorithms and Protocols
 
+#### Lock order (global, kernel-wide)
+
+All sleepable/IRQ-safe locks touched by this subsystem have a total
+order. **Outer → inner**:
+
+1. `process.fd_table_lock`
+2. `pipe.ring.lock` *or* `tty.termios` *or* `tty.ctrl` *or* `ntty.state`
+   (these are mutually exclusive — no code path holds two of them at once)
+3. WaitQueue-internal lock (always innermost; never held across any
+   other lock acquire)
+
+Driver `.poll` methods MUST NOT acquire any lock at levels 1 or 2 — they
+may only take the level-3 WaitQueue lock (via `register`) and read
+atomic indices. This prevents inversion with `sys_poll`'s wait-queue
+registration pass.
+
+`IrqSafeMutex` both disables preemption and (per its name) disables
+interrupts on acquire; wake-from-ISR paths therefore never block on an
+IrqSafeMutex held at the level-2 bulk-state layer because the ISR
+either (a) posts to the deferred-call queue (for ldisc work) or (b) only
+takes a level-3 WaitQueue lock (for cross-CPU wakes). The WaitQueue's
+internal lock is itself IRQ-safe and short-held (append/remove a
+waiter record).
+
+#### Pipe ring concurrency rule
+
+The pipe ring's lock-free poll path rests on a strict invariant about
+how the `head` and `tail` indices are mutated:
+
+1. **Only the last action of a completed mutation ever updates the
+   index.** The writer does `copy chunk into buf[tail..tail+n];
+   tail.store(tail + n, Release);` as the final pair of operations
+   inside the `pipe.ring.lock` critical section — no intermediate
+   `tail` stores are permitted, no mid-critical-section partial
+   advance.
+2. **Indices advance monotonically.** `tail` never decreases; `head`
+   never decreases; both are `AtomicUsize` (64-bit on x86-64), so
+   single-word loads are atomic and never torn.
+3. **Readiness is derived from the snapshot pair.** Poll reads
+   `h = head.load(Acquire); t = tail.load(Acquire);` — because head and
+   tail are never regressed, `fill = t.wrapping_sub(h)` is a valid
+   *consistent* snapshot in the sense that `fill ≤ CAPACITY` and any
+   observed state was real at some point between the two loads. The
+   poll mask is computed from `fill` and `fill == CAPACITY`
+   (POLLOUT/POLLIN respectively).
+4. **On x86-64 (TSO), `Release` on the index store inside the critical
+   section is sufficient for the lock-free reader to observe
+   data-then-index ordering.** This RFC's design targets x86-64 only;
+   a future port to weakly-ordered ISAs (ARMv8) will add an explicit
+   `fence(Release)` before `tail.store`. This caveat is stated so no
+   one copies the pattern to a non-TSO arch without re-checking.
+
+With these rules, `pipe_poll` is lock-free and race-free.
+
 #### Pipe read / write fast paths
 
-Both operate under `pipe.lock`. Poll readiness checks do NOT take the
-lock: they read `head`/`tail` via `Ordering::Acquire` and use the ring's
-invariant `fill = tail - head (wrapping)` to compute readiness. This
-matches Linux's `READ_ONCE(pipe->head_tail)` trick (see Background).
+Both operate under `pipe.ring.lock`. Poll readiness checks do NOT take
+the lock: they read `head`/`tail` via `Ordering::Acquire` per the rule
+above.
 
 ```
-Writer:
-  acquire pipe.lock
+Writer (total n bytes):
+  acquire pipe.ring.lock
   loop:
     fill = tail - head
     free = CAPACITY - fill
-    if free >= min_needed: break
-    if O_NONBLOCK: return EAGAIN
+    // EPIPE check is under-lock: `readers` is mutated only under this
+    // same lock by the reader-drop path, so the observation is coherent
+    // with the ring state.
     if readers == 0:
-       signal current with SIGPIPE (deferred past lock release)
-       return EPIPE
-    drop lock; wait on wr_wait; acquire lock
-  copy chunk into buf[tail..tail+n]
-  tail.store(tail + n, Release)
+      release lock
+      queue_signal(current, SIGPIPE)   // via pending-signal set
+      return EPIPE
+    // Atomicity rule: writes of `n ≤ PIPE_BUF` wait for free ≥ n
+    // (not merely free > 0), so every sub-PIPE_BUF write is visible
+    // as a single non-interleaved chunk in the ring.
+    need = if n <= PIPE_BUF { n } else { 1 };
+    if free >= need: break
+    if end.flags & O_NONBLOCK: release lock; return EAGAIN
+    let tok = wr_wait.register();       // under queue's own lock
+    release pipe.ring.lock
+    sleep_until(tok, no timeout)        // wake-latching (see invariant)
+    acquire pipe.ring.lock
+  let m = min(n, free);
+  copy_from_user(buf[tail..tail+m])     // STAC/CLAC via UserSlice
+  tail.store(tail + m, Release)         // the single publishing store
   release lock
-  rd_wait.wake_one()          // directed wake, not wake_all
+  // Wake every epoll/poll-table registrant + one blocking waiter.
+  rd_wait.wake_poll_then_one()
 ```
 
-`wake_one` is a deliberate divergence from Serenity and Redox, both of
-which wake_all on every transition. Wake-all is a thundering-herd
-hazard for pipes with many blocked readers and no correctness benefit;
-the Linux pipe wait queues use `wake_up_interruptible_sync_poll(...,
-EPOLLIN)` which conceptually wakes one waiter plus any epoll watchers.
+**`wake_poll_then_one`.** On every state transition, we run the
+poll-callback for *every* registered `PollEntry` (so every epoll
+watcher / DAPRA group waiter is notified and can make an edge-trigger
+decision) **and** wake exactly one blocking `read(2)` waiter. This
+mirrors Linux's `wake_up_interruptible_sync_poll(..., EPOLLIN)` — all
+pollers get the notification, only one blocking reader is woken to
+avoid thundering herd. Plain `wake_one` (as the v0 draft proposed) would
+lose edge-triggered wakes under multi-watcher epoll/DAPRA usage; that
+bug is fixed here.
+
+**Co-writer fairness.** Two concurrent writers on the same `Pipe`
+(via `dup(2)` or fd-passing) share a single `pipe.ring.lock` and a
+single `wr_wait` queue. `wr_wait` is FIFO-ordered (first to
+`register` is first to `wake`), and `pipe.ring.lock` hands the lock
+to the waiter just woken (ticket handoff). Together these guarantee
+no writer is starved by a co-writer performing a tight write loop — a
+concern raised by the Security review. Strictly speaking this is a
+property of the `WaitQueue` and `IrqSafeMutex` implementations; both
+are already FIFO in the current vibix codebase, and this RFC commits
+to preserving that property.
+
+**Reader drop path (symmetric correctness for EPIPE).** The last
+`PipeReadEnd` drop acquires `pipe.ring.lock`, decrements `readers`,
+drops the lock, then calls `wr_wait.wake_all()` (all blocked writers
+re-check under lock and return EPIPE together — there is no point in
+waking just one). The decrement-under-lock closes the "writer sees
+`readers > 0`, copies, then reader vanished" race: any writer that
+enters its critical section after the decrement observes `readers ==
+0` and returns EPIPE; any writer that entered before the decrement
+completes its atomic ≤PIPE_BUF write before releasing the lock, and
+the reader sees those bytes on its last read before EOF.
+
+#### Deferred-call queue (ISR → ldisc handoff)
+
+The ISR-to-ldisc handoff uses a per-device bounded ring (128 bytes per
+UART / PS-2 controller). When the ring is full, the ISR drops the
+**newest** byte — matching the behaviour of the downstream 4 KiB raw
+ring on ldisc overflow, so both overflow regimes look the same to
+userspace and neither can be used to grow kernel memory unboundedly.
+A dropped byte bumps a per-device counter surfaced via a future
+sysfs/debugfs node (out of scope here). On UART specifically, when
+the deferred ring crosses a high-water mark (96/128) we deassert RTS
+(if CRTSCTS is negotiated) so the remote side stops transmitting;
+this is the Serenity pattern the RFC Background references. PS-2 has
+no equivalent flow-control primitive and relies on drop.
+
+The ldisc worker runs in **soft-IRQ context**. vibix does not yet have
+a formal soft-IRQ subsystem; for this RFC, "soft-IRQ context" means
+*a pinned kernel worker thread per CPU that runs at a higher priority
+than normal kernel threads and is allowed to acquire level-2 sleepable
+locks*. The equivalent Linux concept is tasklets / workqueue. The
+concrete primitive will be introduced in a companion implementation
+issue (roadmap item: "Introduce soft-IRQ worker for ldisc + deferred-
+call queue"). Until it exists, the ldisc work runs on the task that
+triggered the interrupt via a late-IRQ-return hook — acceptable for
+the UP development configuration but not a final design.
 
 #### TTY input path (ISR → ldisc → ring)
 
 ```
 UART/PS-2 ISR:
   byte = read_data_register()
-  deferred_call_queue.push(|| tty.driver.recv_byte(byte))
+  if !deferred_call_queue.try_push(|| tty.driver.recv_byte(byte)):
+    // Bounded queue full: drop newest, increment drop counter,
+    // deassert RTS on UART if CRTSCTS is set.
+    tty.driver.isr_drop_count += 1
   eoi()
 
 Soft-IRQ worker:
@@ -470,25 +675,72 @@ NTty::write(tty, user_buf):
      && !current.blocks(SIGTTOU)
      && !current.orphaned_pgrp():
       kill_pgrp(current.pgrp, SIGTTOU)
-      return ERESTARTSYS
+      // Kernel-internal sentinel; translated at syscall-exit by the
+      // syscall trampoline (see below) — never returned to userspace.
+      return KERN_ERESTARTSYS
   drop t
-  for b in user_buf:
-    if OPOST:
-      if ONLCR and b == '\n': driver.put(b'\r'); driver.put(b'\n')
-      else if OCRNL and b == '\r': driver.put(b'\n')
-      else: driver.put(b)
-    else: driver.put(b)
+  ...  (OPOST pass, same as before)
   return user_buf.len()
 ```
 
+**`KERN_ERESTARTSYS` translation (kernel-internal, not user-visible).**
+The syscall trampoline in `kernel/src/arch/x86_64/syscall.rs` inspects
+every negative return code on the way out:
+
+- If the code is `KERN_ERESTARTSYS` **and** the signal that triggered
+  the restart was delivered with `SA_RESTART` set, the trampoline
+  rewinds `%rip` to the `syscall` instruction so the userspace
+  instruction re-issues the syscall after the signal handler returns.
+- Otherwise, the trampoline substitutes `-EINTR` as the syscall return
+  value to userspace.
+
+Userspace therefore sees either (a) a transparent restart, or (b)
+`EINTR` — never `ERESTARTSYS`. The errno table in §Kernel–Userspace
+Interface is updated to reflect this: the row for TTY background-write
+reads `EINTR (restartable if SA_RESTART)`. The same rule applies to
+any blocking pipe read/write or poll that is interrupted by a signal.
+
 #### Job control
 
-- `TIOCSCTTY` (ioctl) — if caller is session leader and tty has no session,
-  bind tty.ctrl.session = caller.session.
+- **Controlling-terminal acquisition on `open(2)`**. Matching Linux
+  convention: when a session leader (`getsid() == getpid()`) `open`s
+  a TTY without `O_NOCTTY`, and the session has no existing
+  controlling tty, and the tty has no existing session, the tty
+  becomes the session's controlling tty. Any other combination leaves
+  the ctty state unchanged. `O_NOCTTY` is a *functional* flag, not a
+  no-op: it suppresses acquisition. This closes the POSIX-shell
+  portability gap raised by the User Space reviewer.
+- `TIOCSCTTY` (ioctl) — if caller is session leader and tty has no
+  session, bind `tty.ctrl.session = caller.session`. The Linux
+  `force` argument (root-steal) is **not** supported.
+- `TIOCNOTTY` — release the controlling tty for the calling process's
+  session; also called automatically when the session leader exits.
 - `TIOCSPGRP` — tty.ctrl.session must equal caller.session AND target pgrp
   must be in caller.session; else EPERM. If caller is background and not
   ignoring/blocking SIGTTOU, deliver SIGTTOU first (per POSIX `tcsetpgrp`).
 - `TIOCGPGRP` / `TIOCGSID` — read-only.
+
+#### FIFO open rendezvous (POSIX `open(2)` on a FIFO)
+
+A FIFO created via `mkfifo(3)` / `mknod(2)` is a VFS inode whose
+backing is a shared `Arc<Pipe>` (the same type as the anonymous pipe
+above). `open(2)` semantics are the POSIX-required rendezvous:
+
+| Mode | O_NONBLOCK clear | O_NONBLOCK set |
+|---|---|---|
+| `O_RDONLY` | block until a writer opens | return immediately (success) |
+| `O_WRONLY` | block until a reader opens | return `-ENXIO` if no reader |
+| `O_RDWR` | return immediately (Linux-compatible extension) | return immediately |
+
+Implementation: the FIFO's `Pipe` carries `open_waiters_r: WaitQueue`
+and `open_waiters_w: WaitQueue`. `O_RDONLY` increments `readers`, wakes
+any waiter on `open_waiters_w`, then (if O_NONBLOCK clear and
+`writers == 0`) blocks on `open_waiters_r` until `writers > 0`.
+Symmetric on the write side. The fd is installed in the caller's fd
+table only after the rendezvous completes.
+
+A signal during the rendezvous returns `KERN_ERESTARTSYS` and follows
+the same translation rule as above (user sees EINTR or a restart).
 
 #### Deadline-aware poll readiness (novel contribution)
 
@@ -499,9 +751,36 @@ but only needs to be woken once per "batch" — the remaining N-1 wake-ups
 are wasted work. io_uring's multishot poll partially addresses this per
 ring; epoll's EPOLLEXCLUSIVE addresses thundering herd but not batching.
 
-Academic search found no prior art for attaching a **soft-deadline hint**
-to individual pollfd entries and letting the scheduler **aggregate the
-wake** across a poll group within that latency budget.
+**Prior art and positioning.** The core trade — "accept a bounded
+latency budget in exchange for amortized wake/IRQ cost" — has well-
+established analogs at other layers:
+
+- **Adaptive NIC interrupt moderation / coalescing** (Mogul &
+  Ramakrishnan, "Eliminating Receive Livelock in an Interrupt-Driven
+  Kernel," TOCS 1997; Intel's `InterruptThrottleRate`; DPDK's adaptive
+  polling) applies the same idea *at the device IRQ layer*, with a
+  single device-wide moderation parameter.
+- **Soft timers** (Aron & Druschel, "Soft Timers: efficient microsecond
+  software timer support for network processing," SOSP 1999 / TOCS
+  2000) provide the exact cheap per-group deadline-firing mechanism
+  DAPRA relies on internally.
+- **EPOLLEXCLUSIVE** (Linux ~4.5) picks one thread out of many
+  watchers to avoid thundering herd, but does not batch events.
+- **`io_uring` multishot poll** (Axboe, Kernel Recipes 2020+) amortizes
+  submission/completion within one ring, but the wake itself is still
+  per-event and per-ring.
+- **Pariag et al.**, EuroSys 2007 ("Comparing the Performance of Web
+  Server Architectures") — thundering-herd measurements that motivate
+  wake-one pipe semantics.
+
+DAPRA is a new point in this known design space, not unclaimed
+territory. What it adds is (a) a **per-fd deferral hint**, rather than
+a single device-wide knob, (b) composition across a **poll group**
+shared by cooperating threads in a process, and (c) integration with
+readiness notification (not device IRQs or scheduler deadlines). The
+novelty claim is this specific composition — readiness-notification
+batching with a per-fd budget, aggregated at the kernel level across a
+poll group — not the underlying idea of deferred wake.
 
 **Proposal.** Extend `struct pollfd` with an optional per-fd deadline via
 a new variant syscall:
@@ -519,9 +798,15 @@ pub struct PollFdDeadline {
     pub _pad: i16,
     /// Max wake-defer window in nanoseconds. 0 = "wake me immediately"
     /// (classic poll). Nonzero = "you may defer my wake by up to N ns
-    /// past readiness if you're batching".
+    /// past readiness if you're batching". Hard cap: DAPRA_MAX_DEFER_NS
+    /// = 10_000_000 (10 ms); values above are rejected with -EINVAL on
+    /// syscall entry.
     pub deferral_ns: u32,
 }
+
+const DAPRA_MAX_DEFER_NS: u32 = 10_000_000;  // 10 ms
+
+const _: () = assert!(core::mem::size_of::<PollFdDeadline>() == 16);
 
 sys_poll_deadline(fds: *mut PollFdDeadline, nfds: usize,
                   timeout_ns: i64, group: PollGroupToken) -> isize;
@@ -544,32 +829,44 @@ sys_poll_deadline(fds: *mut PollFdDeadline, nfds: usize,
 5. POLLERR, POLLHUP, POLLNVAL are **never deferred**: an error path must
    not be held back for a latency budget.
 
-**Why this is novel and better than the state of the art.**
-
-- `epoll` + timerfd: gives you a global wake budget but not per-fd; every
-  fd pays the same deferral.
-- `io_uring` multishot poll: amortizes submission/completion within one
-  ring; the wake itself is still per-event.
-- `EPOLLEXCLUSIVE`: picks *one* waiter out of many on the same fd; does
-  not batch events.
-- DAPRA lets a server say, e.g., "stdin has 0 ns deferral (interactive
-  latency), network sockets have 200 µs, internal work-stealing channels
-  have 1 ms — wake me coherently". The kernel has the information to do
-  the right thing because the scheduler *already* knows who's sleeping.
+**Expected benefit (conditional, pending measurement).** We conjecture
+DAPRA reduces wake count for workloads with ≥ 2 fds becoming ready
+within the deferral window — this is the condition for any batching
+scheme to beat single-event delivery. DAPRA is not strictly beneficial:
+when bursts never exceed 1 ready fd per window it reduces to classic
+poll with an added timer cost. The concrete microbenchmark target
+(see §Performance Considerations) is subject to measurement in the
+`pipe-broadcast` bench before any claim of superiority is made.
 
 **Invariants and failure modes.**
 
-- Deferral is soft: the waiter is always eventually woken if ready. A
-  stuck deadline timer must not starve a ready waiter; the timer is
-  per-group and bounded by `max(deferral_ns in group)`.
-- If the process receives a signal during the deferral window, the wake
-  is promoted to immediate (signal delivery trumps deferral).
-- Deferral never extends `timeout` — if timeout expires during a batch
-  window, the waiter is woken at the earlier of (timeout, batch deadline).
-- `PollGroupToken` is a per-process opaque token allocated via a small
-  `sys_poll_group_create` / `sys_poll_group_destroy` pair. Tokens are
-  process-scoped (not inheritable across fork) to keep the group
-  membership model simple.
+- **Liveness bound.** For every waiter *w* in group *g*, the wake-time
+  obeys `wake_time(w) ≤ min(arrival_time(w) + timeout(w),
+  first_ready(g) + min_deferral(g), signal_time(w))`. This is the
+  complete set of bounds: there is no way for a waiter to be deferred
+  past any of them.
+- **Complete list of deferral-exempt wake sources** (nothing may delay
+  these): POLLERR, POLLHUP, POLLNVAL, signal delivery to the waiter,
+  `timeout` expiry, and *peer-blocked-on-me promotion* (see next).
+- **Peer-blocked-on-me promotion (cross-process DoS prevention).** When
+  thread A has a deferred wake pending on fd *F* and thread B is
+  blocked on *F*'s complementary direction (B is waiting for A to
+  read so B can write, or vice versa), A's deferral is promoted to
+  immediate on the ISR side: the moment B registers on the
+  `WaitQueue`, the kernel checks "does any member of the peer waiter
+  set have a pending-deferred readiness that would unblock B?" and, if
+  so, cancels the deferral timer and wakes A now. This prevents the
+  attack described in the Security review (attacker A defers its own
+  read wake, transitively starving victim B's write).
+- **Hard cap on `deferral_ns`.** `DAPRA_MAX_DEFER_NS = 10 ms`. Any
+  value above is rejected with EINVAL. This bounds worst-case waiter
+  latency at 10 ms even in the absence of peer-blocked-on-me
+  promotion, keeping DAPRA in the "interactive" latency regime.
+- **`PollGroupToken` lifecycle.** Tokens are per-process and opaque.
+  Not inheritable across `fork`. Across `execve`, all tokens are
+  revoked (the kernel tears down group state alongside the rest of
+  the process's ephemeral kernel state). Bounded at 64 groups per
+  process; further `poll_group_create` returns EMFILE.
 
 **Scope for this RFC.** We ship `sys_poll_deadline` and the group-token
 syscalls as *additive* — classic POSIX `sys_poll` is unchanged and works
@@ -585,7 +882,26 @@ exists; new numbers allocated from vibix's reserved range for DAPRA):
 | # | Name | Linux # | Notes |
 |---|---|---|---|
 | 22 | `pipe` | 22 | `int pipe(int fds[2]);` Linux ABI exact. |
-| 293 | `pipe2` | 293 | `int pipe2(int fds[2], int flags);` |
+| 293 | `pipe2` | 293 | `int pipe2(int fds[2], int flags);` accepts `O_NONBLOCK`, `O_CLOEXEC`, `O_DIRECT`. |
+
+**`pipe(2)` vs `pipe2(2)` flag semantics (POSIX XSH §pipe, explicit).**
+`sys_pipe(fds)` with no flag argument MUST return two fds with:
+- `O_NONBLOCK` **clear** on both file descriptions (blocking I/O by default);
+- `FD_CLOEXEC` **clear** on both file descriptors (inherited across `execve`).
+
+`sys_pipe2(fds, flags)` honours the three flag bits atomically at create
+time (no `fcntl` round-trip):
+- `O_NONBLOCK` in `flags` → set on both file descriptions.
+- `O_CLOEXEC` in `flags` → set `FD_CLOEXEC` on both fds.
+- `O_DIRECT` in `flags` → select packet-mode semantics (deferred to a
+  future RFC; v1 rejects this bit with `EINVAL` rather than silently
+  accepting it).
+
+Any other bit in `flags` → `EINVAL`. Both fds end up in the calling
+process's fd table in a single atomic installation step — fork/exec
+races that would leak one end to a child are impossible because
+`FD_CLOEXEC` is set before the syscall returns to userspace.
+
 | 7 | `poll` | 7 | `int poll(struct pollfd *, nfds_t, int timeout_ms);` |
 | 271 | `ppoll` | 271 | adds sigmask + timespec. |
 | 23 | `select` | 23 | Classic BSD shape. Layered on poll. |
@@ -686,14 +1002,30 @@ We expose the standard bit values verbatim:
 
 ## Performance Considerations
 
-- **Pipe single-pair throughput.** Target: ≥ 2 GB/s on a single core for
-  bulk `write(pipe, buf, 64K); read(pipe, buf, 64K)` loops under QEMU-KVM
-  on a modern x86-64 host. Dominated by two `memcpy`s per round-trip; with
-  FSRM-aware `rep movsb` and cache-resident `buf`, this is achievable.
-- **Pipe small-message latency.** Target: < 1 µs RTT on a pipe ping-pong
-  with 8-byte payloads, single core. Two context switches + two 8-byte
-  copies + two wakes. Limiting factor is the context-switch cost, not the
-  pipe itself.
+- **Pipe single-pair throughput (speculative, pending measurement).**
+  Aspirational target: ≥ 2 GB/s on a single core for bulk
+  `write(pipe, buf, 64K); read(pipe, buf, 64K)` loops under QEMU-KVM on a
+  modern x86-64 host. This is not an SLA — it is an upper-bound
+  plausibility estimate based on two cache-resident `memcpy`s per
+  round-trip with FSRM-aware `rep movsb`. For calibration, Linux
+  `fs/pipe.c` on bare metal reports ~5–10 GB/s on the same workload; a
+  factor-of-3 to factor-of-5 gap is expected for a younger Rust
+  implementation under a virtualized guest. The commitment is to
+  **measure and publish** `pipe-bulk` benchmark results as part of the
+  implementation PR; if the first measurement comes in below 500 MB/s we
+  investigate before landing, and if it comes in between 500 MB/s and
+  2 GB/s we document the gap and land anyway.
+- **Pipe small-message latency (revised, with budget).** Target:
+  **2–5 µs** RTT on a pipe ping-pong with 8-byte payloads, single core.
+  Budget per round-trip: 2× context switch (≈400-800 ns on modern
+  x86-64 with PCID), 2× wake (≈100-300 ns each), 2× STAC/CLAC +
+  `copy_from/to_user` of 8 bytes (≈100 ns), 2× `IrqSafeMutex`
+  lock/unlock pair (≈50-100 ns uncontested), 2× waitqueue register +
+  cancel (≈200 ns). Sum: ≈2-4 µs before any I-cache/TLB effects. A
+  sub-microsecond target would require avoiding the context switch
+  entirely (e.g., busy-wait on a shared user-kernel ring, out of scope
+  for this RFC), so we publicly commit to 2-5 µs and treat <2 µs as a
+  stretch goal for a later optimization pass.
 - **Poll syscall cost.** Classic `poll` is O(nfds) per call — this is
   fundamental to the API. We amortize with (a) stack-allocated
   `ArrayVec<PollEntry, 8>` fast path for ≤ 8 fds (matches Linux
