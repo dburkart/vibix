@@ -198,7 +198,17 @@ fn legacy_dev_backend(path: &[u8], flags: u64) -> Option<i64> {
     let safe_flags =
         (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
     let backend: Arc<dyn FileBackend> = Arc::new(crate::fs::SerialBackend::new());
-    Some(install_fd(backend, safe_flags))
+    let rc = install_fd(backend, safe_flags);
+    // Linux `open(tty, !O_NOCTTY)` on a session leader with no existing
+    // ctty acquires the tty as the session's controlling terminal. Every
+    // legacy /dev/* path points at the same console tty until multi-tty
+    // support lands (#374).
+    if rc >= 0 && (flags as u32) & oflags::O_NOCTTY == 0 {
+        let caller = crate::process::current_pid();
+        let tty = crate::tty::console_tty();
+        let _ = crate::tty::acquire_ctty_on_open(caller, &tty);
+    }
+    Some(rc)
 }
 
 /// Shared `open` body: used by `sys_open` (dfd == AT_FDCWD) and

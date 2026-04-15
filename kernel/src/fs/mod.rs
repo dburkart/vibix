@@ -124,6 +124,10 @@ pub mod flags {
     pub const O_DIRECTORY: u32 = 0o200000;
     /// Do not follow a symlink in the final path component (`ELOOP`).
     pub const O_NOFOLLOW: u32 = 0o400000;
+    /// Do not acquire the opened tty as the caller session's controlling
+    /// terminal. Linux convention: `open(tty, !O_NOCTTY)` on a session
+    /// leader with no ctty implicitly attaches; `O_NOCTTY` suppresses.
+    pub const O_NOCTTY: u32 = 0o400;
     /// Close this fd on the next `exec()`.
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// Open a stat-only fd (no I/O permitted).
@@ -565,7 +569,71 @@ impl FileBackend for SerialBackend {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, i64> {
-        use crate::tty::termios::{Termios, TCGETS, TCSETS, TCSETSF, TCSETSW};
+        use crate::tty::termios::{
+            Termios, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGSID, TIOCNOTTY, TIOCSCTTY,
+            TIOCSPGRP,
+        };
+        // Job-control ioctls act on the shared console tty. #374/#403 will
+        // replace this with a per-driver Tty lookup; until then every legacy
+        // /dev/{tty,console,serial,std*} fd shares one tty identity.
+        let caller = crate::process::current_pid();
+        match cmd {
+            TIOCSCTTY => {
+                let force = arg != 0;
+                // No credentials subsystem yet → treat all callers as root.
+                // Once UIDs land, this `true` becomes `uid == 0`.
+                let is_root = true;
+                let tty = crate::tty::console_tty();
+                return Ok(crate::tty::tiocsctty_for(caller, &tty, force, is_root));
+            }
+            TIOCSPGRP => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                let mut pgid_bytes = [0u8; 4];
+                unsafe { crate::arch::x86_64::uaccess::copy_from_user(&mut pgid_bytes, arg) }
+                    .map_err(|e| e.as_errno())?;
+                let pgid = u32::from_ne_bytes(pgid_bytes);
+                let tty = crate::tty::console_tty();
+                return Ok(crate::tty::tiocspgrp_for(caller, &tty, pgid));
+            }
+            TIOCGPGRP => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                let tty = crate::tty::console_tty();
+                let rc = crate::tty::tiocgpgrp_for(&tty);
+                if rc < 0 {
+                    return Ok(rc);
+                }
+                let pgid = rc as u32;
+                unsafe {
+                    crate::arch::x86_64::uaccess::copy_to_user(arg, &pgid.to_ne_bytes())
+                }
+                .map_err(|e| e.as_errno())?;
+                return Ok(0);
+            }
+            TIOCGSID => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                let tty = crate::tty::console_tty();
+                let rc = crate::tty::tiocgsid_for(&tty);
+                if rc < 0 {
+                    return Ok(rc);
+                }
+                let sid = rc as u32;
+                unsafe {
+                    crate::arch::x86_64::uaccess::copy_to_user(arg, &sid.to_ne_bytes())
+                }
+                .map_err(|e| e.as_errno())?;
+                return Ok(0);
+            }
+            TIOCNOTTY => {
+                return Ok(crate::tty::tiocnotty_for(caller));
+            }
+            _ => {}
+        }
         match cmd {
             TCGETS => {
                 if arg == 0 {
