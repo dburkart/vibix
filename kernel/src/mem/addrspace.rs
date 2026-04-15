@@ -1089,7 +1089,7 @@ mod tests {
     fn find_hits_exact_start() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma);
+        aspace.insert(vma);
         let hit = aspace.find(0x1_0000).expect("start is inclusive");
         assert_eq!(hit.start, 0x1_0000);
     }
@@ -1098,7 +1098,7 @@ mod tests {
     fn find_hits_interior() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x3_0000);
-        aspace.vmas.insert(vma);
+        aspace.insert(vma);
         let hit = aspace.find(0x2_5000).expect("addr is inside the vma");
         assert_eq!(hit.start, 0x1_0000);
         assert_eq!(hit.end, 0x3_0000);
@@ -1109,7 +1109,7 @@ mod tests {
         // `end` is exclusive — the very last byte is in, the end address is out.
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma);
+        aspace.insert(vma);
         assert!(aspace.find(0x2_0000).is_none());
         assert!(aspace.find(0x1_ffff).is_some());
     }
@@ -1118,7 +1118,7 @@ mod tests {
     fn find_misses_before_start() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         let vma = anon(0x1_0000, 0x2_0000);
-        aspace.vmas.insert(vma);
+        aspace.insert(vma);
         assert!(aspace.find(0x0fff).is_none());
     }
 
@@ -1128,8 +1128,8 @@ mod tests {
         // Use distinct Arc objects so VmaTree does not merge them.
         let a = anon(0x1_0000, 0x2_0000);
         let b = anon(0x5_0000, 0x6_0000);
-        aspace.vmas.insert(a);
-        aspace.vmas.insert(b);
+        aspace.insert(a);
+        aspace.insert(b);
         // In the gap: predecessor is A, but addr >= A.end → miss.
         assert!(aspace.find(0x3_0000).is_none());
         // Inside B.
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn find_unmapped_region_skips_existing_vma() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
-        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
+        aspace.insert(anon(0x4000_0000, 0x4000_2000));
         assert_eq!(aspace.find_unmapped_region(4096), Some(0x4000_2000));
     }
 
@@ -1206,8 +1206,8 @@ mod tests {
     fn find_unmapped_region_uses_gap_between_vmas() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
         // Two VMAs with a 2-page gap at [0x4000_2000, 0x4000_4000).
-        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
-        aspace.vmas.insert(anon(0x4000_4000, 0x4000_6000));
+        aspace.insert(anon(0x4000_0000, 0x4000_2000));
+        aspace.insert(anon(0x4000_4000, 0x4000_6000));
         // Request fits in the gap.
         assert_eq!(aspace.find_unmapped_region(4096), Some(0x4000_2000));
         assert_eq!(aspace.find_unmapped_region(2 * 4096), Some(0x4000_2000));
@@ -1216,8 +1216,8 @@ mod tests {
     #[test]
     fn find_unmapped_region_skips_too_small_gap() {
         let mut aspace = AddressSpace::new_for_test(0x4000_0000);
-        aspace.vmas.insert(anon(0x4000_0000, 0x4000_2000));
-        aspace.vmas.insert(anon(0x4000_3000, 0x4000_5000));
+        aspace.insert(anon(0x4000_0000, 0x4000_2000));
+        aspace.insert(anon(0x4000_3000, 0x4000_5000));
         // Single-page gap at 0x4000_2000 too small for 2 pages — jump
         // past the second VMA.
         assert_eq!(aspace.find_unmapped_region(2 * 4096), Some(0x4000_5000));
@@ -1229,7 +1229,7 @@ mod tests {
         // USER_VA_END — any request should fail.
         let near_top = USER_VA_END as usize - 2 * 4096;
         let mut aspace = AddressSpace::new_for_test(near_top as u64);
-        aspace.vmas.insert(anon(near_top, near_top + 4096));
+        aspace.insert(anon(near_top, near_top + 4096));
         // Only one page free between [near_top+4096, USER_VA_END); a
         // two-page request must return None.
         assert_eq!(aspace.find_unmapped_region(2 * 4096), None);
