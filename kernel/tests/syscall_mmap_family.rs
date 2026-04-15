@@ -112,6 +112,27 @@ fn run_tests() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Write a single byte to a user VA with interrupts disabled.
+///
+/// `copy_to_user` / `copy_from_user` bracket their work with STAC/CLAC
+/// (RFLAGS.AC). The AC bit is per-CPU: a context switch during the
+/// STAC/CLAC window would clobber it on the new CPU, defeating SMAP.
+/// Disabling interrupts for the duration keeps us on the same CPU.
+fn write_user_byte(uva: usize, byte: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        uaccess::copy_to_user(uva, &[byte]).expect("copy_to_user failed");
+    });
+}
+
+/// Read a single byte from a user VA with interrupts disabled.
+fn read_user_byte(uva: usize) -> u8 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut buf = [0u8; 1];
+        uaccess::copy_from_user(&mut buf, uva).expect("copy_from_user failed");
+        buf[0]
+    })
+}
+
 fn mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i64, off: u64) -> i64 {
     unsafe { syscall_dispatch(9, addr, len, prot as u64, flags as u64, fd as u64, off) }
 }
@@ -195,14 +216,10 @@ fn mmap_shared_anon_succeeds() {
     );
     assert!(r > 0, "anon-shared mmap failed: {}", r);
     // Touch the page; should demand-fault without panicking.
-    // copy_to/from_user bracket the access with STAC/CLAC so SMAP is
-    // satisfied when ring-0 test code writes to a USER_ACCESSIBLE page.
-    unsafe {
-        uaccess::copy_to_user(r as usize, &[0x7Fu8]).expect("copy_to_user failed");
-        let mut buf = [0u8; 1];
-        uaccess::copy_from_user(&mut buf, r as usize).expect("copy_from_user failed");
-        assert_eq!(buf[0], 0x7F);
-    }
+    // Helpers bracket with STAC/CLAC (SMAP) and disable interrupts so a
+    // context switch cannot clobber the per-CPU AC bit mid-copy.
+    write_user_byte(r as usize, 0x7F);
+    assert_eq!(read_user_byte(r as usize), 0x7F);
     let _ = munmap(r as u64, 4096);
 }
 
@@ -210,9 +227,7 @@ fn mmap_fixed_noreplace_overlap_eexist() {
     let a = anon_rw(4096);
     // Write a marker into the original page so we can prove it survives the
     // failed MAP_FIXED_NOREPLACE call.
-    unsafe {
-        uaccess::copy_to_user(a as usize, &[0xA5u8]).expect("copy_to_user failed");
-    }
+    write_user_byte(a as usize, 0xA5);
     // Re-requesting the same VA with MAP_FIXED_NOREPLACE must fail EEXIST.
     let r = mmap(
         a,
@@ -232,11 +247,7 @@ fn mmap_fixed_noreplace_overlap_eexist() {
         assert_eq!(vma.start, a as usize);
         assert_eq!(vma.end, (a as usize) + 4096);
     }
-    unsafe {
-        let mut buf = [0u8; 1];
-        uaccess::copy_from_user(&mut buf, a as usize).expect("copy_from_user failed");
-        assert_eq!(buf[0], 0xA5);
-    }
+    assert_eq!(read_user_byte(a as usize), 0xA5);
     // Bare MAP_FIXED at the same VA should succeed (silently evicts) and
     // return the requested address.
     let r = mmap(
@@ -281,12 +292,8 @@ fn mmap_fixed_noreplace_fresh_addr_succeeds() {
         r
     );
     // The mapping must be usable: demand-fault + read-back.
-    unsafe {
-        uaccess::copy_to_user(target as usize, &[0x5Au8]).expect("copy_to_user failed");
-        let mut buf = [0u8; 1];
-        uaccess::copy_from_user(&mut buf, target as usize).expect("copy_from_user failed");
-        assert_eq!(buf[0], 0x5A);
-    }
+    write_user_byte(target as usize, 0x5A);
+    assert_eq!(read_user_byte(target as usize), 0x5A);
     let _ = munmap(target, 4096);
     let _ = munmap(anchor, 4096);
 }
@@ -327,9 +334,7 @@ fn munmap_splits_middle_of_vma() {
 fn mprotect_partial_vma_succeeds() {
     // 4 pages RW — mprotect middle 2 to RO; both fragments must still exist.
     let a = anon_rw(4 * 4096);
-    unsafe {
-        uaccess::copy_to_user(a as usize, &[0xAAu8]).expect("copy_to_user failed");
-    }
+    write_user_byte(a as usize, 0xAA);
     let r = mprotect(a + 4096, 2 * 4096, PROT_READ);
     assert_eq!(r, 0, "mprotect partial VMA failed: {}", r);
 
@@ -385,20 +390,12 @@ fn mprotect_unknown_prot_bits_einval() {
 fn madvise_dontneed_rezeroes_page() {
     // Write a byte, MADV_DONTNEED the page, touch it again, verify zero.
     let a = anon_rw(4096);
-    unsafe {
-        uaccess::copy_to_user(a as usize, &[0x42u8]).expect("copy_to_user failed");
-        let mut buf = [0u8; 1];
-        uaccess::copy_from_user(&mut buf, a as usize).expect("copy_from_user failed");
-        assert_eq!(buf[0], 0x42);
-    }
+    write_user_byte(a as usize, 0x42);
+    assert_eq!(read_user_byte(a as usize), 0x42);
     let r = madvise(a, 4096, MADV_DONTNEED);
     assert_eq!(r, 0);
-    unsafe {
-        // The next read must see 0 — a fresh zero-filled frame.
-        let mut buf = [0u8; 1];
-        uaccess::copy_from_user(&mut buf, a as usize).expect("copy_from_user failed");
-        assert_eq!(buf[0], 0);
-    }
+    // The next read must see 0 — a fresh zero-filled frame.
+    assert_eq!(read_user_byte(a as usize), 0);
     let _ = munmap(a, 4096);
 }
 
@@ -418,32 +415,26 @@ fn malloc_workload_alloc_free_regrow() {
     const LEN: usize = PAGES * 4096;
 
     let a = anon_rw(LEN as u64);
-    unsafe {
-        for p in 0..PAGES {
-            let pattern = (p as u8).wrapping_mul(0x37).wrapping_add(0x11);
-            uaccess::copy_to_user((a as usize) + p * 4096, &[pattern])
-                .expect("copy_to_user failed");
-        }
-        for p in 0..PAGES {
-            let pattern = (p as u8).wrapping_mul(0x37).wrapping_add(0x11);
-            let mut buf = [0u8; 1];
-            uaccess::copy_from_user(&mut buf, (a as usize) + p * 4096)
-                .expect("copy_from_user failed");
-            assert_eq!(buf[0], pattern);
-        }
+    for p in 0..PAGES {
+        let pattern = (p as u8).wrapping_mul(0x37).wrapping_add(0x11);
+        write_user_byte((a as usize) + p * 4096, pattern);
+    }
+    for p in 0..PAGES {
+        let pattern = (p as u8).wrapping_mul(0x37).wrapping_add(0x11);
+        assert_eq!(read_user_byte((a as usize) + p * 4096), pattern);
     }
 
     assert_eq!(munmap(a, LEN as u64), 0);
 
     let b = anon_rw((LEN * 2) as u64);
-    unsafe {
-        // Entire arena must be zero-initialised on first touch.
-        for p in 0..(PAGES * 2) {
-            let mut buf = [0u8; 1];
-            uaccess::copy_from_user(&mut buf, (b as usize) + p * 4096)
-                .expect("copy_from_user failed");
-            assert_eq!(buf[0], 0, "fresh mmap page {} not zero", p);
-        }
+    // Entire arena must be zero-initialised on first touch.
+    for p in 0..(PAGES * 2) {
+        assert_eq!(
+            read_user_byte((b as usize) + p * 4096),
+            0,
+            "fresh mmap page {} not zero",
+            p
+        );
     }
     let _ = munmap(b, (LEN * 2) as u64);
 }
