@@ -123,7 +123,7 @@ pub struct PollTable {
 /// the queue fires a `wake_*` — stored at registration time and handed to
 /// `WaitQueue::register_poll` so it lands on the queue's poller record.
 #[cfg(any(test, target_os = "none"))]
-pub struct PollEntry {
+pub(crate) struct PollEntry {
     queue: Arc<WaitQueue>,
     token: WaitToken,
 }
@@ -276,7 +276,7 @@ impl WaitQueue {
     /// The returned `WaitToken` is remembered by the `PollTable` and
     /// passed to `cancel` when the table is dropped. Production callers
     /// should use `PollTable` rather than calling this directly.
-    pub fn register_poll(&self, wake_tid: usize) -> WaitToken {
+    pub(crate) fn register_poll(&self, wake_tid: usize) -> WaitToken {
         let mut inner = self.inner.lock();
         let token = Self::mint_token(&mut inner);
         inner.pollers.push_back((token, wake_tid));
