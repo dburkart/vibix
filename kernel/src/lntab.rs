@@ -35,11 +35,13 @@ use core::slice;
 const MAGIC: &[u8; 4] = b"LNTB";
 const VERSION: u8 = 1;
 
-/// Fixed reservation for the line table. Patched in place by xtask. A
-/// debug kernel's line-table rows (post-dedup) typically total a few
-/// hundred KiB; 1 MiB gives comfortable headroom. If it overflows, xtask
+/// Fixed reservation for the line table. Patched in place by xtask.
+/// Integration-test binaries pull in more code paths than the main
+/// kernel and produce notably larger line tables — the main kernel
+/// lands around ~990 KiB today while the largest test ELF needs
+/// ~1.15 MiB. 2 MiB gives both headroom. If it overflows, xtask
 /// aborts with a clear "bump LNTAB_BYTES" error.
-pub const LNTAB_BYTES: usize = 1024 * 1024;
+pub const LNTAB_BYTES: usize = 2 * 1024 * 1024;
 
 /// Fixed-size reservation patched in place by xtask after linking. The
 /// explicit non-zero magic in the first four bytes forces LLVM to emit
