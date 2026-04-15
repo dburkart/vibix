@@ -25,11 +25,11 @@ use crate::tty::ring::DeferredByteRing;
 use crate::tty::TtyDriver;
 
 #[cfg(target_os = "none")]
-use alloc::sync::Arc;
-#[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
 use crate::tty::{LineDiscipline, PassthroughLdisc, Tty};
+#[cfg(target_os = "none")]
+use alloc::sync::Arc;
 #[cfg(target_os = "none")]
 use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 #[cfg(target_os = "none")]
