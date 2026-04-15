@@ -952,10 +952,17 @@ fn rwlock_writer_not_starved() {
     // writer should win the lock next (readers queue behind it due to
     // writer_waiting), complete, then readers drain.
     RW_STARVE_GO.store(1, Ordering::SeqCst);
-    // Give workers a chance to run and park inside their lock calls.
-    for _ in 0..20 {
-        x86_64::instructions::hlt();
-    }
+    // Wait until every worker has actually parked on the rwlock
+    // (1 writer + RW_STARVE_READERS). A fixed-hlt grace period was
+    // flaky under heavy CI load — workers sometimes hadn't reached
+    // `block_current` yet when the driver dropped its guard, so a
+    // notify_all found an empty waitqueue and the workers lost the
+    // wake. Polling `waiter_count` closes that window deterministically.
+    wait_for_parked(
+        || RW_STARVE.waiter_count(),
+        1 + RW_STARVE_READERS as usize,
+        4_000,
+    );
     drop(g);
 
     for _ in 0..4_000 {
