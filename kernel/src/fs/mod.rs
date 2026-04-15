@@ -33,6 +33,14 @@ pub trait FileBackend: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64>;
     fn write(&self, buf: &[u8]) -> Result<usize, i64>;
 
+    /// Device-specific control. `cmd` follows Linux's `_IOC` encoding; `arg`
+    /// is the third `ioctl(2)` argument, typically a userspace pointer. The
+    /// default returns `-ENOTTY`, which POSIX defines as "inappropriate ioctl
+    /// for device" — the correct error for fds that expose no `ioctl` surface.
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<i64, i64> {
+        Err(ENOTTY)
+    }
+
     /// Report the backend's current readiness for `sys_poll`/`select`.
     ///
     /// Called in both passes of RFC 0003's two-pass poll (see
@@ -143,6 +151,8 @@ pub const ELOOP: i64 = -40;
 pub const EACCES: i64 = -13;
 pub const EBUSY: i64 = -16;
 pub const EOVERFLOW: i64 = -75;
+pub const ENOTTY: i64 = -25;
+pub const EFAULT: i64 = -14;
 
 /// Per-process file-descriptor array.
 ///
@@ -342,8 +352,33 @@ impl FileDescTable {
 /// Used as the backend for fds 0/1/2. Stdio bypasses the VFS on purpose:
 /// every task gets a direct [`SerialBackend`] so console I/O works even
 /// before `/dev/console` is wired up in `devfs`.
+///
+/// Holds a per-backend [`tty::termios::Termios`] so userspace
+/// `tcgetattr`/`tcsetattr` (via `TCGETS`/`TCSETS` ioctls) have something
+/// to read and write. Semantically the stored struct is a shim until the
+/// real `Tty` wrapper lands (issue #374): N_TTY is not yet consulting it
+/// for canonical-mode or echo processing, but the ABI is in place so
+/// userspace can start calling `tcgetattr` without `-ENOTTY`.
 #[cfg(target_os = "none")]
-pub struct SerialBackend;
+pub struct SerialBackend {
+    termios: spin::Mutex<crate::tty::termios::Termios>,
+}
+
+#[cfg(target_os = "none")]
+impl SerialBackend {
+    pub const fn new() -> Self {
+        Self {
+            termios: spin::Mutex::new(crate::tty::termios::Termios::sane()),
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+impl Default for SerialBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(target_os = "none")]
 impl FileBackend for SerialBackend {
@@ -371,6 +406,39 @@ impl FileBackend for SerialBackend {
         crate::serial::write_bytes(buf);
         Ok(buf.len())
     }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, i64> {
+        use crate::tty::termios::{Termios, TCGETS, TCSETS, TCSETSF, TCSETSW};
+        match cmd {
+            TCGETS => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                let snapshot = *self.termios.lock();
+                // SAFETY: `arg` is a userspace VA. `copy_to_user` validates
+                // the range against USER_VA_END and brackets the write with
+                // STAC/CLAC so SMAP enforces the user mapping.
+                unsafe { crate::arch::x86_64::uaccess::copy_to_user(arg, snapshot.as_bytes()) }
+                    .map_err(|e| e.as_errno())?;
+                Ok(0)
+            }
+            // Drain (TCSETSW) and flush (TCSETSF) reduce to "apply now" until
+            // the output ring and raw-input buffer introduced by #374 exist —
+            // at that point this arm splits and acquires the relevant queues.
+            TCSETS | TCSETSW | TCSETSF => {
+                if arg == 0 {
+                    return Err(EFAULT);
+                }
+                let mut bytes = [0u8; 44];
+                // SAFETY: see TCGETS.
+                unsafe { crate::arch::x86_64::uaccess::copy_from_user(&mut bytes, arg) }
+                    .map_err(|e| e.as_errno())?;
+                *self.termios.lock() = Termios::from_bytes(&bytes);
+                Ok(0)
+            }
+            _ => Err(ENOTTY),
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -381,7 +449,7 @@ impl FileDescTable {
     /// and stderr all map to the same [`SerialBackend`], bypassing the VFS
     /// so console I/O works before any filesystem is mounted.
     pub fn new_with_stdio() -> Self {
-        let serial = Arc::new(SerialBackend) as Arc<dyn FileBackend>;
+        let serial = Arc::new(SerialBackend::new()) as Arc<dyn FileBackend>;
         Self::new_with_backends(serial.clone(), serial.clone(), serial.clone())
     }
 }

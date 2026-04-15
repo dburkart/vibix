@@ -163,7 +163,7 @@ fn legacy_dev_backend(path: &[u8], flags: u64) -> Option<i64> {
     }
     let safe_flags =
         (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
-    let backend: Arc<dyn FileBackend> = Arc::new(crate::fs::SerialBackend);
+    let backend: Arc<dyn FileBackend> = Arc::new(crate::fs::SerialBackend::new());
     Some(install_fd(backend, safe_flags))
 }
 

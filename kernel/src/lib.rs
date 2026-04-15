@@ -62,6 +62,8 @@ pub mod test_harness;
 pub mod test_hook;
 #[cfg(any(test, target_os = "none"))]
 pub mod time;
+#[cfg(any(test, target_os = "none"))]
+pub mod tty;
 
 #[cfg(target_os = "none")]
 pub use test_harness::{exit_qemu, QemuExitCode, Testable};
