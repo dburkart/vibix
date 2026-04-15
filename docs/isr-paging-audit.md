@@ -9,8 +9,8 @@ interrupted a thread that already holds the very lock it wants). An
 accidental blocking-lock acquisition on an ISR path produces a
 silent deadlock the first time the primitive is ever contended.
 
-Origin: issue #306 (follow-up to #147, whose item 1 was resolved by
-#305 moving the reaper off the timer ISR).
+Origin: issue #306 (follow-up to #147, whose item 1 was resolved by #305
+moving the reaper off the timer ISR).
 
 ## Entry points
 
@@ -48,7 +48,7 @@ than hangs, so it has the largest reachable surface:
 
 ## Timer / keyboard / serial call chains
 
-* `timer_interrupt` → `time::on_tick` (atomics) → `notify_eoi` (PIC I/O) → `task::preempt_tick` → `SCHED.lock()` (spin) to pick the next task. Also wakes the reaper `WaitQueue` if there are victims; `WaitQueue::wake_one` takes `SCHED.lock()`.
+* `timer_interrupt` → `time::on_tick` (atomics) → `notify_eoi` (PIC I/O) → `task::preempt_tick` → `SCHED.try_lock()` (spin; bails on contention). Also wakes the reaper `WaitQueue` if there are victims; `WaitQueue::wake_one` takes `SCHED.lock()`.
 * `keyboard_interrupt` → `input::push_scancode_from_isr` (ring buffer behind a spin lock).
 * `serial_interrupt` → `serial::drain_rx_hardware` (port I/O + spin-locked ring buffer).
 

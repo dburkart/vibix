@@ -39,8 +39,10 @@ const ISR_REACHABLE_FILES: &[&str] = &[
 /// an ISR-reachable file fails the lint.
 const FORBIDDEN_PATTERNS: &[&str] = &[
     "BlockingMutex<",
+    "BlockingMutex::<",
     "BlockingMutex::new",
     "BlockingRwLock<",
+    "BlockingRwLock::<",
     "BlockingRwLock::new",
 ];
 
@@ -140,6 +142,25 @@ mod tests {
         let findings = scan_contents("fake.rs", src);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].pattern, "BlockingRwLock::new");
+    }
+
+    #[test]
+    fn turbofish_form_flagged() {
+        // `BlockingMutex::<u32>::new(0)` must not bypass the lint. Without the
+        // `BlockingMutex::<` pattern the bare `BlockingMutex<` and
+        // `BlockingMutex::new` patterns both miss because `::<u32>::` sits
+        // between the name and `new`.
+        let src = "let x = BlockingMutex::<u32>::new(0);\n\
+                   let y = BlockingRwLock::<u32>::new(0);\n";
+        let findings = scan_contents("fake.rs", src);
+        assert!(
+            findings.iter().any(|f| f.pattern == "BlockingMutex::<"),
+            "turbofish BlockingMutex not flagged: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.pattern == "BlockingRwLock::<"),
+            "turbofish BlockingRwLock not flagged: {findings:?}"
+        );
     }
 
     #[test]
