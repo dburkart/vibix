@@ -90,6 +90,12 @@ pub struct LoadedImage {
     /// Virtual base address at which the interpreter was loaded.
     /// `None` if the binary has no PT_INTERP segment.
     pub interp_base: Option<u64>,
+    /// Virtual address of the main binary's program-header table (AT_PHDR).
+    pub phdr_vaddr: u64,
+    /// Number of program-header entries (AT_PHNUM).
+    pub phdr_count: u16,
+    /// Size of each program-header entry in bytes (AT_PHENT).
+    pub phdr_entsize: u16,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -135,6 +141,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         image_end,
         interp_entry: None,
         interp_base: None,
+        phdr_vaddr: 0,
+        phdr_count: 0,
+        phdr_entsize: 0,
     })
 }
 
@@ -206,6 +215,9 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         image_end,
         interp_entry: None,
         interp_base: None,
+        phdr_vaddr: parsed.phdr_vaddr(),
+        phdr_count: parsed.phdr_count(),
+        phdr_entsize: parsed.phdr_entsize(),
     })
 }
 

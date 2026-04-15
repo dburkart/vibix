@@ -27,6 +27,10 @@ use crate::serial_println;
 /// User-space entry point — set by `launch` before the task runs.
 static INIT_ENTRY: AtomicU64 = AtomicU64::new(0);
 
+/// Initial user RSP after the auxv/argv/argc layout has been written into
+/// the stack frame. Set by `launch`; read by `init_ring3_entry`.
+static INIT_STACK_PTR: AtomicU64 = AtomicU64::new(0);
+
 /// Pre-built init AddressSpace (with ELF VMAs and stack VMA).
 /// Consumed by `init_ring3_entry` on first and only use.
 static INIT_ADDRESS_SPACE: Once<Arc<RwLock<AddressSpace>>> = Once::new();
@@ -127,11 +131,36 @@ pub fn launch(bytes: &[u8]) -> usize {
         USER_STACK_TOP
     );
 
+    // 3b. Write the System V AMD64 initial stack layout (argc/argv/envp/auxv)
+    //     into the stack frame via the HHDM window before ring-3 entry.
+    //     The 16-byte AT_RANDOM seed is derived deterministically from the
+    //     entry address and stack physical address.
+    //     TODO: replace with RDRAND once a CSPRNG is wired up.
+    let random_seed = image.entry.as_u64() ^ stack_phys;
+    let mut random_bytes = [0u8; 16];
+    for (i, b) in random_bytes.iter_mut().enumerate() {
+        *b = ((random_seed >> (i % 8 * 8)) & 0xFF) as u8;
+    }
+    let auxv_params = crate::mem::auxv::AuxvParams {
+        entry: image.entry.as_u64(),
+        interp_base: image.interp_base.unwrap_or(0),
+        phdr_vaddr: image.phdr_vaddr,
+        phdr_count: image.phdr_count as u64,
+        phdr_entsize: image.phdr_entsize as u64,
+    };
+    let initial_rsp = crate::mem::auxv::write_initial_stack(
+        stack_phys,
+        USER_STACK_PAGE_VA,
+        &auxv_params,
+        &random_bytes,
+    );
+    serial_println!("init: auxv written, initial rsp={:#x}", initial_rsp);
+
     // 4. Publish entry point and stash the address space.
     // If the binary has a dynamic interpreter (PT_INTERP), jump to the
     // interpreter's entry point — it will relocate itself and the main binary
     // before transferring control to the main binary's entry. The main binary's
-    // original entry point goes into the auxv AT_ENTRY vector (issue #359).
+    // original entry point is in the auxv AT_ENTRY vector.
     let effective_entry = image.interp_entry.unwrap_or(image.entry);
     if let Some(interp_base) = image.interp_base {
         serial_println!(
@@ -142,6 +171,7 @@ pub fn launch(bytes: &[u8]) -> usize {
         );
     }
     INIT_ENTRY.store(effective_entry.as_u64(), Ordering::Release);
+    INIT_STACK_PTR.store(initial_rsp, Ordering::Release);
     INIT_ADDRESS_SPACE.call_once(|| Arc::new(RwLock::new(aspace)));
 
     // 5. Spawn the kernel task that will drop to ring-3 and register it
@@ -163,6 +193,8 @@ pub fn launch(bytes: &[u8]) -> usize {
 fn init_ring3_entry() -> ! {
     let entry = INIT_ENTRY.load(Ordering::Acquire);
     assert!(entry != 0, "init_ring3_entry: INIT_ENTRY not set");
+    let initial_rsp = INIT_STACK_PTR.load(Ordering::Acquire);
+    assert!(initial_rsp != 0, "init_ring3_entry: INIT_STACK_PTR not set");
 
     // Replace this task's (empty) address space with the pre-built one.
     let init_aspace = INIT_ADDRESS_SPACE
@@ -195,11 +227,11 @@ fn init_ring3_entry() -> ! {
     crate::task::arm_ring3_syscall_stack();
 
     serial_println!(
-        "init: entering ring-3 entry={:#x} stack={:#x}",
+        "init: entering ring-3 entry={:#x} rsp={:#x}",
         entry,
-        USER_STACK_TOP
+        initial_rsp
     );
 
     // Drop to ring-3. Never returns.
-    unsafe { syscall::jump_to_ring3(entry, USER_STACK_TOP) }
+    unsafe { syscall::jump_to_ring3(entry, initial_rsp) }
 }
