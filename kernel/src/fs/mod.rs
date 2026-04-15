@@ -563,7 +563,22 @@ impl FileBackend for SerialBackend {
     /// Write path acquires `COM1.lock()` inside `without_interrupts` via
     /// `crate::serial::write_bytes`. No deadlock risk: this call chain
     /// never calls `serial_println!` or re-enters the COM1 mutex.
+    ///
+    /// Job-control gate: if the caller's pgrp is not the console tty's
+    /// foreground pgrp and `TOSTOP` is set, raise `SIGTTOU` and fail the
+    /// write with `EINTR`. Real `ERESTARTSYS` semantics (SA_RESTART-aware
+    /// transparent restart) arrive with the syscall trampoline follow-up.
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
+        let caller = crate::process::current_pid();
+        let tty = crate::tty::console_tty();
+        if let Some(rc) = crate::tty::tty_check_tostop(&tty, caller) {
+            // KERN_ERESTARTSYS → EINTR at the syscall boundary until the
+            // trampoline honours restart semantics.
+            if rc == crate::tty::KERN_ERESTARTSYS {
+                return Err(EINTR);
+            }
+            return Err(rc);
+        }
         crate::serial::write_bytes(buf);
         Ok(buf.len())
     }
