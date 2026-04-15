@@ -418,10 +418,8 @@ impl FileBackend for SerialBackend {
                 // SAFETY: `arg` is a userspace VA. `copy_to_user` validates
                 // the range against USER_VA_END and brackets the write with
                 // STAC/CLAC so SMAP enforces the user mapping.
-                unsafe {
-                    crate::arch::x86_64::uaccess::copy_to_user(arg, snapshot.as_bytes())
-                }
-                .map_err(|e| e.as_errno())?;
+                unsafe { crate::arch::x86_64::uaccess::copy_to_user(arg, snapshot.as_bytes()) }
+                    .map_err(|e| e.as_errno())?;
                 Ok(0)
             }
             // Drain (TCSETSW) and flush (TCSETSF) reduce to "apply now" until
