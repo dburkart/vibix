@@ -1,5 +1,6 @@
 pub mod apic;
 pub mod backtrace;
+pub mod csprng;
 pub mod fpu;
 pub mod gdt;
 pub mod idt;

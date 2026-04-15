@@ -133,14 +133,18 @@ pub fn launch(bytes: &[u8]) -> usize {
 
     // 3b. Write the System V AMD64 initial stack layout (argc/argv/envp/auxv)
     //     into the stack frame via the HHDM window before ring-3 entry.
-    //     The 16-byte AT_RANDOM seed is derived deterministically from the
-    //     entry address and stack physical address.
-    //     TODO: replace with RDRAND once a CSPRNG is wired up.
-    let random_seed = image.entry.as_u64() ^ stack_phys;
-    let mut random_bytes = [0u8; 16];
-    for (i, b) in random_bytes.iter_mut().enumerate() {
-        *b = ((random_seed >> (i % 8 * 8)) & 0xFF) as u8;
-    }
+    //     AT_RANDOM comes from RDRAND/RDSEED; if the CPU supports neither
+    //     (e.g. QEMU without `-cpu max`), fall back to a documented-insecure
+    //     XOR-splat with a boot-time warning.
+    let random_bytes = match crate::arch::x86_64::csprng::rdrand16() {
+        Some(b) => b,
+        None => {
+            serial_println!(
+                "init: WARNING — RDRAND/RDSEED unavailable, AT_RANDOM is deterministic"
+            );
+            crate::arch::x86_64::csprng::at_random_or_fallback(image.entry.as_u64() ^ stack_phys)
+        }
+    };
     let auxv_params = crate::mem::auxv::AuxvParams {
         entry: image.entry.as_u64(),
         interp_base: image.interp_base.unwrap_or(0),
