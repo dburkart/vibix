@@ -109,6 +109,9 @@ pub struct WaitToken(u64);
 #[cfg(any(test, target_os = "none"))]
 pub struct PollTable {
     mode: PollMode,
+    /// Task to wake when any registered queue fires. Only meaningful in Wait
+    /// mode — `probe()` sets this to a sentinel it never hands out.
+    wake_tid: usize,
     entries: Vec<PollEntry>,
 }
 
@@ -116,7 +119,9 @@ pub struct PollTable {
 ///
 /// Holds `Arc<WaitQueue>` (not a raw pointer) per RFC 0003 §Wake-queue entry
 /// lifetime. Cancellation is idempotent and safe even if the queue has
-/// already fired.
+/// already fired. The `wake_tid` identifies the sys_poll task to resume when
+/// the queue fires a `wake_*` — stored at registration time and handed to
+/// `WaitQueue::register_poll` so it lands on the queue's poller record.
 #[cfg(any(test, target_os = "none"))]
 pub struct PollEntry {
     queue: Arc<WaitQueue>,
@@ -125,18 +130,23 @@ pub struct PollEntry {
 
 #[cfg(any(test, target_os = "none"))]
 impl PollTable {
-    /// Construct a probe-mode table. `register` is a no-op in this mode.
+    /// Construct a probe-mode table. `register` is a no-op in this mode, so
+    /// no `wake_tid` is needed.
     pub const fn probe() -> Self {
         Self {
             mode: PollMode::Probe,
+            wake_tid: 0,
             entries: Vec::new(),
         }
     }
 
-    /// Construct a wait-mode table. `register` enqueues `PollEntry`s.
-    pub const fn wait() -> Self {
+    /// Construct a wait-mode table bound to the task that will park after
+    /// the scan. `register` enqueues `PollEntry`s whose poll-side wake targets
+    /// resolve to `wake_tid` — on any `wake_*`, that task is resumed.
+    pub const fn wait(wake_tid: usize) -> Self {
         Self {
             mode: PollMode::Wait,
+            wake_tid,
             entries: Vec::new(),
         }
     }
@@ -161,7 +171,7 @@ impl PollTable {
         if self.entries.iter().any(|e| Arc::ptr_eq(&e.queue, queue)) {
             return;
         }
-        let token = queue.register_poll();
+        let token = queue.register_poll(self.wake_tid);
         self.entries.push(PollEntry {
             queue: queue.clone(),
             token,
@@ -191,9 +201,10 @@ impl Drop for PollTable {
 
 #[cfg(any(test, target_os = "none"))]
 struct WaitQueueInner {
-    /// Tokens registered by `PollTable::register` — woken by every
-    /// `wake_*` call.
-    pollers: VecDeque<WaitToken>,
+    /// `(token, wake_tid)` pairs for passive poll registrations — every
+    /// `wake_*` fires `task::wake(wake_tid)` for each entry so the sleeping
+    /// `sys_poll` task resumes.
+    pollers: VecDeque<(WaitToken, usize)>,
     /// `(token, tid)` pairs for blocking waiters — woken one-at-a-time
     /// by `wake_poll_then_one`, or all by `wake_all`.
     waiters: VecDeque<(WaitToken, usize)>,
@@ -260,13 +271,15 @@ impl WaitQueue {
     /// Register a passive poll interest. Called by `PollTable::register`
     /// in Wait mode.
     ///
+    /// `wake_tid` is the task that a later `wake_*` on this queue should
+    /// resume — typically the `sys_poll` caller that built the `PollTable`.
     /// The returned `WaitToken` is remembered by the `PollTable` and
     /// passed to `cancel` when the table is dropped. Production callers
     /// should use `PollTable` rather than calling this directly.
-    pub fn register_poll(&self) -> WaitToken {
+    pub fn register_poll(&self, wake_tid: usize) -> WaitToken {
         let mut inner = self.inner.lock();
         let token = Self::mint_token(&mut inner);
-        inner.pollers.push_back(token);
+        inner.pollers.push_back((token, wake_tid));
         token
     }
 
@@ -287,7 +300,7 @@ impl WaitQueue {
     /// Idempotent: cancelling an already-fired token is a cheap miss.
     pub fn cancel(&self, token: WaitToken) {
         let mut inner = self.inner.lock();
-        if let Some(pos) = inner.pollers.iter().position(|&t| t == token) {
+        if let Some(pos) = inner.pollers.iter().position(|&(t, _)| t == token) {
             inner.pollers.remove(pos);
             return;
         }
@@ -306,11 +319,15 @@ impl WaitQueue {
         // Drain lists under the lock, then call into task::wake outside
         // it — task::wake touches the scheduler's own locks and must not
         // be called while ours is held.
+        let pollers;
         let woken_waiter;
         {
             let mut inner = self.inner.lock();
-            inner.pollers.clear();
+            pollers = core::mem::take(&mut inner.pollers);
             woken_waiter = inner.waiters.pop_front();
+        }
+        for (_tok, tid) in pollers {
+            task_wake(tid);
         }
         if let Some((_tok, tid)) = woken_waiter {
             task_wake(tid);
@@ -322,11 +339,15 @@ impl WaitQueue {
     /// Used on HUP / error conditions where every parked reader and every
     /// polling selector must observe the state change.
     pub fn wake_all(&self) {
-        let waiters: VecDeque<(WaitToken, usize)>;
+        let pollers;
+        let waiters;
         {
             let mut inner = self.inner.lock();
-            inner.pollers.clear();
+            pollers = core::mem::take(&mut inner.pollers);
             waiters = core::mem::take(&mut inner.waiters);
+        }
+        for (_tok, tid) in pollers {
+            task_wake(tid);
         }
         for (_tok, tid) in waiters {
             task_wake(tid);
@@ -352,8 +373,26 @@ fn task_wake(tid: usize) {
 }
 
 #[cfg(all(test, not(target_os = "none")))]
-fn task_wake(_tid: usize) {
-    // Host-side: no scheduler. Wake is observed via queue-side counters.
+fn task_wake(tid: usize) {
+    // Host-side: no scheduler. Record into a test-visible log so tests can
+    // assert that `wake_*` invoked the stored wake target for each entry.
+    test_wake_log::record(tid);
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod test_wake_log {
+    use alloc::vec::Vec;
+    use spin::Mutex;
+
+    static WAKES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(tid: usize) {
+        WAKES.lock().push(tid);
+    }
+
+    pub(super) fn drain() -> Vec<usize> {
+        core::mem::take(&mut *WAKES.lock())
+    }
 }
 
 #[cfg(test)]
@@ -393,7 +432,7 @@ mod tests {
     #[test]
     fn wait_mode_register_enqueues() {
         let wq = WaitQueue::new();
-        let mut pt = PollTable::wait();
+        let mut pt = PollTable::wait(7);
         pt.register(&wq);
         assert_eq!(pt.entry_count(), 1);
         assert_eq!(wq.counts(), (1, 0));
@@ -402,7 +441,7 @@ mod tests {
     #[test]
     fn wait_mode_register_dedups_same_queue() {
         let wq = WaitQueue::new();
-        let mut pt = PollTable::wait();
+        let mut pt = PollTable::wait(7);
         pt.register(&wq);
         pt.register(&wq);
         pt.register(&wq);
@@ -414,7 +453,7 @@ mod tests {
     fn drop_polltable_cancels_registrations() {
         let wq = WaitQueue::new();
         {
-            let mut pt = PollTable::wait();
+            let mut pt = PollTable::wait(7);
             pt.register(&wq);
             assert_eq!(wq.counts(), (1, 0));
         }
@@ -423,20 +462,49 @@ mod tests {
 
     #[test]
     fn wake_all_drains_pollers_and_waiters() {
+        let _ = test_wake_log::drain();
         let wq = WaitQueue::new();
-        let mut pt = PollTable::wait();
+        let mut pt = PollTable::wait(17);
         pt.register(&wq);
         let _w = wq.register_wait(42);
         assert_eq!(wq.counts(), (1, 1));
         wq.wake_all();
         assert_eq!(wq.counts(), (0, 0));
+        let wakes = test_wake_log::drain();
+        assert!(wakes.contains(&17), "poller's wake target must fire");
+        assert!(wakes.contains(&42), "blocking waiter's tid must fire");
+    }
+
+    #[test]
+    fn wake_poll_then_one_fires_every_poller_wake_target() {
+        // Covers CodeRabbit's #392 finding: a readiness transition must
+        // resume every sleeping sys_poll task registered on the queue.
+        let _ = test_wake_log::drain();
+        let wq = WaitQueue::new();
+        let mut pt_a = PollTable::wait(100);
+        let mut pt_b = PollTable::wait(200);
+        pt_a.register(&wq);
+        pt_b.register(&wq);
+        let _w = wq.register_wait(300);
+
+        wq.wake_poll_then_one();
+
+        let wakes = test_wake_log::drain();
+        assert!(wakes.contains(&100), "pt_a's wake target must fire");
+        assert!(wakes.contains(&200), "pt_b's wake target must fire");
+        assert!(wakes.contains(&300), "blocking waiter must also fire");
+
+        // Keep tables alive so their Drop cancel_all runs after the
+        // assertions.
+        drop(pt_a);
+        drop(pt_b);
     }
 
     #[test]
     fn wake_poll_then_one_drains_pollers_and_pops_one_waiter() {
         let wq = WaitQueue::new();
-        let mut pt1 = PollTable::wait();
-        let mut pt2 = PollTable::wait();
+        let mut pt1 = PollTable::wait(7);
+        let mut pt2 = PollTable::wait(8);
         pt1.register(&wq);
         // Second distinct table to get a second poller entry.
         pt2.register(&wq);
@@ -463,7 +531,7 @@ mod tests {
         // finds an empty list and returns cleanly.
         let wq = WaitQueue::new();
         {
-            let mut pt = PollTable::wait();
+            let mut pt = PollTable::wait(7);
             pt.register(&wq);
         }
         wq.wake_poll_then_one();
@@ -474,7 +542,7 @@ mod tests {
     #[test]
     fn cancel_is_idempotent() {
         let wq = WaitQueue::new();
-        let tok = wq.register_poll();
+        let tok = wq.register_poll(7);
         wq.cancel(tok);
         wq.cancel(tok);
         // Cancel an unknown token.
@@ -485,11 +553,11 @@ mod tests {
     #[test]
     fn token_monotonic_no_aba() {
         let wq = WaitQueue::new();
-        let t0 = wq.register_poll();
+        let t0 = wq.register_poll(7);
         wq.cancel(t0);
-        let t1 = wq.register_poll();
+        let t1 = wq.register_poll(7);
         wq.cancel(t1);
-        let t2 = wq.register_poll();
+        let t2 = wq.register_poll(7);
         wq.cancel(t2);
         assert_ne!(t0, t1);
         assert_ne!(t1, t2);
