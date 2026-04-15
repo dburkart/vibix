@@ -353,6 +353,62 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
     raise_signal_on_pid(pid as u32, sig)
 }
 
+// ── Delivery from exception handlers (IRETQ path) ─────────────────────────
+
+/// Deliver a synchronous fault signal raised from an exception handler (e.g.
+/// `#PF` on a ring-3 access violation) to the currently running task.
+///
+/// Unlike [`check_and_deliver_signals`] (syscall-return path), this is called
+/// from an interrupt handler with no saved `SyscallReturnContext` — the user
+/// RIP/RSP/RFLAGS are captured in the hardware-pushed `InterruptStackFrame`.
+///
+/// Current scope: only the `SIG_DFL` / `DefaultAction::Terminate` case is
+/// implemented. The signal is raised on the current task, then the terminate
+/// path runs directly: `reparent_children → mark_zombie(-sig) → task::exit()`.
+/// `task::exit()` is `!`, so the exception handler never returns — the
+/// scheduler context-switches to the next task instead of executing `IRETQ`.
+///
+/// Handler-dispatch (`Disposition::Handler`) for fault signals is not yet
+/// implemented; installing a SIGSEGV handler and triggering a #PF will fall
+/// through to terminate semantics. Tracked in the follow-up to #337.
+///
+/// # Safety
+/// Must be called from an exception handler on behalf of the currently
+/// running task. Does not return.
+pub unsafe fn deliver_fault_signal_iret(sig: u8) -> ! {
+    // Precondition: `sig` is a valid signal number. `sig == 0` would underflow
+    // the `dispositions[sig - 1]` index below; guard it in debug builds so a
+    // future caller that forgets fails loudly instead of corrupting memory.
+    debug_assert!(sig > 0 && sig <= NSIG, "invalid signal number");
+
+    let task_id = crate::task::current_id();
+    // Raise, immediately clear the pending bit (we service synchronously),
+    // and read the disposition under a single lock acquisition. Doing this in
+    // one critical section avoids a window where another path could observe
+    // the signal pending while we're already about to service it.
+    let disp = crate::process::with_signal_state_for_task(task_id, |state| {
+        state.raise(sig);
+        state.pending &= !sig_bit(sig);
+        state.dispositions[(sig - 1) as usize]
+    })
+    .unwrap_or(Disposition::Default);
+
+    match disp {
+        Disposition::Handler(_) | Disposition::Ignore | Disposition::Default => {
+            // Handler + Ignore paths aren't meaningful for a synchronous fault
+            // (the faulting instruction would re-fault immediately on IRETQ).
+            // Fall through to Terminate for all cases until the follow-up lands.
+            let pid = crate::process::current_pid();
+            crate::serial_println!("signal: terminate pid={} sig={} (fault)", pid, sig);
+            if pid != 0 {
+                crate::process::reparent_children(pid);
+                crate::process::mark_zombie(pid, -(sig as i32));
+            }
+        }
+    }
+    crate::task::exit();
+}
+
 // ── Delivery at syscall return ────────────────────────────────────────────
 
 /// Kernel-stack layout pushed by the `syscall_entry` asm trampoline
@@ -450,6 +506,7 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
             match default_action(sig) {
                 DefaultAction::Terminate => {
                     let pid = crate::process::current_pid();
+                    crate::serial_println!("signal: terminate pid={} sig={}", pid, sig);
                     if pid != 0 {
                         crate::process::reparent_children(pid);
                         crate::process::mark_zombie(pid, -(sig as i32));
