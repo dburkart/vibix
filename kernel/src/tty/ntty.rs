@@ -64,6 +64,11 @@ impl LineBuffer {
         self.len = 0;
     }
 
+    /// Commit the pending line into `dst`. If `dst` fills partway,
+    /// the remaining line bytes are dropped — RFC 0003 §N_TTY
+    /// "drop-newest" overflow applied at the commit boundary. The
+    /// line buffer is cleared either way so the next edit starts
+    /// fresh; there is no "retry later" path in canonical mode.
     fn drain_into(&mut self, dst: &mut RawRing) {
         for i in 0..self.len {
             if !dst.push(self.buf[i]) {
