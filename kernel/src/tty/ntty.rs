@@ -1,7 +1,7 @@
 //! N_TTY line-discipline skeleton (RFC 0003 §N_TTY input).
 //!
 //! This slice implements only the byte-level `c_iflag` input transforms —
-//! pure functions of `Termios.iflag` with no signal generation, line
+//! pure functions of `Termios.c_iflag` with no signal generation, line
 //! buffering, or output path. ICANON / ISIG / OPOST / echo arrive in later
 //! sub-issues of #375.
 
