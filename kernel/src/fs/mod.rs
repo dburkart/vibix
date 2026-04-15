@@ -71,6 +71,17 @@ pub trait FileBackend: Send + Sync {
         Err(ESPIPE)
     }
 
+    /// Read directory entries into `buf` in Linux `linux_dirent64` format.
+    ///
+    /// Each call appends as many whole records as fit and advances the
+    /// backend's internal cursor (for VFS-backed dirs, the shared
+    /// `OpenFile.offset`). Returns the number of bytes written, or `0` at
+    /// end-of-directory. The default returns `ENOTDIR` — the correct error
+    /// for any backend that is not a directory.
+    fn getdents64(&self, _buf: &mut [u8]) -> Result<usize, i64> {
+        Err(ENOTDIR)
+    }
+
     /// Downcast to [`vfs::VfsBackend`] for fd-keyed syscalls that need the
     /// underlying `OpenFile` (e.g. `fstat`, `fstatat` with `AT_EMPTY_PATH`).
     /// Non-VFS backends (`SerialBackend`, test stubs) return `None` and
