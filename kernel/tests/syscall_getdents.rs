@@ -228,9 +228,15 @@ fn getdents_lists_etc() {
         last = e.off;
     }
 
-    // Next call returns 0 (EOF).
-    let (n2, _) = getdents(fd, 1024);
-    assert_eq!(n2, 0, "second getdents must be 0 at EOF, got {}", n2);
+    // Drain to EOF — `/etc` may grow as the rootfs fixture evolves, so
+    // don't hard-code the assumption that the first call already exhausts it.
+    loop {
+        let (next, _) = getdents(fd, 1024);
+        assert!(next >= 0, "getdents64 returned error {} mid-drain", next);
+        if next == 0 {
+            break;
+        }
+    }
 
     close(fd);
 }
