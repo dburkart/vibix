@@ -65,6 +65,10 @@ When filing an issue (by hand or via an agent), the author must set labels befor
 is considered triaged.
 
 1. **Determine priority by asking, in order:**
+   - Is it a CI flake, a build failure, or anything else that breaks the main branch's green
+     status? → `priority:P0`. CI health is always P0 — flaky or broken CI stalls every
+     auto-engineer and masks real regressions, so these jump to the front of the queue
+     regardless of which subsystem they touch.
    - Does this block PID 1 loading and running a userspace binary? → `priority:P0`.
    - Is it required for POSIX readiness, a real FS, or a usable terminal? → `priority:P1`.
    - Is it a polish / hardening / QoL improvement on already-working code? → `priority:P2`.
