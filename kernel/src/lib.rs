@@ -18,6 +18,8 @@ pub mod block;
 pub mod cpu;
 #[cfg(any(test, target_os = "none"))]
 pub mod fs;
+#[cfg(any(test, target_os = "none"))]
+pub mod ipc;
 pub mod input;
 pub mod klog;
 pub mod mem;

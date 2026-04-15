@@ -153,6 +153,8 @@ pub const EBUSY: i64 = -16;
 pub const EOVERFLOW: i64 = -75;
 pub const ENOTTY: i64 = -25;
 pub const EFAULT: i64 = -14;
+pub const EPIPE: i64 = -32;
+pub const EINTR: i64 = -4;
 
 /// Per-process file-descriptor array.
 ///
