@@ -125,8 +125,14 @@ impl Termios {
 
     /// Reinterpret a 44-byte buffer as a termios for copy-from-user.
     pub fn from_bytes(bytes: &[u8; 44]) -> Self {
-        // SAFETY: Same as above — all-integer repr(C) layout.
-        unsafe { *(bytes.as_ptr() as *const Self) }
+        // `bytes` has alignment 1; Termios wants alignment 4. Read through
+        // `ptr::read_unaligned` so the reinterpret is defined even when the
+        // backing buffer is mis-aligned (common for SMAP bounce buffers on
+        // the kernel stack).
+        //
+        // SAFETY: All-integer `#[repr(C)]` layout — every 44-byte pattern
+        // is a valid inhabitant.
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 }
 
