@@ -209,7 +209,10 @@ Record the PR open time. Run one poll tick (step 6b below), then either proceed 
 #### 6c. Review-response
 
 Carry a `--fix-round R` counter (default 0) forward in the wakeup prompt when looping back
-here. **Max 2 fix rounds** — if `R == 2` and findings remain, stop.
+here. **Max 3 fix rounds** — don't give up on review feedback easily; most findings are
+fixable given one more honest attempt. If `R == 3` and findings still remain, **park the
+PR** (see "Parking the PR" below) and continue to the next iteration rather than stopping
+the whole loop.
 
 **Auto-fix CI failures** (before classifying review findings):
 
@@ -330,21 +333,55 @@ If iteration budget not exhausted and no stop condition tripped:
    The `--iteration` flag is what enforces the 8-cycle cap across `/compact` boundaries — don't omit it. Never carry `--phase`, `--pr`, or `--fix-round` into a fresh cycle; those are intra-cycle state that resets each iteration.
 3. End the turn. The next wake-up re-enters this skill from step 1.
 
-## Stopping
+## Parking the PR (soft stop — loop continues)
 
-On any stop condition:
+Some failure modes are *cycle-local*: the current PR can't progress, but the overall loop
+still has useful work to do on other issues. For these, **park** the PR instead of stopping
+the whole loop.
+
+Park semantics:
+
+1. Leave the branch, PR, and issue assignment all in place. Do **not** close the PR.
+2. Add the `needs-human-review` label to the PR via `mcp__github__update_pull_request`
+   (or `gh pr edit <M> --add-label needs-human-review`). Create the label first if it
+   doesn't exist.
+3. Post one comment on the PR via `mcp__github__add_issue_comment` that explains:
+   - Which park reason triggered (e.g. "review feedback unresolved after 3 fix rounds").
+   - A concrete summary of what was tried across all fix rounds.
+   - A list of the remaining findings, quoted or linked, so the human reviewer can pick up
+     cold.
+   - The commit SHAs of each fix-round push.
+4. **Do not** unassign the issue. Keeping the assignment is what prevents the next
+   iteration's step 1 from re-selecting it — `gh issue list --search 'no:assignee'` will
+   skip it naturally. When a human eventually merges the PR, the `Closes #<N>` line
+   closes the issue cleanly.
+5. **Continue the loop**: proceed straight to step 8 (Capture follow-ups, skipping the
+   merged-diff scan since nothing was merged), then step 9 (quota), then step 10
+   (compact + `ScheduleWakeup` for iteration N+1). The `--iteration N` counter still
+   ticks — a parked PR consumes one of the 8 iterations.
+
+Park conditions (soft stops — loop continues):
+
+- `--fix-round` reached 3 and actionable review findings remain.
+- A CodeRabbit rate-limit attempt already re-requested review once and hit the limit
+  again (existing 30-min fallback applies first; park only if that also fails to yield
+  a merge).
+
+## Stopping (hard stop — loop terminates)
+
+For conditions that mean the whole loop should halt, not just the current PR:
 
 1. Leave the current branch and PR in place — do **not** delete or close anything.
 2. If a PR exists for the current cycle, post one comment on it via `mcp__github__add_issue_comment` summarizing why auto-engineer paused and what it tried.
 3. End the turn with a plain-text status to the user. **Do not** call `ScheduleWakeup`.
 
-Stop conditions:
+Hard-stop conditions:
 
-- No unblocked issues remain.
-- 3 consecutive build/test fix attempts failed.
-- `--fix-round` reached 2 and actionable findings remain (2 response cycles exhausted).
-- Any check in `action_required` state (needs human approval).
-- Any security / advisory finding from `github-advanced-security[bot]`.
+- No unblocked issues remain (nothing left to do).
+- 3 consecutive build/test fix attempts failed (likely environmental, needs human).
+- Any check in `action_required` state (explicit human-approval gate).
+- Any security / advisory finding from `github-advanced-security[bot]` (must not
+  auto-adjacent around security issues).
 - Merge conflict against `main` that isn't cleanly resolvable by `git pull --rebase`.
 - Iteration budget of 8 reached.
 - The issue was reassigned away from `dburkart` while auto-engineer held it.
