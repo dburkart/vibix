@@ -85,10 +85,7 @@ const SMOKE_MARKERS: &[&str] = &[
 /// CI QEMU — the child sometimes doesn't finish before HARD_CAP even though
 /// the kernel path is healthy. Missing soft markers warn but don't fail the
 /// suite; a kernel panic is still fatal via the PANIC_MARKER check.
-const SMOKE_SOFT_MARKERS: &[&str] = &[
-    "hello: hello from execed child",
-    "init: fork+exec+wait ok",
-];
+const SMOKE_SOFT_MARKERS: &[&str] = &["hello: hello from execed child", "init: fork+exec+wait ok"];
 
 fn main() -> R<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -989,8 +986,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
 
     let deadline = Instant::now() + HARD_CAP;
     let mut remaining: HashSet<&'static str> = SMOKE_MARKERS.iter().copied().collect();
-    let mut soft_remaining: HashSet<&'static str> =
-        SMOKE_SOFT_MARKERS.iter().copied().collect();
+    let mut soft_remaining: HashSet<&'static str> = SMOKE_SOFT_MARKERS.iter().copied().collect();
     let mut accumulated = String::new();
     let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
