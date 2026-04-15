@@ -52,6 +52,28 @@ The picking rules live in `docs/agent-playbooks/prioritization.md` — this step
 mechanical implementation of that policy. The north star is the minimal useful kernel:
 work P0s first, then P1s, and so on.
 
+#### 1.0. Survey other auto-engineers' in-flight work
+
+Before listing candidate issues, enumerate what other auto-engineer instances are already
+working on. Since all auto-engineers act as the `dburkart` GitHub identity, the signal is
+"open PRs authored by `dburkart` that are not yet merged":
+
+```sh
+gh pr list --author dburkart --state open \
+  --json number,title,headRefName,labels,createdAt
+```
+
+For each open PR, resolve the issue it closes (parse `Closes #<N>` from the PR body, or
+derive `<N>` from the `m<N>-<slug>` branch prefix), then pull that issue's labels to
+collect the `area:*` and `track:*` values. Build a set of **in-flight areas** and
+**in-flight tracks** — the domains other agents are currently touching.
+
+Record this set and note it in your next message to the user (one short line, e.g.
+*"Other auto-engineers in flight: #401 (area:mem, track:userspace), #407 (area:fs) —
+will prefer a different area."*).
+
+#### 1.1. Enumerate candidate issues
+
 ```sh
 gh issue list --search 'no:assignee' --state open \
   --json number,title,labels,body,assignees
@@ -66,9 +88,19 @@ exhausted the priority ordering):
 
 1. `priority:P0` before `priority:P1` before `priority:P2` before `priority:P3`. Issues with
    no `priority:*` label rank **after** `priority:P3` — they are un-triaged.
-2. Within a priority bucket, prefer `track:userspace`, then `track:filesystem`, then
-   `track:terminal`, then `track:posix`, then untracked.
-3. Within a (priority, track) bucket, lowest-numbered first.
+2. Within a priority bucket, **prefer candidates whose `area:*` and `track:*` sets do not
+   overlap with the in-flight sets from step 1.0** — parallel work in disjoint subsystems
+   merges cleanly; two agents in the same area tend to collide on the same files, fight
+   over locks, or race on overlapping refactors. Ties here fall through to the
+   track-preference order (`track:userspace`, `track:filesystem`, `track:terminal`,
+   `track:posix`, untracked).
+3. Within an (priority, area-disjoint) bucket, apply the track preference as a
+   secondary sort.
+4. Within a (priority, track) bucket, lowest-numbered first.
+
+**Priority still wins.** Do not skip a P0 to avoid an area collision — if the only
+available P0 overlaps with another agent's area, pick it anyway. De-conflicting by area
+only matters when candidates are otherwise tied on priority.
 
 If the top candidate's prerequisites are still open, skip it and try the next one rather
 than starting work that cannot land. If a candidate is un-triaged (no `priority:*` label),
