@@ -197,6 +197,10 @@ name = "syscall_getdents"
 harness = false
 
 [[test]]
+name = "syscall_open_flags"
+harness = false
+
+[[test]]
 name = "vm_integration"
 harness = false
 
@@ -218,4 +222,8 @@ harness = false
 
 [[test]]
 name = "anon_fault_saturated"
+harness = false
+
+[[test]]
+name = "shell_introspection"
 harness = false

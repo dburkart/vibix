@@ -64,6 +64,8 @@ const ANSI_BRIGHT: [u32; 8] = [
 /// Off-screen rows kept in the scrollback ring.
 pub const SCROLLBACK_ROWS: usize = 200;
 
+use crate::fbview::{clamp_offset_down, clamp_offset_up, split_viewport};
+
 // ─── character cell ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -120,6 +122,12 @@ pub struct Console {
     scroll_head: usize,
     scroll_filled: usize,
 
+    // Viewport offset, in rows, from the live bottom. 0 = pinned to live
+    // output; positive values show that many rows of scrollback above the
+    // live top. Clamped to `scroll_filled`. Any new character output calls
+    // `pin_to_bottom()` first so live output always snaps the view back.
+    scroll_offset: usize,
+
     // SGR colour state.  We track base colour indices so that toggling
     // `bold` retroactively re-selects the bright palette entry.
     fg_base: Option<u8>, // 0-7 if an ANSI colour; None = default
@@ -172,6 +180,7 @@ impl Console {
             scrollback,
             scroll_head: 0,
             scroll_filled: 0,
+            scroll_offset: 0,
             fg_base: None,
             bg_base: None,
             bold: false,
@@ -207,6 +216,7 @@ impl Console {
     // ── screen clear ──────────────────────────────────────────────────────
 
     pub fn clear(&mut self) {
+        self.scroll_offset = 0;
         for cell in self.cells.iter_mut() {
             *cell = Cell::blank();
         }
@@ -273,6 +283,11 @@ impl Console {
     /// Called by the blink task.
     pub fn toggle_cursor(&mut self) {
         self.cursor_on = !self.cursor_on;
+        // When scrolled back, the live cursor isn't on screen. Flip the
+        // state so re-pinning restores the correct phase, but don't paint.
+        if self.scroll_offset != 0 {
+            return;
+        }
         let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
         self.draw_cursor(cx, cy, on);
     }
@@ -332,9 +347,161 @@ impl Console {
         }
     }
 
+    // ── scrollback viewport ───────────────────────────────────────────────
+
+    /// Maximum scroll-back offset the current viewport can reach.
+    fn max_scroll_offset(&self) -> usize {
+        self.scroll_filled
+    }
+
+    /// Step size for a page of scrollback — one screen minus one row of
+    /// overlap so readers don't lose their place.
+    fn page_step(&self) -> usize {
+        self.rows.saturating_sub(1).max(1)
+    }
+
+    /// Repaint the entire pixel grid from the scroll-back ring + live
+    /// `cells`, honoring `scroll_offset`. Used whenever the viewport
+    /// shifts or returns to live.
+    fn repaint_viewport(&mut self) {
+        let cols = self.cols;
+        let rows = self.rows;
+        let offset = self.scroll_offset.min(self.scroll_filled);
+        let (k, _live_rows) = split_viewport(offset, self.scroll_filled, rows);
+        // Rows [0..k): scrollback. The oldest visible row is age `offset-1`,
+        // and each successive row in the viewport is one step newer.
+        for r in 0..k {
+            let age = offset - 1 - r;
+            // Copy cells from the scrollback ring directly without an
+            // intermediate buffer so rows wider than 256 columns render
+            // correctly. Index arithmetic is duplicated here rather than
+            // calling scrollback_row() to avoid holding an immutable borrow
+            // across render_cell_at, which needs &mut self.
+            let ring_row = (self.scroll_head + self.scroll_filled - 1 - age) % SCROLLBACK_ROWS;
+            let base = ring_row * cols;
+            for c in 0..cols {
+                let cell = self.scrollback[base + c];
+                self.render_cell_at(c, r, cell);
+            }
+        }
+        // Rows [k..rows): top `rows - k` rows of live cells.
+        for r in k..rows {
+            let live_row = r - k;
+            for c in 0..cols {
+                let cell = self.cells[live_row * cols + c];
+                self.render_cell_at(c, r, cell);
+            }
+        }
+    }
+
+    /// If the viewport is scrolled back, snap it to live and repaint.
+    /// Called at the top of every output-producing path so new writes
+    /// always show up.
+    fn pin_to_bottom(&mut self) {
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.repaint_viewport();
+        }
+    }
+
+    /// Scroll the viewport up by `lines` (toward older output). Saturates
+    /// at `scroll_filled` rows.
+    pub fn scroll_view_up(&mut self, lines: usize) {
+        let new = clamp_offset_up(self.scroll_offset, lines, self.max_scroll_offset());
+        if new != self.scroll_offset {
+            self.scroll_offset = new;
+            self.repaint_viewport();
+            self.draw_indicator();
+        }
+    }
+
+    /// Scroll the viewport down by `lines` (toward live output). Saturates
+    /// at 0; reaching 0 erases the indicator.
+    pub fn scroll_view_down(&mut self, lines: usize) {
+        let new = clamp_offset_down(self.scroll_offset, lines);
+        if new != self.scroll_offset {
+            self.scroll_offset = new;
+            self.repaint_viewport();
+            if self.scroll_offset == 0 {
+                // Restore cursor cell — indicator lived there only in pixels.
+                let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+                self.draw_cursor(cx, cy, on);
+            } else {
+                self.draw_indicator();
+            }
+        }
+    }
+
+    /// Page one screen up.
+    pub fn scroll_view_up_page(&mut self) {
+        let step = self.page_step();
+        self.scroll_view_up(step);
+    }
+
+    /// Page one screen down.
+    pub fn scroll_view_down_page(&mut self) {
+        let step = self.page_step();
+        self.scroll_view_down(step);
+    }
+
+    /// Paint a small `[-offset/filled]` marker in the top row's right edge.
+    /// Written only to the pixel buffer (not the grid), so a pin-to-bottom
+    /// repaint from `cells` naturally erases it.
+    fn draw_indicator(&mut self) {
+        if self.scroll_offset == 0 || self.cols < 16 {
+            return;
+        }
+        // Build the ASCII marker, e.g. "[-12/200]".
+        let mut buf = [0u8; 24];
+        let mut w = 0;
+        let write_byte = |buf: &mut [u8; 24], w: &mut usize, b: u8| {
+            if *w < buf.len() {
+                buf[*w] = b;
+                *w += 1;
+            }
+        };
+        let write_num = |buf: &mut [u8; 24], w: &mut usize, mut n: usize| {
+            if n == 0 {
+                write_byte(buf, w, b'0');
+                return;
+            }
+            let mut digits = [0u8; 6];
+            let mut d = 0;
+            while n > 0 && d < digits.len() {
+                digits[d] = b'0' + (n % 10) as u8;
+                n /= 10;
+                d += 1;
+            }
+            while d > 0 {
+                d -= 1;
+                write_byte(buf, w, digits[d]);
+            }
+        };
+        write_byte(&mut buf, &mut w, b'[');
+        write_byte(&mut buf, &mut w, b'-');
+        write_num(&mut buf, &mut w, self.scroll_offset);
+        write_byte(&mut buf, &mut w, b'/');
+        write_num(&mut buf, &mut w, self.scroll_filled);
+        write_byte(&mut buf, &mut w, b']');
+        let len = w;
+        if len >= self.cols {
+            return;
+        }
+        let start_col = self.cols - len;
+        for (i, b) in buf.iter().enumerate().take(len) {
+            let cell = Cell {
+                ch: *b as char,
+                fg: ANSI_BRIGHT[3], // bright yellow — catches the eye
+                bg: DEFAULT_BG,
+            };
+            self.render_cell_at(start_col + i, 0, cell);
+        }
+    }
+
     // ── cursor-aware movement ─────────────────────────────────────────────
 
     fn move_to_newline(&mut self) {
+        self.pin_to_bottom();
         let (cx, cy) = (self.cx, self.cy);
         self.draw_cursor(cx, cy, false);
         self.cx = 0;
@@ -350,6 +517,10 @@ impl Console {
     // ── character output ──────────────────────────────────────────────────
 
     fn put_char(&mut self, c: char) {
+        // New output must snap the viewport back to live so the user sees
+        // what just got written.
+        self.pin_to_bottom();
+
         let fg = self.cur_fg();
         let bg = self.cur_bg();
 
@@ -425,6 +596,7 @@ impl Console {
                     self.move_to_newline();
                 }
                 '\r' => {
+                    self.pin_to_bottom();
                     let (cx, cy) = (self.cx, self.cy);
                     self.draw_cursor(cx, cy, false);
                     self.cx = 0;
@@ -432,6 +604,7 @@ impl Console {
                     self.draw_cursor(cx, cy, on);
                 }
                 '\t' => {
+                    self.pin_to_bottom();
                     let next_tab = ((self.cx / 8) + 1) * 8;
                     let (cx, cy) = (self.cx, self.cy);
                     self.draw_cursor(cx, cy, false);
@@ -519,6 +692,24 @@ pub fn init(console: Console) {
 pub fn toggle_cursor() {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.toggle_cursor();
+    }
+}
+
+/// Scroll the viewport one page up toward older output. No-op when the
+/// scrollback ring is empty. Call from the input layer when the user
+/// presses Shift+PgUp.
+pub fn scroll_view_up_page() {
+    if let Some(c) = CONSOLE.lock().as_mut() {
+        c.scroll_view_up_page();
+    }
+}
+
+/// Scroll the viewport one page down toward live output. Reaching 0
+/// erases the scroll indicator. Call from the input layer when the user
+/// presses Shift+PgDn.
+pub fn scroll_view_down_page() {
+    if let Some(c) = CONSOLE.lock().as_mut() {
+        c.scroll_view_down_page();
     }
 }
 

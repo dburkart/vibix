@@ -20,9 +20,10 @@ mod kernel_side {
 
     use super::ansi::{self, CsiFinal, Event};
     use super::line_editor::{Effect, Input, LineEditor};
+    use crate::build_info;
     use crate::mem::{frame, heap, FRAME_SIZE};
     use crate::task::TaskStateView;
-    use crate::{input, pci, serial, serial_print, serial_println, task, time};
+    use crate::{framebuffer, input, pci, serial, serial_print, serial_println, task, time};
 
     /// Flipped to `true` the first time the shell's `run` enters its main
     /// loop. Integration tests poll this to confirm the shell actually
@@ -63,6 +64,20 @@ mod kernel_side {
             return serial_byte(b, state);
         }
         let key = input::try_read_key()?;
+        // Shift+PgUp/PgDn pages the framebuffer scrollback. We capture the
+        // shift state immediately after decode (before any other scancode
+        // can advance the modifier state) and consume the key without
+        // forwarding it to the line editor.
+        if let DecodedKey::RawKey(kc @ (KeyCode::PageUp | KeyCode::PageDown)) = key {
+            if input::shift_held() {
+                match kc {
+                    KeyCode::PageUp => framebuffer::scroll_view_up_page(),
+                    KeyCode::PageDown => framebuffer::scroll_view_down_page(),
+                    _ => {}
+                }
+                return None;
+            }
+        }
         match key {
             DecodedKey::Unicode(c) => char_to_input(c),
             DecodedKey::RawKey(KeyCode::ArrowUp) => Some(Input::HistoryPrev),
@@ -158,10 +173,22 @@ mod kernel_side {
             "mem" => cmd_mem(),
             "tasks" => cmd_tasks(),
             "pci" => cmd_pci(),
+            "uname" => cmd_uname(rest),
+            "version" => cmd_version(),
+            "whoami" => cmd_whoami(),
+            "clear" => cmd_clear(),
+            "date" => cmd_date(),
             "echo" => serial_println!("{}", rest),
             "panic" => panic!("shell: panic builtin invoked"),
             _ => serial_println!("unknown command: {} (try `help`)", cmd),
         }
+    }
+
+    /// Test-only entry point: run one line through the dispatch table
+    /// without touching the line editor or input rings. Integration
+    /// tests capture the serial output directly via UART loopback.
+    pub fn dispatch_for_test(line: &str) {
+        dispatch(line);
     }
 
     fn cmd_help() {
@@ -172,6 +199,11 @@ mod kernel_side {
         serial_println!("  mem             heap + free-frame counters");
         serial_println!("  tasks           live task ids and remaining slices");
         serial_println!("  pci             enumerated PCI devices on bus 0");
+        serial_println!("  uname [-asrvm]  print kernel name / release / arch");
+        serial_println!("  version         kernel version + build metadata");
+        serial_println!("  whoami          print effective user name");
+        serial_println!("  clear           clear the screen (Ctrl+L with no key)");
+        serial_println!("  date            wall-clock time from the RTC (UTC)");
         serial_println!("  echo <args>     echo the rest of the line");
         serial_println!("  panic           trigger a kernel panic (test aid)");
     }
@@ -250,6 +282,116 @@ mod kernel_side {
         }
     }
 
+    fn cmd_uname(args: &str) {
+        // Flag parsing: glued (`-am`) or split (`-a -m`) tokens are
+        // both accepted; bare `uname` → `-s`. `-a` wins over any other
+        // letters in the same invocation (Linux behavior).
+        let mut show_name = false;
+        let mut show_release = false;
+        let mut show_version = false;
+        let mut show_machine = false;
+        let mut show_all = false;
+        let mut any_flag = false;
+        let mut bad: Option<char> = None;
+
+        for tok in args.split_whitespace() {
+            if let Some(rest) = tok.strip_prefix('-') {
+                if rest.is_empty() {
+                    bad = Some('-');
+                    break;
+                }
+                for c in rest.chars() {
+                    any_flag = true;
+                    match c {
+                        'a' => show_all = true,
+                        's' => show_name = true,
+                        'r' => show_release = true,
+                        'v' => show_version = true,
+                        'm' => show_machine = true,
+                        other => {
+                            bad = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if bad.is_some() {
+                    break;
+                }
+            } else {
+                bad = Some(tok.chars().next().unwrap_or('?'));
+                break;
+            }
+        }
+
+        if let Some(c) = bad {
+            serial_println!("uname: invalid option -- '{}'", c);
+            return;
+        }
+
+        if !any_flag {
+            show_name = true;
+        }
+
+        if show_all {
+            serial_println!(
+                "{} {} {} {}",
+                build_info::KERNEL_NAME,
+                build_info::RELEASE,
+                build_info::BUILD_TIMESTAMP,
+                build_info::ARCH,
+            );
+            return;
+        }
+
+        let mut first = true;
+        for (flag, value) in [
+            (show_name, build_info::KERNEL_NAME),
+            (show_release, build_info::RELEASE),
+            (show_version, build_info::BUILD_TIMESTAMP),
+            (show_machine, build_info::ARCH),
+        ] {
+            if flag {
+                if !first {
+                    serial_print!(" ");
+                }
+                serial_print!("{}", value);
+                first = false;
+            }
+        }
+        serial_println!();
+    }
+
+    fn cmd_version() {
+        serial_println!(
+            "{} {} {} {}",
+            build_info::KERNEL_NAME,
+            build_info::RELEASE,
+            build_info::BUILD_TIMESTAMP,
+            build_info::ARCH,
+        );
+        serial_println!(
+            "build: {} (git {})",
+            build_info::PROFILE,
+            build_info::GIT_SHA,
+        );
+    }
+
+    fn cmd_whoami() {
+        serial_println!("root");
+    }
+
+    fn cmd_clear() {
+        // Same VT100 sequence the line editor emits on Ctrl+L.
+        serial_print!("\x1b[2J\x1b[H");
+    }
+
+    fn cmd_date() {
+        match time::wall_clock() {
+            Some(now) => serial_println!("{} UTC", now),
+            None => serial_println!("date: unavailable (no RTC)"),
+        }
+    }
+
     fn cmd_tasks() {
         task::for_each_task(|t| {
             let tag = match t.state {
@@ -270,4 +412,4 @@ mod kernel_side {
 }
 
 #[cfg(target_os = "none")]
-pub use kernel_side::{run, SHELL_ONLINE};
+pub use kernel_side::{dispatch_for_test, run, SHELL_ONLINE};

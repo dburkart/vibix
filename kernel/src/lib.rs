@@ -15,6 +15,7 @@ extern crate alloc;
 pub mod abi;
 #[cfg(any(test, target_os = "none"))]
 pub mod block;
+pub mod build_info;
 pub mod cpu;
 #[cfg(any(test, target_os = "none"))]
 pub mod fs;
@@ -35,6 +36,7 @@ pub mod arch;
 pub mod bench;
 #[cfg(target_os = "none")]
 pub mod boot;
+pub mod fbview;
 #[cfg(target_os = "none")]
 pub mod framebuffer;
 #[cfg(any(test, target_os = "none"))]
