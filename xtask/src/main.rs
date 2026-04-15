@@ -795,12 +795,7 @@ fn parse_test_names(manifest: &str) -> R<Vec<String>> {
 /// Integration tests that parse from `kernel/Cargo.toml` but should
 /// NOT be run by `cargo xtask test`. Each entry must name the
 /// follow-up issue that tracks re-enabling it. Empty is the goal.
-///
-/// - `syscall_mmap_family`: `mmap_shared_anon_succeeds` hangs under
-///   QEMU (>30s timeout). Predates #292 and was silently skipped by
-///   the previous hardcoded allowlist; surfaced once the list became
-///   manifest-driven. Tracked in the follow-up opened alongside #292.
-const TEST_SKIPLIST: &[&str] = &["syscall_mmap_family"];
+const TEST_SKIPLIST: &[&str] = &[];
 
 /// Read `kernel/Cargo.toml` and return the declared integration-test
 /// target names, minus anything in [`TEST_SKIPLIST`]. Derived
@@ -1126,9 +1121,7 @@ harness = false
     #[test]
     fn parse_test_names_live_manifest_contains_new_entries() {
         // Guards against silent drift: these were previously absent
-        // from the hardcoded xtask array (issue #292). `syscall_mmap_family`
-        // is tracked in the manifest but currently in TEST_SKIPLIST,
-        // so assert it via the raw parser rather than the filtered list.
+        // from the hardcoded xtask array (issue #292).
         let raw = parse_test_names(
             &std::fs::read_to_string(workspace_root().join("kernel").join("Cargo.toml")).unwrap(),
         )
@@ -1140,7 +1133,7 @@ harness = false
             );
         }
         let filtered = integration_test_names().expect("parse live manifest");
-        for expected in &["execve_atomic", "fork_refcount"] {
+        for expected in &["execve_atomic", "fork_refcount", "syscall_mmap_family"] {
             assert!(
                 filtered.iter().any(|n| n == expected),
                 "expected {expected} in derived test list, got {filtered:?}"
