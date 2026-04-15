@@ -392,12 +392,10 @@ impl FileDescTable {
         let mut cur = desc.flags.load(Ordering::Relaxed);
         loop {
             let next = (cur & !mutable) | (new_flags & mutable);
-            match desc.flags.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match desc
+                .flags
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(()),
                 Err(observed) => cur = observed,
             }

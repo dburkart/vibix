@@ -313,9 +313,7 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
         guard,
     );
     let backend: Arc<dyn FileBackend> = Arc::new(VfsBackend { open_file: of });
-    let fd_flags =
-        (flags as u32) & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR | oflags::O_CLOEXEC);
-    install_fd(backend, fd_flags)
+    install_fd(backend, flags as u32)
 }
 
 /// `stat(path, *statbuf)` (follow=true) / `lstat(path, *statbuf)`

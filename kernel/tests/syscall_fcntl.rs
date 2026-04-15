@@ -19,7 +19,9 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
-use vibix::fs::{EBADF, EINVAL, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL};
+use vibix::fs::{
+    EBADF, EINVAL, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL,
+};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
 use vibix::{
@@ -60,12 +62,27 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("fcntl_getfl_reflects_open_flags", &(fcntl_getfl_reflects_open_flags as fn())),
-        ("fcntl_setfl_mutates_only_mutable_bits", &(fcntl_setfl_mutates_only_mutable_bits as fn())),
-        ("fcntl_getfd_setfd_roundtrip_cloexec", &(fcntl_getfd_setfd_roundtrip_cloexec as fn())),
+        (
+            "fcntl_getfl_reflects_open_flags",
+            &(fcntl_getfl_reflects_open_flags as fn()),
+        ),
+        (
+            "fcntl_setfl_mutates_only_mutable_bits",
+            &(fcntl_setfl_mutates_only_mutable_bits as fn()),
+        ),
+        (
+            "fcntl_getfd_setfd_roundtrip_cloexec",
+            &(fcntl_getfd_setfd_roundtrip_cloexec as fn()),
+        ),
         ("fcntl_dupfd_uses_floor", &(fcntl_dupfd_uses_floor as fn())),
-        ("fcntl_dupfd_cloexec_sets_bit_only_on_new", &(fcntl_dupfd_cloexec_sets_bit_only_on_new as fn())),
-        ("fcntl_unknown_cmd_einval", &(fcntl_unknown_cmd_einval as fn())),
+        (
+            "fcntl_dupfd_cloexec_sets_bit_only_on_new",
+            &(fcntl_dupfd_cloexec_sets_bit_only_on_new as fn()),
+        ),
+        (
+            "fcntl_unknown_cmd_einval",
+            &(fcntl_unknown_cmd_einval as fn()),
+        ),
         ("fcntl_bad_fd_ebadf", &(fcntl_bad_fd_ebadf as fn())),
     ];
     for (name, t) in tests {
