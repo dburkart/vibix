@@ -118,6 +118,8 @@ fn main() -> R<()> {
             run(&opts)?;
         }
         "test" => test_all()?,
+        "test-unit" => test_unit()?,
+        "test-integration" => test_integration()?,
         "test-runner" => {
             let kernel = rest.first().ok_or("test-runner: missing kernel ELF path")?;
             test_runner(Path::new(kernel))?;
@@ -133,7 +135,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench]"
+                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench]"
             );
             std::process::exit(2);
         }
@@ -897,7 +899,7 @@ fn integration_test_names() -> R<Vec<String>> {
     Ok(filtered)
 }
 
-fn test_all() -> R<()> {
+fn test_unit() -> R<()> {
     // Host unit tests (--lib only; pure-logic modules).
     println!("→ host unit tests");
     check(
@@ -906,7 +908,10 @@ fn test_all() -> R<()> {
             .args(["test", "--package", "vibix", "--lib"])
             .status()?,
     )?;
+    Ok(())
+}
 
+fn test_integration() -> R<()> {
     // QEMU integration tests. Each is invoked by name so cargo doesn't
     // also try to build the lib's no_std test harness (which would
     // require std). Cargo's runner config invokes us back as
@@ -925,7 +930,12 @@ fn test_all() -> R<()> {
         cmd.arg("--test").arg(t);
     }
     check(cmd.status()?)?;
+    Ok(())
+}
 
+fn test_all() -> R<()> {
+    test_unit()?;
+    test_integration()?;
     Ok(())
 }
 
