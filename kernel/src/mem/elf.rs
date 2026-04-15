@@ -10,11 +10,14 @@ use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
+/// ELF type: shared object / position-independent executable (dynamic linker).
+const ET_DYN: u16 = 3;
 
 /// Path suffix the Limine config publishes for the PID 1 init ELF.
 /// Module lookup uses `ends_with` so an absolute-path prefix won't
@@ -71,6 +74,9 @@ pub(crate) struct LoadSegment {
 #[derive(Clone, Copy)]
 pub(crate) struct ParsedElf<'a> {
     ehdr: Elf64Ehdr,
+    /// The full source image bytes, needed to resolve segment content
+    /// (e.g. the PT_INTERP path string at `p_offset`).
+    bytes: &'a [u8],
     phdr_bytes: &'a [u8],
     phnum: usize,
 }
@@ -165,6 +171,38 @@ impl<'a> ParsedElf<'a> {
     pub(crate) fn entry(&self) -> VirtAddr {
         VirtAddr::new(self.ehdr.e_entry)
     }
+
+    /// Return the interpreter path from the PT_INTERP segment, if present.
+    ///
+    /// The returned slice is the null-terminated path string *without* the
+    /// trailing `\0`. Returns `None` if there is no PT_INTERP segment, if the
+    /// segment's file range is out of bounds, or if the segment contains no
+    /// null byte (malformed).
+    pub(crate) fn interp_path(&self) -> Option<&'a [u8]> {
+        for i in 0..self.phnum {
+            let off = i * core::mem::size_of::<Elf64Phdr>();
+            // SAFETY: phdr_bytes was bounds-checked during parse to hold
+            // exactly `phnum` contiguous Elf64Phdr records.
+            let ph = unsafe {
+                core::ptr::read_unaligned(
+                    self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>(),
+                )
+            };
+            if ph.p_type != PT_INTERP {
+                continue;
+            }
+            let start = ph.p_offset as usize;
+            let end = (ph.p_offset as usize).checked_add(ph.p_filesz as usize)?;
+            if end > self.bytes.len() {
+                return None;
+            }
+            let content = &self.bytes[start..end];
+            // Find the null terminator within the segment content.
+            let nul = content.iter().position(|&b| b == 0)?;
+            return Some(&self.bytes[start..start + nul]);
+        }
+        None
+    }
 }
 
 /// Iterate `PT_LOAD` segments of the running kernel's ELF image,
@@ -196,17 +234,7 @@ pub(super) fn kernel_load_segments() -> impl Iterator<Item = LoadSegment> {
 
 #[cfg(target_os = "none")]
 pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
-    let resp = crate::boot::MODULE_REQUEST.get_response()?;
-    let file = resp
-        .modules()
-        .iter()
-        .find(|f| f.path().to_bytes().ends_with(USERSPACE_INIT_MODULE_SUFFIX))?;
-    let base = file.addr();
-    let size = file.size() as usize;
-    // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
-    // memory, which is preserved across `reclaim_bootloader_memory()`.
-    // The slice stays valid for the rest of the kernel's lifetime.
-    Some(unsafe { core::slice::from_raw_parts(base, size) })
+    module_bytes_for_path(USERSPACE_INIT_MODULE_SUFFIX)
 }
 
 /// Return the raw bytes of the `userspace_hello.elf` Limine module, or
@@ -214,14 +242,28 @@ pub(crate) fn first_loaded_module_bytes() -> Option<&'static [u8]> {
 /// replace the calling process's image with a fresh ELF payload.
 #[cfg(target_os = "none")]
 pub(crate) fn hello_module_bytes() -> Option<&'static [u8]> {
+    module_bytes_for_path(b"/boot/userspace_hello.elf")
+}
+
+/// Return the bytes of the Limine module whose path ends with `suffix`, or
+/// `None` if no such module was loaded.
+///
+/// Used to locate the dynamic interpreter (PT_INTERP) by path. The module
+/// path in the Limine config is typically the full absolute path (e.g.
+/// `/boot/ld-musl-x86_64.so.1`); callers pass the suffix (e.g.
+/// `b"ld-musl-x86_64.so.1"`) to avoid requiring an exact path match.
+#[cfg(target_os = "none")]
+pub(crate) fn module_bytes_for_path(suffix: &[u8]) -> Option<&'static [u8]> {
     let resp = crate::boot::MODULE_REQUEST.get_response()?;
     let file = resp
         .modules()
         .iter()
-        .find(|f| f.path().to_bytes().ends_with(b"/boot/userspace_hello.elf"))?;
+        .find(|f| f.path().to_bytes().ends_with(suffix))?;
     let base = file.addr();
     let size = file.size() as usize;
-    // SAFETY: same lifetime guarantee as first_loaded_module_bytes.
+    // SAFETY: Limine places module payloads in EXECUTABLE_AND_MODULES
+    // memory, preserved across reclaim_bootloader_memory(). The slice
+    // stays valid for the rest of the kernel's lifetime.
     Some(unsafe { core::slice::from_raw_parts(base, size) })
 }
 
@@ -314,12 +356,16 @@ fn parse_elf64_inner(bytes: &[u8]) -> Result<ParsedElf<'_>, ElfParseError> {
             entry_covered = true;
         }
     }
-    if !entry_covered {
+    // ET_DYN (shared objects / dynamic linkers) may have e_entry == 0 and
+    // PT_LOAD segments starting at vaddr 0. The OS supplies the actual load
+    // base at runtime, so the entry-coverage check doesn't apply.
+    if !entry_covered && ehdr.e_type != ET_DYN {
         return Err(ElfParseError::EntryOutsideLoadSegment);
     }
 
     Ok(ParsedElf {
         ehdr,
+        bytes,
         phdr_bytes: &bytes[phoff..phdr_table_end],
         phnum,
     })
@@ -476,5 +522,85 @@ mod tests {
         let mut bytes = sample_elf_bytes();
         put64(&mut bytes, 24, 0x500000); // entry outside both PT_LOADs
         assert!(try_parse_elf64(&bytes).is_none());
+    }
+
+    /// Build a minimal ELF with a PT_INTERP segment and two PT_LOAD segments.
+    /// The interp path bytes are appended after the phdr table.
+    fn sample_elf_with_interp(path: &[u8]) -> Vec<u8> {
+        // Layout: EHDR | PHDR[0]=PT_INTERP | PHDR[1]=PT_LOAD(rx) | PHDR[2]=PT_LOAD(rw) | path bytes
+        let phdr_count = 3;
+        let phdr_table_size = phdr_count * PHDR_SIZE;
+        let path_offset = EHDR_SIZE + phdr_table_size;
+        // path bytes include null terminator
+        let total = path_offset + path.len() + 1;
+
+        let mut bytes = vec![0u8; total];
+        // ELF magic + class/data/version
+        bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // little-endian
+        bytes[6] = 1; // ELF v1
+        put16(&mut bytes, 16, 2); // ET_EXEC
+        put16(&mut bytes, 18, 0x3e); // x86_64
+        put32(&mut bytes, 20, 1); // EV_CURRENT
+        put64(&mut bytes, 24, 0x400080); // entry (within PT_LOAD[0])
+        put64(&mut bytes, 32, EHDR_SIZE as u64); // e_phoff
+        put16(&mut bytes, 52, EHDR_SIZE as u16); // e_ehsize
+        put16(&mut bytes, 54, PHDR_SIZE as u16); // e_phentsize
+        put16(&mut bytes, 56, phdr_count as u16); // e_phnum
+
+        // phdr 0: PT_INTERP
+        let p0 = EHDR_SIZE;
+        put32(&mut bytes, p0, 3); // PT_INTERP
+        put64(&mut bytes, p0 + 8, path_offset as u64); // p_offset → appended path
+        put64(&mut bytes, p0 + 32, (path.len() + 1) as u64); // p_filesz (with nul)
+        put64(&mut bytes, p0 + 40, (path.len() + 1) as u64); // p_memsz
+
+        // phdr 1: PT_LOAD RX (covers entry 0x400080)
+        let p1 = EHDR_SIZE + PHDR_SIZE;
+        put32(&mut bytes, p1, 1); // PT_LOAD
+        put32(&mut bytes, p1 + 4, 1); // PF_X
+        put64(&mut bytes, p1 + 16, 0x400000); // p_vaddr
+        put64(&mut bytes, p1 + 40, 0x2000); // p_memsz
+
+        // phdr 2: PT_LOAD RW
+        let p2 = EHDR_SIZE + 2 * PHDR_SIZE;
+        put32(&mut bytes, p2, 1); // PT_LOAD
+        put32(&mut bytes, p2 + 4, 2); // PF_W
+        put64(&mut bytes, p2 + 16, 0x402000); // p_vaddr
+        put64(&mut bytes, p2 + 40, 0x1000); // p_memsz
+
+        // Write the path bytes (with null terminator) at `path_offset`.
+        bytes[path_offset..path_offset + path.len()].copy_from_slice(path);
+        bytes[path_offset + path.len()] = 0; // null terminator
+
+        bytes
+    }
+
+    #[test]
+    fn interp_path_returns_correct_string() {
+        let path = b"/lib/ld-musl-x86_64.so.1";
+        let bytes = sample_elf_with_interp(path);
+        let parsed = parse_elf64(&bytes);
+        assert_eq!(parsed.interp_path(), Some(path.as_slice()));
+    }
+
+    #[test]
+    fn interp_path_none_when_no_interp() {
+        let bytes = sample_elf_bytes();
+        let parsed = parse_elf64(&bytes);
+        assert!(parsed.interp_path().is_none());
+    }
+
+    #[test]
+    fn interp_path_none_when_no_null_terminator() {
+        let path = b"/lib/ld-musl-x86_64.so.1";
+        let mut bytes = sample_elf_with_interp(path);
+        // Overwrite the null terminator with a non-null byte so the segment
+        // contains no null byte.
+        let path_offset = EHDR_SIZE + 3 * PHDR_SIZE;
+        bytes[path_offset + path.len()] = b'!';
+        let parsed = parse_elf64(&bytes);
+        assert!(parsed.interp_path().is_none());
     }
 }

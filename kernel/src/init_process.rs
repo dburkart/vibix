@@ -128,7 +128,20 @@ pub fn launch(bytes: &[u8]) -> usize {
     );
 
     // 4. Publish entry point and stash the address space.
-    INIT_ENTRY.store(image.entry.as_u64(), Ordering::Release);
+    // If the binary has a dynamic interpreter (PT_INTERP), jump to the
+    // interpreter's entry point — it will relocate itself and the main binary
+    // before transferring control to the main binary's entry. The main binary's
+    // original entry point goes into the auxv AT_ENTRY vector (issue #359).
+    let effective_entry = image.interp_entry.unwrap_or(image.entry);
+    if let Some(interp_base) = image.interp_base {
+        serial_println!(
+            "init: dynamic interpreter at base={:#x} entry={:#x} (main entry={:#x})",
+            interp_base,
+            effective_entry.as_u64(),
+            image.entry.as_u64(),
+        );
+    }
+    INIT_ENTRY.store(effective_entry.as_u64(), Ordering::Release);
     INIT_ADDRESS_SPACE.call_once(|| Arc::new(RwLock::new(aspace)));
 
     // 5. Spawn the kernel task that will drop to ring-3 and register it

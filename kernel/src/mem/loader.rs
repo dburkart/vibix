@@ -59,7 +59,19 @@ pub enum LoadError {
     /// first non-canonical lower-half address. Reject at load time so
     /// the panic can't be reached from a malformed user ELF.
     SegmentEndsAtUserVaEnd,
+    /// The main ELF has a PT_INTERP segment naming an interpreter, but no
+    /// Limine module with a matching path suffix was found.
+    InterpNotFound,
+    /// The interpreter ELF named by PT_INTERP failed to parse or map.
+    InterpLoadFailed,
 }
+
+/// Virtual base address where the dynamic interpreter (PT_INTERP) is loaded.
+///
+/// Chosen to be above the typical userspace binary load range (~0x400000) but
+/// well below the stack top (~0x7FFF_F000). This is a fixed address; a future
+/// ASLR implementation will randomize it.
+pub const INTERP_LOAD_BASE: u64 = 0x4000_0000;
 
 /// Result of a successful load: the entry point, segment count, and the
 /// page-aligned virtual address one byte past the last `PT_LOAD` segment.
@@ -72,6 +84,12 @@ pub struct LoadedImage {
     /// First page-aligned address after the last PT_LOAD segment.
     /// The `sys_brk` implementation uses this as the initial heap start.
     pub image_end: u64,
+    /// Entry point of the dynamic interpreter (PT_INTERP), adjusted by
+    /// `INTERP_LOAD_BASE`. `None` if the binary has no PT_INTERP segment.
+    pub interp_entry: Option<VirtAddr>,
+    /// Virtual base address at which the interpreter was loaded.
+    /// `None` if the binary has no PT_INTERP segment.
+    pub interp_base: Option<u64>,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -115,6 +133,8 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         entry,
         segments,
         image_end,
+        interp_entry: None,
+        interp_base: None,
     })
 }
 
@@ -155,7 +175,7 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
             err = Some(LoadError::SegmentEndsAtUserVaEnd);
             break;
         }
-        if let Err((e, mapped)) = map_user_segment(bytes, seg, pml4) {
+        if let Err((e, mapped)) = map_user_segment(bytes, seg, pml4, 0) {
             err = Some(e);
             partial_pages = mapped;
             break;
@@ -184,6 +204,8 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         entry,
         segments,
         image_end,
+        interp_entry: None,
+        interp_base: None,
     })
 }
 
@@ -243,27 +265,31 @@ pub fn load_user_elf_with_vmas(
 ) -> Result<LoadedImage, LoadError> {
     use super::vmatree::{Share, Vma};
     use super::vmobject::{AnonObject, VmObject};
-    use x86_64::VirtAddr;
 
-    let image = load_user_elf(bytes, pml4)?;
+    let mut image = load_user_elf(bytes, pml4)?;
 
     let parsed = elf::try_parse_elf64(bytes).ok_or(LoadError::NotElf64)?;
-    for seg in parsed.load_segments() {
-        if seg.vaddr.as_u64() >= UPPER_HALF_START {
-            continue;
+
+    // Helper closure: register one ELF segment as a VMA, pre-populating the
+    // AnonObject cache with the frames the loader just installed at
+    // `effective_vaddr = seg.vaddr + base_offset`.
+    let mut register_vma = |seg: elf::LoadSegment, base_offset: u64| {
+        let effective_vaddr = seg.vaddr.as_u64().wrapping_add(base_offset);
+        if effective_vaddr >= UPPER_HALF_START {
+            return;
         }
         let page_count = seg.memsz.div_ceil(PAGE_SIZE) as usize;
-        let start = seg.vaddr.as_u64() as usize;
+        let start = effective_vaddr as usize;
         let end = start + page_count * PAGE_SIZE as usize;
         let obj = AnonObject::new(Some(page_count));
 
         // Pre-populate the cache with the frames the loader just mapped.
         for i in 0..page_count {
-            let va = VirtAddr::new(seg.vaddr.as_u64() + i as u64 * PAGE_SIZE);
+            let va = VirtAddr::new(effective_vaddr + i as u64 * PAGE_SIZE);
             if let Some((frame, _)) = paging::translate_in_pml4(pml4, va) {
                 let phys = frame.start_address().as_u64();
                 // insert_existing_frame increments refcount by 1 for the
-                // cache reference. The PTE reference was set by load_user_elf
+                // cache reference. The PTE reference was set by the loader
                 // on a freshly-allocated frame (refcount 1), so saturation
                 // is statically impossible here.
                 obj.insert_existing_frame(i, phys)
@@ -283,6 +309,51 @@ pub fn load_user_elf_with_vmas(
             0,
         );
         address_space.insert(vma);
+    };
+
+    for seg in parsed.load_segments() {
+        register_vma(seg, 0);
+    }
+
+    // Check for a dynamic interpreter (PT_INTERP). If present, look it up
+    // in the Limine modules by path suffix, load its segments at
+    // INTERP_LOAD_BASE, and record its adjusted entry point.
+    if let Some(interp_path) = parsed.interp_path() {
+        let interp_bytes =
+            elf::module_bytes_for_path(interp_path).ok_or(LoadError::InterpNotFound)?;
+
+        let interp_parsed =
+            elf::try_parse_elf64(interp_bytes).ok_or(LoadError::InterpLoadFailed)?;
+
+        // Load interpreter PT_LOAD segments at INTERP_LOAD_BASE.
+        let mut interp_err: Option<LoadError> = None;
+        for seg in interp_parsed.load_segments() {
+            let seg_end = seg
+                .vaddr
+                .as_u64()
+                .wrapping_add(INTERP_LOAD_BASE)
+                .wrapping_add(seg.memsz);
+            if seg_end >= USER_VA_END {
+                interp_err = Some(LoadError::InterpLoadFailed);
+                break;
+            }
+            if let Err((e, _)) = map_user_segment(interp_bytes, seg, pml4, INTERP_LOAD_BASE) {
+                interp_err = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = interp_err {
+            return Err(e);
+        }
+
+        // Register interpreter segments as VMAs so fork copies them.
+        for seg in interp_parsed.load_segments() {
+            register_vma(seg, INTERP_LOAD_BASE);
+        }
+
+        let interp_entry_vaddr = interp_parsed.entry().as_u64() + INTERP_LOAD_BASE;
+        image.interp_entry = Some(VirtAddr::new(interp_entry_vaddr));
+        image.interp_base = Some(INTERP_LOAD_BASE);
     }
 
     Ok(image)
@@ -292,27 +363,36 @@ pub fn load_user_elf_with_vmas(
 /// pages that had been successfully mapped into `pml4` before the error —
 /// the caller uses that count to unmap and free those frames on the
 /// failure path.
+///
+/// `base_offset` is added to each segment's `p_vaddr` before mapping. Pass
+/// `0` for the main binary (which is linked at its final load address) and
+/// `INTERP_LOAD_BASE` for a position-independent interpreter whose segment
+/// vaddrs start near 0.
 fn map_user_segment(
     bytes: &[u8],
     seg: elf::LoadSegment,
     pml4: PhysFrame<Size4KiB>,
+    base_offset: u64,
 ) -> Result<(), (LoadError, u64)> {
-    if seg.vaddr.as_u64() >= UPPER_HALF_START {
+    let effective_vaddr = seg
+        .vaddr
+        .as_u64()
+        .checked_add(base_offset)
+        .ok_or((LoadError::SegmentNotLowerHalf, 0))?;
+    if effective_vaddr >= UPPER_HALF_START {
         return Err((LoadError::SegmentNotLowerHalf, 0));
     }
     // Reject segments whose virtual range overflows or crosses the
     // lower-half ceiling. Without this check, a large `p_memsz` could
     // push later pages into non-canonical space, panicking in
     // `VirtAddr::new()` during the mapping loop.
-    if seg
-        .vaddr
-        .as_u64()
+    if effective_vaddr
         .checked_add(seg.memsz)
         .map_or(true, |end| end > UPPER_HALF_START)
     {
         return Err((LoadError::SegmentNotLowerHalf, 0));
     }
-    if seg.vaddr.as_u64() & (PAGE_SIZE - 1) != 0 {
+    if effective_vaddr & (PAGE_SIZE - 1) != 0 {
         return Err((LoadError::SegmentNotPageAligned, 0));
     }
 
@@ -328,7 +408,7 @@ fn map_user_segment(
 
     let mut mapped = 0u64;
     for i in 0..page_count {
-        let va = seg.vaddr + i * PAGE_SIZE;
+        let va = VirtAddr::new(effective_vaddr + i * PAGE_SIZE);
         let page = Page::<Size4KiB>::containing_address(va);
         // map_in_pml4 allocates a fresh zeroed frame and installs it in
         // pml4 (not the global kernel mapper).
