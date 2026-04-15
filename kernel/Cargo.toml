@@ -189,6 +189,10 @@ name = "syscall_vfs"
 harness = false
 
 [[test]]
+name = "syscall_lseek"
+harness = false
+
+[[test]]
 name = "vm_integration"
 harness = false
 

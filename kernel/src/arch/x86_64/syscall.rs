@@ -336,6 +336,28 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // lseek(fd, offset, whence) — reposition the shared open-file offset.
+        //   whence: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2.
+        // Returns the new absolute offset on success, or a negated errno
+        // (EBADF, EINVAL, ESPIPE, EOVERFLOW).
+        LSEEK => {
+            let fd = a0 as u32;
+            let off = a1 as i64;
+            let whence = a2 as i32;
+            let backend = {
+                let tbl = crate::task::current_fd_table();
+                let x = match tbl.lock().get(fd) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                x
+            };
+            match backend.lseek(off, whence) {
+                Ok(n) => n,
+                Err(e) => e,
+            }
+        }
+
         // dup2(oldfd, newfd)
         DUP2 => {
             let oldfd = a0 as u32;

@@ -59,6 +59,18 @@ pub trait FileBackend: Send + Sync {
         DEFAULT_POLLMASK
     }
 
+    /// Reposition the shared file offset per POSIX `lseek(2)`.
+    ///
+    /// `whence` follows the Linux ABI (`SEEK_SET`=0, `SEEK_CUR`=1,
+    /// `SEEK_END`=2). The default returns `ESPIPE`, which is the correct
+    /// answer for pipes, FIFOs, sockets, and any other backend that has
+    /// no random-access offset — matching the Linux behaviour for drivers
+    /// without a `.llseek` file-op. Backends over seekable objects
+    /// (VFS-backed regular files) override this.
+    fn lseek(&self, _off: i64, _whence: i32) -> Result<i64, i64> {
+        Err(ESPIPE)
+    }
+
     /// Downcast to [`vfs::VfsBackend`] for fd-keyed syscalls that need the
     /// underlying `OpenFile` (e.g. `fstat`, `fstatat` with `AT_EMPTY_PATH`).
     /// Non-VFS backends (`SerialBackend`, test stubs) return `None` and
@@ -155,6 +167,7 @@ pub const ENOTTY: i64 = -25;
 pub const EFAULT: i64 = -14;
 pub const EPIPE: i64 = -32;
 pub const EINTR: i64 = -4;
+pub const ESPIPE: i64 = -29;
 
 /// Per-process file-descriptor array.
 ///
@@ -631,6 +644,16 @@ mod tests {
         assert!(t.get(0).is_ok());
         assert!(t.get(1).is_ok());
         assert!(t.get(2).is_ok());
+    }
+
+    #[test]
+    fn default_lseek_returns_espipe() {
+        // Backends that do not override lseek (pipes, sockets, synthetic
+        // stdio) must surface ESPIPE — matching Linux's behaviour for
+        // drivers without a .llseek file-op.
+        let backend = NullBackend;
+        assert_eq!(backend.lseek(0, 0), Err(ESPIPE));
+        assert_eq!(backend.lseek(42, 1), Err(ESPIPE));
     }
 
     #[test]
