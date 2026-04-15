@@ -161,13 +161,27 @@ fn resolve_file_path(
 }
 
 /// Normalize a file path relative to the workspace root when possible.
-/// Falls back to the absolute path (or whatever gimli gave us) unchanged.
+/// For paths outside the workspace (sysroot, cargo-registry, etc.), keeps
+/// only the last two path components so the strtab stays compact and
+/// machine-independent (e.g. `.../spin/src/mutex.rs` → `src/mutex.rs`).
 fn normalize(path: &str, workspace_root: &Path) -> String {
     let p = Path::new(path);
     if let Ok(stripped) = p.strip_prefix(workspace_root) {
         stripped.to_string_lossy().into_owned()
     } else {
-        path.to_string()
+        // Keep only the last two normal components so the blob doesn't
+        // embed machine-specific absolute sysroot or registry paths.
+        // Root/prefix components are skipped so the result is always
+        // a relative fragment (e.g. `/etc/passwd` → `etc/passwd`,
+        // `/libc.so` → `libc.so`).
+        let components: Vec<_> = p
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .rev()
+            .take(2)
+            .collect();
+        let short: PathBuf = components.into_iter().rev().collect();
+        short.to_string_lossy().into_owned()
     }
 }
 
@@ -175,8 +189,22 @@ fn normalize(path: &str, workspace_root: &Path) -> String {
 /// with the same source location to their first pc.
 fn sort_and_dedup(rows: &mut Vec<LnRow>) {
     rows.sort_by_key(|a| a.pc);
-    // Drop rows sharing a pc with an earlier entry.
-    rows.dedup_by(|a, b| a.pc == b.pc);
+    // For equal-PC rows, keep the LAST entry: DWARF iteration order is
+    // implementation-defined, but for inlined functions the innermost
+    // (callee) source location tends to appear last and is more useful
+    // for backtraces than the call-site row that comes first.
+    // `dedup_by` removes `a` (the later slot) when the closure returns
+    // true, so we copy `a`'s fields into `b` before returning true.
+    rows.dedup_by(|a, b| {
+        if a.pc == b.pc {
+            b.file = a.file.clone();
+            b.line = a.line;
+            b.col = a.col;
+            true
+        } else {
+            false
+        }
+    });
     // Collapse adjacent rows with identical source triples, keeping the
     // lowest pc. Iterate in a single pass.
     let mut write = 0usize;
@@ -346,6 +374,8 @@ mod tests {
         let mut rows = vec![row(0x1000, "a.rs", 1, 0), row(0x1000, "a.rs", 2, 0)];
         sort_and_dedup(&mut rows);
         assert_eq!(rows.len(), 1);
+        // The LAST row for a given PC is kept (line 2, not line 1).
+        assert_eq!(rows[0].line, 2);
     }
 
     #[test]
@@ -423,6 +453,27 @@ mod tests {
     fn normalize_strips_workspace_prefix() {
         let ws = Path::new("/ws");
         assert_eq!(normalize("/ws/kernel/src/foo.rs", ws), "kernel/src/foo.rs");
-        assert_eq!(normalize("/etc/passwd", ws), "/etc/passwd");
+        // Non-workspace paths are shortened to the last two normal components.
+        assert_eq!(normalize("/etc/passwd", ws), "etc/passwd");
+    }
+
+    #[test]
+    fn normalize_shortens_non_workspace_path() {
+        let ws = Path::new("/ws");
+        // Cargo registry paths get truncated to the last two components.
+        assert_eq!(
+            normalize(
+                "/home/user/.cargo/registry/src/spin/src/mutex.rs",
+                ws
+            ),
+            "src/mutex.rs"
+        );
+    }
+
+    #[test]
+    fn normalize_shortens_single_component_path() {
+        let ws = Path::new("/ws");
+        // Paths with fewer than two components return what's available.
+        assert_eq!(normalize("/libc.so", ws), "libc.so");
     }
 }
