@@ -22,7 +22,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::{FileBackend, EINVAL, EOVERFLOW};
+use crate::fs::{flags as oflags, FileBackend, EINVAL, EOVERFLOW};
 
 use super::open_file::OpenFile;
 use super::ops::Whence;
@@ -66,8 +66,16 @@ impl FileBackend for VfsBackend {
     /// read-only filesystem).
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
         let mut off = self.open_file.offset.lock();
-        let n = self.open_file.ops.write(&self.open_file, buf, *off)?;
-        *off = off.checked_add(n as u64).ok_or(EOVERFLOW)?;
+        // POSIX O_APPEND: under the offset mutex (which also serialises
+        // writes through dup'd fds that share this open-file description),
+        // snap the write position to end-of-file before dispatching.
+        let write_off = if self.open_file.flags & oflags::O_APPEND != 0 {
+            self.open_file.inode.meta.read().size
+        } else {
+            *off
+        };
+        let n = self.open_file.ops.write(&self.open_file, buf, write_off)?;
+        *off = write_off.checked_add(n as u64).ok_or(EOVERFLOW)?;
         Ok(n)
     }
 
@@ -105,6 +113,7 @@ mod tests {
     use crate::fs::vfs::FsId;
     use crate::fs::{flags, FileDescTable, FileDescription, EINVAL, EOVERFLOW, ESPIPE};
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     // -----------------------------------------------------------------------
     // Stubs
@@ -183,6 +192,18 @@ mod tests {
     }
 
     fn make_open_file_with_ops(ops: Arc<dyn FileOps>) -> Arc<OpenFile> {
+        make_open_file_with_ops_flags(ops, 0)
+    }
+
+    fn make_open_file_with_ops_flags(ops: Arc<dyn FileOps>, flags: u32) -> Arc<OpenFile> {
+        make_open_file_with_ops_flags_meta(ops, flags, InodeMeta::default())
+    }
+
+    fn make_open_file_with_ops_flags_meta(
+        ops: Arc<dyn FileOps>,
+        flags: u32,
+        meta: InodeMeta,
+    ) -> Arc<OpenFile> {
         let sb = Arc::new(SuperBlock::new(
             FsId(42),
             Arc::new(StubSuperOps),
@@ -196,11 +217,11 @@ mod tests {
             Arc::new(StubInodeOps),
             ops.clone(),
             InodeKind::Reg,
-            InodeMeta::default(),
+            meta,
         ));
         let dentry = Dentry::new_root(inode.clone());
         let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
-        OpenFile::new(dentry, inode, ops, sb.clone(), 0, guard)
+        OpenFile::new(dentry, inode, ops, sb.clone(), flags, guard)
     }
 
     fn make_open_file(fill_byte: u8) -> Arc<OpenFile> {
@@ -337,6 +358,67 @@ mod tests {
         let of = make_open_file(0);
         let backend = VfsBackend { open_file: of };
         assert_eq!(backend.lseek(0, SEEK_SET), Err(ESPIPE));
+    }
+
+    /// A `FileOps` stub that records the offset its `write` was called at.
+    struct RecordingWriteOps {
+        last_off: AtomicU64,
+    }
+    impl FileOps for RecordingWriteOps {
+        fn write(&self, _f: &OpenFile, buf: &[u8], off: u64) -> Result<usize, i64> {
+            self.last_off.store(off, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn write_without_o_append_uses_tracked_offset() {
+        let ops = Arc::new(RecordingWriteOps {
+            last_off: AtomicU64::new(0),
+        });
+        let of = make_open_file_with_ops_flags_meta(
+            ops.clone(),
+            0,
+            InodeMeta {
+                size: 100,
+                ..Default::default()
+            },
+        );
+        *of.offset.lock() = 7;
+        let backend = VfsBackend {
+            open_file: of.clone(),
+        };
+        backend.write(b"xyz").expect("write");
+        assert_eq!(ops.last_off.load(Ordering::SeqCst), 7);
+        assert_eq!(*of.offset.lock(), 10);
+    }
+
+    #[test]
+    fn write_with_o_append_snaps_to_eof() {
+        let ops = Arc::new(RecordingWriteOps {
+            last_off: AtomicU64::new(0),
+        });
+        let of = make_open_file_with_ops_flags_meta(
+            ops.clone(),
+            flags::O_APPEND,
+            InodeMeta {
+                size: 100,
+                ..Default::default()
+            },
+        );
+        // Even if the tracked offset points elsewhere, O_APPEND must
+        // dispatch the write at the current EOF.
+        *of.offset.lock() = 0;
+        let backend = VfsBackend {
+            open_file: of.clone(),
+        };
+        backend.write(b"abcd").expect("write");
+        assert_eq!(
+            ops.last_off.load(Ordering::SeqCst),
+            100,
+            "O_APPEND must use inode size as write offset"
+        );
+        assert_eq!(*of.offset.lock(), 104, "offset advances from EOF by n");
     }
 
     #[test]
