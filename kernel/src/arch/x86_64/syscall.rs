@@ -566,10 +566,17 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
     for (i, b) in random_bytes.iter_mut().enumerate() {
         *b = ((random_seed >> (i % 8 * 8)) & 0xFF) as u8;
     }
+    let auxv_params = crate::mem::auxv::AuxvParams {
+        entry: image.entry.as_u64(),
+        interp_base: image.interp_base.unwrap_or(0),
+        phdr_vaddr: image.phdr_vaddr,
+        phdr_count: image.phdr_count as u64,
+        phdr_entsize: image.phdr_entsize as u64,
+    };
     let initial_rsp = crate::mem::auxv::write_initial_stack(
         stack_phys,
         crate::init_process::USER_STACK_PAGE_VA,
-        &image,
+        &auxv_params,
         &random_bytes,
     );
 
