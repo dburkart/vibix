@@ -222,6 +222,21 @@ fn unmap_partial_load(
     completed: usize,
     partial_pages: u64,
 ) {
+    unmap_partial_load_at_base(parsed, pml4, 0, completed, partial_pages);
+}
+
+/// Like [`unmap_partial_load`] but with an explicit `base_offset` added to
+/// each segment's `p_vaddr` before computing the virtual address to unmap.
+/// Used to clean up a partially-mapped interpreter whose segments were loaded
+/// at `INTERP_LOAD_BASE` rather than at their literal `p_vaddr` values.
+#[cfg(target_os = "none")]
+fn unmap_partial_load_at_base(
+    parsed: elf::ParsedElf<'_>,
+    pml4: PhysFrame<Size4KiB>,
+    base_offset: u64,
+    completed: usize,
+    partial_pages: u64,
+) {
     use x86_64::structures::paging::FrameDeallocator;
     let mut alloc = paging::KernelFrameAllocator;
     for (idx, seg) in parsed.load_segments().enumerate().take(completed + 1) {
@@ -231,7 +246,7 @@ fn unmap_partial_load(
             partial_pages
         };
         for i in 0..pages {
-            let va = seg.vaddr + i * PAGE_SIZE;
+            let va = VirtAddr::new(seg.vaddr.as_u64().wrapping_add(base_offset) + i * PAGE_SIZE);
             let page = Page::<Size4KiB>::containing_address(va);
             if let Ok(frame) = paging::unmap_in_pml4(pml4, page) {
                 // SAFETY: frame was just unmapped from `pml4`; no other
@@ -319,13 +334,23 @@ pub fn load_user_elf_with_vmas(
     // in the Limine modules by path suffix, load its segments at
     // INTERP_LOAD_BASE, and record its adjusted entry point.
     if let Some(interp_path) = parsed.interp_path() {
+        // PT_INTERP stores the full path (e.g. `/lib/ld-musl-x86_64.so.1`)
+        // but the Limine module is usually published under `/boot/...`. Match
+        // on the basename only so the path prefix difference doesn't matter.
+        let interp_basename = interp_path
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map(|slash| &interp_path[slash + 1..])
+            .unwrap_or(interp_path);
         let interp_bytes =
-            elf::module_bytes_for_path(interp_path).ok_or(LoadError::InterpNotFound)?;
+            elf::module_bytes_for_path(interp_basename).ok_or(LoadError::InterpNotFound)?;
 
         let interp_parsed =
             elf::try_parse_elf64(interp_bytes).ok_or(LoadError::InterpLoadFailed)?;
 
         // Load interpreter PT_LOAD segments at INTERP_LOAD_BASE.
+        let mut interp_completed = 0usize;
+        let mut interp_partial_pages = 0u64;
         let mut interp_err: Option<LoadError> = None;
         for seg in interp_parsed.load_segments() {
             let seg_end = seg
@@ -337,12 +362,24 @@ pub fn load_user_elf_with_vmas(
                 interp_err = Some(LoadError::InterpLoadFailed);
                 break;
             }
-            if let Err((e, _)) = map_user_segment(interp_bytes, seg, pml4, INTERP_LOAD_BASE) {
+            if let Err((e, mapped)) = map_user_segment(interp_bytes, seg, pml4, INTERP_LOAD_BASE) {
+                interp_partial_pages = mapped;
                 interp_err = Some(e);
                 break;
             }
+            interp_completed += 1;
         }
         if let Some(e) = interp_err {
+            // Free any interpreter frames we already mapped so the staged
+            // AddressSpace doesn't leak them on drop (VMAs haven't been
+            // registered yet at this point).
+            unmap_partial_load_at_base(
+                interp_parsed,
+                pml4,
+                INTERP_LOAD_BASE,
+                interp_completed,
+                interp_partial_pages,
+            );
             return Err(e);
         }
 
