@@ -99,6 +99,15 @@ impl FileBackend for VfsBackend {
         }
         Ok(new_off as i64)
     }
+
+    /// Read directory entries by delegating to [`FileOps::getdents`], using
+    /// the shared `OpenFile.offset` as the resumption cookie.
+    ///
+    /// Non-directory inodes surface as `ENOTDIR` from the underlying ops.
+    fn getdents64(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        let mut off = self.open_file.offset.lock();
+        self.open_file.ops.getdents(&self.open_file, buf, &mut *off)
+    }
 }
 
 #[cfg(test)]

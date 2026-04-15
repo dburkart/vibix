@@ -358,6 +358,43 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // getdents64(fd, buf, len) — read directory entries into a
+        // user buffer as packed `linux_dirent64` records. Advances the
+        // shared open-file offset (the per-open cookie) by however many
+        // entries were written. Returns bytes written, 0 at end-of-dir,
+        // or a negated errno (EBADF, EFAULT, ENOTDIR, EINVAL).
+        GETDENTS64 => {
+            let fd = a0 as u32;
+            let buf_va = a1 as usize;
+            let len = a2 as usize;
+            let backend = {
+                let tbl = crate::task::current_fd_table();
+                let x = match tbl.lock().get(fd) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                x
+            };
+            if len == 0 {
+                return crate::fs::EINVAL;
+            }
+            if let Err(e) = uaccess::check_user_range(buf_va, len) {
+                return e.as_errno();
+            }
+            // Kernel bounce buffer bounded by a fixed cap, matching Linux's
+            // per-call ceiling. Userspace that needs more than a page of
+            // dirents simply calls getdents64 again.
+            let mut chunk = [0u8; 4096];
+            let n = core::cmp::min(chunk.len(), len);
+            match backend.getdents64(&mut chunk[..n]) {
+                Ok(nw) => match uaccess::copy_to_user(buf_va, &chunk[..nw]) {
+                    Ok(()) => nw as i64,
+                    Err(e) => e.as_errno(),
+                },
+                Err(e) => e,
+            }
+        }
+
         // dup2(oldfd, newfd)
         DUP2 => {
             let oldfd = a0 as u32;
