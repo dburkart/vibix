@@ -193,9 +193,22 @@ pub fn len() -> usize {
 
 /// Format a single return address the way a human wants to read it:
 /// `0x<addr> <name>+0x<off>` when a symbol is found, else `0x<addr> ?`.
+/// If a line-table entry is available, append ` at <file>:<line>:<col>`.
 pub fn format_addr<W: Write>(w: &mut W, addr: u64) -> fmt::Result {
     match resolve(addr) {
-        Some((name, off)) => write!(w, "{addr:#018x} {name}+{off:#x}"),
+        Some((name, off)) => {
+            write!(w, "{addr:#018x} {name}+{off:#x}")?;
+            if let Some((file, line, col)) = crate::lntab::resolve_line(addr) {
+                if line != 0 {
+                    if col != 0 {
+                        write!(w, " at {file}:{line}:{col}")?;
+                    } else {
+                        write!(w, " at {file}:{line}")?;
+                    }
+                }
+            }
+            Ok(())
+        }
         None => write!(w, "{addr:#018x} ?"),
     }
 }

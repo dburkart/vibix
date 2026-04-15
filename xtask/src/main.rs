@@ -22,6 +22,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 mod isr_audit;
+mod lntab;
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -290,6 +291,9 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     if !bin.exists() {
         return Err(format!("kernel binary missing at {}", bin.display()).into());
     }
+    // embed_lntab must run before strip_debug — it parses the ELF's
+    // own DWARF line tables, which strip_debug drops.
+    lntab::embed(&bin, &workspace_root())?;
     strip_debug(&bin)?;
     embed_ksymtab(&bin)?;
     Ok(bin)
@@ -696,7 +700,8 @@ fn test_runner(kernel: &Path) -> R<()> {
     let name = kernel.file_name().unwrap().to_string_lossy();
     // Mirror the build() post-link fixups so integration-test ELFs pass
     // Limine's PHDR validation and their panic-path backtraces resolve
-    // to symbol names.
+    // to symbol names and source coordinates.
+    lntab::embed(kernel, &workspace_root())?;
     strip_debug(kernel)?;
     embed_ksymtab(kernel)?;
     let iso = workspace_root().join("target").join(format!("{name}.iso"));

@@ -17,6 +17,15 @@ panic = "abort"
 lto = true
 codegen-units = 1
 
+# Line tables only — xtask parses .debug_line post-link to emit an
+# embedded address→file:line:col table (issue #62), then strip_debug
+# drops the DWARF from the shipped image.
+[profile.dev.package.vibix]
+debug = 1
+
+[profile.release.package.vibix]
+debug = 1
+
 # panic="abort" for the test/bench profiles is enforced via the
 # `-Z panic-abort-tests` flag in .cargo/config.toml; setting it here
 # directly is ignored by cargo.
