@@ -85,8 +85,17 @@ slug_file=""
 poller_pid=""
 restore_tmux_rename=""
 if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
-    prev="$(tmux show-window-options -v automatic-rename 2>/dev/null || echo on)"
-    tmux set-window-option automatic-rename off >/dev/null 2>&1 || true
+    # Capture the window ID of the pane this script is running in, so the
+    # poller renames *this* window rather than whatever window happens to be
+    # active when it fires. Window IDs (e.g. @7) are stable across renames
+    # and reordering; indices are not.
+    tmux_window_id="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null || true)"
+    if [ -z "$tmux_window_id" ]; then
+        tmux_window_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
+    fi
+
+    prev="$(tmux show-window-options ${tmux_window_id:+-t "$tmux_window_id"} -v automatic-rename 2>/dev/null || echo on)"
+    tmux set-window-option ${tmux_window_id:+-t "$tmux_window_id"} automatic-rename off >/dev/null 2>&1 || true
     restore_tmux_rename="$prev"
 
     slug_file="$(mktemp -t vibix-ae-slug.XXXXXX)"
@@ -100,7 +109,7 @@ if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
         while [ -e "$slug_file" ]; do
             cur="$(cat "$slug_file" 2>/dev/null || true)"
             if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
-                tmux rename-window "AE -> $cur" >/dev/null 2>&1 || true
+                tmux rename-window ${tmux_window_id:+-t "$tmux_window_id"} "AE -> $cur" >/dev/null 2>&1 || true
                 last="$cur"
             fi
             sleep 1
@@ -111,7 +120,7 @@ if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
     trap '
         [ -n "$poller_pid" ] && kill "$poller_pid" 2>/dev/null || true
         [ -n "$slug_file" ] && rm -f "$slug_file" 2>/dev/null || true
-        tmux set-window-option automatic-rename "$restore_tmux_rename" >/dev/null 2>&1 || true
+        tmux set-window-option ${tmux_window_id:+-t "$tmux_window_id"} automatic-rename "$restore_tmux_rename" >/dev/null 2>&1 || true
     ' EXIT
 fi
 
