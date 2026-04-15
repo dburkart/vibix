@@ -95,10 +95,32 @@ fn is_zero_timeout_ms(timeout_ms: i64) -> bool {
     timeout_ms == 0
 }
 
+/// Validates a `timeval` and returns `true` if it represents a zero timeout
+/// (probe-only). Returns `Err(EINVAL)` for negative or out-of-range fields.
+#[cfg(target_os = "none")]
+fn validate_timeval(tv: &Timeval) -> Result<bool, i64> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return Err(crate::fs::EINVAL);
+    }
+    Ok(tv.tv_sec == 0 && tv.tv_usec == 0)
+}
+
+/// Validates a `timespec` and returns `true` if it represents a zero timeout
+/// (probe-only). Returns `Err(EINVAL)` for negative or out-of-range fields.
+#[cfg(target_os = "none")]
+fn validate_timespec(ts: &Timespec) -> Result<bool, i64> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(crate::fs::EINVAL);
+    }
+    Ok(ts.tv_sec == 0 && ts.tv_nsec == 0)
+}
+
+#[cfg(test)]
 fn is_zero_timeval(tv: &Timeval) -> bool {
     tv.tv_sec == 0 && tv.tv_usec == 0
 }
 
+#[cfg(test)]
 fn is_zero_timespec(ts: &Timespec) -> bool {
     ts.tv_sec == 0 && ts.tv_nsec == 0
 }
@@ -203,15 +225,29 @@ fn do_poll(fds: &mut [PollFd], probe_only: bool) -> i64 {
     }
 
     // ── Final probe after wake ───────────────────────────────────────────────
-    // Check if a signal interrupted us.
+    // Re-probe first: if any fd is ready, return the ready count.  Another
+    // waiter may have consumed readiness before us, producing a spurious wake,
+    // but the fds themselves tell us whether we actually got anything.
+    {
+        let mut tbl = PollTable::probe();
+        let ready = probe_pass(fds, &mut tbl);
+        if ready > 0 {
+            return ready as i64;
+        }
+    }
+
+    // Re-probe came up empty.  Only now check for a pending signal — if
+    // readiness and a signal arrive together the re-probe above has already
+    // returned the ready fds, so we never convert a ready wake into -EINTR.
     let signal_pending =
         crate::process::with_signal_state_for_task(tid, |s| s.pending != 0).unwrap_or(false);
     if signal_pending {
         return crate::fs::EINTR;
     }
 
-    let mut tbl = PollTable::probe();
-    probe_pass(fds, &mut tbl) as i64
+    // Spurious wake with no signal and no ready fds — return 0 (timeout
+    // semantics; real deadline handling is future work).
+    0
 }
 
 // ── Syscall implementations ───────────────────────────────────────────────────
@@ -239,9 +275,11 @@ pub unsafe fn sys_poll(fds_uva: u64, nfds: u64, timeout_ms: i64) -> i64 {
         }
         let result = do_poll(slice, is_zero_timeout_ms(timeout_ms));
         if result >= 0 {
-            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+            if let Err(e) = uaccess::copy_to_user(fds_uva as usize, unsafe {
                 core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8)
-            });
+            }) {
+                return e.as_errno();
+            }
         }
         result
     } else {
@@ -256,9 +294,11 @@ pub unsafe fn sys_poll(fds_uva: u64, nfds: u64, timeout_ms: i64) -> i64 {
         }
         let result = do_poll(&mut fds_vec, is_zero_timeout_ms(timeout_ms));
         if result >= 0 {
-            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+            if let Err(e) = uaccess::copy_to_user(fds_uva as usize, unsafe {
                 core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
-            });
+            }) {
+                return e.as_errno();
+            }
         }
         result
     }
@@ -287,7 +327,10 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
         ) {
             return e.as_errno();
         }
-        is_zero_timespec(&ts)
+        match validate_timespec(&ts) {
+            Ok(zero) => zero,
+            Err(e) => return e,
+        }
     };
 
     if n <= 8 {
@@ -301,9 +344,11 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
         }
         let result = do_poll(slice, probe_only);
         if result >= 0 {
-            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+            if let Err(e) = uaccess::copy_to_user(fds_uva as usize, unsafe {
                 core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8)
-            });
+            }) {
+                return e.as_errno();
+            }
         }
         result
     } else {
@@ -317,9 +362,11 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
         }
         let result = do_poll(&mut fds_vec, probe_only);
         if result >= 0 {
-            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+            if let Err(e) = uaccess::copy_to_user(fds_uva as usize, unsafe {
                 core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
-            });
+            }) {
+                return e.as_errno();
+            }
         }
         result
     }
@@ -444,7 +491,10 @@ pub unsafe fn sys_select(
         ) {
             return e.as_errno();
         }
-        is_zero_timeval(&tv)
+        match validate_timeval(&tv) {
+            Ok(zero) => zero,
+            Err(e) => return e,
+        }
     };
 
     // Read fd_sets.
@@ -491,6 +541,14 @@ pub unsafe fn sys_select(
         return result;
     }
 
+    // EBADF: select(2) must return -EBADF if any fd in the input sets was invalid.
+    if fds
+        .iter()
+        .any(|pfd| pfd.revents & crate::poll::POLLNVAL != 0)
+    {
+        return EBADF;
+    }
+
     // Scatter results.
     let mut read_out = [0u8; FD_SET_BYTES];
     let mut write_out = [0u8; FD_SET_BYTES];
@@ -516,13 +574,19 @@ pub unsafe fn sys_select(
     );
 
     if readfds_uva != 0 {
-        let _ = uaccess::copy_to_user(readfds_uva as usize, &read_out);
+        if let Err(e) = uaccess::copy_to_user(readfds_uva as usize, &read_out) {
+            return e.as_errno();
+        }
     }
     if writefds_uva != 0 {
-        let _ = uaccess::copy_to_user(writefds_uva as usize, &write_out);
+        if let Err(e) = uaccess::copy_to_user(writefds_uva as usize, &write_out) {
+            return e.as_errno();
+        }
     }
     if exceptfds_uva != 0 {
-        let _ = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out);
+        if let Err(e) = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out) {
+            return e.as_errno();
+        }
     }
 
     ready as i64
@@ -558,7 +622,10 @@ pub unsafe fn sys_pselect6(
         ) {
             return e.as_errno();
         }
-        is_zero_timespec(&ts)
+        match validate_timespec(&ts) {
+            Ok(zero) => zero,
+            Err(e) => return e,
+        }
     };
 
     let mut read_buf = [0u8; FD_SET_BYTES];
@@ -604,6 +671,14 @@ pub unsafe fn sys_pselect6(
         return result;
     }
 
+    // EBADF: pselect6(2) must return -EBADF if any fd in the input sets was invalid.
+    if fds
+        .iter()
+        .any(|pfd| pfd.revents & crate::poll::POLLNVAL != 0)
+    {
+        return EBADF;
+    }
+
     let mut read_out = [0u8; FD_SET_BYTES];
     let mut write_out = [0u8; FD_SET_BYTES];
     let mut exc_out = [0u8; FD_SET_BYTES];
@@ -628,13 +703,19 @@ pub unsafe fn sys_pselect6(
     );
 
     if readfds_uva != 0 {
-        let _ = uaccess::copy_to_user(readfds_uva as usize, &read_out);
+        if let Err(e) = uaccess::copy_to_user(readfds_uva as usize, &read_out) {
+            return e.as_errno();
+        }
     }
     if writefds_uva != 0 {
-        let _ = uaccess::copy_to_user(writefds_uva as usize, &write_out);
+        if let Err(e) = uaccess::copy_to_user(writefds_uva as usize, &write_out) {
+            return e.as_errno();
+        }
     }
     if exceptfds_uva != 0 {
-        let _ = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out);
+        if let Err(e) = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out) {
+            return e.as_errno();
+        }
     }
 
     ready as i64
