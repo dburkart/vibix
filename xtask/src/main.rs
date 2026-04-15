@@ -305,13 +305,45 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
 /// that wraps past the kernel/user boundary and makes Limine reject the
 /// image ("No higher half PHDRs exist"). `/DISCARD/` in the linker script
 /// doesn't catch them reliably here, so strip post-link.
+///
+/// Prefers `llvm-objcopy` (from the rustup `llvm-tools` component bundled
+/// with the active toolchain) over the system `objcopy`.  The system binary
+/// is typically GNU objcopy for the host architecture, which cannot process
+/// a cross-compiled ELF on a different host (e.g. aarch64 host, x86_64
+/// kernel).  `llvm-objcopy` is architecture-agnostic and always correct.
 fn strip_debug(kernel: &Path) -> R<()> {
-    let status = Command::new("objcopy")
+    let tool = find_llvm_objcopy().unwrap_or_else(|| std::ffi::OsString::from("objcopy"));
+    let status = Command::new(&tool)
         .arg("--strip-debug")
         .arg(kernel)
         .status()?;
     check(status)?;
     Ok(())
+}
+
+/// Locate `llvm-objcopy` from the active rustup toolchain's `llvm-tools`
+/// component.  Returns `None` if `rustc` is not on PATH or the binary is not
+/// found (caller falls back to system `objcopy`).
+fn find_llvm_objcopy() -> Option<std::ffi::OsString> {
+    // Ask rustc for its sysroot (e.g.
+    // ~/.rustup/toolchains/nightly-aarch64-unknown-linux-gnu).
+    let output = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    // llvm-tools are installed under
+    // <sysroot>/lib/rustlib/<host-triple>/bin/llvm-objcopy.
+    // Use a glob-style search so we don't need to hard-code the host triple.
+    let bin_glob = sysroot.join("lib").join("rustlib");
+    for entry in fs::read_dir(&bin_glob).ok()? {
+        let entry = entry.ok()?;
+        let candidate = entry.path().join("bin").join("llvm-objcopy");
+        if candidate.exists() {
+            return Some(candidate.into_os_string());
+        }
+    }
+    None
 }
 
 /// Post-link step: read the freshly-linked ELF's own symbol table and
