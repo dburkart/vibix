@@ -20,6 +20,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::poll::{PollMask, PollTable, DEFAULT_POLLMASK};
+
 #[cfg(target_os = "none")]
 pub mod vfs;
 
@@ -30,6 +32,24 @@ pub mod vfs;
 pub trait FileBackend: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64>;
     fn write(&self, buf: &[u8]) -> Result<usize, i64>;
+
+    /// Report the backend's current readiness for `sys_poll`/`select`.
+    ///
+    /// Called in both passes of RFC 0003's two-pass poll (see
+    /// `docs/RFC/0003-pipes-poll-tty.md` §"Poll table"). The default
+    /// implementation returns [`DEFAULT_POLLMASK`] — read and write both
+    /// ready — matching Linux's `DEFAULT_POLLMASK` for drivers that lack
+    /// a `.poll` file-op. Backends that own a `WaitQueue`
+    /// (pipes, ttys, sockets) override this to publish real readiness
+    /// and to register the passed-in `PollTable` on their wait queues
+    /// during the Wait pass.
+    ///
+    /// Today `PollTable::register` does not yet exist — it lands with
+    /// `WaitQueue` in issue #369 — so this hook currently has no
+    /// behavioural effect beyond reporting the default mask.
+    fn poll(&self, _pt: &mut PollTable) -> PollMask {
+        DEFAULT_POLLMASK
+    }
 
     /// Downcast to [`vfs::VfsBackend`] for fd-keyed syscalls that need the
     /// underlying `OpenFile` (e.g. `fstat`, `fstatat` with `AT_EMPTY_PATH`).
@@ -541,6 +561,13 @@ mod tests {
         assert!(t.get(0).is_ok());
         assert!(t.get(1).is_ok());
         assert!(t.get(2).is_ok());
+    }
+
+    #[test]
+    fn default_poll_returns_default_pollmask() {
+        let backend = NullBackend;
+        let mut pt = PollTable::probe();
+        assert_eq!(backend.poll(&mut pt), DEFAULT_POLLMASK);
     }
 
     #[test]
