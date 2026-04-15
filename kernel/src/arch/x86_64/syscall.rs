@@ -507,6 +507,18 @@ pub unsafe extern "C" fn syscall_dispatch(
         // pipe2(pipefd, flags) — like pipe() but with O_NONBLOCK/O_CLOEXEC.
         PIPE2 => crate::ipc::pipe::sys_pipe2(a0, a1 as u32),
 
+        // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
+        POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
+
+        // ppoll(fds, nfds, tmo_p, sigmask) — like poll() with timespec.
+        PPOLL => crate::poll::syscalls::sys_ppoll(a0, a1, a2, a3),
+
+        // select(nfds, readfds, writefds, exceptfds, timeout).
+        SELECT => crate::poll::syscalls::sys_select(a0, a1, a2, a3, a4),
+
+        // pselect6(nfds, readfds, writefds, exceptfds, ts, sigmask).
+        PSELECT6 => crate::poll::syscalls::sys_pselect6(a0, a1, a2, a3, a4, a5),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -1006,6 +1018,10 @@ pub mod syscall_nr {
     pub const CHDIR: u64 = 80;
     pub const PIPE: u64 = 22;
     pub const PIPE2: u64 = 293;
+    pub const POLL: u64 = 7;
+    pub const SELECT: u64 = 23;
+    pub const PSELECT6: u64 = 270;
+    pub const PPOLL: u64 = 271;
 }
 
 #[cfg(test)]
@@ -1055,5 +1071,11 @@ mod tests {
         assert_eq!(syscall_nr::SIGACTION, 13, "SYS_rt_sigaction must be 13");
         assert_eq!(syscall_nr::SIGPROCMASK, 14, "SYS_rt_sigprocmask must be 14");
         assert_eq!(syscall_nr::KILL, 62, "SYS_kill must be 62");
+
+        // Poll / select
+        assert_eq!(syscall_nr::POLL, 7, "SYS_poll must be 7");
+        assert_eq!(syscall_nr::SELECT, 23, "SYS_select must be 23");
+        assert_eq!(syscall_nr::PSELECT6, 270, "SYS_pselect6 must be 270");
+        assert_eq!(syscall_nr::PPOLL, 271, "SYS_ppoll must be 271");
     }
 }

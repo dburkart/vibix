@@ -38,6 +38,9 @@
 //! and returns immediately — the wake is never dropped on the floor.
 //! This mirrors the protocol in `sync::WaitQueue`.
 
+#[cfg(any(test, target_os = "none"))]
+pub mod syscalls;
+
 #[cfg(target_os = "none")]
 use crate::sync::irqlock::IrqLock;
 #[cfg(any(test, target_os = "none"))]
