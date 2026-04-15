@@ -15,8 +15,8 @@ use core::panic::PanicInfo;
 
 use vibix::process::{self, test_helpers as h};
 use vibix::tty::{
-    acquire_ctty_on_open, tiocgpgrp_for, tiocgsid_for, tiocnotty_for, tiocsctty_for,
-    tiocspgrp_for, Tty,
+    acquire_ctty_on_open, tiocgpgrp_for, tiocgsid_for, tiocnotty_for, tiocsctty_for, tiocspgrp_for,
+    Tty,
 };
 use vibix::{
     exit_qemu, serial_println,

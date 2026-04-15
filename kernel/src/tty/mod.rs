@@ -401,7 +401,6 @@ pub fn acquire_ctty_on_open(caller_pid: u32, tty: &Arc<Tty>) -> bool {
     process::try_acquire_ctty_atomic(caller_pid, tty)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,4 +461,3 @@ mod tests {
         assert_eq!(d.write(b"hi"), 2);
     }
 }
-

@@ -607,10 +607,8 @@ impl FileBackend for SerialBackend {
                     return Ok(rc);
                 }
                 let pgid = rc as u32;
-                unsafe {
-                    crate::arch::x86_64::uaccess::copy_to_user(arg, &pgid.to_ne_bytes())
-                }
-                .map_err(|e| e.as_errno())?;
+                unsafe { crate::arch::x86_64::uaccess::copy_to_user(arg, &pgid.to_ne_bytes()) }
+                    .map_err(|e| e.as_errno())?;
                 return Ok(0);
             }
             TIOCGSID => {
@@ -623,10 +621,8 @@ impl FileBackend for SerialBackend {
                     return Ok(rc);
                 }
                 let sid = rc as u32;
-                unsafe {
-                    crate::arch::x86_64::uaccess::copy_to_user(arg, &sid.to_ne_bytes())
-                }
-                .map_err(|e| e.as_errno())?;
+                unsafe { crate::arch::x86_64::uaccess::copy_to_user(arg, &sid.to_ne_bytes()) }
+                    .map_err(|e| e.as_errno())?;
                 return Ok(0);
             }
             TIOCNOTTY => {
