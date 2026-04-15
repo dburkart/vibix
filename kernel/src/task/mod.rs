@@ -34,6 +34,7 @@
 
 pub mod priority;
 mod scheduler;
+pub mod softirq;
 mod switch;
 mod task;
 
@@ -905,6 +906,12 @@ fn reaper_loop() -> ! {
 /// a waitqueue); both paths restore a correct IF on return to task
 /// code.
 pub fn preempt_tick() {
+    // Drain any pending soft-IRQs before touching the scheduler lock.
+    // Handlers run IRQ-off on the interrupted task's stack; keeping
+    // them outside the SCHED critical section means a handler that
+    // wakes a task doesn't deadlock on our own lock.
+    softirq::drain();
+
     // `try_lock` + bail: block_current (or another preempt tick
     // mid-switch) may already hold SCHED. We'll get another tick in
     // 10 ms.
