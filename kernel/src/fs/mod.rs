@@ -361,16 +361,6 @@ impl FileDescTable {
         self.alloc_fd_with_flags(desc, 0)
     }
 
-    /// Make `newfd` an alias for `oldfd`'s description. Returns `newfd`.
-    ///
-    /// - If `newfd == oldfd` and it is open, returns `newfd` without any
-    ///   change.
-    /// - If `newfd` was already open, it is closed silently before
-    ///   reassignment (POSIX `dup2` semantics).
-    /// - Returns `EBADF` if `oldfd` is not open.
-    /// - Returns `EINVAL` if `newfd >= MAX_FD`.
-    ///
-    /// The new fd starts with `FD_CLOEXEC` cleared (POSIX `dup2` semantics).
     /// Return the open-file description's status flags for `fd`
     /// (`fcntl(fd, F_GETFL)`).
     pub fn get_status_flags(&self, fd: u32) -> Result<u32, i64> {
@@ -473,6 +463,16 @@ impl FileDescTable {
         Ok(fd)
     }
 
+    /// Make `newfd` an alias for `oldfd`'s description. Returns `newfd`.
+    ///
+    /// - If `newfd == oldfd` and it is open, returns `newfd` without any
+    ///   change.
+    /// - If `newfd` was already open, it is closed silently before
+    ///   reassignment (POSIX `dup2` semantics).
+    /// - Returns `EBADF` if `oldfd` is not open.
+    /// - Returns `EINVAL` if `newfd >= MAX_FD`.
+    ///
+    /// The new fd starts with `FD_CLOEXEC` cleared (POSIX `dup2` semantics).
     pub fn dup2(&mut self, oldfd: u32, newfd: u32) -> Result<u32, i64> {
         if newfd as usize >= MAX_FD {
             return Err(EINVAL);

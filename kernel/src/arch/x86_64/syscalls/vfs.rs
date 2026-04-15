@@ -146,7 +146,12 @@ fn install_fd(backend: Arc<dyn FileBackend>, flags: u32) -> i64 {
     // returns the full set. The per-fd O_CLOEXEC bit is split out into the
     // slot's fd_flags — dup'd fds must not inherit it.
     let fd_flags = flags & oflags::O_CLOEXEC;
-    let status_flags = flags & !oflags::O_CLOEXEC;
+    // Only POSIX file-status flags persist on the open-file description.
+    // Creation-time / path-resolution bits (O_CREAT, O_EXCL, O_TRUNC,
+    // O_DIRECTORY, O_NOFOLLOW) affect open() only and must not surface
+    // via fcntl(F_GETFL).
+    let status_flags = flags
+        & (oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_ASYNC);
     let desc = Arc::new(FileDescription::new(backend, status_flags));
     let tbl = crate::task::current_fd_table();
     let result = tbl.lock().alloc_fd_with_flags(desc, fd_flags);

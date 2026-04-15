@@ -464,8 +464,10 @@ mod tests {
             open_file: of.clone(),
         }) as Arc<dyn FileBackend>;
         let mut t = FileDescTable::new();
-        let cloexec_desc = Arc::new(FileDescription::new(backend, flags::O_CLOEXEC));
-        let fd = t.alloc_fd(cloexec_desc).expect("alloc_fd");
+        let cloexec_desc = Arc::new(FileDescription::new(backend, 0));
+        let fd = t
+            .alloc_fd_with_flags(cloexec_desc, flags::O_CLOEXEC)
+            .expect("alloc_fd");
 
         // Allocate a non-cloexec fd too.
         struct NullBackend;
