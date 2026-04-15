@@ -18,6 +18,7 @@ use spin::{Lazy, Mutex};
 
 use crate::signal::SignalState;
 use crate::sync::WaitQueue;
+use crate::tty::{ProcessGroupId, SessionId, Tty};
 
 /// Scheduling / lifecycle state of a process entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +42,16 @@ pub struct ProcessEntry {
     pub state: ProcessState,
     /// Per-process signal state — pending mask, blocked mask, dispositions.
     pub signals: Arc<Mutex<SignalState>>,
+    /// POSIX session id. `setsid` creates a new session with `session_id
+    /// == pgrp_id == pid`; children inherit across `fork` and `execve`.
+    pub session_id: SessionId,
+    /// POSIX process-group id. Always equal to the pgrp leader's pid.
+    pub pgrp_id: ProcessGroupId,
+    /// Controlling terminal, if any. Cleared by `setsid`; `TIOCSCTTY`
+    /// (#376) acquires one; shared by every member of a session via
+    /// `Arc` so the tty outlives the session leader until every
+    /// referring process has dropped it.
+    pub controlling_tty: Option<Arc<Tty>>,
 }
 
 struct Table {
@@ -86,16 +97,29 @@ pub fn register_init(task_id: usize) {
             exit_status: None,
             state: ProcessState::Alive,
             signals: Arc::new(Mutex::new(SignalState::new())),
+            session_id: 1,
+            pgrp_id: 1,
+            controlling_tty: None,
         },
     );
     t.pid_of.insert(task_id, 1);
 }
 
 /// Allocate a new PID and insert a live entry for `task_id` with
-/// `parent_pid` as parent. Returns the new PID.
+/// `parent_pid` as parent, inheriting session / pgrp / controlling tty
+/// from the parent entry. Returns the new PID.
+///
+/// If `parent_pid` is not in the table (kernel-origin process, test
+/// harness), the new entry starts with `session_id == pgrp_id == pid`
+/// and no controlling tty — i.e. its own session.
 pub fn register(task_id: usize, parent_pid: u32) -> u32 {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let mut t = TABLE.lock();
+    let (session_id, pgrp_id, controlling_tty) = t
+        .by_pid
+        .get(&parent_pid)
+        .map(|p| (p.session_id, p.pgrp_id, p.controlling_tty.clone()))
+        .unwrap_or((pid, pid, None));
     t.by_pid.insert(
         pid,
         ProcessEntry {
@@ -105,6 +129,9 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
             exit_status: None,
             state: ProcessState::Alive,
             signals: Arc::new(Mutex::new(SignalState::new())),
+            session_id,
+            pgrp_id,
+            controlling_tty,
         },
     );
     t.pid_of.insert(task_id, pid);
@@ -233,4 +260,215 @@ pub fn with_signal_state_for_task<R>(
 pub fn task_id_for_pid(pid: u32) -> Option<usize> {
     let t = TABLE.lock();
     t.by_pid.get(&pid).map(|e| e.task_id)
+}
+
+// ── Session / process-group syscalls ──────────────────────────────────────
+//
+// POSIX errno values returned by these helpers. Centralised so the syscall
+// dispatch arms stay readable.
+const EPERM: i64 = -1;
+const ESRCH: i64 = -3;
+const EINVAL: i64 = -22;
+
+/// Pure helper behind `setsid()` — see [`sys_setsid`]. Accepts the caller
+/// pid explicitly so host unit tests can drive it without going through
+/// the scheduler's `current_id()`.
+pub fn setsid_for(caller_pid: u32) -> i64 {
+    if caller_pid == 0 {
+        return EPERM;
+    }
+    let mut t = TABLE.lock();
+    let Some(entry) = t.by_pid.get_mut(&caller_pid) else {
+        return EPERM;
+    };
+    if entry.pgrp_id == caller_pid {
+        return EPERM;
+    }
+    entry.session_id = caller_pid;
+    entry.pgrp_id = caller_pid;
+    entry.controlling_tty = None;
+    caller_pid as i64
+}
+
+/// `setsid()` — create a new session with the caller as leader.
+///
+/// POSIX requires EPERM if the caller is already a process-group leader,
+/// to prevent a pgrp being split across two sessions.  On success sets
+/// `session_id == pgrp_id == pid` and drops any existing controlling tty,
+/// then returns the new session id.
+pub fn sys_setsid() -> i64 {
+    setsid_for(current_pid())
+}
+
+/// `getsid(pid)` — return the session id of `pid`, or of the caller if
+/// `pid == 0`. Returns ESRCH for unknown pids.
+pub fn sys_getsid(pid: u32) -> i64 {
+    let t = TABLE.lock();
+    let target = if pid == 0 {
+        let self_pid = *t.pid_of.get(&crate::task::current_id()).unwrap_or(&0);
+        if self_pid == 0 {
+            return ESRCH;
+        }
+        self_pid
+    } else {
+        pid
+    };
+    match t.by_pid.get(&target) {
+        Some(e) => e.session_id as i64,
+        None => ESRCH,
+    }
+}
+
+/// `getpgid(pid)` — return the pgrp id of `pid`, or of the caller if
+/// `pid == 0`. Returns ESRCH for unknown pids.
+pub fn sys_getpgid(pid: u32) -> i64 {
+    let t = TABLE.lock();
+    let target = if pid == 0 {
+        let self_pid = *t.pid_of.get(&crate::task::current_id()).unwrap_or(&0);
+        if self_pid == 0 {
+            return ESRCH;
+        }
+        self_pid
+    } else {
+        pid
+    };
+    match t.by_pid.get(&target) {
+        Some(e) => e.pgrp_id as i64,
+        None => ESRCH,
+    }
+}
+
+/// Pure helper behind `setpgid()` — see [`sys_setpgid`]. Accepts the
+/// caller pid explicitly for testability.
+pub fn setpgid_for(caller_pid: u32, pid: u32, pgid: u32) -> i64 {
+    if caller_pid == 0 {
+        return EPERM;
+    }
+    let mut t = TABLE.lock();
+
+    let target_pid = if pid == 0 { caller_pid } else { pid };
+    let pgid = if pgid == 0 { target_pid } else { pgid };
+
+    let caller_session = match t.by_pid.get(&caller_pid) {
+        Some(e) => e.session_id,
+        None => return EPERM,
+    };
+
+    let (target_session, target_is_leader) = match t.by_pid.get(&target_pid) {
+        Some(e) => (e.session_id, e.session_id == e.pid),
+        None => return ESRCH,
+    };
+
+    if target_pid != caller_pid {
+        let parent_is_caller = t
+            .by_pid
+            .get(&target_pid)
+            .map(|e| e.parent_pid == caller_pid)
+            .unwrap_or(false);
+        if !parent_is_caller {
+            return ESRCH;
+        }
+    }
+
+    if target_session != caller_session {
+        return EPERM;
+    }
+
+    if target_is_leader {
+        return EPERM;
+    }
+
+    if pgid != target_pid {
+        match t.by_pid.values().find(|e| e.pgrp_id == pgid) {
+            Some(e) if e.session_id == caller_session => {}
+            Some(_) => return EPERM,
+            None => return EINVAL,
+        }
+    }
+
+    if let Some(entry) = t.by_pid.get_mut(&target_pid) {
+        entry.pgrp_id = pgid;
+    }
+    0
+}
+
+/// `setpgid(pid, pgid)` — move `pid` into process group `pgid`.
+///
+/// Per POSIX:
+/// - `pid == 0` means the caller; `pgid == 0` means "same as `pid`".
+/// - The target must be the caller or one of the caller's children.
+/// - Target and `pgid`'s session must match the caller's session.
+/// - `pgid` must either equal `pid` (creating a new pgrp) or name an
+///   existing pgrp in the same session.
+/// - A session leader may not change its own pgrp (EPERM).
+pub fn sys_setpgid(pid: u32, pgid: u32) -> i64 {
+    setpgid_for(current_pid(), pid, pgid)
+}
+
+/// Session/pgrp test helpers, exposed so the `session_syscalls` kernel
+/// integration test can drive the table without the scheduler. Not
+/// gated on `cfg(test)` because the integration test is a separate
+/// crate that imports `vibix` as a normal dependency.
+#[doc(hidden)]
+pub mod test_helpers {
+    use super::*;
+
+    /// Drop every entry in TABLE so tests don't leak state into each
+    /// other.  Also resets `NEXT_PID` so pid allocation is deterministic.
+    pub fn reset_table() {
+        let mut t = TABLE.lock();
+        t.by_pid.clear();
+        t.pid_of.clear();
+        NEXT_PID.store(2, Ordering::Relaxed);
+    }
+
+    /// Insert a synthetic entry with an explicit pid so tests can drive
+    /// the session syscalls without going through the real scheduler.
+    pub fn insert(pid: u32, parent_pid: u32, session_id: u32, pgrp_id: u32) {
+        let mut t = TABLE.lock();
+        t.by_pid.insert(
+            pid,
+            ProcessEntry {
+                pid,
+                task_id: pid as usize,
+                parent_pid,
+                exit_status: None,
+                state: ProcessState::Alive,
+                signals: Arc::new(Mutex::new(SignalState::new())),
+                session_id,
+                pgrp_id,
+                controlling_tty: None,
+            },
+        );
+        t.pid_of.insert(pid as usize, pid);
+    }
+
+    /// Overwrite fields on an existing entry from a test — used to set
+    /// up edge cases like "child is itself a session leader".
+    pub fn patch(pid: u32, mut f: impl FnMut(&mut ProcessEntry)) {
+        let mut t = TABLE.lock();
+        if let Some(e) = t.by_pid.get_mut(&pid) {
+            f(e);
+        }
+    }
+
+    /// Borrow a snapshot of the entry for assertions.
+    pub fn snapshot(pid: u32) -> Option<(u32, u32, bool)> {
+        let t = TABLE.lock();
+        t.by_pid
+            .get(&pid)
+            .map(|e| (e.session_id, e.pgrp_id, e.controlling_tty.is_some()))
+    }
+
+    /// Attach a fresh controlling TTY (used by setsid-clears-ctty test).
+    pub fn attach_ctty(pid: u32) {
+        let mut t = TABLE.lock();
+        if let Some(e) = t.by_pid.get_mut(&pid) {
+            e.controlling_tty = Some(Arc::new(Tty::new()));
+        }
+    }
+
+    pub const EPERM_I64: i64 = EPERM;
+    pub const ESRCH_I64: i64 = ESRCH;
+    pub const EINVAL_I64: i64 = EINVAL;
 }

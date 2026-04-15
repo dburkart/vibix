@@ -556,6 +556,20 @@ pub unsafe extern "C" fn syscall_dispatch(
         // pselect6(nfds, readfds, writefds, exceptfds, ts, sigmask).
         PSELECT6 => crate::poll::syscalls::sys_pselect6(a0, a1, a2, a3, a4, a5),
 
+        // setsid() — create a new session with the caller as leader.
+        SETSID => crate::process::sys_setsid(),
+
+        // getsid(pid) — return the session id of `pid`, or the caller's
+        // session when pid==0.
+        GETSID => crate::process::sys_getsid(a0 as u32),
+
+        // setpgid(pid, pgid) — move `pid` into process group `pgid`.
+        SETPGID => crate::process::sys_setpgid(a0 as u32, a1 as u32),
+
+        // getpgid(pid) — return the pgrp id of `pid`, or the caller's
+        // pgrp when pid==0.
+        GETPGID => crate::process::sys_getpgid(a0 as u32),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -1059,6 +1073,10 @@ pub mod syscall_nr {
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
+    pub const SETPGID: u64 = 109;
+    pub const SETSID: u64 = 112;
+    pub const GETPGID: u64 = 121;
+    pub const GETSID: u64 = 124;
 }
 
 #[cfg(test)]
@@ -1114,5 +1132,11 @@ mod tests {
         assert_eq!(syscall_nr::SELECT, 23, "SYS_select must be 23");
         assert_eq!(syscall_nr::PSELECT6, 270, "SYS_pselect6 must be 270");
         assert_eq!(syscall_nr::PPOLL, 271, "SYS_ppoll must be 271");
+
+        // Session / process group
+        assert_eq!(syscall_nr::SETPGID, 109, "SYS_setpgid must be 109");
+        assert_eq!(syscall_nr::SETSID, 112, "SYS_setsid must be 112");
+        assert_eq!(syscall_nr::GETPGID, 121, "SYS_getpgid must be 121");
+        assert_eq!(syscall_nr::GETSID, 124, "SYS_getsid must be 124");
     }
 }

@@ -227,3 +227,7 @@ harness = false
 [[test]]
 name = "shell_introspection"
 harness = false
+
+[[test]]
+name = "session_syscalls"
+harness = false
