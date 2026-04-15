@@ -26,7 +26,7 @@ use super::ops::{
 };
 use super::super_block::{SbFlags, SuperBlock};
 use super::MountFlags;
-use crate::fs::{EINVAL, ENOENT, ENOTDIR};
+use crate::fs::{EINVAL, EISDIR, ENOENT, ENOTDIR, EROFS};
 
 const BLOCK: usize = 512;
 
@@ -149,7 +149,7 @@ impl InodeOps for TarInodeOps {
 
     fn setattr(&self, _inode: &Inode, _attr: &SetAttr) -> Result<(), i64> {
         // Read-only.
-        Err(-30) // EROFS
+        Err(EROFS)
     }
 
     fn readlink(&self, inode: &Inode, buf: &mut [u8]) -> Result<usize, i64> {
@@ -183,7 +183,7 @@ impl FileOps for TarFileOps {
         let node = sup.node(f.inode.ino)?;
         let (offset, len) = match &node.data {
             NodeData::Reg { offset, len } => (*offset, *len),
-            NodeData::Dir { .. } => return Err(-21), // EISDIR
+            NodeData::Dir { .. } => return Err(EISDIR),
             NodeData::Link { .. } => return Err(EINVAL),
         };
         if off as usize >= len {
@@ -201,7 +201,7 @@ impl FileOps for TarFileOps {
         let node = sup.node(f.inode.ino)?;
         let size = match &node.data {
             NodeData::Reg { len, .. } => *len as i64,
-            NodeData::Dir { .. } => return Err(-21), // EISDIR
+            NodeData::Dir { .. } => return Err(EISDIR),
             NodeData::Link { .. } => return Err(EINVAL),
         };
         let mut cur = f.offset.lock();

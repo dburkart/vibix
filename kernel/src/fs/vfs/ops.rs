@@ -15,6 +15,7 @@ use super::inode::{Inode, InodeMeta};
 use super::open_file::OpenFile;
 use super::super_block::SuperBlock;
 use super::{Access, Credential, InodeKind, Timespec};
+use crate::fs::{EACCES, EINVAL, ENOENT, ENOTDIR, ENOTTY, EPERM, ESPIPE};
 
 /// Source of a mount operation. Separated from the target path so
 /// future sources (block device, ramdisk module, network URL) can be
@@ -189,7 +190,7 @@ pub trait SuperOps: Send + Sync {
 /// FS doesn't have to stub them.
 pub trait InodeOps: Send + Sync {
     fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, i64> {
-        Err(super::super::ENOENT)
+        Err(ENOENT)
     }
     fn create(&self, _dir: &Inode, _name: &[u8], _mode: u16) -> Result<Arc<Inode>, i64> {
         Err(EPERM)
@@ -220,7 +221,7 @@ pub trait InodeOps: Send + Sync {
     }
 
     fn readlink(&self, _inode: &Inode, _buf: &mut [u8]) -> Result<usize, i64> {
-        Err(EINVAL_OP)
+        Err(EINVAL)
     }
 
     fn getattr(&self, inode: &Inode, out: &mut Stat) -> Result<(), i64>;
@@ -237,7 +238,7 @@ pub trait InodeOps: Send + Sync {
 /// control channel.
 pub trait FileOps: Send + Sync {
     fn read(&self, _f: &OpenFile, _buf: &mut [u8], _off: u64) -> Result<usize, i64> {
-        Err(EINVAL_OP)
+        Err(EINVAL)
     }
     fn write(&self, _f: &OpenFile, _buf: &[u8], _off: u64) -> Result<usize, i64> {
         // Read-only filesystems keep this default; signal "write not
@@ -260,15 +261,6 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 }
-
-// errno values used by default trait bodies. The broadly-used ones
-// already live in `kernel::fs`; re-exported here for readability.
-const EPERM: i64 = -1;
-const EINVAL_OP: i64 = super::super::EINVAL;
-const ENOTTY: i64 = -25;
-const ENOTDIR: i64 = -20;
-const ESPIPE: i64 = -29;
-const EACCES: i64 = -13;
 
 /// Default POSIX permission check: owner / group / other bits in
 /// `InodeMeta.mode`. uid 0 (root) bypasses all checks. The `execute`
