@@ -5,6 +5,7 @@
 //! `LineDiscipline`, `TtyDriver`, and `DeferredByteRing` arrive with
 //! #374–#376.
 
+pub mod ntty;
 pub mod termios;
 
 use core::sync::atomic::{AtomicU32, Ordering};
