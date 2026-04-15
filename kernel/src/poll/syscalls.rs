@@ -36,8 +36,8 @@ use crate::fs::EINVAL;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PollFd {
-    pub fd:      i32,
-    pub events:  u16,
+    pub fd: i32,
+    pub events: u16,
     pub revents: u16,
 }
 
@@ -45,7 +45,7 @@ pub struct PollFd {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timeval {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_usec: i64,
 }
 
@@ -53,7 +53,7 @@ pub struct Timeval {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timespec {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_nsec: i64,
 }
 
@@ -108,9 +108,9 @@ fn is_zero_timespec(ts: &Timespec) -> bool {
 #[cfg(target_os = "none")]
 use crate::arch::x86_64::uaccess;
 #[cfg(target_os = "none")]
-use crate::poll::{PollMask, PollTable};
-#[cfg(target_os = "none")]
 use crate::fs::EBADF;
+#[cfg(target_os = "none")]
+use crate::poll::{PollMask, PollTable};
 
 /// Flags that are always returned in `revents` even if not in `events`.
 #[cfg(target_os = "none")]
@@ -204,8 +204,8 @@ fn do_poll(fds: &mut [PollFd], probe_only: bool) -> i64 {
 
     // ── Final probe after wake ───────────────────────────────────────────────
     // Check if a signal interrupted us.
-    let signal_pending = crate::process::with_signal_state_for_task(tid, |s| s.pending != 0)
-        .unwrap_or(false);
+    let signal_pending =
+        crate::process::with_signal_state_for_task(tid, |s| s.pending != 0).unwrap_or(false);
     if signal_pending {
         return crate::fs::EINTR;
     }
@@ -239,10 +239,9 @@ pub unsafe fn sys_poll(fds_uva: u64, nfds: u64, timeout_ms: i64) -> i64 {
         }
         let result = do_poll(slice, is_zero_timeout_ms(timeout_ms));
         if result >= 0 {
-            let _ = uaccess::copy_to_user(
-                fds_uva as usize,
-                unsafe { core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8) },
-            );
+            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+                core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8)
+            });
         }
         result
     } else {
@@ -250,21 +249,16 @@ pub unsafe fn sys_poll(fds_uva: u64, nfds: u64, timeout_ms: i64) -> i64 {
         // SAFETY: PollFd is #[repr(C)] with no padding, valid for any bit pattern.
         unsafe { fds_vec.set_len(n) };
         if let Err(e) = uaccess::copy_from_user(
-            unsafe {
-                core::slice::from_raw_parts_mut(fds_vec.as_mut_ptr() as *mut u8, n * 8)
-            },
+            unsafe { core::slice::from_raw_parts_mut(fds_vec.as_mut_ptr() as *mut u8, n * 8) },
             fds_uva as usize,
         ) {
             return e.as_errno();
         }
         let result = do_poll(&mut fds_vec, is_zero_timeout_ms(timeout_ms));
         if result >= 0 {
-            let _ = uaccess::copy_to_user(
-                fds_uva as usize,
-                unsafe {
-                    core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
-                },
-            );
+            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+                core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
+            });
         }
         result
     }
@@ -288,9 +282,7 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
     } else {
         let mut ts = Timespec::default();
         if let Err(e) = uaccess::copy_from_user(
-            unsafe {
-                core::slice::from_raw_parts_mut(&mut ts as *mut Timespec as *mut u8, 16)
-            },
+            unsafe { core::slice::from_raw_parts_mut(&mut ts as *mut Timespec as *mut u8, 16) },
             ts_uva as usize,
         ) {
             return e.as_errno();
@@ -309,31 +301,25 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
         }
         let result = do_poll(slice, probe_only);
         if result >= 0 {
-            let _ = uaccess::copy_to_user(
-                fds_uva as usize,
-                unsafe { core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8) },
-            );
+            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+                core::slice::from_raw_parts(slice.as_ptr() as *const u8, n * 8)
+            });
         }
         result
     } else {
         let mut fds_vec: Vec<PollFd> = Vec::with_capacity(n);
         unsafe { fds_vec.set_len(n) };
         if let Err(e) = uaccess::copy_from_user(
-            unsafe {
-                core::slice::from_raw_parts_mut(fds_vec.as_mut_ptr() as *mut u8, n * 8)
-            },
+            unsafe { core::slice::from_raw_parts_mut(fds_vec.as_mut_ptr() as *mut u8, n * 8) },
             fds_uva as usize,
         ) {
             return e.as_errno();
         }
         let result = do_poll(&mut fds_vec, probe_only);
         if result >= 0 {
-            let _ = uaccess::copy_to_user(
-                fds_uva as usize,
-                unsafe {
-                    core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
-                },
-            );
+            let _ = uaccess::copy_to_user(fds_uva as usize, unsafe {
+                core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, n * 8)
+            });
         }
         result
     }
@@ -349,8 +335,8 @@ pub unsafe fn sys_ppoll(fds_uva: u64, nfds: u64, ts_uva: u64, _sigmask_uva: u64)
 #[cfg(target_os = "none")]
 fn select_build_fds(
     nfds: usize,
-    readfds:   Option<&[u8; FD_SET_BYTES]>,
-    writefds:  Option<&[u8; FD_SET_BYTES]>,
+    readfds: Option<&[u8; FD_SET_BYTES]>,
+    writefds: Option<&[u8; FD_SET_BYTES]>,
     exceptfds: Option<&[u8; FD_SET_BYTES]>,
 ) -> Vec<PollFd> {
     let mut fds: Vec<PollFd> = Vec::new();
@@ -383,14 +369,20 @@ fn select_build_fds(
 fn select_scatter_results(
     nfds: usize,
     fds: &[PollFd],
-    mut readfds:   Option<&mut [u8; FD_SET_BYTES]>,
-    mut writefds:  Option<&mut [u8; FD_SET_BYTES]>,
+    mut readfds: Option<&mut [u8; FD_SET_BYTES]>,
+    mut writefds: Option<&mut [u8; FD_SET_BYTES]>,
     mut exceptfds: Option<&mut [u8; FD_SET_BYTES]>,
 ) -> usize {
     // First zero out all three sets; we'll re-populate from fds.
-    if let Some(r) = readfds.as_deref_mut()   { r.fill(0); }
-    if let Some(w) = writefds.as_deref_mut()  { w.fill(0); }
-    if let Some(e) = exceptfds.as_deref_mut() { e.fill(0); }
+    if let Some(r) = readfds.as_deref_mut() {
+        r.fill(0);
+    }
+    if let Some(w) = writefds.as_deref_mut() {
+        w.fill(0);
+    }
+    if let Some(e) = exceptfds.as_deref_mut() {
+        e.fill(0);
+    }
 
     let mut count = 0usize;
     for pfd in fds {
@@ -430,11 +422,11 @@ fn select_scatter_results(
 /// All non-NULL uva pointers must be valid userspace addresses.
 #[cfg(target_os = "none")]
 pub unsafe fn sys_select(
-    nfds:         u64,
-    readfds_uva:  u64,
+    nfds: u64,
+    readfds_uva: u64,
     writefds_uva: u64,
     exceptfds_uva: u64,
-    timeout_uva:  u64,
+    timeout_uva: u64,
 ) -> i64 {
     if nfds as usize > NFDS_SELECT_MAX {
         return EINVAL;
@@ -456,29 +448,41 @@ pub unsafe fn sys_select(
     };
 
     // Read fd_sets.
-    let mut read_buf  = [0u8; FD_SET_BYTES];
+    let mut read_buf = [0u8; FD_SET_BYTES];
     let mut write_buf = [0u8; FD_SET_BYTES];
-    let mut exc_buf   = [0u8; FD_SET_BYTES];
+    let mut exc_buf = [0u8; FD_SET_BYTES];
 
     if readfds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut read_buf, readfds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut read_buf, readfds_uva as usize) {
+            return e.as_errno();
+        }
     }
     if writefds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut write_buf, writefds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut write_buf, writefds_uva as usize) {
+            return e.as_errno();
+        }
     }
     if exceptfds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut exc_buf, exceptfds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut exc_buf, exceptfds_uva as usize) {
+            return e.as_errno();
+        }
     }
 
-    let readfds   = if readfds_uva   != 0 { Some(&read_buf)  } else { None };
-    let writefds  = if writefds_uva  != 0 { Some(&write_buf) } else { None };
-    let exceptfds = if exceptfds_uva != 0 { Some(&exc_buf)   } else { None };
+    let readfds = if readfds_uva != 0 {
+        Some(&read_buf)
+    } else {
+        None
+    };
+    let writefds = if writefds_uva != 0 {
+        Some(&write_buf)
+    } else {
+        None
+    };
+    let exceptfds = if exceptfds_uva != 0 {
+        Some(&exc_buf)
+    } else {
+        None
+    };
 
     let mut fds = select_build_fds(n, readfds, writefds, exceptfds);
 
@@ -488,30 +492,37 @@ pub unsafe fn sys_select(
     }
 
     // Scatter results.
-    let mut read_out  = [0u8; FD_SET_BYTES];
+    let mut read_out = [0u8; FD_SET_BYTES];
     let mut write_out = [0u8; FD_SET_BYTES];
-    let mut exc_out   = [0u8; FD_SET_BYTES];
+    let mut exc_out = [0u8; FD_SET_BYTES];
     let ready = select_scatter_results(
-        n, &fds,
-        if readfds_uva   != 0 { Some(&mut read_out)  } else { None },
-        if writefds_uva  != 0 { Some(&mut write_out) } else { None },
-        if exceptfds_uva != 0 { Some(&mut exc_out)   } else { None },
+        n,
+        &fds,
+        if readfds_uva != 0 {
+            Some(&mut read_out)
+        } else {
+            None
+        },
+        if writefds_uva != 0 {
+            Some(&mut write_out)
+        } else {
+            None
+        },
+        if exceptfds_uva != 0 {
+            Some(&mut exc_out)
+        } else {
+            None
+        },
     );
 
     if readfds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            readfds_uva as usize, &read_out,
-        );
+        let _ = uaccess::copy_to_user(readfds_uva as usize, &read_out);
     }
     if writefds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            writefds_uva as usize, &write_out,
-        );
+        let _ = uaccess::copy_to_user(writefds_uva as usize, &write_out);
     }
     if exceptfds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            exceptfds_uva as usize, &exc_out,
-        );
+        let _ = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out);
     }
 
     ready as i64
@@ -525,11 +536,11 @@ pub unsafe fn sys_select(
 /// All non-NULL uva pointers must be valid userspace addresses.
 #[cfg(target_os = "none")]
 pub unsafe fn sys_pselect6(
-    nfds:         u64,
-    readfds_uva:  u64,
+    nfds: u64,
+    readfds_uva: u64,
     writefds_uva: u64,
     exceptfds_uva: u64,
-    ts_uva:       u64,
+    ts_uva: u64,
     _sigmask_uva: u64,
 ) -> i64 {
     if nfds as usize > NFDS_SELECT_MAX {
@@ -550,29 +561,41 @@ pub unsafe fn sys_pselect6(
         is_zero_timespec(&ts)
     };
 
-    let mut read_buf  = [0u8; FD_SET_BYTES];
+    let mut read_buf = [0u8; FD_SET_BYTES];
     let mut write_buf = [0u8; FD_SET_BYTES];
-    let mut exc_buf   = [0u8; FD_SET_BYTES];
+    let mut exc_buf = [0u8; FD_SET_BYTES];
 
     if readfds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut read_buf, readfds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut read_buf, readfds_uva as usize) {
+            return e.as_errno();
+        }
     }
     if writefds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut write_buf, writefds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut write_buf, writefds_uva as usize) {
+            return e.as_errno();
+        }
     }
     if exceptfds_uva != 0 {
-        if let Err(e) = uaccess::copy_from_user(
-            &mut exc_buf, exceptfds_uva as usize,
-        ) { return e.as_errno(); }
+        if let Err(e) = uaccess::copy_from_user(&mut exc_buf, exceptfds_uva as usize) {
+            return e.as_errno();
+        }
     }
 
-    let readfds   = if readfds_uva   != 0 { Some(&read_buf)  } else { None };
-    let writefds  = if writefds_uva  != 0 { Some(&write_buf) } else { None };
-    let exceptfds = if exceptfds_uva != 0 { Some(&exc_buf)   } else { None };
+    let readfds = if readfds_uva != 0 {
+        Some(&read_buf)
+    } else {
+        None
+    };
+    let writefds = if writefds_uva != 0 {
+        Some(&write_buf)
+    } else {
+        None
+    };
+    let exceptfds = if exceptfds_uva != 0 {
+        Some(&exc_buf)
+    } else {
+        None
+    };
 
     let mut fds = select_build_fds(n, readfds, writefds, exceptfds);
 
@@ -581,30 +604,37 @@ pub unsafe fn sys_pselect6(
         return result;
     }
 
-    let mut read_out  = [0u8; FD_SET_BYTES];
+    let mut read_out = [0u8; FD_SET_BYTES];
     let mut write_out = [0u8; FD_SET_BYTES];
-    let mut exc_out   = [0u8; FD_SET_BYTES];
+    let mut exc_out = [0u8; FD_SET_BYTES];
     let ready = select_scatter_results(
-        n, &fds,
-        if readfds_uva   != 0 { Some(&mut read_out)  } else { None },
-        if writefds_uva  != 0 { Some(&mut write_out) } else { None },
-        if exceptfds_uva != 0 { Some(&mut exc_out)   } else { None },
+        n,
+        &fds,
+        if readfds_uva != 0 {
+            Some(&mut read_out)
+        } else {
+            None
+        },
+        if writefds_uva != 0 {
+            Some(&mut write_out)
+        } else {
+            None
+        },
+        if exceptfds_uva != 0 {
+            Some(&mut exc_out)
+        } else {
+            None
+        },
     );
 
     if readfds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            readfds_uva as usize, &read_out,
-        );
+        let _ = uaccess::copy_to_user(readfds_uva as usize, &read_out);
     }
     if writefds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            writefds_uva as usize, &write_out,
-        );
+        let _ = uaccess::copy_to_user(writefds_uva as usize, &write_out);
     }
     if exceptfds_uva != 0 {
-        let _ = uaccess::copy_to_user(
-            exceptfds_uva as usize, &exc_out,
-        );
+        let _ = uaccess::copy_to_user(exceptfds_uva as usize, &exc_out);
     }
 
     ready as i64
@@ -663,16 +693,34 @@ mod tests {
 
     #[test]
     fn zero_timeval() {
-        assert!(is_zero_timeval(&Timeval { tv_sec: 0, tv_usec: 0 }));
-        assert!(!is_zero_timeval(&Timeval { tv_sec: 0, tv_usec: 1 }));
-        assert!(!is_zero_timeval(&Timeval { tv_sec: 1, tv_usec: 0 }));
+        assert!(is_zero_timeval(&Timeval {
+            tv_sec: 0,
+            tv_usec: 0
+        }));
+        assert!(!is_zero_timeval(&Timeval {
+            tv_sec: 0,
+            tv_usec: 1
+        }));
+        assert!(!is_zero_timeval(&Timeval {
+            tv_sec: 1,
+            tv_usec: 0
+        }));
     }
 
     #[test]
     fn zero_timespec() {
-        assert!(is_zero_timespec(&Timespec { tv_sec: 0, tv_nsec: 0 }));
-        assert!(!is_zero_timespec(&Timespec { tv_sec: 0, tv_nsec: 1 }));
-        assert!(!is_zero_timespec(&Timespec { tv_sec: 1, tv_nsec: 0 }));
+        assert!(is_zero_timespec(&Timespec {
+            tv_sec: 0,
+            tv_nsec: 0
+        }));
+        assert!(!is_zero_timespec(&Timespec {
+            tv_sec: 0,
+            tv_nsec: 1
+        }));
+        assert!(!is_zero_timespec(&Timespec {
+            tv_sec: 1,
+            tv_nsec: 0
+        }));
     }
 
     // ── ABI layout ────────────────────────────────────────────────────────────
@@ -682,9 +730,16 @@ mod tests {
         assert_eq!(core::mem::size_of::<PollFd>(), 8);
         assert_eq!(core::mem::align_of::<PollFd>(), 4);
         // fd at offset 0, events at 4, revents at 6
-        let p = PollFd { fd: 0x12345678, events: 0xABCD, revents: 0xEF01 };
+        let p = PollFd {
+            fd: 0x12345678,
+            events: 0xABCD,
+            revents: 0xEF01,
+        };
         let bytes: [u8; 8] = unsafe { core::mem::transmute(p) };
-        assert_eq!(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), 0x12345678);
+        assert_eq!(
+            i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            0x12345678
+        );
         assert_eq!(u16::from_ne_bytes([bytes[4], bytes[5]]), 0xABCD);
         assert_eq!(u16::from_ne_bytes([bytes[6], bytes[7]]), 0xEF01);
     }
