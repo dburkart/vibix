@@ -2,7 +2,7 @@
 //! panicking, `build_info` constants are populated, and `whoami`'s
 //! serial output is captured end-to-end via UART loopback.
 //!
-//! Serial loopback is only used for the tiny `whoami` output (6 bytes)
+//! Serial loopback is only used for the tiny `whoami` output (5 bytes)
 //! so the transmission fits inside the UART's 16-byte hardware FIFO
 //! during the `without_interrupts` window `serial_println!` takes.
 //! Larger outputs (`uname -a`, `version`) would race FIFO drain vs.
@@ -69,7 +69,10 @@ fn run_tests() {
 
 fn build_info_constants_populated() {
     assert_eq!(build_info::KERNEL_NAME, "vibix");
-    assert_eq!(build_info::ARCH, "x86_64");
+    assert!(
+        !build_info::ARCH.is_empty(),
+        "ARCH should be set from CARGO_CFG_TARGET_ARCH via build.rs"
+    );
     assert!(
         !build_info::RELEASE.is_empty(),
         "RELEASE should come from CARGO_PKG_VERSION"

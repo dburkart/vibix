@@ -56,9 +56,9 @@ fn build_timestamp() -> String {
     format_epoch(epoch)
 }
 
-/// Format seconds-since-epoch as `YYYY-MM-DD HH:MM:SS` UTC. No external
-/// dep — proleptic Gregorian calendar with a leap-year cycle that is
-/// correct for every year in the foreseeable future.
+/// Format seconds-since-epoch as `YYYY-MM-DDTHH:MM:SSZ` (ISO-8601 UTC).
+/// No external dep — proleptic Gregorian calendar with a leap-year cycle
+/// that is correct for every year in the foreseeable future.
 fn format_epoch(epoch: u64) -> String {
     let secs = epoch % 60;
     let mins = (epoch / 60) % 60;
@@ -100,7 +100,7 @@ fn format_epoch(epoch: u64) -> String {
     let day = days + 1;
 
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, mins, secs
     )
 }
