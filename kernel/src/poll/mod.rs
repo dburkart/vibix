@@ -38,14 +38,14 @@
 //! and returns immediately — the wake is never dropped on the floor.
 //! This mirrors the protocol in `sync::WaitQueue`.
 
+#[cfg(target_os = "none")]
+use crate::sync::irqlock::IrqLock;
 #[cfg(any(test, target_os = "none"))]
 use alloc::collections::VecDeque;
 #[cfg(any(test, target_os = "none"))]
 use alloc::sync::Arc;
 #[cfg(any(test, target_os = "none"))]
 use alloc::vec::Vec;
-#[cfg(target_os = "none")]
-use crate::sync::irqlock::IrqLock;
 
 // Host tests can't use IrqLock (it touches RFLAGS.IF) — fall back to a
 // plain spin mutex, which has the same external API for our purposes.
