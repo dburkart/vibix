@@ -167,11 +167,14 @@ pub struct DString {
 }
 
 impl DString {
-    /// Construct from a byte slice. Rejects empty names, names longer
-    /// than [`NAME_MAX`], and names containing `/` or NUL (both
-    /// illegal per POSIX §4.5).
+    /// Construct from a byte slice. Rejects empty names with `EINVAL`,
+    /// names longer than [`NAME_MAX`] with `ENAMETOOLONG`, and names
+    /// containing `/` or NUL with `EINVAL` (both illegal per POSIX §4.5).
     pub fn try_from_bytes(s: &[u8]) -> Result<Self, i64> {
-        if s.is_empty() || s.len() > NAME_MAX {
+        if s.is_empty() {
+            return Err(super::EINVAL);
+        }
+        if s.len() > NAME_MAX {
             return Err(super::ENAMETOOLONG);
         }
         if s.iter().any(|&b| b == b'/' || b == 0) {
@@ -221,13 +224,20 @@ mod tests {
 
     #[test]
     fn dstring_rejects_empty() {
-        assert!(DString::try_from_bytes(b"").is_err());
+        assert_eq!(
+            DString::try_from_bytes(b""),
+            Err(super::super::EINVAL),
+            "empty names must return EINVAL per POSIX, not ENAMETOOLONG"
+        );
     }
 
     #[test]
     fn dstring_rejects_too_long() {
         let long = [b'a'; NAME_MAX + 1];
-        assert!(DString::try_from_bytes(&long).is_err());
+        assert_eq!(
+            DString::try_from_bytes(&long),
+            Err(super::super::ENAMETOOLONG)
+        );
     }
 
     #[test]
