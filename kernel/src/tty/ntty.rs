@@ -7,7 +7,7 @@
 
 use spin::Mutex;
 
-use super::termios::{ICRNL, IGNCR, INLCR, ISTRIP, Termios};
+use super::termios::{Termios, ICRNL, IGNCR, INLCR, ISTRIP};
 
 /// Interior N_TTY state. Guarded by lock class "2d" per RFC 0003 §Lock
 /// order. Kept a unit placeholder until the `DeferredByteRing` primitive
