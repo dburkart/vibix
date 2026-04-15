@@ -74,7 +74,7 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u
     hang();
 }
 
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageFaultErrorCode) {
     // Clear RFLAGS.AC immediately so the handler runs with SMAP live,
     // even if we entered mid-`stac` bracket from `uaccess::copy_*`. The
     // IRET at exit restores the saved RFLAGS (and therefore AC) from
@@ -280,7 +280,16 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
             addr_u64,
             code,
         );
-        unsafe { crate::signal::deliver_fault_signal_iret(crate::signal::SIGSEGV) };
+        // SAFETY: we are in the #PF exception handler for the current task;
+        // `frame` is the live hardware-pushed InterruptStackFrame.  Passing
+        // `&mut frame` allows deliver_fault_signal_iret to rewrite RIP/RSP
+        // if a handler is installed (IRETQ redirects to the handler).  For
+        // Default/Ignore, deliver_fault_signal_iret calls task::exit() and
+        // never returns — IRETQ does not fire.
+        unsafe {
+            crate::signal::deliver_fault_signal_iret(crate::signal::SIGSEGV, &mut frame, addr_u64)
+        };
+        return; // handler path: IRETQ fires the signal handler
     }
 
     serial_println!(

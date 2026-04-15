@@ -26,7 +26,7 @@
 //!    in the signal handler rather than the original user RIP.
 //!
 //! 2. **Exception return from ring-3** — the `#PF` handler (and future
-//!    `#GP`) calls [`deliver_fault_signal`] which directly modifies the
+//!    `#GP`) calls [`deliver_fault_signal_iret`] which directly modifies the
 //!    `InterruptStackFrame` so `IRETQ` redirects to the signal handler.
 //!
 //! ## Limitations (known, tracked as follow-ups)
@@ -359,23 +359,30 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
 /// `#PF` on a ring-3 access violation) to the currently running task.
 ///
 /// Unlike [`check_and_deliver_signals`] (syscall-return path), this is called
-/// from an interrupt handler with no saved `SyscallReturnContext` — the user
-/// RIP/RSP/RFLAGS are captured in the hardware-pushed `InterruptStackFrame`.
+/// from an interrupt handler — the user RIP/RSP/RFLAGS are captured in the
+/// hardware-pushed `InterruptStackFrame`.
 ///
-/// Current scope: only the `SIG_DFL` / `DefaultAction::Terminate` case is
-/// implemented. The signal is raised on the current task, then the terminate
-/// path runs directly: `reparent_children → mark_zombie(-sig) → task::exit()`.
-/// `task::exit()` is `!`, so the exception handler never returns — the
-/// scheduler context-switches to the next task instead of executing `IRETQ`.
+/// - `Disposition::Handler(va)`: pushes a `SigFrame` onto the user stack and
+///   rewrites the `InterruptStackFrame` so that `IRETQ` redirects execution to
+///   the signal handler.  Returns normally; the caller must then return from
+///   the exception handler so `IRETQ` fires.
+/// - `Disposition::Default` / `Disposition::Ignore`: the default action for
+///   fault signals is `Terminate`.  Calls `task::exit()` (`-> !`), so neither
+///   the caller nor `IRETQ` runs.
 ///
-/// Handler-dispatch (`Disposition::Handler`) for fault signals is not yet
-/// implemented; installing a SIGSEGV handler and triggering a #PF will fall
-/// through to terminate semantics. Tracked in the follow-up to #337.
+/// `fault_addr` is written into `siginfo.si_addr` (bytes 16–23 of `info`) so
+/// the handler can inspect the faulting address via `siginfo_t.si_addr`.
 ///
 /// # Safety
-/// Must be called from an exception handler on behalf of the currently
-/// running task. Does not return.
-pub unsafe fn deliver_fault_signal_iret(sig: u8) -> ! {
+/// - Must be called from an exception handler on behalf of the currently
+///   running task.
+/// - `frame` must point to the live hardware-pushed `InterruptStackFrame` for
+///   the current exception.  Mutating it redirects `IRETQ`.
+pub unsafe fn deliver_fault_signal_iret(
+    sig: u8,
+    frame: &mut x86_64::structures::idt::InterruptStackFrame,
+    fault_addr: u64,
+) {
     // Precondition: `sig` is a valid signal number. `sig == 0` would underflow
     // the `dispositions[sig - 1]` index below; guard it in debug builds so a
     // future caller that forgets fails loudly instead of corrupting memory.
@@ -383,28 +390,81 @@ pub unsafe fn deliver_fault_signal_iret(sig: u8) -> ! {
 
     let task_id = crate::task::current_id();
     // Raise, immediately clear the pending bit (we service synchronously),
-    // and read the disposition under a single lock acquisition. Doing this in
-    // one critical section avoids a window where another path could observe
-    // the signal pending while we're already about to service it.
-    let disp = crate::process::with_signal_state_for_task(task_id, |state| {
+    // and read the disposition + pre-delivery mask under a single lock
+    // acquisition.  Capturing the mask here matches `deliver_signal` semantics:
+    // the saved `uc_sigmask` in the frame is what was in effect before delivery,
+    // so `sigreturn` restores it correctly.
+    let (disp, pre_block_mask) = crate::process::with_signal_state_for_task(task_id, |state| {
         state.raise(sig);
         state.pending &= !sig_bit(sig);
-        state.dispositions[(sig - 1) as usize]
+        let pre = state.blocked;
+        state.blocked |= sig_bit(sig); // block signal for duration of handler
+        (state.dispositions[(sig - 1) as usize], pre)
     })
-    .unwrap_or(Disposition::Default);
+    .unwrap_or((Disposition::Default, 0));
 
     match disp {
-        Disposition::Handler(_) | Disposition::Ignore | Disposition::Default => {
-            // Handler + Ignore paths aren't meaningful for a synchronous fault
-            // (the faulting instruction would re-fault immediately on IRETQ).
-            // Fall through to Terminate for all cases until the follow-up lands.
-            let pid = crate::process::current_pid();
-            crate::serial_println!("signal: terminate pid={} sig={} (fault)", pid, sig);
-            if pid != 0 {
-                crate::process::reparent_children(pid);
-                crate::process::mark_zombie(pid, -(sig as i32));
+        Disposition::Handler(handler_va) => {
+            // Validate the handler VA before touching the frame.  A
+            // kernel-space VA here would be a compromised sigaction; fall
+            // through to Terminate rather than redirecting IRETQ into the
+            // kernel.
+            if uaccess::check_user_range(handler_va as usize, 1).is_err() {
+                crate::serial_println!(
+                    "signal: handler VA {:#x} is not user-space — terminating pid={}",
+                    handler_va,
+                    crate::process::current_pid()
+                );
+                deliver_fault_terminate(sig);
             }
+
+            // Snapshot user RIP/RSP/RFLAGS from the hardware frame.
+            let saved_rip = frame.instruction_pointer.as_u64();
+            let saved_rflags = frame.cpu_flags.bits();
+            let saved_rsp = frame.stack_pointer.as_u64();
+
+            // Push signal frame.  On failure (bad user RSP) terminate.
+            let new_rsp = match frame::push_fault_signal_frame(
+                saved_rsp,
+                sig,
+                saved_rip,
+                saved_rflags,
+                pre_block_mask,
+                fault_addr,
+            ) {
+                Ok(sp) => sp,
+                Err(()) => {
+                    deliver_fault_terminate(sig);
+                }
+            };
+
+            // Redirect IRETQ to the handler.  The volatile write through
+            // `as_mut()` is required so LLVM does not optimise away the
+            // store (the frame lives on the exception stack, not a normal
+            // Rust allocation).
+            frame.as_mut().update(|f| {
+                f.instruction_pointer = x86_64::VirtAddr::new(handler_va);
+                f.stack_pointer = x86_64::VirtAddr::new(new_rsp);
+            });
+            // Return normally — the caller must `return` so IRETQ fires.
         }
+        Disposition::Ignore | Disposition::Default => {
+            // Default / Ignore for a synchronous fault means Terminate.
+            deliver_fault_terminate(sig);
+        }
+    }
+}
+
+/// Terminate the current process due to a fault signal.  Called from
+/// [`deliver_fault_signal_iret`] for the `Default`/`Ignore` case.
+///
+/// Does not return (`-> !`).
+fn deliver_fault_terminate(sig: u8) -> ! {
+    let pid = crate::process::current_pid();
+    crate::serial_println!("signal: terminate pid={} sig={} (fault)", pid, sig);
+    if pid != 0 {
+        crate::process::reparent_children(pid);
+        crate::process::mark_zombie(pid, -(sig as i32));
     }
     crate::task::exit();
 }
