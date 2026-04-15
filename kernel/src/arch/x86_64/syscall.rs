@@ -561,7 +561,12 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
     // interpreter's entry point; otherwise jump directly to the binary's entry.
     let effective_entry = image.interp_entry.unwrap_or(image.entry);
     // Never returns.
-    unsafe { jump_to_ring3(effective_entry.as_u64(), crate::init_process::USER_STACK_TOP) }
+    unsafe {
+        jump_to_ring3(
+            effective_entry.as_u64(),
+            crate::init_process::USER_STACK_TOP,
+        )
+    }
 }
 
 /// Public wrapper around `copy_path_from_user` for use by the VFS

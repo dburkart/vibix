@@ -184,9 +184,7 @@ impl<'a> ParsedElf<'a> {
             // SAFETY: phdr_bytes was bounds-checked during parse to hold
             // exactly `phnum` contiguous Elf64Phdr records.
             let ph = unsafe {
-                core::ptr::read_unaligned(
-                    self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>(),
-                )
+                core::ptr::read_unaligned(self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>())
             };
             if ph.p_type != PT_INTERP {
                 continue;
