@@ -16,6 +16,7 @@
 pub mod ntty;
 pub mod ps2;
 pub mod ring;
+pub mod serial;
 pub mod termios;
 
 use alloc::sync::Arc;

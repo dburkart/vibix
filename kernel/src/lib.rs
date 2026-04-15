@@ -96,6 +96,7 @@ pub fn init() {
     }
     time::init();
     tty::ps2::init();
+    tty::serial::init();
 }
 
 /// Halt forever. Handy in panic paths and as a terminal call in tests.
