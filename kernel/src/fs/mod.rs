@@ -39,7 +39,7 @@ pub trait FileBackend: Send + Sync {
     /// `docs/RFC/0003-pipes-poll-tty.md` §"Poll table"). The default
     /// implementation returns [`DEFAULT_POLLMASK`] — read and write both
     /// ready — matching Linux's `DEFAULT_POLLMASK` for drivers that lack
-    /// a `.poll` file-op. Backends that own a [`crate::poll::WaitQueue`]
+    /// a `.poll` file-op. Backends that own a `WaitQueue`
     /// (pipes, ttys, sockets) override this to publish real readiness
     /// and to register the passed-in `PollTable` on their wait queues
     /// during the Wait pass.
