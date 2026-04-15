@@ -78,10 +78,7 @@ fn null() -> Arc<dyn FileBackend> {
 }
 
 fn null_desc() -> Arc<FileDescription> {
-    Arc::new(FileDescription {
-        backend: null(),
-        flags: 0,
-    })
+    Arc::new(FileDescription::new(null(), 0))
 }
 
 fn make_table() -> FileDescTable {

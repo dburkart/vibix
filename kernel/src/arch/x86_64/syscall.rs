@@ -395,6 +395,43 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // fcntl(fd, cmd, arg) — per-fd status / close-on-exec / dup-above.
+        // Returns cmd-specific value on success, negated errno on error.
+        FCNTL => {
+            let fd = a0 as u32;
+            let cmd = a1 as u32;
+            let arg = a2;
+            let tbl = crate::task::current_fd_table();
+            let mut guard = tbl.lock();
+            match cmd {
+                crate::fs::F_GETFD => match guard.get_fd_flags(fd) {
+                    Ok(v) => v as i64,
+                    Err(e) => e,
+                },
+                crate::fs::F_SETFD => match guard.set_fd_flags(fd, arg as u32) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                },
+                crate::fs::F_GETFL => match guard.get_status_flags(fd) {
+                    Ok(v) => v as i64,
+                    Err(e) => e,
+                },
+                crate::fs::F_SETFL => match guard.set_status_flags(fd, arg as u32) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                },
+                crate::fs::F_DUPFD => match guard.dupfd_from(fd, arg as u32, false) {
+                    Ok(new_fd) => new_fd as i64,
+                    Err(e) => e,
+                },
+                crate::fs::F_DUPFD_CLOEXEC => match guard.dupfd_from(fd, arg as u32, true) {
+                    Ok(new_fd) => new_fd as i64,
+                    Err(e) => e,
+                },
+                _ => crate::fs::EINVAL,
+            }
+        }
+
         // dup2(oldfd, newfd)
         DUP2 => {
             let oldfd = a0 as u32;
@@ -1061,6 +1098,7 @@ pub mod syscall_nr {
     pub const CLOSE: u64 = 3;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
+    pub const FCNTL: u64 = 72;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
@@ -1101,6 +1139,7 @@ mod tests {
         assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
         assert_eq!(syscall_nr::DUP, 32, "SYS_dup must be 32");
         assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
+        assert_eq!(syscall_nr::FCNTL, 72, "SYS_fcntl must be 72");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
         // Memory management

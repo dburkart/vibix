@@ -292,7 +292,7 @@ mod tests {
             open_file: of.clone(),
         }) as Arc<dyn FileBackend>;
         let mut parent = FileDescTable::new();
-        let desc = Arc::new(FileDescription { backend, flags: 0 });
+        let desc = Arc::new(FileDescription::new(backend, 0));
         let fd = parent.alloc_fd(desc).expect("alloc_fd");
 
         // Fork — child shares the Arc<OpenFile>.
@@ -446,10 +446,7 @@ mod tests {
             open_file: of.clone(),
         }) as Arc<dyn FileBackend>;
         let mut parent = FileDescTable::new();
-        let desc = Arc::new(FileDescription {
-            backend: parent_backend,
-            flags: 0,
-        });
+        let desc = Arc::new(FileDescription::new(parent_backend, 0));
         let fd = parent.alloc_fd(desc).expect("alloc_fd");
         let child = parent.clone_for_fork();
 
@@ -467,11 +464,10 @@ mod tests {
             open_file: of.clone(),
         }) as Arc<dyn FileBackend>;
         let mut t = FileDescTable::new();
-        let cloexec_desc = Arc::new(FileDescription {
-            backend,
-            flags: flags::O_CLOEXEC,
-        });
-        let fd = t.alloc_fd(cloexec_desc).expect("alloc_fd");
+        let cloexec_desc = Arc::new(FileDescription::new(backend, 0));
+        let fd = t
+            .alloc_fd_with_flags(cloexec_desc, flags::O_CLOEXEC)
+            .expect("alloc_fd");
 
         // Allocate a non-cloexec fd too.
         struct NullBackend;
@@ -483,10 +479,10 @@ mod tests {
                 Ok(buf.len())
             }
         }
-        let null_desc = Arc::new(FileDescription {
-            backend: Arc::new(NullBackend) as Arc<dyn FileBackend>,
-            flags: 0,
-        });
+        let null_desc = Arc::new(FileDescription::new(
+            Arc::new(NullBackend) as Arc<dyn FileBackend>,
+            0,
+        ));
         let null_fd = t.alloc_fd(null_desc).expect("alloc null fd");
 
         t.close_cloexec();

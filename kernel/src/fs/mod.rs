@@ -19,6 +19,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::poll::{PollMask, PollTable, DEFAULT_POLLMASK};
 
@@ -117,6 +118,8 @@ pub mod flags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking I/O on fifos, sockets, and character devices.
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// 0o20000 = 0x2000 = 8192
+    pub const O_ASYNC: u32 = 0o20000;
     /// Require the resolved path to refer to a directory (`ENOTDIR` if not).
     pub const O_DIRECTORY: u32 = 0o200000;
     /// Do not follow a symlink in the final path component (`ELOOP`).
@@ -153,11 +156,39 @@ pub mod flags {
 /// count; the last `close()` drops it.
 pub struct FileDescription {
     pub backend: Arc<dyn FileBackend>,
-    pub flags: u32,
+    /// OFD status flags (access mode + mutable bits like `O_APPEND`,
+    /// `O_NONBLOCK`, `O_ASYNC`). Interior-mutable so `fcntl(F_SETFL)` can
+    /// mutate them through the `Arc` shared by dup'd fds — POSIX requires
+    /// the change to be visible on every fd that aliases this description.
+    pub flags: AtomicU32,
+}
+
+impl FileDescription {
+    /// Construct a new description with initial status `flags`.
+    pub fn new(backend: Arc<dyn FileBackend>, flags: u32) -> Self {
+        Self {
+            backend,
+            flags: AtomicU32::new(flags),
+        }
+    }
 }
 
 /// Maximum number of simultaneously open fds per process.
 const MAX_FD: usize = 1024;
+
+/// `fcntl(2)` commands. Numeric values match the Linux x86_64 ABI
+/// (`<asm-generic/fcntl.h>`). `F_DUPFD_CLOEXEC` is Linux-only (since 2.6.24)
+/// but widely relied on.
+pub const F_DUPFD: u32 = 0;
+pub const F_GETFD: u32 = 1;
+pub const F_SETFD: u32 = 2;
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
+pub const F_DUPFD_CLOEXEC: u32 = 1030;
+
+/// Per-fd flag returned by `F_GETFD` / accepted by `F_SETFD`. Internally
+/// stored as `flags::O_CLOEXEC`.
+pub const FD_CLOEXEC: u32 = 1;
 
 /// Linux errno constants (negated so they match syscall return values).
 pub const EPERM: i64 = -1;
@@ -218,24 +249,15 @@ impl FileDescTable {
     ) -> Self {
         let mut t = Self::new();
         t.slots.push(Some((
-            Arc::new(FileDescription {
-                backend: stdin,
-                flags: flags::O_RDONLY,
-            }),
+            Arc::new(FileDescription::new(stdin, flags::O_RDONLY)),
             0,
         )));
         t.slots.push(Some((
-            Arc::new(FileDescription {
-                backend: stdout,
-                flags: flags::O_WRONLY,
-            }),
+            Arc::new(FileDescription::new(stdout, flags::O_WRONLY)),
             0,
         )));
         t.slots.push(Some((
-            Arc::new(FileDescription {
-                backend: stderr,
-                flags: flags::O_WRONLY,
-            }),
+            Arc::new(FileDescription::new(stderr, flags::O_WRONLY)),
             0,
         )));
         t
@@ -344,6 +366,108 @@ impl FileDescTable {
         let desc = self.get_desc(oldfd)?;
         // fd_flags = 0: new fd has FD_CLOEXEC cleared (POSIX dup semantics).
         self.alloc_fd_with_flags(desc, 0)
+    }
+
+    /// Return the open-file description's status flags for `fd`
+    /// (`fcntl(fd, F_GETFL)`).
+    pub fn get_status_flags(&self, fd: u32) -> Result<u32, i64> {
+        let desc = self.get_desc(fd)?;
+        Ok(desc.flags.load(Ordering::Relaxed))
+    }
+
+    /// Mutate the open-file description's status flags for `fd`
+    /// (`fcntl(fd, F_SETFL, flags)`).
+    ///
+    /// Per POSIX only `O_APPEND`, `O_NONBLOCK`, and `O_ASYNC` are writable;
+    /// other bits in `new_flags` are silently ignored, and the access-mode
+    /// plus creation-time bits already on the description are preserved.
+    pub fn set_status_flags(&mut self, fd: u32, new_flags: u32) -> Result<(), i64> {
+        let desc = self.get_desc(fd)?;
+        let mutable = flags::O_APPEND | flags::O_NONBLOCK | flags::O_ASYNC;
+        // Atomic swap under a tight loop so concurrent `F_SETFL` callers on
+        // dup'd fds can't lose each other's edits.
+        let mut cur = desc.flags.load(Ordering::Relaxed);
+        loop {
+            let next = (cur & !mutable) | (new_flags & mutable);
+            match desc
+                .flags
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Return the per-fd flags for `fd` (`fcntl(fd, F_GETFD)`).
+    ///
+    /// Today the only defined per-fd flag is `FD_CLOEXEC` (bit 0). Internally
+    /// we store it as `flags::O_CLOEXEC` in the slot's `fd_flags`; this
+    /// method translates it to the userspace `FD_CLOEXEC` bit.
+    pub fn get_fd_flags(&self, fd: u32) -> Result<u32, i64> {
+        let (_, fd_flags) = self
+            .slots
+            .get(fd as usize)
+            .and_then(Option::as_ref)
+            .ok_or(EBADF)?;
+        if *fd_flags & flags::O_CLOEXEC != 0 {
+            Ok(FD_CLOEXEC)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Mutate the per-fd flags for `fd` (`fcntl(fd, F_SETFD, flags)`).
+    ///
+    /// Accepts the userspace `FD_CLOEXEC` bit and translates it to the
+    /// internal `O_CLOEXEC` storage. Other bits in `new_flags` are silently
+    /// ignored (Linux behaviour).
+    pub fn set_fd_flags(&mut self, fd: u32, new_flags: u32) -> Result<(), i64> {
+        let slot = self
+            .slots
+            .get_mut(fd as usize)
+            .and_then(Option::as_mut)
+            .ok_or(EBADF)?;
+        if new_flags & FD_CLOEXEC != 0 {
+            slot.1 |= flags::O_CLOEXEC;
+        } else {
+            slot.1 &= !flags::O_CLOEXEC;
+        }
+        Ok(())
+    }
+
+    /// Allocate the lowest free fd `>= min_fd` and duplicate `oldfd` into
+    /// it. Backs `fcntl(oldfd, F_DUPFD, min_fd)` and
+    /// `fcntl(oldfd, F_DUPFD_CLOEXEC, min_fd)`.
+    ///
+    /// Returns `EINVAL` if `min_fd >= MAX_FD`, `EMFILE` when the table is
+    /// full, and `EBADF` if `oldfd` is not open.
+    pub fn dupfd_from(&mut self, oldfd: u32, min_fd: u32, cloexec: bool) -> Result<u32, i64> {
+        if min_fd as usize >= MAX_FD {
+            return Err(EINVAL);
+        }
+        let desc = self.get_desc(oldfd)?;
+        let fd_flags = if cloexec { flags::O_CLOEXEC } else { 0 };
+        // Search existing slots from `min_fd` upward for a hole.
+        if (min_fd as usize) < self.slots.len() {
+            for (i, slot) in self.slots.iter_mut().enumerate().skip(min_fd as usize) {
+                if slot.is_none() {
+                    *slot = Some((desc, fd_flags));
+                    return Ok(i as u32);
+                }
+            }
+        }
+        // No hole at or after `min_fd`; extend the vec, padding with holes
+        // from the current end up to `min_fd`, then push.
+        if self.slots.len() >= MAX_FD {
+            return Err(EMFILE);
+        }
+        while self.slots.len() < min_fd as usize {
+            self.slots.push(None);
+        }
+        let fd = self.slots.len() as u32;
+        self.slots.push(Some((desc, fd_flags)));
+        Ok(fd)
     }
 
     /// Make `newfd` an alias for `oldfd`'s description. Returns `newfd`.
@@ -511,10 +635,7 @@ mod tests {
     }
 
     fn null_desc() -> Arc<FileDescription> {
-        Arc::new(FileDescription {
-            backend: null(),
-            flags: 0,
-        })
+        Arc::new(FileDescription::new(null(), 0))
     }
 
     fn make_table() -> FileDescTable {

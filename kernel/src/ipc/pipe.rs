@@ -462,14 +462,14 @@ pub unsafe fn sys_pipe2(pipefd_uva: u64, flags: u32) -> i64 {
 
     let pipe = Pipe::new();
 
-    let read_desc = Arc::new(FileDescription {
-        backend: Arc::new(PipeReadEnd::new(pipe.clone(), nonblocking)),
-        flags: if nonblocking { O_NONBLOCK } else { 0 },
-    });
-    let write_desc = Arc::new(FileDescription {
-        backend: Arc::new(PipeWriteEnd::new(pipe, nonblocking)),
-        flags: if nonblocking { O_NONBLOCK } else { 0 },
-    });
+    let read_desc = Arc::new(FileDescription::new(
+        Arc::new(PipeReadEnd::new(pipe.clone(), nonblocking)),
+        if nonblocking { O_NONBLOCK } else { 0 },
+    ));
+    let write_desc = Arc::new(FileDescription::new(
+        Arc::new(PipeWriteEnd::new(pipe, nonblocking)),
+        if nonblocking { O_NONBLOCK } else { 0 },
+    ));
 
     let fd_table_arc = crate::task::current_fd_table();
     let mut fd_table = fd_table_arc.lock();
