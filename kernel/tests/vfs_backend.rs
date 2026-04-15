@@ -150,7 +150,7 @@ fn read_advances_offset() {
         open_file: of.clone(),
     }) as Arc<dyn FileBackend>;
     let mut t = FileDescTable::new();
-    let desc = Arc::new(FileDescription { backend, flags: 0 });
+    let desc = Arc::new(FileDescription::new(backend, 0));
     let fd = t.alloc_fd(desc).expect("alloc_fd");
 
     let b = t.get(fd).expect("fd open");
@@ -168,7 +168,7 @@ fn write_advances_offset() {
         open_file: of.clone(),
     }) as Arc<dyn FileBackend>;
     let mut t = FileDescTable::new();
-    let desc = Arc::new(FileDescription { backend, flags: 0 });
+    let desc = Arc::new(FileDescription::new(backend, 0));
     let fd = t.alloc_fd(desc).expect("alloc_fd");
 
     let b = t.get(fd).expect("fd open");
@@ -192,7 +192,7 @@ fn fork_shares_open_file_description() {
         open_file: of.clone(),
     }) as Arc<dyn FileBackend>;
     let mut parent = FileDescTable::new();
-    let desc = Arc::new(FileDescription { backend, flags: 0 });
+    let desc = Arc::new(FileDescription::new(backend, 0));
     let fd = parent.alloc_fd(desc).expect("alloc_fd");
 
     // Fork the fd table.
@@ -234,10 +234,7 @@ fn close_cloexec_drops_vfs_backend() {
     let of = make_open_file(0);
     let cloexec_backend = Arc::new(VfsBackend { open_file: of }) as Arc<dyn FileBackend>;
     let mut t = FileDescTable::new();
-    let cloexec_desc = Arc::new(FileDescription {
-        backend: cloexec_backend,
-        flags: 0,
-    });
+    let cloexec_desc = Arc::new(FileDescription::new(cloexec_backend, 0));
     let cloexec_fd = t
         .alloc_fd_with_flags(cloexec_desc, flags::O_CLOEXEC)
         .expect("alloc cloexec fd");
@@ -245,10 +242,7 @@ fn close_cloexec_drops_vfs_backend() {
     // A non-cloexec VfsBackend fd must survive exec.
     let of2 = make_open_file(0);
     let keep_backend = Arc::new(VfsBackend { open_file: of2 }) as Arc<dyn FileBackend>;
-    let keep_desc = Arc::new(FileDescription {
-        backend: keep_backend,
-        flags: 0,
-    });
+    let keep_desc = Arc::new(FileDescription::new(keep_backend, 0));
     let keep_fd = t.alloc_fd(keep_desc).expect("alloc keep fd");
 
     t.close_cloexec();

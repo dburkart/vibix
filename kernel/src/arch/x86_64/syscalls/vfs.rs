@@ -141,12 +141,13 @@ fn stat_into_user(inode: &Arc<Inode>, user_statbuf: u64) -> i64 {
 /// caller's `O_*` flags; access-mode bits go into `FileDescription.flags`
 /// and `O_CLOEXEC` is split into the per-fd slot via `alloc_fd_with_flags`.
 fn install_fd(backend: Arc<dyn FileBackend>, flags: u32) -> i64 {
-    let access_flags = flags & (oflags::O_RDONLY | oflags::O_WRONLY | oflags::O_RDWR);
+    // Preserve every status flag the caller passed (access mode, O_APPEND,
+    // O_NONBLOCK, etc.) on the open-file description so fcntl(F_GETFL)
+    // returns the full set. The per-fd O_CLOEXEC bit is split out into the
+    // slot's fd_flags — dup'd fds must not inherit it.
     let fd_flags = flags & oflags::O_CLOEXEC;
-    let desc = Arc::new(FileDescription {
-        backend,
-        flags: access_flags,
-    });
+    let status_flags = flags & !oflags::O_CLOEXEC;
+    let desc = Arc::new(FileDescription::new(backend, status_flags));
     let tbl = crate::task::current_fd_table();
     let result = tbl.lock().alloc_fd_with_flags(desc, fd_flags);
     match result {

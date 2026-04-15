@@ -197,6 +197,10 @@ name = "syscall_getdents"
 harness = false
 
 [[test]]
+name = "syscall_fcntl"
+harness = false
+
+[[test]]
 name = "syscall_open_flags"
 harness = false
 
