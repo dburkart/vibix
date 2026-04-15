@@ -694,7 +694,7 @@ impl FileOps for RamfsInode {
                 children,
                 parent_ino,
             } => (children, *parent_ino),
-            _ => return Err(-20i64), // ENOTDIR
+            _ => return Err(ENOTDIR),
         };
 
         let dir_ino = inode.ino;
