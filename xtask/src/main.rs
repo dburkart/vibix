@@ -533,9 +533,22 @@ fn ensure_initrd() -> R<PathBuf> {
     // DIRS headers + 2 file headers + 2 padded data blocks + 2 end blocks.
     const EXPECTED_SIZE: u64 = ((DIRS.len() + 2 + 2 + 2) * 512) as u64;
 
+    // Size-only isn't sufficient — a file of the right length but wrong content
+    // would silently produce a bad rootfs. Also verify the USTAR magic at offset
+    // 257 (mirrors the pattern used in ensure_test_disk).
     let needs_write = match fs::metadata(&path) {
-        Ok(m) => m.len() != EXPECTED_SIZE,
-        Err(_) => true,
+        Ok(m) if m.len() == EXPECTED_SIZE => {
+            let mut magic = [0u8; 6];
+            fs::File::open(&path)
+                .and_then(|mut f| {
+                    use std::io::{Read, Seek, SeekFrom};
+                    f.seek(SeekFrom::Start(257))?;
+                    f.read_exact(&mut magic)
+                })
+                .map(|()| magic != *b"ustar\0")
+                .unwrap_or(true)
+        }
+        _ => true,
     };
 
     if needs_write {
@@ -1024,6 +1037,9 @@ mod tests {
             })
             .sum();
         assert_eq!(computed, stored);
+        // Checksum field is 6 octal digits + NUL + space (8 bytes total)
+        assert_eq!(block[154], 0, "byte 154 must be NUL");
+        assert_eq!(block[155], b' ', "byte 155 must be space");
     }
 
     #[test]
