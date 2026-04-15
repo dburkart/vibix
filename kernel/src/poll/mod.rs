@@ -382,16 +382,20 @@ fn task_wake(tid: usize) {
 #[cfg(all(test, not(target_os = "none")))]
 mod test_wake_log {
     use alloc::vec::Vec;
-    use spin::Mutex;
+    use core::cell::RefCell;
 
-    static WAKES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    // Thread-local so parallel test threads each get their own log and
+    // can't clobber each other's drain() calls (CodeRabbit #392).
+    thread_local! {
+        static WAKES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
 
     pub(super) fn record(tid: usize) {
-        WAKES.lock().push(tid);
+        WAKES.with(|v| v.borrow_mut().push(tid));
     }
 
     pub(super) fn drain() -> Vec<usize> {
-        core::mem::take(&mut *WAKES.lock())
+        WAKES.with(|v| core::mem::take(&mut *v.borrow_mut()))
     }
 }
 
