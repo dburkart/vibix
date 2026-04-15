@@ -196,14 +196,25 @@ impl FileOps for TarFileOps {
         Ok(n)
     }
 
-    fn seek(&self, _f: &OpenFile, whence: Whence, off: i64) -> Result<u64, i64> {
-        // Only SEEK_SET is meaningful without an internal offset
-        // here; lseek's real work happens in `OpenFile.offset`, so
-        // we just validate and echo.
-        match whence {
-            Whence::Set if off >= 0 => Ok(off as u64),
-            _ => Err(EINVAL),
+    fn seek(&self, f: &OpenFile, whence: Whence, off: i64) -> Result<u64, i64> {
+        let sup = self.super_()?;
+        let node = sup.node(f.inode.ino)?;
+        let size = match &node.data {
+            NodeData::Reg { len, .. } => *len as i64,
+            NodeData::Dir { .. } => return Err(-21), // EISDIR
+            NodeData::Link { .. } => return Err(EINVAL),
+        };
+        let mut cur = f.offset.lock();
+        let new_off = match whence {
+            Whence::Set => off,
+            Whence::Cur => (*cur as i64).saturating_add(off),
+            Whence::End => size.saturating_add(off),
+        };
+        if new_off < 0 {
+            return Err(EINVAL);
         }
+        *cur = new_off as u64;
+        Ok(*cur)
     }
 
     fn getdents(&self, f: &OpenFile, buf: &mut [u8], cookie: &mut u64) -> Result<usize, i64> {
