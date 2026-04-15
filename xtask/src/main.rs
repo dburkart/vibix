@@ -964,13 +964,17 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("no stdout pipe")?;
 
-    // Hard ceiling: a watchdog thread kills QEMU after 90 s so that a
+    // Hard ceiling: a watchdog thread kills QEMU after HARD_CAP so that a
     // blocking read_line() on a stalled kernel cannot hang indefinitely.
-    // 30 s was borderline on un-accelerated CI QEMU (no KVM on ubuntu-latest):
+    // 90 s was borderline on un-accelerated CI QEMU (no KVM on ubuntu-latest):
     // fork+exec markers intermittently arrived past the cap even though the
-    // kernel was healthy. The loop exits as soon as every marker appears, so
-    // a generous ceiling only affects genuine hangs.
-    const HARD_CAP: Duration = Duration::from_secs(90);
+    // kernel was healthy. The loop exits as soon as every marker appears or
+    // the kernel prints a panic marker, so a generous ceiling only affects
+    // genuine hangs.
+    const HARD_CAP: Duration = Duration::from_secs(180);
+    // Kernel panic marker printed by the panic_handler in kernel/src/main.rs.
+    // Seeing this means the kernel has already lost — don't wait out HARD_CAP.
+    const PANIC_MARKER: &str = "KERNEL PANIC:";
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(HARD_CAP);
         let _ = Command::new("kill").arg(pid.to_string()).status();
@@ -981,6 +985,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let mut accumulated = String::new();
     let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
+    let mut panicked = false;
 
     // Read QEMU serial output one line at a time.  read_line() blocks until
     // a newline arrives or the pipe closes (after kill).  We check for
@@ -994,6 +999,10 @@ fn smoke(opts: &BuildOpts) -> R<()> {
             Ok(0) => break, // pipe closed (QEMU killed by watchdog or exited)
             Ok(_) => {
                 accumulated.push_str(&line);
+                if line.contains(PANIC_MARKER) {
+                    panicked = true;
+                    break;
+                }
                 remaining.retain(|m| !accumulated.contains(m));
                 if remaining.is_empty() {
                     break;
@@ -1007,6 +1016,11 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let _ = Command::new("kill").arg(pid.to_string()).status();
     let _ = watchdog.join();
     let _ = child.wait();
+
+    if panicked {
+        eprintln!("--- captured serial ---\n{accumulated}\n-----------------------");
+        return Err("smoke: kernel panic detected".into());
+    }
 
     if remaining.is_empty() {
         println!("→ smoke: all {} markers present ✓", SMOKE_MARKERS.len());
