@@ -23,7 +23,7 @@ mod kernel_side {
     use crate::build_info;
     use crate::mem::{frame, heap, FRAME_SIZE};
     use crate::task::TaskStateView;
-    use crate::{input, pci, serial, serial_print, serial_println, task, time};
+    use crate::{framebuffer, input, pci, serial, serial_print, serial_println, task, time};
 
     /// Flipped to `true` the first time the shell's `run` enters its main
     /// loop. Integration tests poll this to confirm the shell actually
@@ -64,6 +64,20 @@ mod kernel_side {
             return serial_byte(b, state);
         }
         let key = input::try_read_key()?;
+        // Shift+PgUp/PgDn pages the framebuffer scrollback. We capture the
+        // shift state immediately after decode (before any other scancode
+        // can advance the modifier state) and consume the key without
+        // forwarding it to the line editor.
+        if let DecodedKey::RawKey(kc @ (KeyCode::PageUp | KeyCode::PageDown)) = key {
+            if input::shift_held() {
+                match kc {
+                    KeyCode::PageUp => framebuffer::scroll_view_up_page(),
+                    KeyCode::PageDown => framebuffer::scroll_view_down_page(),
+                    _ => {}
+                }
+                return None;
+            }
+        }
         match key {
             DecodedKey::Unicode(c) => char_to_input(c),
             DecodedKey::RawKey(KeyCode::ArrowUp) => Some(Input::HistoryPrev),

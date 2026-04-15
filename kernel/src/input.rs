@@ -137,6 +137,14 @@ mod kernel_side {
         OVERFLOWS.load(Ordering::Relaxed)
     }
 
+    /// Whether either Shift key is currently held, per the pc-keyboard
+    /// decoder's internal modifier state. Reflects the state as of the
+    /// last decoded scancode — safe to call immediately after
+    /// [`try_read_key`] returns a key.
+    pub fn shift_held() -> bool {
+        KEYBOARD.lock().get_modifiers().is_shifted()
+    }
+
     /// Block (via `hlt`) until a decoded key is available.
     ///
     /// Disabling interrupts before the final empty-check plugs the race

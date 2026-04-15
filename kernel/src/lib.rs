@@ -36,6 +36,7 @@ pub mod arch;
 pub mod bench;
 #[cfg(target_os = "none")]
 pub mod boot;
+pub mod fbview;
 #[cfg(target_os = "none")]
 pub mod framebuffer;
 #[cfg(any(test, target_os = "none"))]
