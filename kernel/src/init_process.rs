@@ -142,7 +142,9 @@ pub fn launch(bytes: &[u8]) -> usize {
             serial_println!(
                 "init: WARNING — RDRAND/RDSEED unavailable, AT_RANDOM is deterministic"
             );
-            crate::arch::x86_64::csprng::at_random_or_fallback(image.entry.as_u64() ^ stack_phys)
+            crate::arch::x86_64::csprng::deterministic_at_random_fallback(
+                image.entry.as_u64() ^ stack_phys,
+            )
         }
     };
     let auxv_params = crate::mem::auxv::AuxvParams {

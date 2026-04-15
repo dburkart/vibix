@@ -701,7 +701,7 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
             crate::serial_println!(
                 "exec: WARNING — RDRAND/RDSEED unavailable, AT_RANDOM is deterministic"
             );
-            super::csprng::at_random_or_fallback(image.entry.as_u64() ^ stack_phys)
+            super::csprng::deterministic_at_random_fallback(image.entry.as_u64() ^ stack_phys)
         }
     };
     let auxv_params = crate::mem::auxv::AuxvParams {

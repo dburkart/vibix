@@ -66,14 +66,22 @@ pub fn rdrand16() -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// Produce 16 bytes for AT_RANDOM. Prefers [`rdrand16`]; if the CPU
-/// supports neither RDRAND nor RDSEED (or every retry failed), falls
-/// back to splatting `seed` across the buffer — **insecure**, documented
-/// as such, and intended only to keep old QEMU configs bootable.
-pub fn at_random_or_fallback(seed: u64) -> [u8; 16] {
-    if let Some(bytes) = rdrand16() {
-        return bytes;
-    }
+/// Deterministic AT_RANDOM fallback for hosts where RDRAND/RDSEED are
+/// unavailable. Splats `seed` across the 16-byte buffer — **insecure**,
+/// documented as such, and intended only to keep old QEMU configs
+/// bootable. Callers must invoke [`rdrand16`] first and only reach this
+/// helper on the `None` branch (with a serial warning).
+///
+/// When `seed == 0`, the seed is replaced with a fixed non-zero
+/// constant (the SplitMix64 / golden-ratio nothing-up-my-sleeve value)
+/// so the buffer is never all-zero — an all-zero AT_RANDOM is the
+/// worst possible "random" value to hand userspace.
+pub fn deterministic_at_random_fallback(seed: u64) -> [u8; 16] {
+    let seed = if seed == 0 {
+        0x9e37_79b9_7f4a_7c15
+    } else {
+        seed
+    };
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
         *b = ((seed >> ((i % 8) * 8)) & 0xFF) as u8;
@@ -124,18 +132,19 @@ mod tests {
 
     #[test]
     fn fallback_derives_bytes_from_seed() {
-        let bytes = at_random_or_fallback(0xdead_beef_cafe_babe);
+        let bytes = deterministic_at_random_fallback(0xdead_beef_cafe_babe);
         // Seed splatted across 16 bytes: first 8 = seed LE, next 8 = same pattern.
         assert_eq!(&bytes[..8], &0xdead_beef_cafe_babe_u64.to_le_bytes());
         assert_eq!(&bytes[8..], &0xdead_beef_cafe_babe_u64.to_le_bytes());
     }
 
     #[test]
-    fn fallback_zero_seed_is_all_zero() {
-        // Documents the known-insecure fallback: seed=0 yields an
-        // all-zero array. The kernel must never rely on the fallback
-        // for anything security-sensitive — the `serial_println!`
-        // warning in the call sites is the user-visible signal.
-        assert_eq!(at_random_or_fallback(0), [0u8; 16]);
+    fn fallback_zero_seed_is_never_all_zero() {
+        // Handing userspace an all-zero AT_RANDOM is the worst possible
+        // failure mode of the fallback, so seed==0 must be remapped to
+        // a fixed non-zero constant before splatting.
+        let bytes = deterministic_at_random_fallback(0);
+        assert_ne!(bytes, [0u8; 16]);
+        assert_eq!(&bytes[..8], &0x9e37_79b9_7f4a_7c15_u64.to_le_bytes());
     }
 }
