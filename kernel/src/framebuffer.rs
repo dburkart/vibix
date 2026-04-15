@@ -377,8 +377,7 @@ impl Console {
             // correctly. Index arithmetic is duplicated here rather than
             // calling scrollback_row() to avoid holding an immutable borrow
             // across render_cell_at, which needs &mut self.
-            let ring_row =
-                (self.scroll_head + self.scroll_filled - 1 - age) % SCROLLBACK_ROWS;
+            let ring_row = (self.scroll_head + self.scroll_filled - 1 - age) % SCROLLBACK_ROWS;
             let base = ring_row * cols;
             for c in 0..cols {
                 let cell = self.scrollback[base + c];
