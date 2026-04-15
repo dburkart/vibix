@@ -8,7 +8,7 @@
 use spin::Mutex;
 
 use super::termios::{
-    Termios, ECHO, ECHOE, ICRNL, IGNCR, INLCR, ISTRIP, OCRNL, ONLCR, OPOST, VERASE,
+    Termios, ECHO, ECHOE, ECHONL, ICRNL, IGNCR, INLCR, ISTRIP, OCRNL, ONLCR, OPOST, VERASE,
 };
 
 /// Byte sink used by the output path. `process_output` and `queue_echo`
@@ -100,15 +100,18 @@ impl NTty {
 
     /// Push one echoed character through the OPOST-aware output path.
     ///
-    /// With `ECHO` clear, produces nothing. With `ECHOE` set and `c` equal
-    /// to `VERASE`, emits the visual-erase sequence `"\b \b"`. Otherwise
-    /// echoes `c` literally. All emitted bytes flow through
-    /// `process_output` so OPOST still governs the wire format.
+    /// With `ECHO` clear, produces nothing — except that `ECHONL` forces
+    /// `\n` through regardless, matching the `-echo echonl` termios
+    /// mode. With `ECHOE` set and `c` equal to `VERASE`, emits the
+    /// visual-erase sequence `"\b \b"`. Otherwise echoes `c` literally.
+    /// All emitted bytes flow through `process_output` so OPOST still
+    /// governs the wire format.
     pub fn queue_echo(&self, termios: &Termios, c: u8, out: &mut dyn OutSink) {
-        if termios.c_lflag & ECHO == 0 {
+        let lflag = termios.c_lflag;
+        if lflag & ECHO == 0 && !(lflag & ECHONL != 0 && c == b'\n') {
             return;
         }
-        if termios.c_lflag & ECHOE != 0 && c == termios.c_cc[VERASE] {
+        if lflag & ECHOE != 0 && c == termios.c_cc[VERASE] {
             self.process_output(termios, &[0x08, b' ', 0x08], out);
             return;
         }
@@ -300,6 +303,23 @@ mod tests {
         let n = NTty::new();
         let mut out = Vec::new();
         n.queue_echo(&t, t.c_cc[VERASE], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn queue_echo_echonl_emits_nl_with_echo_off() {
+        // `-echo echonl` forces newlines through the echo path even with
+        // ECHO clear. OPOST | ONLCR still expands the \n to \r\n.
+        let mut t = Termios::sane();
+        t.c_oflag = OPOST | ONLCR;
+        t.c_lflag = ECHONL;
+        let n = NTty::new();
+        let mut out = Vec::new();
+        n.queue_echo(&t, b'\n', &mut out);
+        assert_eq!(out, b"\r\n");
+        // Non-newline bytes are still suppressed.
+        let mut out = Vec::new();
+        n.queue_echo(&t, b'a', &mut out);
         assert!(out.is_empty());
     }
 
