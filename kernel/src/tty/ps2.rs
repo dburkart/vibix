@@ -145,6 +145,8 @@ mod tests {
 
     #[test]
     fn ring_isr_push_and_drain_preserves_order() {
+        while PS2_RX_RING.pop().is_some() {}
+
         PS2_RX_RING.push(0x1e); // scancode 'a' make
         PS2_RX_RING.push(0xab);
         let mut out = Vec::new();
