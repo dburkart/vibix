@@ -13,7 +13,90 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # Fast lane: formatting, clippy (host-only), and release build sanity.
+  # Does not need QEMU, so it finishes well ahead of the kernel test jobs.
+  fmt-build:
+    name: fmt + build (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            xorriso build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-fmt-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fmt-build-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # Kernel clippy requires --target x86_64-unknown-none + -Z build-std,
+      # which isn't wired through xtask yet. Scope clippy to the host-crate
+      # (xtask) for now; kernel clippy is a follow-up.
+      - name: cargo clippy (xtask)
+        run: cargo clippy -p xtask --all-targets -- -D warnings
+
+      - name: cargo xtask build --release
+        run: cargo xtask build --release
+
+  unit-tests:
+    name: host unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-unit-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo xtask test-unit
+        run: cargo xtask test-unit
+
+  integration-tests:
+    name: integration tests (QEMU)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -40,24 +123,46 @@ jobs:
             ~/.cargo/git
             target
             build/limine
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-integration-
+            ${{ runner.os }}-cargo-
 
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+      - name: cargo xtask test-integration
+        run: cargo xtask test-integration
 
-      # Kernel clippy requires --target x86_64-unknown-none + -Z build-std,
-      # which isn't wired through xtask yet. Scope clippy to the host-crate
-      # (xtask) for now; kernel clippy is a follow-up.
-      - name: cargo clippy (xtask)
-        run: cargo clippy -p xtask --all-targets -- -D warnings
+  smoke:
+    name: smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: cargo xtask test
-        run: cargo xtask test
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
 
       - name: cargo xtask smoke
         run: cargo xtask smoke
-
-      - name: cargo xtask build --release
-        run: cargo xtask build --release
-
