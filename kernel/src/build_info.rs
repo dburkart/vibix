@@ -5,7 +5,7 @@
 //! from host unit tests alike.
 
 pub const KERNEL_NAME: &str = "vibix";
-pub const ARCH: &str = "x86_64";
+pub const ARCH: &str = env!("VIBIX_TARGET_ARCH");
 
 /// Kernel "release" string — mirrors Linux's `uname -r` slot. We don't
 /// yet version the kernel independently of the workspace, so the crate

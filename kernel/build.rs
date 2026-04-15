@@ -10,10 +10,12 @@ fn main() {
     let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
     let ts = build_timestamp();
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string());
 
     println!("cargo:rustc-env=VIBIX_GIT_SHA={}", sha);
     println!("cargo:rustc-env=VIBIX_BUILD_TIMESTAMP={}", ts);
     println!("cargo:rustc-env=VIBIX_BUILD_PROFILE={}", profile);
+    println!("cargo:rustc-env=VIBIX_TARGET_ARCH={}", arch);
 
     // Only rebuild when the HEAD ref or the packed-refs file changes —
     // not on every source edit. Paths are relative to the workspace

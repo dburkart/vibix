@@ -122,7 +122,7 @@ fn whoami_prints_root() {
     let mut mcr: Port<u8> = Port::new(COM1_BASE + UART_REG_MCR);
     let saved_mcr = unsafe { mcr.read() };
 
-    // Enter loopback. "root\r\n" is 6 bytes → fits in the 16-byte
+    // Enter loopback. "root\n" is 5 bytes → fits in the 16-byte
     // 16550 RX FIFO during the single `without_interrupts` window
     // `serial_println!` takes.
     unsafe { mcr.write(MCR_LOOPBACK_BITS) };
@@ -134,7 +134,7 @@ fn whoami_prints_root() {
         while let Some(b) = serial::try_read_byte() {
             collected.push(b);
         }
-        if collected.len() >= 6 {
+        if collected.len() >= 5 {
             break;
         }
         x86_64::instructions::hlt();
