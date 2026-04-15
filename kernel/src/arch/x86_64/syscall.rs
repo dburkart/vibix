@@ -474,6 +474,11 @@ pub unsafe extern "C" fn syscall_dispatch(
         // kill(pid, sig) — send signal to process.
         KILL => crate::signal::sys_kill(a0, a1),
 
+        // ioctl(fd, cmd, arg) — device-specific control. Only the tty-like
+        // `SerialBackend` handles non-trivial `cmd`s today; all other
+        // backends inherit the `-ENOTTY` default.
+        IOCTL => super::syscalls::ioctl::sys_ioctl(a0, a1 as u32, a2 as usize),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -944,6 +949,7 @@ syscall_entry:
 pub mod syscall_nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const IOCTL: u64 = 16;
     pub const BRK: u64 = 12;
     pub const FORK: u64 = 57;
     pub const EXECVE: u64 = 59;
@@ -990,6 +996,7 @@ mod tests {
         // Basic I/O
         assert_eq!(syscall_nr::READ, 0, "SYS_read must be 0");
         assert_eq!(syscall_nr::WRITE, 1, "SYS_write must be 1");
+        assert_eq!(syscall_nr::IOCTL, 16, "SYS_ioctl must be 16");
         assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
         assert_eq!(syscall_nr::DUP, 32, "SYS_dup must be 32");
         assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
