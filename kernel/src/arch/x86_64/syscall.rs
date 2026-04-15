@@ -479,6 +479,12 @@ pub unsafe extern "C" fn syscall_dispatch(
         // backends inherit the `-ENOTTY` default.
         IOCTL => super::syscalls::ioctl::sys_ioctl(a0, a1 as u32, a2 as usize),
 
+        // pipe(pipefd) — create anonymous pipe; fds[0]=read, fds[1]=write.
+        PIPE => crate::ipc::pipe::sys_pipe(a0),
+
+        // pipe2(pipefd, flags) — like pipe() but with O_NONBLOCK/O_CLOEXEC.
+        PIPE2 => crate::ipc::pipe::sys_pipe2(a0, a1 as u32),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -976,6 +982,8 @@ pub mod syscall_nr {
     pub const NEWFSTATAT: u64 = 262;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
+    pub const PIPE: u64 = 22;
+    pub const PIPE2: u64 = 293;
 }
 
 #[cfg(test)]
