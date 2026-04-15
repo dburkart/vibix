@@ -228,6 +228,24 @@ Record the PR open time. Run one poll tick (step 6b below), then either proceed 
    > Cursor Bugbot posts exclusively inline; missing the second endpoint means all Cursor
    > findings are invisible. The bot login is `cursor[bot]`, matched by the `cursor` pattern.
 
+   **CodeRabbit rate-limit handling.** A CodeRabbit comment that contains the marker
+   `<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->` (or a
+   "Rate limit exceeded" heading with a "Please wait **N minutes and M seconds**" body)
+   is **not** a real review — it is a deferral notice. Do not count it toward the
+   "≥1 review-bot comment" gate in step 3. Instead:
+
+   1. Parse the wait duration from the comment body (e.g. `6 minutes and 23 seconds` →
+      `383` seconds). If parsing fails, default to `600` seconds.
+   2. Schedule the next poll tick with `delaySeconds = waitSeconds + 60` (a one-minute
+      buffer so the rate-limit window has fully reset on CodeRabbit's side), overriding
+      the normal cadence table for this one tick.
+   3. On that next poll tick, if no newer CodeRabbit review has appeared, trigger a
+      re-review by posting `@coderabbitai review` as a PR comment via
+      `mcp__github__add_issue_comment`, then resume normal polling cadence.
+   4. Do this at most **once per PR** — if CodeRabbit rate-limits again after the
+      re-review request, treat the rate-limit comment as a terminal "no bot review" and
+      fall back to the 30-minute-elapsed rule in step 3 to unblock merge.
+
 3. Evaluate "done" criteria (from `docs/agent-playbooks/pr-review.md`):
    - Every check is in a terminal state (`success`, `failure`, `skipped`, `cancelled`,
      `neutral`, `timed_out`, `stale`) — nothing `in_progress`, `queued`, or `pending`.
