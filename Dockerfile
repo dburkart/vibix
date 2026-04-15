@@ -1,4 +1,9 @@
-FROM ubuntu:24.04
+# Pinned to amd64: the kernel crate pulls in x86_64-only deps (pic8259,
+# uart_16550, x86_64), so the host rustc inside the container must be
+# x86_64-unknown-linux-gnu. On Apple Silicon, Docker Desktop must have
+# "Use Rosetta for x86_64/amd64 emulation" enabled (Settings → General);
+# QEMU-based emulation trips a Go regexp panic in `gh` on init.
+FROM --platform=linux/amd64 ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
