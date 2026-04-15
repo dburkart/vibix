@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: Pipes, Poll, and TTY Line Discipline
-status: In Review
+status: Accepted
 created: 2026-04-15
 ---
 
@@ -1155,26 +1155,33 @@ would have leaked `ERESTARTSYS`.
 
 ## Open Questions
 
-1. **Pipe SPSC vs locked ring, revisited.** If initial benchmarking shows
-   lock contention is significant even in the SPSC case, swap the inner
-   mutex for true SPSC atomics. Defer until measurement.
-2. **PTY scope.** This RFC mentions `Pty{Master,Slave}` as TTY-driver
-   implementers but does not design `devpts` or the `/dev/ptmx` path.
-   File a follow-on RFC for PTY once the base TTY lands.
-3. **`sigaltstack` for SIGPIPE delivery.** vibix's signal delivery does
-   not yet support alternate stacks; SIGPIPE is delivered on the default
-   stack only. POSIX permits this; flag as an `area:security` follow-up.
-4. **Canonical VMIN/VTIME timer source.** MIN=0,TIME>0 needs a per-read
-   one-shot timer; we assume `hpet.rs` gives us ≤ 100 µs resolution.
-   Verify before implementing non-canonical reads.
-5. **DAPRA default deferral via libc.** Whether a future `libc.so` should
-   set a conservative default `deferral_ns` on normal `poll(3)` calls is
-   deferred to userspace policy. Kernel defaults to 0.
-6. **POLLRDBAND / POLLWRBAND.** Accept the flags (POSIX requires the
-   symbols) but never set them (no STREAMS priority bands). Documented
-   as a known POSIX-conforming no-op.
-7. **select exceptfds semantics.** Linux maps `exceptfds` to POLLPRI. We
-   do the same — documented here to avoid surprise.
+All questions below are **deferred to implementation** — they are measurement-
+or policy-driven and do not block the design. Implementation issues filed
+from the Implementation Roadmap below will pick them up as they arise.
+
+1. **Pipe SPSC vs locked ring, revisited.** *Deferred to implementation.* If
+   initial benchmarking shows lock contention in the SPSC case, swap the
+   inner mutex for true SPSC atomics. Measurement gate is the `pipe-bulk`
+   bench committed in §Performance Considerations.
+2. **PTY scope.** *Out of scope; future RFC.* This RFC mentions
+   `Pty{Master,Slave}` as TTY-driver implementers but does not design
+   `devpts` or the `/dev/ptmx` path. A follow-on RFC will cover PTY once
+   the base TTY lands.
+3. **`sigaltstack` for SIGPIPE delivery.** *Deferred to implementation.*
+   vibix's signal delivery does not yet support alternate stacks; SIGPIPE
+   is delivered on the default stack only. POSIX permits this; captured
+   as an `area:security` follow-up issue.
+4. **Canonical VMIN/VTIME timer source.** *Deferred to implementation.*
+   MIN=0,TIME>0 needs a per-read one-shot timer assuming `hpet.rs` gives
+   us ≤ 100 µs resolution. Verify during non-canonical read implementation.
+5. **DAPRA default deferral via libc.** *Deferred to userspace policy.*
+   Whether a future `libc.so` should set a conservative default
+   `deferral_ns` on `poll(3)` is deferred. Kernel defaults to 0.
+6. **POLLRDBAND / POLLWRBAND.** *Resolved — documented no-op.* Accept the
+   symbols (POSIX requires them) but never set them (no STREAMS priority
+   bands).
+7. **select exceptfds semantics.** *Resolved — Linux-compatible.* Linux
+   maps `exceptfds` to POLLPRI; we do the same.
 
 ## Implementation Roadmap
 
