@@ -525,13 +525,18 @@ fn ustar_header_block(name: &str, typeflag: u8, mode: u16, size: u64) -> [u8; 51
 fn ensure_initrd() -> R<PathBuf> {
     let path = initrd_path();
 
-    const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/", "etc/init/"];
+    const DIRS: &[&str] = &["dev/", "tmp/", "bin/", "etc/", "etc/init/", "lib/"];
     const HOSTNAME_FILE: &str = "etc/hostname";
     const HOSTNAME_PAYLOAD: &[u8] = b"vibix\n";
     const NESTED_FILE: &str = "etc/init/hello.txt";
     const NESTED_PAYLOAD: &[u8] = b"nested\n";
-    // DIRS headers + 2 file headers + 2 padded data blocks + 2 end blocks.
-    const EXPECTED_SIZE: u64 = ((DIRS.len() + 2 + 2 + 2) * 512) as u64;
+    const LDSO_FILE: &str = "lib/ld-musl-x86_64.so.1";
+    const LDSO_SIZE: u64 = 645_736;
+    const LDSO_BLOCKS: u64 = (LDSO_SIZE + 511) / 512; // = 1262 blocks
+                                                      // DIRS headers + 3 file headers + (2 small + LDSO_BLOCKS) data blocks + 2 end blocks.
+    const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 3 + 2 + LDSO_BLOCKS + 2) * 512;
+
+    let ldso_src = workspace_root().join("userspace/lib/ld-musl-x86_64.so.1");
 
     let needs_write = match fs::metadata(&path) {
         Ok(m) => m.len() != EXPECTED_SIZE,
@@ -541,6 +546,14 @@ fn ensure_initrd() -> R<PathBuf> {
     if needs_write {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        let ldso_bytes = fs::read(&ldso_src)?;
+        if ldso_bytes.len() as u64 != LDSO_SIZE {
+            return Err(format!(
+                "ld-musl-x86_64.so.1: expected {LDSO_SIZE} bytes, got {}",
+                ldso_bytes.len()
+            )
+            .into());
         }
         let mut data: Vec<u8> = Vec::with_capacity(EXPECTED_SIZE as usize);
         for &dir in DIRS {
@@ -557,6 +570,12 @@ fn ensure_initrd() -> R<PathBuf> {
         let mut payload_block = [0u8; 512];
         payload_block[..NESTED_PAYLOAD.len()].copy_from_slice(NESTED_PAYLOAD);
         data.extend_from_slice(&payload_block);
+        // lib/ld-musl-x86_64.so.1 — dynamic linker for musl-linked user binaries.
+        data.extend_from_slice(&ustar_file_block(LDSO_FILE, LDSO_SIZE));
+        let padded_len = ((ldso_bytes.len() + 511) / 512) * 512;
+        let mut ldso_padded = vec![0u8; padded_len];
+        ldso_padded[..ldso_bytes.len()].copy_from_slice(&ldso_bytes);
+        data.extend_from_slice(&ldso_padded);
         // Two 512-byte zero blocks mark end-of-archive.
         data.extend_from_slice(&[0u8; 1024]);
         fs::write(&path, &data)?;
@@ -599,6 +618,10 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     fs::copy(userspace_init, iso_root.join("boot/userspace_init.elf"))?;
     fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
     fs::copy(&initrd, iso_root.join("boot/rootfs.tar"))?;
+    fs::copy(
+        workspace_root().join("userspace/lib/ld-musl-x86_64.so.1"),
+        iso_root.join("boot/ld-musl-x86_64.so.1"),
+    )?;
     fs::copy(
         workspace_root().join("kernel/limine.conf"),
         iso_root.join("boot/limine/limine.conf"),
