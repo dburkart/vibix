@@ -743,6 +743,11 @@ pub fn current_growsdown_lookup(
 /// - The bootstrap task calls `exit` — it owns the kernel PML4 and the
 ///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
+    // Disable IRQs before acquiring SCHED so that IrqLock saves `false`
+    // and restores `false` on guard drop — keeping IRQs masked through
+    // the context_switch call below, which executes after the guard is
+    // released. IrqLock cannot be used end-to-end here because the
+    // guard drop would re-enable IRQs before context_switch.
     interrupts::disable();
     let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_syscall_top) = {
         let mut sched = SCHED.lock();
@@ -1032,6 +1037,12 @@ pub fn current_id() -> usize {
 /// bootstrap task is always ready, so this only fires if something
 /// genuinely wedged the scheduler.
 pub fn block_current() {
+    // Disable IRQs before acquiring SCHED so that IrqLock saves `false`
+    // and restores `false` on guard drop — keeping IRQs masked through
+    // the context_switch call below, which executes after the guard is
+    // released. IrqLock cannot be used end-to-end here because the guard
+    // drop would re-enable IRQs before context_switch. `was_on` is saved
+    // before the disable so IF can be restored correctly after the switch.
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
