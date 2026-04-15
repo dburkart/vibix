@@ -185,6 +185,9 @@ mod tests {
             "watermark must stay low below threshold"
         );
         r.push(0);
-        assert!(r.watermark_high(), "watermark must flip at {WATERMARK_HIGH}");
+        assert!(
+            r.watermark_high(),
+            "watermark must flip at {WATERMARK_HIGH}"
+        );
     }
 }
