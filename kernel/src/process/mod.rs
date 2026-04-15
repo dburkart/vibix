@@ -520,6 +520,41 @@ pub fn sys_setpgid(pid: u32, pgid: u32) -> i64 {
     setpgid_for(current_pid(), pid, pgid)
 }
 
+/// Collect every live pid whose `pgrp_id == pgid` into `out`.
+///
+/// Used by the N_TTY ISIG path to fan a signal out to the foreground
+/// pgrp (#431). Takes `TABLE.lock()` only for the walk and releases it
+/// before returning, so callers are free to re-enter the process table
+/// (e.g. via `signal::raise_signal_on_pid`, which acquires the same
+/// lock) while iterating the collected pids.
+pub fn collect_pgrp_members(pgid: u32, out: &mut alloc::vec::Vec<u32>) {
+    if pgid == 0 {
+        return;
+    }
+    let t = TABLE.lock();
+    for entry in t.by_pid.values() {
+        if entry.pgrp_id == pgid && matches!(entry.state, ProcessState::Alive) {
+            out.push(entry.pid);
+        }
+    }
+}
+
+/// Orphaned in the conservative sense the issue calls out: no live
+/// member of `pgid` remains in the process table. Linux's real
+/// `will_become_orphaned_pgrp` test also walks parents, but until
+/// session reparenting lands we approximate with "no members" — which
+/// matches the Linux behavior for a pgrp whose leader has exited and
+/// whose members all followed.
+pub fn pgrp_is_orphaned(pgid: u32) -> bool {
+    if pgid == 0 {
+        return true;
+    }
+    let t = TABLE.lock();
+    !t.by_pid
+        .values()
+        .any(|e| e.pgrp_id == pgid && matches!(e.state, ProcessState::Alive))
+}
+
 /// Session/pgrp test helpers, exposed so the `session_syscalls` kernel
 /// integration test can drive the table without the scheduler. Not
 /// gated on `cfg(test)` because the integration test is a separate

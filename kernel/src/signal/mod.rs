@@ -257,6 +257,34 @@ pub fn raise_signal_on_pid(pid: u32, sig: u8) -> i64 {
     }
 }
 
+/// Send signal `sig` to every live member of process group `pgid`.
+///
+/// Returns the number of processes the signal was delivered to. `pgid == 0`
+/// yields `0`. `-EINVAL` (-22) for `sig == 0` or out-of-range. Unlike
+/// POSIX `kill()`, the "signal 0 = existence check" form has no caller in
+/// the kernel — the N_TTY ISIG fast path only ever sends 1..=NSIG — so the
+/// safer choice is to reject it outright rather than silently walk the
+/// pgrp and wake tasks. Used by the N_TTY ISIG fast path (#431); the
+/// caller reads `tty.ctrl.pgrp_snapshot` lock-free and passes the result
+/// here.
+pub fn send_to_pgrp(pgid: u32, sig: u8) -> i64 {
+    if sig == 0 || sig > NSIG {
+        return -22; // EINVAL
+    }
+    if pgid == 0 {
+        return 0;
+    }
+    let mut pids: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    crate::process::collect_pgrp_members(pgid, &mut pids);
+    let mut delivered: i64 = 0;
+    for pid in pids {
+        if raise_signal_on_pid(pid, sig) == 0 {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
 // ── Syscall handlers ──────────────────────────────────────────────────────
 
 /// `sigaction(sig, act_uva, oldact_uva)` — register or query a signal
