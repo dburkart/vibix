@@ -150,8 +150,8 @@ fn install_fd(backend: Arc<dyn FileBackend>, flags: u32) -> i64 {
     // Creation-time / path-resolution bits (O_CREAT, O_EXCL, O_TRUNC,
     // O_DIRECTORY, O_NOFOLLOW) affect open() only and must not surface
     // via fcntl(F_GETFL).
-    let status_flags = flags
-        & (oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_ASYNC);
+    let status_flags =
+        flags & (oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_ASYNC);
     let desc = Arc::new(FileDescription::new(backend, status_flags));
     let tbl = crate::task::current_fd_table();
     let result = tbl.lock().alloc_fd_with_flags(desc, fd_flags);
