@@ -41,6 +41,7 @@ pub extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
 pub extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
     let code: u8 = unsafe { Port::new(0x60).read() };
     crate::input::push_scancode_from_isr(code);
+    crate::tty::ps2::push_scancode_from_isr(code);
     notify_eoi(InterruptIndex::Keyboard.as_u8());
 }
 

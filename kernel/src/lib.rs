@@ -95,6 +95,7 @@ pub fn init() {
         Err(e) => serial_println!("hpet: unavailable ({:?}), falling back to PIT", e),
     }
     time::init();
+    tty::ps2::init();
 }
 
 /// Halt forever. Handy in panic paths and as a terminal call in tests.
