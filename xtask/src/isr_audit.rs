@@ -129,7 +129,9 @@ mod tests {
         // Second line: matches both `BlockingMutex<` and `BlockingMutex::new`.
         assert_eq!(findings.len(), 2, "got: {findings:?}");
         assert_eq!(findings[0].line_no, 2);
-        assert!(findings[0].pattern == "BlockingMutex<" || findings[0].pattern == "BlockingMutex::new");
+        assert!(
+            findings[0].pattern == "BlockingMutex<" || findings[0].pattern == "BlockingMutex::new"
+        );
     }
 
     #[test]
@@ -142,8 +144,7 @@ mod tests {
 
     #[test]
     fn escape_hatch_suppresses_finding() {
-        let src =
-            "let x = BlockingMutex::new(0); // isr-audit: ok — routed via reaper\n";
+        let src = "let x = BlockingMutex::new(0); // isr-audit: ok — routed via reaper\n";
         assert!(scan_contents("fake.rs", src).is_empty());
     }
 
