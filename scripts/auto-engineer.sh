@@ -84,9 +84,68 @@ tmux_pane_vol_opts=()
 slug_file=""
 poller_pid=""
 restore_tmux_rename=""
+hints_vol_opts=()
+
+# The image is pinned to linux/amd64 (Rosetta required on Apple Silicon,
+# qemu-user elsewhere). When the host is not amd64, the container runs
+# under emulation and cargo xtask wall-clock times balloon. Write a hints
+# file that the auto-engineer skill will read to pick generous Bash-tool
+# timeouts. On native amd64 hosts the file is absent and no guidance leaks
+# into the agent's context.
+hints_file=""
+host_arch="$(uname -m)"
+case "$host_arch" in
+    x86_64|amd64) : ;;
+    *)
+        hints_file="$(mktemp -t vibix-host-hints.XXXXXX.md)"
+        cat > "$hints_file" <<'EOF'
+# Host hints
+
+This container is pinned to `linux/amd64` but the host is not amd64, so
+every instruction runs under emulation (Rosetta on Apple Silicon, qemu-user
+elsewhere). Wall-clock for `cargo xtask` is ~5-10x native.
+
+When invoking these commands through the Bash tool, set `timeout` at least
+as high as the value below. Do not use the tool's 120000 ms default — it
+will kill the command mid-run and force rework.
+
+| Command             | Observed (emulated) | Use timeout |
+|---------------------|---------------------|-------------|
+| `cargo xtask build` | ~65 s warm, 3-5 min cold | `300000` (5 min) |
+| `cargo xtask test`  | ~330 s (~5.5 min)        | `600000` (10 min, tool max) |
+| `cargo xtask smoke` | ~34 s warm, ~100 s cold  | `200000` (~3.3 min) |
+
+The Bash tool caps `timeout` at 600000 ms. For `cargo xtask test` use the
+cap. If a command legitimately needs longer, run it in the background
+(`run_in_background: true`) and poll instead of extending the timeout.
+EOF
+        hints_vol_opts+=(-v "$hints_file:/etc/vibix-host-hints.md:ro")
+        ;;
+esac
+
+tmux_window_id=""
+cleanup() {
+    [ -n "$poller_pid" ] && kill "$poller_pid" 2>/dev/null || true
+    [ -n "$slug_file" ] && rm -f "$slug_file" 2>/dev/null || true
+    [ -n "$hints_file" ] && rm -f "$hints_file" 2>/dev/null || true
+    if [ -n "$restore_tmux_rename" ] && command -v tmux >/dev/null 2>&1; then
+        tmux set-window-option ${tmux_window_id:+-t "$tmux_window_id"} automatic-rename "$restore_tmux_rename" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
 if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
-    prev="$(tmux show-window-options -v automatic-rename 2>/dev/null || echo on)"
-    tmux set-window-option automatic-rename off >/dev/null 2>&1 || true
+    # Capture the window ID of the pane this script is running in, so the
+    # poller renames *this* window rather than whatever window happens to be
+    # active when it fires. Window IDs (e.g. @7) are stable across renames
+    # and reordering; indices are not.
+    tmux_window_id="$(tmux display-message -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null || true)"
+    if [ -z "$tmux_window_id" ]; then
+        tmux_window_id="$(tmux display-message -p '#{window_id}' 2>/dev/null || true)"
+    fi
+
+    prev="$(tmux show-window-options ${tmux_window_id:+-t "$tmux_window_id"} -v automatic-rename 2>/dev/null || echo on)"
+    tmux set-window-option ${tmux_window_id:+-t "$tmux_window_id"} automatic-rename off >/dev/null 2>&1 || true
     restore_tmux_rename="$prev"
 
     slug_file="$(mktemp -t vibix-ae-slug.XXXXXX)"
@@ -100,25 +159,20 @@ if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
         while [ -e "$slug_file" ]; do
             cur="$(cat "$slug_file" 2>/dev/null || true)"
             if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
-                tmux rename-window "AE -> $cur" >/dev/null 2>&1 || true
+                tmux rename-window ${tmux_window_id:+-t "$tmux_window_id"} "AE -> $cur" >/dev/null 2>&1 || true
                 last="$cur"
             fi
             sleep 1
         done
     ) &
     poller_pid=$!
-
-    trap '
-        [ -n "$poller_pid" ] && kill "$poller_pid" 2>/dev/null || true
-        [ -n "$slug_file" ] && rm -f "$slug_file" 2>/dev/null || true
-        tmux set-window-option automatic-rename "$restore_tmux_rename" >/dev/null 2>&1 || true
-    ' EXIT
 fi
 
 docker run --rm -it \
     ${docker_sec_opts[@]+"${docker_sec_opts[@]}"} \
     "${claude_vol_opts[@]}" \
     ${tmux_pane_vol_opts[@]+"${tmux_pane_vol_opts[@]}"} \
+    ${hints_vol_opts[@]+"${hints_vol_opts[@]}"} \
     -e GITHUB_TOKEN \
     -e ANTHROPIC_API_KEY \
     -e GIT_AUTHOR_NAME \

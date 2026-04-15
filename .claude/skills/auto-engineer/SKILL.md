@@ -13,6 +13,8 @@ Read these shared playbooks first:
 - `docs/agent-playbooks/pr-review.md`
 - `docs/agent-playbooks/prioritization.md`
 
+If `/etc/vibix-host-hints.md` exists, read it too — it carries host-specific guidance (e.g. larger Bash-tool timeouts when the container is running under emulation) that overrides the default assumptions in these playbooks. On native amd64 hosts the file is absent and there's nothing to read.
+
 Closes the full SDLC loop without prompting the user between steps. Each invocation runs **one cycle** (pick → plan → implement → PR → wait → merge), then reschedules itself via `ScheduleWakeup` with prompt `/auto-engineer` for the next cycle. Stops cleanly when it runs out of work or hits something it can't safely resolve.
 
 This skill is a deliberate override of the project's default "don't merge your own PRs" rule — merging is the whole point of closing the loop. It only applies while auto-engineer is driving.
@@ -212,6 +214,8 @@ cargo xtask build
 cargo xtask test
 cargo xtask smoke
 ```
+
+When invoking these through the Bash tool, pick the `timeout` parameter from `/etc/vibix-host-hints.md` if present — emulated hosts need the full 600000 ms cap for `cargo xtask test`. If the hints file is absent, native amd64 timings apply and the tool's 120000 ms default is usually fine for `build`/`smoke` but still too tight for `test` (budget ~180000 ms).
 
 On failure: diagnose and fix in place. **Maximum 3 fix attempts per cycle.** If the 3rd attempt still fails → **stop** with a summary of the failure and what was tried.
 

@@ -42,6 +42,8 @@ pub mod init_process;
 #[cfg(target_os = "none")]
 pub mod ksymtab;
 pub mod lntab;
+#[cfg(any(test, target_os = "none"))]
+pub mod poll;
 #[cfg(target_os = "none")]
 pub mod process;
 #[cfg(target_os = "none")]

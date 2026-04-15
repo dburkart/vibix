@@ -964,9 +964,13 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("no stdout pipe")?;
 
-    // Hard ceiling: a watchdog thread kills QEMU after 30 s so that a
+    // Hard ceiling: a watchdog thread kills QEMU after 90 s so that a
     // blocking read_line() on a stalled kernel cannot hang indefinitely.
-    const HARD_CAP: Duration = Duration::from_secs(30);
+    // 30 s was borderline on un-accelerated CI QEMU (no KVM on ubuntu-latest):
+    // fork+exec markers intermittently arrived past the cap even though the
+    // kernel was healthy. The loop exits as soon as every marker appears, so
+    // a generous ceiling only affects genuine hangs.
+    const HARD_CAP: Duration = Duration::from_secs(90);
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(HARD_CAP);
         let _ = Command::new("kill").arg(pid.to_string()).status();
