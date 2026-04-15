@@ -692,13 +692,18 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
 
     // Write the System V AMD64 initial stack layout (argc/argv/envp/auxv) into
     // the new stack frame via the HHDM window, matching what init_process does.
-    // TODO: replace with RDRAND once a CSPRNG is wired up.
+    // AT_RANDOM comes from RDRAND/RDSEED; falls back to an insecure XOR-splat
+    // with a warning if the CPU supports neither.
     let stack_phys = stack_frame.start_address().as_u64();
-    let random_seed = image.entry.as_u64() ^ stack_phys;
-    let mut random_bytes = [0u8; 16];
-    for (i, b) in random_bytes.iter_mut().enumerate() {
-        *b = ((random_seed >> (i % 8 * 8)) & 0xFF) as u8;
-    }
+    let random_bytes = match super::csprng::rdrand16() {
+        Some(b) => b,
+        None => {
+            crate::serial_println!(
+                "exec: WARNING — RDRAND/RDSEED unavailable, AT_RANDOM is deterministic"
+            );
+            super::csprng::deterministic_at_random_fallback(image.entry.as_u64() ^ stack_phys)
+        }
+    };
     let auxv_params = crate::mem::auxv::AuxvParams {
         entry: image.entry.as_u64(),
         interp_base: image.interp_base.unwrap_or(0),

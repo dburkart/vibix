@@ -67,10 +67,12 @@ impl Features {
             Feature::Popcnt => self.leaf1_ecx & (1 << 23) != 0,
             Feature::Xsave => self.leaf1_ecx & (1 << 26) != 0,
             Feature::Avx => self.leaf1_ecx & (1 << 28) != 0,
+            Feature::Rdrand => self.leaf1_ecx & (1 << 30) != 0,
             // Leaf 7, sub-leaf 0, EBX
             Feature::Fsgsbase => self.leaf7_ebx & (1 << 0) != 0,
             Feature::Avx2 => self.leaf7_ebx & (1 << 5) != 0,
             Feature::Smep => self.leaf7_ebx & (1 << 7) != 0,
+            Feature::Rdseed => self.leaf7_ebx & (1 << 18) != 0,
             Feature::Smap => self.leaf7_ebx & (1 << 20) != 0,
             // Extended leaf 0x8000_0001
             Feature::Rdtscp => self.ext_edx & (1 << 27) != 0,
@@ -114,6 +116,10 @@ pub enum Feature {
     Popcnt,
     /// LZCNT instruction — extended leaf 0x8000_0001, ECX bit 5.
     Lzcnt,
+    /// RDRAND instruction — leaf 1, ECX bit 30.
+    Rdrand,
+    /// RDSEED instruction — leaf 7 sub-leaf 0, EBX bit 18.
+    Rdseed,
 }
 
 /// Return `true` if the CPU supports `f`.
@@ -203,6 +209,12 @@ pub fn init() {
     if features.has(Feature::Lzcnt) {
         crate::serial_print!(" LZCNT");
     }
+    if features.has(Feature::Rdrand) {
+        crate::serial_print!(" RDRAND");
+    }
+    if features.has(Feature::Rdseed) {
+        crate::serial_print!(" RDSEED");
+    }
     crate::serial_println!();
 }
 
@@ -219,8 +231,8 @@ mod tests {
         // Ext ECX:    LZCNT (5)
         let f = Features::from_raw(
             (1 << 16) | (1 << 25) | (1 << 26), // leaf1_edx
-            (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 28), // leaf1_ecx
-            (1 << 0) | (1 << 5) | (1 << 7) | (1 << 20), // leaf7_ebx
+            (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 28) | (1 << 30), // leaf1_ecx
+            (1 << 0) | (1 << 5) | (1 << 7) | (1 << 18) | (1 << 20), // leaf7_ebx
             0,                                 // leaf7_ecx
             0,                                 // leaf7_edx
             1 << 27,                           // ext_edx
@@ -241,6 +253,8 @@ mod tests {
         assert!(f.has(Feature::Fsgsbase));
         assert!(f.has(Feature::Rdtscp));
         assert!(f.has(Feature::Lzcnt));
+        assert!(f.has(Feature::Rdrand));
+        assert!(f.has(Feature::Rdseed));
     }
 
     #[test]
