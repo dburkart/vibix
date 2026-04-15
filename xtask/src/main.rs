@@ -211,73 +211,52 @@ fn virtio_blk_args(disk: &Path) -> Vec<String> {
     ]
 }
 
-fn userspace_init_binary() -> PathBuf {
-    workspace_root()
+/// Build a ring-3 userspace binary. All ring-3 crates in this repo link at
+/// 0x400000 (lower half) with the small code model, so the cargo flags,
+/// existence check, and strip_debug step are identical — only the package
+/// name and linker script differ.
+///
+/// Setting RUSTFLAGS wholesale overrides the workspace
+/// `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml, so
+/// every flag the kernel target still needs is re-supplied here.
+fn build_userspace_binary(package: &str, link_ld: &str) -> R<PathBuf> {
+    let rustflags = userspace_rustflags(link_ld);
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .args(["build", "--package", package])
+        .args(KERNEL_BUILD_STD_ARGS);
+    check(cmd.status()?)?;
+    let bin = workspace_root()
         .join("target")
         .join(KERNEL_TARGET)
         .join("debug")
-        .join("userspace_init")
+        .join(package);
+    if !bin.exists() {
+        return Err(format!("userspace {package} binary missing at {}", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
+fn userspace_rustflags(link_ld: &str) -> String {
+    [
+        format!("-C link-arg=-T{link_ld}"),
+        "-C relocation-model=static".into(),
+        "-C code-model=small".into(),
+        "-C no-redzone=yes".into(),
+        "-C force-frame-pointers=yes".into(),
+    ]
+    .join(" ")
 }
 
 fn build_userspace_init() -> R<PathBuf> {
-    // Setting RUSTFLAGS wholesale overrides the workspace
-    // `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
-    // so we must re-supply every flag the kernel target still needs.
-    // The init binary links at 0x400000 (lower half, user space) and
-    // uses the small code model — no ±2 GiB kernel assumptions.
-    let rustflags = [
-        "-C link-arg=-Tuserspace/init/link.ld",
-        "-C relocation-model=static",
-        "-C code-model=small",
-        "-C no-redzone=yes",
-        "-C force-frame-pointers=yes",
-    ]
-    .join(" ");
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(workspace_root())
-        .env("RUSTFLAGS", rustflags)
-        .args(["build", "--package", "userspace_init"])
-        .args(KERNEL_BUILD_STD_ARGS);
-    check(cmd.status()?)?;
-    let bin = userspace_init_binary();
-    if !bin.exists() {
-        return Err(format!("userspace init binary missing at {}", bin.display()).into());
-    }
-    strip_debug(&bin)?;
-    Ok(bin)
-}
-
-fn userspace_hello_binary() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join(KERNEL_TARGET)
-        .join("debug")
-        .join("userspace_hello")
+    build_userspace_binary("userspace_init", "userspace/init/link.ld")
 }
 
 /// Build the hello binary — the exec() target for the fork+exec+wait test.
-/// Links at 0x400000 (lower half) just like init so load_user_elf accepts it.
 fn build_userspace_hello() -> R<PathBuf> {
-    let rustflags = [
-        "-C link-arg=-Tuserspace/hello/link.ld",
-        "-C relocation-model=static",
-        "-C code-model=small",
-        "-C no-redzone=yes",
-        "-C force-frame-pointers=yes",
-    ]
-    .join(" ");
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(workspace_root())
-        .env("RUSTFLAGS", rustflags)
-        .args(["build", "--package", "userspace_hello"])
-        .args(KERNEL_BUILD_STD_ARGS);
-    check(cmd.status()?)?;
-    let bin = userspace_hello_binary();
-    if !bin.exists() {
-        return Err(format!("userspace hello binary missing at {}", bin.display()).into());
-    }
-    strip_debug(&bin)?;
-    Ok(bin)
+    build_userspace_binary("userspace_hello", "userspace/hello/link.ld")
 }
 
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
@@ -1018,6 +997,32 @@ fn check(status: ExitStatus) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn userspace_rustflags_contains_linker_script_and_shared_flags() {
+        let flags = userspace_rustflags("userspace/init/link.ld");
+        assert!(
+            flags.contains("-C link-arg=-Tuserspace/init/link.ld"),
+            "missing -T linker arg: {flags}"
+        );
+        for shared in [
+            "-C relocation-model=static",
+            "-C code-model=small",
+            "-C no-redzone=yes",
+            "-C force-frame-pointers=yes",
+        ] {
+            assert!(flags.contains(shared), "missing {shared} in {flags}");
+        }
+    }
+
+    #[test]
+    fn userspace_rustflags_threads_link_ld_argument() {
+        let a = userspace_rustflags("userspace/init/link.ld");
+        let b = userspace_rustflags("userspace/hello/link.ld");
+        assert_ne!(a, b);
+        assert!(a.contains("init/link.ld"));
+        assert!(b.contains("hello/link.ld"));
+    }
 
     #[test]
     fn ustar_dir_block_checksum_valid() {
