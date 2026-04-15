@@ -360,39 +360,29 @@ impl Console {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// Fetch the scrollback cell at `age` rows before the live top
-    /// (age 0 = most recently pushed). Returns `None` if `age` is out of
-    /// the filled range.
-    fn scrollback_row(&self, age: usize) -> Option<&[Cell]> {
-        if age >= self.scroll_filled {
-            return None;
-        }
-        let cols = self.cols;
-        let ring_row = (self.scroll_head + self.scroll_filled - 1 - age) % SCROLLBACK_ROWS;
-        let base = ring_row * cols;
-        Some(&self.scrollback[base..base + cols])
-    }
-
     /// Repaint the entire pixel grid from the scroll-back ring + live
     /// `cells`, honoring `scroll_offset`. Used whenever the viewport
     /// shifts or returns to live.
     fn repaint_viewport(&mut self) {
         let cols = self.cols;
         let rows = self.rows;
-        let (k, _live_rows) = split_viewport(self.scroll_offset, self.scroll_filled, rows);
-        // Rows [0..k): scrollback, with age decreasing as r grows.
+        let offset = self.scroll_offset.min(self.scroll_filled);
+        let (k, _live_rows) = split_viewport(offset, self.scroll_filled, rows);
+        // Rows [0..k): scrollback. The oldest visible row is age `offset-1`,
+        // and each successive row in the viewport is one step newer.
         for r in 0..k {
-            let age = k - 1 - r;
-            // Copy out the row so we don't hold an immutable borrow across
-            // render_cell_at, which needs &mut self.
-            let mut buf: [Cell; 256] = [Cell::blank(); 256];
-            if let Some(row) = self.scrollback_row(age) {
-                for (i, cell) in row.iter().enumerate().take(cols.min(buf.len())) {
-                    buf[i] = *cell;
-                }
-            }
-            for c in 0..cols.min(buf.len()) {
-                self.render_cell_at(c, r, buf[c]);
+            let age = offset - 1 - r;
+            // Copy cells from the scrollback ring directly without an
+            // intermediate buffer so rows wider than 256 columns render
+            // correctly. Index arithmetic is duplicated here rather than
+            // calling scrollback_row() to avoid holding an immutable borrow
+            // across render_cell_at, which needs &mut self.
+            let ring_row =
+                (self.scroll_head + self.scroll_filled - 1 - age) % SCROLLBACK_ROWS;
+            let base = ring_row * cols;
+            for c in 0..cols {
+                let cell = self.scrollback[base + c];
+                self.render_cell_at(c, r, cell);
             }
         }
         // Rows [k..rows): top `rows - k` rows of live cells.
