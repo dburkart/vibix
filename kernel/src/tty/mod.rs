@@ -1,16 +1,34 @@
 //! TTY subsystem.
 //!
-//! Today this module is [`termios`] plus a minimal [`Tty`] stub with the
-//! job-control fields the PCB needs for `setsid`/`setpgid` (#372). The
-//! `LineDiscipline`, `TtyDriver`, and `DeferredByteRing` arrive with
-//! #374–#376.
+//! This module defines the generic [`Tty`] container, the [`TtyDriver`]
+//! and [`LineDiscipline`] traits, and the allocation-free
+//! [`DeferredByteRing`](ring::DeferredByteRing) byte buffer used to hand
+//! decoded bytes off from a device ISR to a soft-IRQ drain context.
+//!
+//! Actual device wiring (16550 serial UART rx, PS/2 keyboard rx) lands
+//! in follow-ups (#405, #406) once the soft-IRQ bottom-half primitive
+//! from #404 is available. The stub [`PassthroughLdisc`] preserves the
+//! current raw-byte behavior until the N_TTY skeleton (#428/#375) is
+//! wired in.
+//!
+//! See `docs/RFC/0003-pipes-poll-tty.md` for the design rationale.
 
 pub mod ntty;
+pub mod ring;
 pub mod termios;
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::poll::WaitQueue;
+#[cfg(target_os = "none")]
+use crate::sync::IrqLock;
+use termios::Termios;
+
+// Host tests can't use IrqLock (it touches RFLAGS.IF) — fall back to a
+// plain spin mutex, which has the same external API for our purposes.
+#[cfg(all(test, not(target_os = "none")))]
+use spin::Mutex as IrqLock;
 
 /// POSIX session identifier. `0` is reserved for "no session" (bootstrap
 /// kernel tasks before the process table is populated).
@@ -75,22 +93,150 @@ impl Default for JobControl {
     }
 }
 
-/// Minimal TTY stub.
+/// Bottom-half device driver abstraction.
 ///
-/// #372 needs `Option<Arc<Tty>>` in the PCB to hold the controlling
-/// terminal, and the N_TTY ISIG path needs a place to publish the pgrp
-/// snapshot. #374 extends this with `driver`, `ldisc`, `termios`, and
-/// `read_wait`/`write_wait` wait-queues — additive changes that don't
-/// touch the PCB wiring landed here.
+/// Implementations own the hardware-specific tx path (`write`/`flush`).
+/// Rx runs on the hardware ISR, which pushes decoded bytes into a
+/// [`DeferredByteRing`](ring::DeferredByteRing) and raises a soft-IRQ;
+/// the registered drain handler then feeds bytes into
+/// [`LineDiscipline::receive_byte`]. Rx is therefore not part of this
+/// trait — a driver only needs to publish a tx surface.
+pub trait TtyDriver: Send + Sync {
+    /// Synchronously push `buf` toward the device. Returns the number of
+    /// bytes accepted. May be called from process context only — the
+    /// ISR-side "queue a decoded byte" path goes through the driver's
+    /// own `DeferredByteRing`, not through this method.
+    fn write(&self, buf: &[u8]) -> usize;
+
+    /// Block until any hardware tx queue has drained. Best-effort;
+    /// drivers with no tx queue may implement as a no-op.
+    fn flush(&self) {}
+}
+
+/// Line-discipline dispatch surface.
+///
+/// A line discipline consumes bytes arriving from a driver and decides
+/// what to do with them: echo, canonicalize, signal-dispatch, and
+/// eventually deliver into the `Tty`'s read buffer. [`PassthroughLdisc`]
+/// is the minimum implementation (no-op `open`/`close`, `receive_byte`
+/// defers to a test sink or hard-sinks to the console).
+pub trait LineDiscipline: Send + Sync {
+    /// Called once per byte arriving from the driver's rx path. Runs in
+    /// soft-IRQ context — must not allocate and must not take any lock
+    /// that the process-context path holds across a preemption.
+    fn receive_byte(&self, tty: &Tty, byte: u8);
+
+    /// Called when a tty first attaches this discipline. Returns an
+    /// errno on failure.
+    fn open(&self, tty: &Tty) -> Result<(), i64>;
+
+    /// Called when the discipline is being torn down or swapped out.
+    fn close(&self, tty: &Tty);
+}
+
+/// Trivial passthrough line discipline — a no-op placeholder.
+///
+/// `receive_byte` appends incoming bytes into an optional test sink and
+/// otherwise drops them on the floor. Used as the default ldisc for a
+/// tty until N_TTY (#428/#375) lands, and as the harness for host unit
+/// tests in this file.
+pub struct PassthroughLdisc {
+    sink: IrqLock<Option<alloc::vec::Vec<u8>>>,
+}
+
+impl PassthroughLdisc {
+    pub const fn new() -> Self {
+        Self {
+            sink: IrqLock::new(None),
+        }
+    }
+
+    /// Install an empty collector vec so tests can observe the byte
+    /// stream arriving from the driver. Returns a handle that tests
+    /// drain via [`drain_sink`](Self::drain_sink).
+    pub fn with_sink() -> Self {
+        Self {
+            sink: IrqLock::new(Some(alloc::vec::Vec::new())),
+        }
+    }
+
+    /// Take the currently-collected bytes, leaving an empty vec in place
+    /// if a sink is installed, or returning an empty vec if there isn't.
+    pub fn drain_sink(&self) -> alloc::vec::Vec<u8> {
+        let mut g = self.sink.lock();
+        match g.as_mut() {
+            Some(v) => core::mem::take(v),
+            None => alloc::vec::Vec::new(),
+        }
+    }
+}
+
+impl Default for PassthroughLdisc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LineDiscipline for PassthroughLdisc {
+    fn receive_byte(&self, _tty: &Tty, byte: u8) {
+        let mut g = self.sink.lock();
+        if let Some(v) = g.as_mut() {
+            v.push(byte);
+        }
+    }
+
+    fn open(&self, _tty: &Tty) -> Result<(), i64> {
+        Ok(())
+    }
+
+    fn close(&self, _tty: &Tty) {}
+}
+
+/// Trivial driver stub used as the default for a [`Tty`] until a real
+/// hardware driver is attached. `write` discards bytes; `flush` is a
+/// no-op. Allocated once per [`Tty`] via `Arc::new(NullDriver)`.
+pub struct NullDriver;
+
+impl TtyDriver for NullDriver {
+    fn write(&self, buf: &[u8]) -> usize {
+        buf.len()
+    }
+}
+
+/// Generic TTY container.
+///
+/// Holds a device driver (`driver`), an active line discipline
+/// (`ldisc`), the termios settings (`termios`), job-control state
+/// (`ctrl`), and two wait-queues (`read_wait`, `write_wait`) for
+/// blocking readers/writers. Ownership is `Arc<Tty>` so the same
+/// controlling terminal can be shared across a session's processes.
 pub struct Tty {
-    pub ctrl: Mutex<JobControl>,
+    pub driver: Arc<dyn TtyDriver>,
+    pub ldisc: Arc<dyn LineDiscipline>,
+    pub termios: IrqLock<Termios>,
+    pub ctrl: IrqLock<JobControl>,
+    pub read_wait: Arc<WaitQueue>,
+    pub write_wait: Arc<WaitQueue>,
 }
 
 impl Tty {
-    pub fn new() -> Self {
+    /// Build a tty with an explicit driver and line discipline.
+    pub fn with_driver(driver: Arc<dyn TtyDriver>, ldisc: Arc<dyn LineDiscipline>) -> Self {
         Self {
-            ctrl: Mutex::new(JobControl::new()),
+            driver,
+            ldisc,
+            termios: IrqLock::new(Termios::sane()),
+            ctrl: IrqLock::new(JobControl::new()),
+            read_wait: WaitQueue::new(),
+            write_wait: WaitQueue::new(),
         }
+    }
+
+    /// Build a stub tty with no hardware wiring. Used by the PCB for
+    /// controlling-terminal job-control state (#372) before any real
+    /// tty has been attached.
+    pub fn new() -> Self {
+        Self::with_driver(Arc::new(NullDriver), Arc::new(PassthroughLdisc::new()))
     }
 }
 
@@ -136,5 +282,27 @@ mod tests {
         assert!(ctrl.session.is_none());
         assert!(ctrl.pgrp.is_none());
         assert_eq!(ctrl.pgrp_snapshot.load(), 0);
+    }
+
+    #[test]
+    fn passthrough_ldisc_appends_bytes_in_order() {
+        let ldisc = Arc::new(PassthroughLdisc::with_sink());
+        let tty = Tty::with_driver(
+            Arc::new(NullDriver),
+            ldisc.clone() as Arc<dyn LineDiscipline>,
+        );
+        for b in b"hello" {
+            tty.ldisc.receive_byte(&tty, *b);
+        }
+        assert_eq!(ldisc.drain_sink(), b"hello");
+        // Second drain after take yields empty.
+        assert!(ldisc.drain_sink().is_empty());
+    }
+
+    #[test]
+    fn null_driver_reports_all_bytes_written() {
+        let d = NullDriver;
+        assert_eq!(d.write(b""), 0);
+        assert_eq!(d.write(b"hi"), 2);
     }
 }
