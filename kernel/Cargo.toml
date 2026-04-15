@@ -211,3 +211,7 @@ harness = false
 [[test]]
 name = "anon_fault_saturated"
 harness = false
+
+[[test]]
+name = "shell_introspection"
+harness = false
