@@ -376,19 +376,18 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
 /// Must be called from an exception handler on behalf of the currently
 /// running task. Does not return.
 pub unsafe fn deliver_fault_signal_iret(sig: u8) -> ! {
-    let task_id = crate::task::current_id();
-    // Raise the signal on the current task so the disposition lookup below
-    // sees it pending (and any future handler-dispatch path can treat it
-    // the same as a sigqueue from another task).
-    let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-        state.raise(sig);
-    });
+    // Precondition: `sig` is a valid signal number. `sig == 0` would underflow
+    // the `dispositions[sig - 1]` index below; guard it in debug builds so a
+    // future caller that forgets fails loudly instead of corrupting memory.
+    debug_assert!(sig > 0 && sig <= NSIG, "invalid signal number");
 
-    // Look up the disposition; SIGSEGV/SIGBUS/SIGILL/SIGFPE are all
-    // default-Terminate, but a future syscall may have registered a handler.
+    let task_id = crate::task::current_id();
+    // Raise, immediately clear the pending bit (we service synchronously),
+    // and read the disposition under a single lock acquisition. Doing this in
+    // one critical section avoids a window where another path could observe
+    // the signal pending while we're already about to service it.
     let disp = crate::process::with_signal_state_for_task(task_id, |state| {
-        // Clear the pending bit we just set — we're about to service it
-        // synchronously below, either as Terminate or (TODO) handler-redirect.
+        state.raise(sig);
         state.pending &= !sig_bit(sig);
         state.dispositions[(sig - 1) as usize]
     })
