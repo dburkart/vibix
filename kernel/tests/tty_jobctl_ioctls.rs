@@ -64,6 +64,10 @@ fn run_tests() {
             &(tiocsctty_idempotent_within_same_session as fn()),
         ),
         (
+            "tiocsctty_rejects_when_leader_already_owns_other_tty",
+            &(tiocsctty_rejects_when_leader_already_owns_other_tty as fn()),
+        ),
+        (
             "tiocspgrp_rejects_cross_session",
             &(tiocspgrp_rejects_cross_session as fn()),
         ),
@@ -186,6 +190,21 @@ fn tiocsctty_idempotent_within_same_session() {
     let tty = fresh_tty();
     assert_eq!(tiocsctty_for(7, &tty, false, false), 0);
     assert_eq!(tiocsctty_for(7, &tty, false, false), 0);
+}
+
+fn tiocsctty_rejects_when_leader_already_owns_other_tty() {
+    h::reset_table();
+    h::insert(7, 0, 7, 7);
+    let tty_a = fresh_tty();
+    let tty_b = fresh_tty();
+    assert_eq!(tiocsctty_for(7, &tty_a, false, false), 0);
+    // Attempting to switch to a different tty must fail, leaving tty_a untouched.
+    assert_eq!(tiocsctty_for(7, &tty_b, false, false), h::EPERM_I64);
+    assert_eq!(tiocsctty_for(7, &tty_b, true, true), h::EPERM_I64);
+    assert!(tty_b.ctrl.lock().session.is_none());
+    let ctrl_a = tty_a.ctrl.lock();
+    assert_eq!(ctrl_a.session, Some(7));
+    assert_eq!(ctrl_a.pgrp, Some(7));
 }
 
 fn tiocspgrp_rejects_cross_session() {

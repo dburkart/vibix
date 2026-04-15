@@ -336,6 +336,40 @@ pub fn session_using_tty(tty: &Arc<Tty>) -> Option<SessionId> {
         })
 }
 
+/// Atomic ctty acquisition: check session-leader, no existing ctty, and
+/// `tty` unattached — if all hold, attach under a single TABLE → `tty.ctrl`
+/// critical section. Returns `true` if the attach happened.
+///
+/// The check-then-set pattern in the caller is TOCTOU-vulnerable otherwise:
+/// two leaders could each observe "no ctty / tty free" before either writes,
+/// and the resulting state would violate the one-ctty-per-session invariant.
+/// Collapsing everything into one critical section matches the documented
+/// lock order (TABLE → `tty.ctrl`) and keeps the invariant mechanically.
+pub fn try_acquire_ctty_atomic(pid: u32, tty: &Arc<Tty>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut t = TABLE.lock();
+    let Some(entry) = t.by_pid.get(&pid) else {
+        return false;
+    };
+    if entry.session_id != pid {
+        return false;
+    }
+    if entry.controlling_tty.is_some() {
+        return false;
+    }
+    let sid = entry.session_id;
+    let mut ctrl = tty.ctrl.lock();
+    if ctrl.session.is_some() {
+        return false;
+    }
+    t.by_pid.get_mut(&pid).unwrap().controlling_tty = Some(Arc::clone(tty));
+    ctrl.session = Some(sid);
+    ctrl.set_pgrp(Some(pid));
+    true
+}
+
 /// Clear the controlling tty on every member of `sid`. Returns the
 /// number of entries affected. Called by `TIOCNOTTY` on a session
 /// leader and by `TIOCSCTTY(force)` when stealing from an old session.

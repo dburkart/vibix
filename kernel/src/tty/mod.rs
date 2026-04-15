@@ -293,6 +293,12 @@ pub fn tiocsctty_for(caller_pid: u32, tty: &Arc<Tty>, force: bool, is_root: bool
     if !process::is_session_leader(caller_pid) {
         return EPERM;
     }
+    if let Some(existing_tty) = process::ctty_of(caller_pid) {
+        if Arc::ptr_eq(&existing_tty, tty) {
+            return 0;
+        }
+        return EPERM;
+    }
     let caller_sid = match process::session_of(caller_pid) {
         Some(s) => s,
         None => return EPERM,
@@ -392,27 +398,7 @@ pub fn tiocnotty_for(caller_pid: u32) -> i64 {
 /// because this is a best-effort side-effect of `open`, not a gate on it.
 #[cfg(target_os = "none")]
 pub fn acquire_ctty_on_open(caller_pid: u32, tty: &Arc<Tty>) -> bool {
-    if caller_pid == 0 {
-        return false;
-    }
-    if !process::is_session_leader(caller_pid) {
-        return false;
-    }
-    if process::ctty_of(caller_pid).is_some() {
-        return false;
-    }
-    if tty.ctrl.lock().session.is_some() {
-        return false;
-    }
-    let sid = match process::session_of(caller_pid) {
-        Some(s) => s,
-        None => return false,
-    };
-    process::set_ctty(caller_pid, Some(Arc::clone(tty)));
-    let mut ctrl = tty.ctrl.lock();
-    ctrl.session = Some(sid);
-    ctrl.set_pgrp(Some(caller_pid));
-    true
+    process::try_acquire_ctty_atomic(caller_pid, tty)
 }
 
 
