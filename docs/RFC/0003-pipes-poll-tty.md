@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: Pipes, Poll, and TTY Line Discipline
-status: Draft
+status: In Review
 created: 2026-04-15
 ---
 
