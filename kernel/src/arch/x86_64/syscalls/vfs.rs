@@ -33,12 +33,9 @@ use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
 use crate::fs::{
-    flags as oflags, FileBackend, FileDescription, EBADF, EEXIST, EINVAL, ENAMETOOLONG, ENOENT,
-    ENOMEM, ENOTDIR,
+    flags as oflags, FileBackend, FileDescription, EBADF, EEXIST, EINVAL, EISDIR, ENAMETOOLONG,
+    ENOENT, ENOMEM, ENOTDIR,
 };
-
-/// EISDIR isn't in the top-level `crate::fs` errno set yet; inline the Linux value.
-const EISDIR: i64 = -21;
 
 /// Linux x86_64 value of the "use the current working directory"
 /// sentinel for `*at` syscalls. Sign-extended as an `i32`, negative,

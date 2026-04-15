@@ -54,17 +54,7 @@ use super::ops::{
 use super::super_block::{SbFlags, SuperBlock};
 use super::DString;
 
-// ---------------------------------------------------------------------------
-// Local errno values
-// ---------------------------------------------------------------------------
-
-const EPERM: i64 = -1;
-const ENOENT: i64 = -2;
-const EISDIR: i64 = -21;
-const ENOTDIR: i64 = -20;
-const ENOTEMPTY: i64 = -39;
-const EINVAL: i64 = -22;
-const EXDEV: i64 = -18;
+use crate::fs::{EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EXDEV};
 
 // RAMFS_MAGIC matches Linux's value.
 const RAMFS_MAGIC: u64 = 0x858458f6;

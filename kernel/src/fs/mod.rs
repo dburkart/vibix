@@ -149,25 +149,32 @@ pub struct FileDescription {
 const MAX_FD: usize = 1024;
 
 /// Linux errno constants (negated so they match syscall return values).
+pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
+pub const EINTR: i64 = -4;
 pub const EBADF: i64 = -9;
-pub const ENOMEM: i64 = -12;
 pub const EAGAIN: i64 = -11;
-pub const EINVAL: i64 = -22;
-pub const EMFILE: i64 = -24;
-pub const ENAMETOOLONG: i64 = -36;
+pub const ENOMEM: i64 = -12;
+pub const EACCES: i64 = -13;
+pub const EFAULT: i64 = -14;
+pub const EBUSY: i64 = -16;
 pub const EEXIST: i64 = -17;
+pub const EXDEV: i64 = -18;
 pub const ENODEV: i64 = -19;
 pub const ENOTDIR: i64 = -20;
-pub const ELOOP: i64 = -40;
-pub const EACCES: i64 = -13;
-pub const EBUSY: i64 = -16;
-pub const EOVERFLOW: i64 = -75;
+pub const EISDIR: i64 = -21;
+pub const EINVAL: i64 = -22;
+pub const EMFILE: i64 = -24;
 pub const ENOTTY: i64 = -25;
-pub const EFAULT: i64 = -14;
-pub const EPIPE: i64 = -32;
-pub const EINTR: i64 = -4;
+pub const EFBIG: i64 = -27;
+pub const ENOSPC: i64 = -28;
 pub const ESPIPE: i64 = -29;
+pub const EROFS: i64 = -30;
+pub const EPIPE: i64 = -32;
+pub const ENAMETOOLONG: i64 = -36;
+pub const ENOTEMPTY: i64 = -39;
+pub const ELOOP: i64 = -40;
+pub const EOVERFLOW: i64 = -75;
 
 /// Per-process file-descriptor array.
 ///
@@ -676,5 +683,38 @@ mod tests {
         t.close_cloexec();
         assert_eq!(t.get(3).err(), Some(EBADF));
         assert!(t.get(4).is_ok());
+    }
+
+    /// Errno ABI matrix — pins each constant to its Linux x86_64 value
+    /// (negated). Any divergence from these numbers is an ABI break for
+    /// userspace and must fail here before shipping.
+    #[test]
+    fn errno_constants_match_linux_abi() {
+        assert_eq!(EPERM, -1);
+        assert_eq!(ENOENT, -2);
+        assert_eq!(EINTR, -4);
+        assert_eq!(EBADF, -9);
+        assert_eq!(EAGAIN, -11);
+        assert_eq!(ENOMEM, -12);
+        assert_eq!(EACCES, -13);
+        assert_eq!(EFAULT, -14);
+        assert_eq!(EBUSY, -16);
+        assert_eq!(EEXIST, -17);
+        assert_eq!(EXDEV, -18);
+        assert_eq!(ENODEV, -19);
+        assert_eq!(ENOTDIR, -20);
+        assert_eq!(EISDIR, -21);
+        assert_eq!(EINVAL, -22);
+        assert_eq!(EMFILE, -24);
+        assert_eq!(ENOTTY, -25);
+        assert_eq!(EFBIG, -27);
+        assert_eq!(ENOSPC, -28);
+        assert_eq!(ESPIPE, -29);
+        assert_eq!(EROFS, -30);
+        assert_eq!(EPIPE, -32);
+        assert_eq!(ENAMETOOLONG, -36);
+        assert_eq!(ENOTEMPTY, -39);
+        assert_eq!(ELOOP, -40);
+        assert_eq!(EOVERFLOW, -75);
     }
 }

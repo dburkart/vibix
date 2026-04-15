@@ -45,14 +45,7 @@ use super::ops::{
 use super::super_block::{SbFlags, SuperBlock};
 use super::MountFlags;
 
-// ---------------------------------------------------------------------------
-// errno constants
-// ---------------------------------------------------------------------------
-
-const ENOENT: i64 = -2;
-const EAGAIN: i64 = -11;
-const EISDIR: i64 = -21;
-const ENOTDIR: i64 = -20;
+use crate::fs::{EAGAIN, EISDIR, ENOENT};
 
 // DEVFS_MAGIC — not in the Linux set but chosen to be distinct.
 const DEVFS_MAGIC: u64 = 0x1373;
