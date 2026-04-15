@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::fs::{FileBackend, FileDescription, EBADF, EAGAIN, EINVAL, EPIPE};
+use crate::fs::{FileBackend, FileDescription, EAGAIN, EBADF, EINVAL, EPIPE};
 use crate::poll::{PollMask, PollTable, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 // On the kernel target use IrqLock (which saves/restores RFLAGS.IF).
@@ -126,9 +126,7 @@ impl PipeRing {
         }
         // Publish the new head with Release so subsequent writers see the
         // freed space on their next Acquire load.
-        self.head
-            .0
-            .fetch_add(n, Ordering::Release);
+        self.head.0.fetch_add(n, Ordering::Release);
         n
     }
 
@@ -138,7 +136,10 @@ impl PipeRing {
     /// `self.free() >= data.len()`.**
     fn write_bytes_locked(&self, data: &[u8]) {
         let n = data.len();
-        debug_assert!(n <= self.free(), "write_bytes_locked called without enough free space");
+        debug_assert!(
+            n <= self.free(),
+            "write_bytes_locked called without enough free space"
+        );
         let tail = self.tail.0.load(Ordering::Relaxed) & (PIPE_CAPACITY - 1);
         let first = core::cmp::min(n, PIPE_CAPACITY - tail);
         // SAFETY: buf is valid for the entire ring; indices are within bounds.
@@ -152,9 +153,7 @@ impl PipeRing {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(first), ptr2, n - first);
             }
         }
-        self.tail
-            .0
-            .fetch_add(n, Ordering::Release);
+        self.tail.0.fetch_add(n, Ordering::Release);
     }
 }
 
@@ -259,9 +258,7 @@ impl FileBackend for PipeReadEnd {
                 // Re-check under lock before parking (wait-latching invariant).
                 {
                     let _guard = self.pipe.ring.lock.lock();
-                    if self.pipe.ring.len() > 0
-                        || self.pipe.writers.load(Ordering::Acquire) == 0
-                    {
+                    if self.pipe.ring.len() > 0 || self.pipe.writers.load(Ordering::Acquire) == 0 {
                         self.pipe.rd_wait.cancel(tok);
                         // Loop back — will take fast path or return EOF.
                         continue;
@@ -487,9 +484,7 @@ pub unsafe fn sys_pipe2(pipefd_uva: u64, flags: u32) -> i64 {
 
     // Write [read_fd, write_fd] as two i32s to userspace.
     let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(fds.as_ptr() as *const u8, 8)
-    };
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(fds.as_ptr() as *const u8, 8) };
     match uaccess::copy_to_user(pipefd_uva as usize, bytes) {
         Ok(()) => 0,
         Err(e) => {
