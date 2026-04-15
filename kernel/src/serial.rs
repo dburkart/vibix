@@ -131,6 +131,7 @@ pub(crate) fn drain_rx_hardware() {
             if !RX_RING.lock().push(b) {
                 RX_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             }
+            crate::tty::serial::push_byte_from_isr(b);
         }
     }
 }
