@@ -326,7 +326,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // dup(oldfd)
-        32 => {
+        DUP => {
             let oldfd = a0 as u32;
             let tbl = crate::task::current_fd_table();
             let result = tbl.lock().dup(oldfd);
@@ -337,7 +337,7 @@ pub unsafe extern "C" fn syscall_dispatch(
         }
 
         // dup2(oldfd, newfd)
-        33 => {
+        DUP2 => {
             let oldfd = a0 as u32;
             let newfd = a1 as u32;
             let tbl = crate::task::current_fd_table();
@@ -936,6 +936,8 @@ pub mod syscall_nr {
     pub const OPENAT: u64 = 257;
     pub const LSEEK: u64 = 8;
     pub const CLOSE: u64 = 3;
+    pub const DUP: u64 = 32;
+    pub const DUP2: u64 = 33;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
@@ -963,6 +965,8 @@ mod tests {
         assert_eq!(syscall_nr::READ, 0, "SYS_read must be 0");
         assert_eq!(syscall_nr::WRITE, 1, "SYS_write must be 1");
         assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
+        assert_eq!(syscall_nr::DUP, 32, "SYS_dup must be 32");
+        assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
         // Memory management
