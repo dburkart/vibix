@@ -73,6 +73,10 @@ name = "preempt"
 harness = false
 
 [[test]]
+name = "softirq"
+harness = false
+
+[[test]]
 name = "pml4_switch"
 harness = false
 
