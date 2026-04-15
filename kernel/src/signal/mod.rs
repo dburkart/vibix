@@ -270,12 +270,14 @@ pub fn send_to_pgrp(pgid: u32, sig: u8) -> i64 {
     if pgid == 0 {
         return 0;
     }
+    let mut pids: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    crate::process::collect_pgrp_members(pgid, &mut pids);
     let mut delivered: i64 = 0;
-    crate::process::for_each_in_pgrp(pgid, |pid| {
+    for pid in pids {
         if raise_signal_on_pid(pid, sig) == 0 {
             delivered += 1;
         }
-    });
+    }
     delivered
 }
 

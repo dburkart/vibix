@@ -405,21 +405,21 @@ pub fn sys_setpgid(pid: u32, pgid: u32) -> i64 {
     setpgid_for(current_pid(), pid, pgid)
 }
 
-/// Invoke `f(pid)` for every live entry whose `pgrp_id == pgid`.
+/// Collect every live pid whose `pgrp_id == pgid` into `out`.
 ///
 /// Used by the N_TTY ISIG path to fan a signal out to the foreground
-/// pgrp (#431). Takes `TABLE.lock()` for the walk; the closure runs
-/// with the lock held, so callers must not re-enter the process table
-/// from `f` — typical use is `|pid| signal::raise_signal_on_pid(pid, sig)`
-/// which touches only the per-task signal state.
-pub fn for_each_in_pgrp(pgid: u32, mut f: impl FnMut(u32)) {
+/// pgrp (#431). Takes `TABLE.lock()` only for the walk and releases it
+/// before returning, so callers are free to re-enter the process table
+/// (e.g. via `signal::raise_signal_on_pid`, which acquires the same
+/// lock) while iterating the collected pids.
+pub fn collect_pgrp_members(pgid: u32, out: &mut alloc::vec::Vec<u32>) {
     if pgid == 0 {
         return;
     }
     let t = TABLE.lock();
     for entry in t.by_pid.values() {
         if entry.pgrp_id == pgid && matches!(entry.state, ProcessState::Alive) {
-            f(entry.pid);
+            out.push(entry.pid);
         }
     }
 }
