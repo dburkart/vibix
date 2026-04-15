@@ -44,9 +44,6 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 #[cfg(any(test, target_os = "none"))]
 use alloc::vec::Vec;
-#[cfg(any(test, target_os = "none"))]
-use core::sync::atomic::{AtomicU64, Ordering};
-
 #[cfg(target_os = "none")]
 use crate::sync::irqlock::IrqLock;
 
@@ -95,10 +92,10 @@ pub enum PollMode {
 /// Opaque handle returned by `WaitQueue::register_poll` and
 /// `register_wait`. Used to cancel a registration or de-duplicate re-registers.
 ///
-/// Tokens are minted from a per-queue monotonic `AtomicU64`, so they are
-/// never reused within a single queue's lifetime — an entry cancelled after
-/// its slot is freed cannot be confused with a later registrant occupying
-/// that slot (no ABA).
+/// Tokens are minted from a per-queue monotonic `u64` counter under the
+/// queue's inner lock, so they are never reused within a single queue's
+/// lifetime — an entry cancelled after its slot is freed cannot be confused
+/// with a later registrant occupying that slot (no ABA).
 #[cfg(any(test, target_os = "none"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitToken(u64);
@@ -237,7 +234,6 @@ struct WaitQueueInner {
 #[cfg(any(test, target_os = "none"))]
 pub struct WaitQueue {
     inner: IrqLock<WaitQueueInner>,
-    token_counter: AtomicU64,
 }
 
 #[cfg(any(test, target_os = "none"))]
@@ -250,7 +246,6 @@ impl WaitQueue {
                 waiters: VecDeque::new(),
                 next_token: 0,
             }),
-            token_counter: AtomicU64::new(0),
         })
     }
 
@@ -272,9 +267,6 @@ impl WaitQueue {
         let mut inner = self.inner.lock();
         let token = Self::mint_token(&mut inner);
         inner.pollers.push_back(token);
-        // Also bump the external counter so tests can observe monotonicity
-        // without taking the lock.
-        self.token_counter.fetch_add(1, Ordering::Relaxed);
         token
     }
 
@@ -288,7 +280,6 @@ impl WaitQueue {
         let mut inner = self.inner.lock();
         let token = Self::mint_token(&mut inner);
         inner.waiters.push_back((token, tid));
-        self.token_counter.fetch_add(1, Ordering::Relaxed);
         token
     }
 
