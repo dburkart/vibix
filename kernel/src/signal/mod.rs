@@ -64,6 +64,8 @@ pub const SIGCHLD: u8 = 17;
 pub const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
+pub const SIGTTIN: u8 = 21;
+pub const SIGTTOU: u8 = 22;
 
 /// Maximum signal number supported.  Linux defines 64 but we only need the
 /// standard 31 for now.  The bitmask is a `u64` so the representation is
@@ -124,7 +126,7 @@ pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
         SIGCHLD => DefaultAction::Ignore,
         SIGCONT => DefaultAction::Continue,
-        SIGSTOP | SIGTSTP => DefaultAction::Stop,
+        SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => DefaultAction::Stop,
         SIGURG | 28 => DefaultAction::Ignore, // SIGWINCH=28, SIGURG=23
         _ => DefaultAction::Terminate,
     }
