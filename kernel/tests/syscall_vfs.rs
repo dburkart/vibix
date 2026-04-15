@@ -288,18 +288,22 @@ fn stat_pathmax_boundary_is_accepted() {
     // crucially NOT ENAMETOOLONG (which would mean the accept side has
     // an off-by-one). Stage at page 6 to avoid the overlong test's
     // page 4 and the staging stat page.
+    //
+    // path_walk enforces both PATH_MAX (total) and NAME_MAX (255) per
+    // component, so the PATH_MAX-byte string must be composed of short
+    // components: `/a/a/a...`. Each `/a` is 2 bytes, giving PATH_MAX/2
+    // one-character components after the leading slash-pair — well
+    // inside NAME_MAX.
     install_user_staging_vma();
     let path_uva = (USER_PAGE_VA + 6 * 4096) as u64;
+    const _: () = assert!(PATH_MAX % 2 == 0, "test assumes PATH_MAX even");
     unsafe {
         let dst = path_uva as *mut u8;
-        // First byte is '/' so path_walk treats this as absolute; the
-        // remaining PATH_MAX - 1 bytes are a single component name that
-        // doesn't exist. Total non-NUL bytes = PATH_MAX.
-        ptr::write_volatile(dst, b'/');
-        let mut i = 1;
+        let mut i = 0;
         while i < PATH_MAX {
-            ptr::write_volatile(dst.add(i), b'a');
-            i += 1;
+            ptr::write_volatile(dst.add(i), b'/');
+            ptr::write_volatile(dst.add(i + 1), b'a');
+            i += 2;
         }
         ptr::write_volatile(dst.add(PATH_MAX), 0);
     }
