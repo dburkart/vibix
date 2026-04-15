@@ -211,22 +211,16 @@ fn virtio_blk_args(disk: &Path) -> Vec<String> {
     ]
 }
 
-fn userspace_init_binary() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join(KERNEL_TARGET)
-        .join("debug")
-        .join("userspace_init")
-}
-
-fn build_userspace_init() -> R<PathBuf> {
-    // Setting RUSTFLAGS wholesale overrides the workspace
-    // `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
-    // so we must re-supply every flag the kernel target still needs.
-    // The init binary links at 0x400000 (lower half, user space) and
-    // uses the small code model — no ±2 GiB kernel assumptions.
+/// Build a user-space binary package and strip its debug sections.
+///
+/// Setting RUSTFLAGS wholesale overrides the workspace
+/// `[target.x86_64-unknown-none] rustflags` from .cargo/config.toml,
+/// so we must re-supply every flag the kernel target still needs.
+/// User-space binaries link at 0x400000 (lower half) and use the small
+/// code model — no ±2 GiB kernel assumptions.
+fn build_userspace_binary(package: &str, link_ld: &str) -> R<PathBuf> {
     let rustflags = [
-        "-C link-arg=-Tuserspace/init/link.ld",
+        &format!("-C link-arg=-T{link_ld}"),
         "-C relocation-model=static",
         "-C code-model=small",
         "-C no-redzone=yes",
@@ -236,48 +230,29 @@ fn build_userspace_init() -> R<PathBuf> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
         .env("RUSTFLAGS", rustflags)
-        .args(["build", "--package", "userspace_init"])
+        .args(["build", "--package", package])
         .args(KERNEL_BUILD_STD_ARGS);
     check(cmd.status()?)?;
-    let bin = userspace_init_binary();
+    let bin = workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join(package);
     if !bin.exists() {
-        return Err(format!("userspace init binary missing at {}", bin.display()).into());
+        return Err(format!("userspace binary {package} missing at {}", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
 }
 
-fn userspace_hello_binary() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join(KERNEL_TARGET)
-        .join("debug")
-        .join("userspace_hello")
+fn build_userspace_init() -> R<PathBuf> {
+    build_userspace_binary("userspace_init", "userspace/init/link.ld")
 }
 
 /// Build the hello binary — the exec() target for the fork+exec+wait test.
 /// Links at 0x400000 (lower half) just like init so load_user_elf accepts it.
 fn build_userspace_hello() -> R<PathBuf> {
-    let rustflags = [
-        "-C link-arg=-Tuserspace/hello/link.ld",
-        "-C relocation-model=static",
-        "-C code-model=small",
-        "-C no-redzone=yes",
-        "-C force-frame-pointers=yes",
-    ]
-    .join(" ");
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(workspace_root())
-        .env("RUSTFLAGS", rustflags)
-        .args(["build", "--package", "userspace_hello"])
-        .args(KERNEL_BUILD_STD_ARGS);
-    check(cmd.status()?)?;
-    let bin = userspace_hello_binary();
-    if !bin.exists() {
-        return Err(format!("userspace hello binary missing at {}", bin.display()).into());
-    }
-    strip_debug(&bin)?;
-    Ok(bin)
+    build_userspace_binary("userspace_hello", "userspace/hello/link.ld")
 }
 
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
