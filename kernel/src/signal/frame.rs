@@ -166,6 +166,68 @@ pub unsafe fn push_signal_frame(
     Ok(frame_addr)
 }
 
+/// Push a `SigFrame` for a hardware fault (e.g. `#PF` SIGSEGV) onto the user
+/// stack.  Same as [`push_signal_frame`] but additionally writes `fault_addr`
+/// into `siginfo.si_addr` (bytes 16–23 of `info`) and sets `si_code` to
+/// `SEGV_MAPERR` (1) at bytes 4–7 so the handler can inspect the faulting
+/// address via `siginfo_t`.
+///
+/// Returns `Ok(new_rsp)` or `Err(())` on a bad user pointer.
+///
+/// # Safety
+/// Writes to user VA via `uaccess::copy_to_user`.
+pub unsafe fn push_fault_signal_frame(
+    user_rsp: u64,
+    sig: u8,
+    saved_rip: u64,
+    saved_rflags: u64,
+    saved_mask: u64,
+    fault_addr: u64,
+) -> Result<u64, ()> {
+    use crate::arch::x86_64::uaccess;
+
+    let frame_size = mem::size_of::<SigFrame>() as u64;
+    let frame_top = user_rsp.checked_sub(frame_size).ok_or(())?;
+    let frame_addr = (frame_top & !15u64).wrapping_sub(8);
+
+    if uaccess::check_user_range(frame_addr as usize, frame_size as usize).is_err() {
+        return Err(());
+    }
+
+    let mut frame = SigFrame {
+        pretcode: frame_addr + mem::offset_of!(SigFrame, trampoline_code) as u64,
+        sig: sig as u32,
+        _pad: 0,
+        info: [0u8; 128],
+        uc_flags: 0,
+        uc_link: 0,
+        uc_stack: [0u64; 3],
+        gregs: [0u64; 23],
+        uc_sigmask: saved_mask,
+        _reserved: [0u8; 8],
+        fpstate: 0,
+        trampoline_code: SIGRETURN_TRAMPOLINE,
+        _trampoline_pad: [0u8; 7],
+    };
+
+    // si_signo (bytes 0–3)
+    frame.info[..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+    // si_code = SEGV_MAPERR=1 (bytes 4–7)
+    frame.info[4..8].copy_from_slice(&1u32.to_ne_bytes());
+    // si_addr (bytes 16–23)
+    frame.info[16..24].copy_from_slice(&fault_addr.to_ne_bytes());
+
+    frame.gregs[REG_RIP] = saved_rip;
+    frame.gregs[REG_EFLAGS] = saved_rflags;
+    frame.gregs[REG_RSP] = user_rsp;
+
+    let frame_bytes =
+        core::slice::from_raw_parts(&frame as *const SigFrame as *const u8, frame_size as usize);
+    uaccess::copy_to_user(frame_addr as usize, frame_bytes).map_err(|_| ())?;
+
+    Ok(frame_addr)
+}
+
 /// Restore register context from a `SigFrame` at `frame_addr` on the user
 /// stack.
 ///
