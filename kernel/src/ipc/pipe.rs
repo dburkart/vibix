@@ -338,7 +338,13 @@ impl FileBackend for PipeWriteEnd {
         while !remaining.is_empty() {
             // Check for broken pipe (no readers).
             if self.pipe.readers.load(Ordering::Acquire) == 0 {
-                // Raise SIGPIPE on the current task and return EPIPE.
+                // If we already wrote some bytes, return the partial count (Linux
+                // behaviour). Only signal SIGPIPE and return EPIPE on the first
+                // loop iteration (written == 0), matching the POSIX requirement
+                // that SIGPIPE fires when *no* data has been transferred.
+                if written > 0 {
+                    return Ok(written);
+                }
                 #[cfg(target_os = "none")]
                 {
                     let tid = crate::task::current_id();
