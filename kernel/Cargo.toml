@@ -193,6 +193,10 @@ name = "syscall_lseek"
 harness = false
 
 [[test]]
+name = "syscall_open_flags"
+harness = false
+
+[[test]]
 name = "vm_integration"
 harness = false
 

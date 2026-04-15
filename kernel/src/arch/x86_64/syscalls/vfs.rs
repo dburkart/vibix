@@ -25,6 +25,7 @@ use super::super::syscall::copy_path_from_user_pub;
 use super::super::uaccess;
 use crate::fs::vfs::dentry::{DFlags, Dentry};
 use crate::fs::vfs::ops::{meta_into_stat, Stat};
+use crate::fs::vfs::ops::{SetAttr, SetAttrMask};
 use crate::fs::vfs::path_walk::{path_walk, LookupFlags, MountResolver, NameIdata, PATH_MAX};
 use crate::fs::vfs::super_block::SbActiveGuard;
 use crate::fs::vfs::Credential;
@@ -32,9 +33,12 @@ use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
 use crate::fs::{
-    flags as oflags, FileBackend, FileDescription, EBADF, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM,
-    ENOTDIR,
+    flags as oflags, FileBackend, FileDescription, EBADF, EEXIST, EINVAL, ENAMETOOLONG, ENOENT,
+    ENOMEM, ENOTDIR,
 };
+
+/// EISDIR isn't in the top-level `crate::fs` errno set yet; inline the Linux value.
+const EISDIR: i64 = -21;
 
 /// Linux x86_64 value of the "use the current working directory"
 /// sentinel for `*at` syscalls. Sign-extended as an `i32`, negative,
@@ -151,6 +155,33 @@ fn install_fd(backend: Arc<dyn FileBackend>, flags: u32) -> i64 {
     }
 }
 
+/// Split `path` into its parent directory and final component for
+/// `O_CREAT`-style dispatch. Rejects inputs with no nameable leaf — an
+/// empty path, a bare `/`, or anything whose final component is `.` /
+/// `..` / empty (trailing slash) — since `create(parent, leaf)` cannot
+/// act on them.
+fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), i64> {
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    // Strip a trailing slash for "/foo/" but keep bare "/" as-is so the
+    // rejection below triggers.
+    let trimmed = if path.len() > 1 && *path.last().unwrap() == b'/' {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    let (parent, leaf) = match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(0) => (&b"/"[..], &trimmed[1..]),
+        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+        None => (&b"."[..], trimmed),
+    };
+    if leaf.is_empty() || leaf == b"." || leaf == b".." {
+        return Err(ENOENT);
+    }
+    Ok((parent, leaf))
+}
+
 /// `/dev/{stdin,stdout,stderr,serial}` legacy compat: returns a
 /// `SerialBackend`-backed description when path matches. None otherwise.
 fn legacy_dev_backend(path: &[u8], flags: u64) -> Option<i64> {
@@ -173,49 +204,89 @@ fn legacy_dev_backend(path: &[u8], flags: u64) -> Option<i64> {
 /// `dfd` is accepted but only `AT_FDCWD` is honored today — passing a
 /// real fd for a relative path returns `-EINVAL` because per-process
 /// cwd / fd-rooted walks don't exist yet (#239).
-pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, _mode: u64) -> i64 {
+pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) -> i64 {
     // 1. Copy the user path.
     let buf = match copy_user_path(path_uva) {
         Ok(b) => b,
         Err(e) => return e,
     };
     let path = buf.as_slice();
-
-    // 2. Mutating create/truncate flags not supported in the read-path
-    //    subset. Fail loudly so userspace gets a clear signal rather than
-    //    a silent no-op.
     let flags32 = flags as u32;
-    if flags32 & oflags::O_CREAT != 0 {
-        return crate::fs::EACCES;
-    }
-    if flags32 & oflags::O_TRUNC != 0 {
-        return crate::fs::EACCES;
-    }
 
-    // 3. Legacy /dev/{stdin,stdout,stderr,serial} fast path. Bypasses
+    // 2. Legacy /dev/{stdin,stdout,stderr,serial} fast path. Bypasses
     //    the VFS so a smoke boot that opens these before the devfs
     //    character devices exist keeps working.
     if let Some(r) = legacy_dev_backend(path, flags) {
         return r;
     }
 
-    // 4. `*at` preconditions. Non-AT_FDCWD dfd is out of scope for the
+    // 3. `*at` preconditions. Non-AT_FDCWD dfd is out of scope for the
     //    read-path subset; absolute paths ignore dfd entirely.
     let is_absolute = path.first() == Some(&b'/');
     if dfd != AT_FDCWD && !is_absolute {
         return EINVAL;
     }
 
-    // 5. Walk.
-    let follow = (flags as u32) & oflags::O_NOFOLLOW == 0;
+    // 4. Walk. If O_CREAT is set and the leaf does not exist, try to
+    //    create it in the parent directory, then re-walk.
+    let follow = flags32 & oflags::O_NOFOLLOW == 0;
     let (inode, nd) = match resolve_inode(path, follow) {
-        Ok(v) => v,
+        Ok(v) => {
+            // File exists. With O_CREAT|O_EXCL this is an error.
+            if flags32 & oflags::O_CREAT != 0 && flags32 & oflags::O_EXCL != 0 {
+                return EEXIST;
+            }
+            v
+        }
+        Err(e) if e == ENOENT && flags32 & oflags::O_CREAT != 0 => {
+            let (parent_path, leaf) = match split_parent(path) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if parent_inode.kind != InodeKind::Dir {
+                return ENOTDIR;
+            }
+            let create_mode = (mode as u16) & 0o7777;
+            if let Err(e) = parent_inode.ops.create(&parent_inode, leaf, create_mode) {
+                return e;
+            }
+            // Re-resolve to pick up the freshly created dentry+inode.
+            match resolve_inode(path, follow) {
+                Ok(v) => v,
+                Err(e) => return e,
+            }
+        }
         Err(e) => return e,
     };
 
-    // 6. O_DIRECTORY check.
-    if (flags as u32) & oflags::O_DIRECTORY != 0 && inode.kind != InodeKind::Dir {
+    // 5. O_DIRECTORY check.
+    if flags32 & oflags::O_DIRECTORY != 0 && inode.kind != InodeKind::Dir {
         return ENOTDIR;
+    }
+
+    // 6. O_TRUNC: zero the file length for a writable open on a regular
+    //    file. Silently ignored on a read-only open (Linux semantics);
+    //    rejected with EISDIR on a directory.
+    if flags32 & oflags::O_TRUNC != 0 {
+        if inode.kind == InodeKind::Dir {
+            return EISDIR;
+        }
+        let access = flags32 & oflags::O_ACCMODE;
+        if inode.kind == InodeKind::Reg && (access == oflags::O_WRONLY || access == oflags::O_RDWR)
+        {
+            let attr = SetAttr {
+                mask: SetAttrMask::SIZE,
+                size: 0,
+                ..SetAttr::default()
+            };
+            if let Err(e) = inode.ops.setattr(&inode, &attr) {
+                return e;
+            }
+        }
     }
 
     // 7. Build the OpenFile. The edge list in `nd` keeps the SB alive
