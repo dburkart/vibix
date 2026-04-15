@@ -532,7 +532,7 @@ fn ensure_initrd() -> R<PathBuf> {
     const NESTED_PAYLOAD: &[u8] = b"nested\n";
     const LDSO_FILE: &str = "lib/ld-musl-x86_64.so.1";
     const LDSO_SIZE: u64 = 645_736;
-    const LDSO_BLOCKS: u64 = (LDSO_SIZE + 511) / 512; // = 1262 blocks
+    const LDSO_BLOCKS: u64 = LDSO_SIZE.div_ceil(512); // = 1262 blocks
                                                       // DIRS headers + 3 file headers + (2 small + LDSO_BLOCKS) data blocks + 2 end blocks.
     const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 3 + 2 + LDSO_BLOCKS + 2) * 512;
 
@@ -572,7 +572,7 @@ fn ensure_initrd() -> R<PathBuf> {
         data.extend_from_slice(&payload_block);
         // lib/ld-musl-x86_64.so.1 — dynamic linker for musl-linked user binaries.
         data.extend_from_slice(&ustar_file_block(LDSO_FILE, LDSO_SIZE));
-        let padded_len = ((ldso_bytes.len() + 511) / 512) * 512;
+        let padded_len = ldso_bytes.len().div_ceil(512) * 512;
         let mut ldso_padded = vec![0u8; padded_len];
         ldso_padded[..ldso_bytes.len()].copy_from_slice(&ldso_bytes);
         data.extend_from_slice(&ldso_padded);
