@@ -43,7 +43,7 @@ jobs:
             ~/.cargo/git
             target
             build/limine
-          key: ${{ runner.os }}-cargo-fmt-build-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-fmt-build-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-fmt-build-
             ${{ runner.os }}-cargo-
@@ -123,7 +123,7 @@ jobs:
             ~/.cargo/git
             target
             build/limine
-          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-integration-
             ${{ runner.os }}-cargo-
@@ -159,7 +159,7 @@ jobs:
             ~/.cargo/git
             target
             build/limine
-          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-smoke-
             ${{ runner.os }}-cargo-
