@@ -462,10 +462,7 @@ mod tests {
         let ws = Path::new("/ws");
         // Cargo registry paths get truncated to the last two components.
         assert_eq!(
-            normalize(
-                "/home/user/.cargo/registry/src/spin/src/mutex.rs",
-                ws
-            ),
+            normalize("/home/user/.cargo/registry/src/spin/src/mutex.rs", ws),
             "src/mutex.rs"
         );
     }
