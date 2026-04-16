@@ -897,7 +897,10 @@ mod tests {
     #[test]
     fn fifo_open_nonblock_wronly_enxio_without_reader() {
         let fifo = Pipe::new_for_fifo();
-        let e = fifo.open_write(/* nonblocking */ true).unwrap_err();
+        let e = match fifo.open_write(/* nonblocking */ true) {
+            Ok(_) => panic!("O_NONBLOCK|O_WRONLY without reader must ENXIO"),
+            Err(e) => e,
+        };
         assert_eq!(e, ENXIO);
         assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
     }
@@ -944,7 +947,10 @@ mod tests {
         // after provisionally incrementing then rolling back the reader
         // count. Asserts the rollback — counts must be zero again.
         let fifo = Pipe::new_for_fifo();
-        let e = fifo.open_read(/* nonblocking */ false).unwrap_err();
+        let e = match fifo.open_read(/* nonblocking */ false) {
+            Ok(_) => panic!("blocking open_read without writer must fail on host"),
+            Err(e) => e,
+        };
         assert_eq!(e, EAGAIN);
         assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
     }
@@ -955,7 +961,10 @@ mod tests {
         // without O_NONBLOCK and there is no reader, the provisional
         // writer increment must be rolled back before returning.
         let fifo = Pipe::new_for_fifo();
-        let e = fifo.open_write(/* nonblocking */ false).unwrap_err();
+        let e = match fifo.open_write(/* nonblocking */ false) {
+            Ok(_) => panic!("blocking open_write without reader must fail on host"),
+            Err(e) => e,
+        };
         assert_eq!(e, EAGAIN);
         assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
     }
