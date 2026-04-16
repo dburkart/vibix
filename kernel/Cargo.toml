@@ -205,6 +205,10 @@ name = "syscall_fcntl"
 harness = false
 
 [[test]]
+name = "syscall_dup_family"
+harness = false
+
+[[test]]
 name = "syscall_open_flags"
 harness = false
 
@@ -250,4 +254,8 @@ harness = false
 
 [[test]]
 name = "tty_sigttin_read"
+harness = false
+
+[[test]]
+name = "shell_help"
 harness = false

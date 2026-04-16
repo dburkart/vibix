@@ -160,6 +160,147 @@ mod kernel_side {
         serial_print!("{}", PROMPT);
     }
 
+    /// Per-builtin help text. `summary` feeds the global `help` listing;
+    /// `usage` and `examples` are shown by `help <cmd>`.
+    pub struct BuiltinHelp {
+        pub summary: &'static str,
+        pub usage: &'static str,
+        pub examples: &'static [&'static str],
+    }
+
+    /// One row of the dispatch table. Pairing the runner and the help
+    /// text in one struct means new builtins can't be added without
+    /// supplying both.
+    struct Builtin {
+        name: &'static str,
+        run: fn(&str),
+        help: BuiltinHelp,
+    }
+
+    /// Source-of-truth dispatch table. Order is alphabetical so the
+    /// `help` listing reads naturally — hand-maintained, since the table
+    /// only compiles under `target_os = "none"` and can't be checked by
+    /// a host-side unit test.
+    const BUILTINS: &[Builtin] = &[
+        Builtin {
+            name: "clear",
+            run: cmd_clear_wrap,
+            help: BuiltinHelp {
+                summary: "clear the screen (VT100)",
+                usage: "clear",
+                examples: &["clear"],
+            },
+        },
+        Builtin {
+            name: "date",
+            run: cmd_date_wrap,
+            help: BuiltinHelp {
+                summary: "wall-clock time from the RTC (UTC)",
+                usage: "date",
+                examples: &["date"],
+            },
+        },
+        Builtin {
+            name: "echo",
+            run: cmd_echo,
+            help: BuiltinHelp {
+                summary: "echo the rest of the line",
+                usage: "echo <args...>",
+                examples: &["echo hello world"],
+            },
+        },
+        Builtin {
+            name: "help",
+            run: cmd_help,
+            help: BuiltinHelp {
+                summary: "list builtins, or describe one",
+                usage: "help [cmd]",
+                examples: &["help", "help tasks"],
+            },
+        },
+        Builtin {
+            name: "mem",
+            run: cmd_mem_wrap,
+            help: BuiltinHelp {
+                summary: "heap + free-frame counters",
+                usage: "mem",
+                examples: &["mem"],
+            },
+        },
+        Builtin {
+            name: "panic",
+            run: cmd_panic,
+            help: BuiltinHelp {
+                summary: "trigger a kernel panic (test aid)",
+                usage: "panic",
+                examples: &["panic"],
+            },
+        },
+        Builtin {
+            name: "pci",
+            run: cmd_pci_wrap,
+            help: BuiltinHelp {
+                summary: "enumerated PCI devices on bus 0",
+                usage: "pci",
+                examples: &["pci"],
+            },
+        },
+        Builtin {
+            name: "tasks",
+            run: cmd_tasks_wrap,
+            help: BuiltinHelp {
+                summary: "live task ids, states, and remaining slices",
+                usage: "tasks",
+                examples: &["tasks"],
+            },
+        },
+        Builtin {
+            name: "time",
+            run: cmd_time_wrap,
+            help: BuiltinHelp {
+                summary: "seconds since boot, ms precision",
+                usage: "time",
+                examples: &["time"],
+            },
+        },
+        Builtin {
+            name: "uname",
+            run: cmd_uname,
+            help: BuiltinHelp {
+                summary: "print kernel name / release / arch",
+                usage: "uname [-asrvm]",
+                examples: &["uname", "uname -a", "uname -srm"],
+            },
+        },
+        Builtin {
+            name: "uptime",
+            run: cmd_uptime_wrap,
+            help: BuiltinHelp {
+                summary: "milliseconds since boot",
+                usage: "uptime",
+                examples: &["uptime"],
+            },
+        },
+        Builtin {
+            name: "version",
+            run: cmd_version_wrap,
+            help: BuiltinHelp {
+                summary: "kernel version + build metadata",
+                usage: "version",
+                examples: &["version"],
+            },
+        },
+        Builtin {
+            name: "whoami",
+            run: cmd_whoami_wrap,
+            help: BuiltinHelp {
+                summary: "print effective user name",
+                usage: "whoami",
+                examples: &["whoami"],
+            },
+        },
+    ];
+
     fn dispatch(line: &str) {
         if line.is_empty() {
             return;
@@ -168,21 +309,9 @@ mod kernel_side {
             Some((c, r)) => (c, r),
             None => (line, ""),
         };
-        match cmd {
-            "help" => cmd_help(),
-            "uptime" => cmd_uptime(),
-            "time" => cmd_time(),
-            "mem" => cmd_mem(),
-            "tasks" => cmd_tasks(),
-            "pci" => cmd_pci(),
-            "uname" => cmd_uname(rest),
-            "version" => cmd_version(),
-            "whoami" => cmd_whoami(),
-            "clear" => cmd_clear(),
-            "date" => cmd_date(),
-            "echo" => serial_println!("{}", rest),
-            "panic" => panic!("shell: panic builtin invoked"),
-            _ => serial_println!("unknown command: {} (try `help`)", cmd),
+        match BUILTINS.iter().find(|b| b.name == cmd) {
+            Some(b) => (b.run)(rest),
+            None => serial_println!("unknown command: {} (try `help`)", cmd),
         }
     }
 
@@ -193,21 +322,72 @@ mod kernel_side {
         dispatch(line);
     }
 
-    fn cmd_help() {
-        serial_println!("builtins:");
-        serial_println!("  help            show this list");
-        serial_println!("  uptime          milliseconds since boot");
-        serial_println!("  time            seconds since boot, ms precision");
-        serial_println!("  mem             heap + free-frame counters");
-        serial_println!("  tasks           live task ids and remaining slices");
-        serial_println!("  pci             enumerated PCI devices on bus 0");
-        serial_println!("  uname [-asrvm]  print kernel name / release / arch");
-        serial_println!("  version         kernel version + build metadata");
-        serial_println!("  whoami          print effective user name");
-        serial_println!("  clear           clear the screen (Ctrl+L with no key)");
-        serial_println!("  date            wall-clock time from the RTC (UTC)");
-        serial_println!("  echo <args>     echo the rest of the line");
-        serial_println!("  panic           trigger a kernel panic (test aid)");
+    fn cmd_help(args: &str) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            serial_println!("builtins:");
+            for b in BUILTINS {
+                serial_println!("  {:<8}  {}", b.name, b.help.summary);
+            }
+            return;
+        }
+        match BUILTINS.iter().find(|b| b.name == arg) {
+            Some(b) => {
+                serial_println!("{}", b.help.summary);
+                serial_println!("usage: {}", b.help.usage);
+                if !b.help.examples.is_empty() {
+                    serial_println!("examples:");
+                    for ex in b.help.examples {
+                        serial_println!("  $ {}", ex);
+                    }
+                }
+            }
+            None => serial_println!("help: no help for `{}`", arg),
+        }
+    }
+
+    fn cmd_echo(rest: &str) {
+        serial_println!("{}", rest);
+    }
+
+    fn cmd_panic(_: &str) {
+        panic!("shell: panic builtin invoked");
+    }
+
+    fn cmd_uptime_wrap(_: &str) {
+        cmd_uptime();
+    }
+
+    fn cmd_time_wrap(_: &str) {
+        cmd_time();
+    }
+
+    fn cmd_pci_wrap(_: &str) {
+        cmd_pci();
+    }
+
+    fn cmd_tasks_wrap(_: &str) {
+        cmd_tasks();
+    }
+
+    fn cmd_version_wrap(_: &str) {
+        cmd_version();
+    }
+
+    fn cmd_whoami_wrap(_: &str) {
+        cmd_whoami();
+    }
+
+    fn cmd_clear_wrap(_: &str) {
+        cmd_clear();
+    }
+
+    fn cmd_date_wrap(_: &str) {
+        cmd_date();
+    }
+
+    fn cmd_mem_wrap(_: &str) {
+        cmd_mem();
     }
 
     fn cmd_uptime() {
