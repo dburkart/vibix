@@ -54,12 +54,26 @@ use core::panic::PanicInfo;
 /// Smoke-test marker — asserted by `cargo xtask smoke`.
 const HELLO_MSG: &[u8] = b"init: hello from pid 1\n";
 
+/// Emitted immediately on ring-3 entry, before the first `write(1, ...)`.
+/// Localises the #478 flake: if `init: iretq to ring-3` fires but this
+/// marker doesn't, the first `SYSCALL` instruction or entry trampoline
+/// never ran. fd=2 is used so it's separable from HELLO_MSG on fd=1 and
+/// rules out an fd-1-specific bug.
+const PRE_WRITE_MSG: &[u8] = b"init: pre-write marker\n";
+
+/// Emitted right after the first `write(1, HELLO_MSG)` returns.
+/// If PRE_WRITE fires and HELLO_MSG fires but this doesn't, the write
+/// syscall return path is the culprit.
+const POST_WRITE_MSG: &[u8] = b"init: post-write marker\n";
+
 /// Emitted after the parent collects the child's exit status.
 const DONE_MSG: &[u8] = b"init: fork+exec+wait ok\n";
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    write(2, PRE_WRITE_MSG);
     write(1, HELLO_MSG);
+    write(1, POST_WRITE_MSG);
 
     // fork() — child PID returned to parent; 0 returned to child.
     let fork_ret: i64;

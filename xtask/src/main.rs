@@ -98,7 +98,13 @@ const SMOKE_MARKERS: &[&str] = &[
     // `ring3-first-fault:` diagnostic line emitted by the IDT fault
     // handlers in that case).
     "ring3-iretq: rip=",
+    // Fine-grained userspace markers bracketing the first `write`
+    // syscall. See userspace/init/src/main.rs — together with
+    // `ring3-iretq:` and "init: hello from pid 1" these localise the
+    // #478 flake to the exact step that failed.
+    "init: pre-write marker",
     "init: hello from pid 1",
+    "init: post-write marker",
 ];
 
 /// Markers for the fork+exec+wait flow. These are flakey under un-accelerated
