@@ -25,6 +25,9 @@ pub fn brand() -> &'static str {
     let (Some(buf), Some(len)) = (BRAND.get(), BRAND_LEN.get()) else {
         return "unknown";
     };
+    if *len == 0 {
+        return "unknown";
+    }
     core::str::from_utf8(&buf[..*len]).unwrap_or("unknown")
 }
 

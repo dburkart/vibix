@@ -75,7 +75,12 @@ const SMOKE_MARKERS: &[&str] = &[
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
-    "banner: vibix ",
+    // Front-anchored and includes the kernel release so a regression that
+    // drops either the banner prefix or the release interpolation fails
+    // smoke, not just one of the two. Relies on xtask + kernel sharing the
+    // workspace version so CARGO_PKG_VERSION matches what build_info::RELEASE
+    // stamps into the banner at build time.
+    concat!("banner: vibix ", env!("CARGO_PKG_VERSION")),
     "userspace module ELF entry=",
     "userspace: loader mapping image",
     "syscall: SYSCALL/SYSRET enabled",
@@ -582,19 +587,34 @@ fn ensure_initrd() -> R<PathBuf> {
 
     let ldso_src = workspace_root().join("userspace/lib/ld-musl-x86_64.so.1");
 
-    // Size-only isn't sufficient — a file of the right length but wrong content
-    // would silently produce a bad rootfs. Also verify the USTAR magic at offset
-    // 257 (mirrors the pattern used in ensure_test_disk).
+    // Size + magic aren't sufficient — changing MOTD_PAYLOAD to another
+    // equal-or-shorter string would leave the old payload on disk (same
+    // length, same magic). Also compare the motd data block bytes so the
+    // cache invalidates when the payload changes.
+    // Layout offsets: DIRS.len() dir headers, then hostname hdr+data
+    // (2 blocks), then nested hdr+data (2 blocks), then motd header
+    // (1 block), then motd data.
+    const MOTD_DATA_OFFSET: u64 = (DIRS.len() as u64 + 2 + 2 + 1) * 512;
     let needs_write = match fs::metadata(&path) {
         Ok(m) if m.len() == EXPECTED_SIZE => {
             let mut magic = [0u8; 6];
+            let mut motd_block = [0u8; 512];
             fs::File::open(&path)
                 .and_then(|mut f| {
                     use std::io::{Read, Seek, SeekFrom};
                     f.seek(SeekFrom::Start(257))?;
-                    f.read_exact(&mut magic)
+                    f.read_exact(&mut magic)?;
+                    f.seek(SeekFrom::Start(MOTD_DATA_OFFSET))?;
+                    f.read_exact(&mut motd_block)
                 })
-                .map(|()| magic != *b"ustar\0")
+                .map(|()| {
+                    if magic != *b"ustar\0" {
+                        return true;
+                    }
+                    let plen = MOTD_PAYLOAD.len();
+                    &motd_block[..plen] != MOTD_PAYLOAD
+                        || motd_block[plen..].iter().any(|&b| b != 0)
+                })
                 .unwrap_or(true)
         }
         _ => true,
@@ -1168,6 +1188,14 @@ mod tests {
         assert!(data.len() >= 4 * 512);
         assert_eq!(data.len() % 512, 0);
         assert!(data[data.len() - 1024..].iter().all(|&b| b == 0));
+        // Content checks: USTAR magic is present in the first header (so
+        // we know a real tar got written, not 4 zero blocks), and the
+        // `etc/motd` filename appears somewhere in the archive.
+        assert_eq!(&data[257..263], b"ustar\0");
+        assert!(
+            data.windows(8).any(|w| w == b"etc/motd"),
+            "archive missing etc/motd entry"
+        );
     }
 
     #[test]
