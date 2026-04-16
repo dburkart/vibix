@@ -5,12 +5,16 @@
 //! the same way.
 //!
 //! Exposes synchronous polled `read(lba, buf)` and `write(lba, buf)`
-//! against the first detected virtio-blk device. No caching, no
-//! interrupts — polled I/O only (issue #81 added the write path on top
-//! of the original step-1 read-only driver from #43).
+//! against the first detected virtio-blk device. Reads go through a
+//! small in-memory [`cache`] (set-associative, 4 KiB lines) and writes
+//! invalidate any overlapping cached page before hitting the driver —
+//! write-back is deliberately out of scope (issue #82). Polled I/O,
+//! no interrupts.
 
 #[cfg(any(test, target_os = "none"))]
 pub mod virtio_blk;
+
+pub mod cache;
 
 /// Size of one disk sector in bytes. The virtio-blk spec fixes this at
 /// 512 regardless of the underlying medium's physical block size.
@@ -34,31 +38,39 @@ pub enum BlkError {
 #[cfg(target_os = "none")]
 pub fn init() {
     virtio_blk::init();
+    cache::init();
 }
 
 /// Read `buf.len() / 512` sectors starting at `lba` into `buf`.
 ///
-/// `buf.len()` must be a non-zero multiple of [`SECTOR_SIZE`]. Blocks the
-/// calling task on a polled spin-wait; intended for boot-time probes and
-/// the not-yet-existent filesystem layer, not for general user traffic.
+/// `buf.len()` must be a non-zero multiple of [`SECTOR_SIZE`]. Routed
+/// through the block [`cache`]: previously-seen pages return without
+/// hitting the device. Blocks the calling task on a polled spin-wait
+/// on cache miss.
 #[cfg(target_os = "none")]
 pub fn read(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
-    virtio_blk::read(lba, buf)
+    cache::read_through(lba, buf)
 }
 
 /// Write `buf.len() / 512` sectors from `buf` starting at `lba`.
 ///
-/// Same shape as [`read`]: `buf.len()` must be a non-zero multiple of
-/// [`SECTOR_SIZE`] and must not exceed a single 4 KiB page (the bounce
-/// buffer cap). Blocks on a polled spin-wait until the device reports
-/// completion or the poll budget elapses.
+/// Same shape as [`read`]. Invalidates any cached page overlapping the
+/// written range, then issues the write through the driver. Blocks on
+/// a polled spin-wait until the device reports completion or the poll
+/// budget elapses.
 #[cfg(target_os = "none")]
 pub fn write(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
-    virtio_blk::write(lba, buf)
+    cache::write_invalidate(lba, buf)
 }
 
 /// `true` once a backend has completed bring-up.
 #[cfg(target_os = "none")]
 pub fn ready() -> bool {
     virtio_blk::ready()
+}
+
+/// Monotonic cache counters (hits/misses/invalidations/fills).
+#[cfg(target_os = "none")]
+pub fn cache_stats() -> cache::CacheStats {
+    cache::stats()
 }
