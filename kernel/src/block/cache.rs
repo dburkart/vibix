@@ -116,7 +116,11 @@ impl<const LINES: usize> Cache<LINES> {
             return Err(BlkError::BadAlign);
         }
         let sectors = (buf.len() / SECTOR_SIZE) as u64;
-        let end = lba + sectors;
+        // Reject ranges that would wrap past u64::MAX. Without this a
+        // caller passing `lba` near the top of the address space could
+        // walk a wrapped `end`, return Ok(()) with an unfilled buffer,
+        // or (in invalidate) iterate the wrong pages unboundedly.
+        let end = lba.checked_add(sectors).ok_or(BlkError::BadAlign)?;
         let mut cur = lba;
         let mut out_off = 0;
         while cur < end {
@@ -175,11 +179,14 @@ impl<const LINES: usize> Cache<LINES> {
             return Err(BlkError::BadAlign);
         }
         let sectors = (buf.len() / SECTOR_SIZE) as u64;
-        self.invalidate_range(lba, sectors, stats, sets, ways);
+        self.invalidate_range(lba, sectors, stats, sets, ways)?;
         backend.write(lba, buf)
     }
 
-    /// Drop every valid line overlapping `[lba, lba+sectors)`.
+    /// Drop every valid line overlapping `[lba, lba+sectors)`. Returns
+    /// `BlkError::BadAlign` if `sectors == 0` or the range would wrap
+    /// past u64::MAX; otherwise iterates covering page LBAs and clears
+    /// matching valid lines.
     pub fn invalidate_range(
         &mut self,
         lba: u64,
@@ -187,8 +194,11 @@ impl<const LINES: usize> Cache<LINES> {
         stats: &CacheCounters,
         sets: usize,
         ways: usize,
-    ) {
-        let end = lba + sectors;
+    ) -> Result<(), BlkError> {
+        if sectors == 0 {
+            return Err(BlkError::BadAlign);
+        }
+        let end = lba.checked_add(sectors).ok_or(BlkError::BadAlign)?;
         let first_page = lba & !(LINE_SECTORS - 1);
         let last_page = (end - 1) & !(LINE_SECTORS - 1);
         let mut page = first_page;
@@ -203,6 +213,7 @@ impl<const LINES: usize> Cache<LINES> {
             }
             page += LINE_SECTORS;
         }
+        Ok(())
     }
 
     fn lookup(&self, set: usize, ways: usize, page_lba: u64) -> Option<usize> {
@@ -520,6 +531,29 @@ mod tests {
             c.read_through(0, &mut empty, &mut disk, &ctrs, NUM_SETS, WAYS),
             Err(BlkError::BadAlign)
         );
+    }
+
+    #[test]
+    fn wraparound_rejected() {
+        // lba near u64::MAX with a buf that would wrap must not walk a
+        // wrapped `end`. Both read and write should reject without
+        // touching the backend.
+        let mut c = Cache::<TOTAL_LINES>::new();
+        let ctrs = CacheCounters::new();
+        let mut disk = MockDisk::new(8);
+        let lba = u64::MAX - 1; // leaves only 1 sector before wrap
+        let mut buf = [0u8; 4 * SECTOR_SIZE]; // 4 sectors → wraps
+        assert_eq!(
+            c.read_through(lba, &mut buf, &mut disk, &ctrs, NUM_SETS, WAYS),
+            Err(BlkError::BadAlign)
+        );
+        let w = [0u8; 4 * SECTOR_SIZE];
+        assert_eq!(
+            c.write_invalidate(lba, &w, &mut disk, &ctrs, NUM_SETS, WAYS),
+            Err(BlkError::BadAlign)
+        );
+        assert_eq!(disk.reads, 0);
+        assert_eq!(disk.writes, 0);
     }
 
     #[test]
