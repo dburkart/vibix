@@ -265,5 +265,9 @@ name = "syscall_mkfifo"
 harness = false
 
 [[test]]
+name = "ntty_sigint_flush"
+harness = false
+
+[[test]]
 name = "gdbstub_loop"
 harness = false

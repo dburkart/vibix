@@ -229,6 +229,13 @@ impl NTty {
         }
     }
 
+    /// Number of bytes a reader would observe on the raw (post-commit)
+    /// ring. Exposed for integration tests that assert the VINTR flush
+    /// drains previously-committed lines.
+    pub fn reader_len(&self) -> usize {
+        self.state.lock().raw.len()
+    }
+
     /// Signal-aware entry point. Must be called before the hot
     /// `receive_byte` path when a [`JobControl`] is available (i.e. for
     /// any tty that has a controlling session) so Ctrl-C / Ctrl-\ /
@@ -269,6 +276,15 @@ impl NTty {
                         dispatch.send_to_pgrp(pgrp, sig);
                     }
                 }
+                // Flush any in-progress line and committed raw bytes so a
+                // subsequent reader observes an empty queue. Matches Linux
+                // `n_tty_receive_signal_chars` + `isig(... flush=true)`:
+                // the user typed ^C to abort, so discarding queued input is
+                // the expected behaviour.
+                let mut st = self.state.lock();
+                st.line.clear();
+                st.raw.head = st.raw.tail;
+                st.raw.eof_pos = None;
                 return None;
             }
         }
