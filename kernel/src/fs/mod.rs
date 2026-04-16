@@ -198,6 +198,7 @@ pub const FD_CLOEXEC: u32 = 1;
 pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const EINTR: i64 = -4;
+pub const EIO: i64 = -5;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;
@@ -549,6 +550,14 @@ impl FileBackend for SerialBackend {
     /// blocking semantics must re-try in a loop (the blocking wait-queue path
     /// lives in a future `read` syscall extension).
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        let caller = crate::process::current_pid();
+        let tty = crate::tty::console_tty();
+        if let Some(rc) = crate::tty::tty_check_sigttin(&tty, caller) {
+            if rc == crate::tty::KERN_ERESTARTSYS {
+                return Err(EINTR);
+            }
+            return Err(rc);
+        }
         for (i, byte) in buf.iter_mut().enumerate() {
             match crate::serial::try_read_byte() {
                 Some(b) => *byte = b,

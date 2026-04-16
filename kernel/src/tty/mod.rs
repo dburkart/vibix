@@ -281,6 +281,7 @@ pub fn console_tty() -> Arc<Tty> {
 const EPERM: i64 = -1;
 #[cfg(target_os = "none")]
 const ENOTTY: i64 = -25;
+pub const EIO: i64 = -5;
 
 /// Linux-internal "restart this syscall" sentinel. Not user-visible: the
 /// syscall trampoline either restarts the call transparently (SA_RESTART)
@@ -442,6 +443,36 @@ pub fn tty_check_tostop(tty: &Tty, caller_pid: u32) -> Option<i64> {
         return None;
     }
     process::raise_signal_on_pgrp(caller_pgrp, crate::signal::SIGTTOU);
+    Some(KERN_ERESTARTSYS)
+}
+
+/// POSIX background-pgrp read gate for `read(tty, ...)`.
+///
+/// When a background-pgrp process attempts `read()` on its controlling
+/// terminal, POSIX requires SIGTTIN. Unlike `tty_check_tostop` this is
+/// unconditional — no termios flag gates it. If SIGTTIN is blocked or
+/// ignored by the caller, returns `Some(EIO)` instead of raising the
+/// signal. Returns `None` when the read should proceed.
+#[cfg(target_os = "none")]
+pub fn tty_check_sigttin(tty: &Tty, caller_pid: u32) -> Option<i64> {
+    if caller_pid == 0 {
+        return None;
+    }
+    let fg = tty.ctrl.lock().pgrp_snapshot.load();
+    if fg == 0 {
+        return None;
+    }
+    let caller_pgrp = match process::pgrp_of(caller_pid) {
+        Some(p) => p,
+        None => return None,
+    };
+    if caller_pgrp == fg {
+        return None;
+    }
+    if process::is_signal_blocked_or_ignored(caller_pid, crate::signal::SIGTTIN) {
+        return Some(EIO);
+    }
+    process::raise_signal_on_pgrp(caller_pgrp, crate::signal::SIGTTIN);
     Some(KERN_ERESTARTSYS)
 }
 

@@ -247,3 +247,7 @@ harness = false
 [[test]]
 name = "tty_tostop_sigttou"
 harness = false
+
+[[test]]
+name = "tty_sigttin_read"
+harness = false
