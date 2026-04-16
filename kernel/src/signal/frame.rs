@@ -42,6 +42,13 @@
 use core::mem;
 
 /// Index of key registers in `SigFrame::gregs`.
+const REG_R8: usize = 0;
+const REG_R9: usize = 1;
+const REG_R10: usize = 2;
+const REG_RDI: usize = 8;
+const REG_RSI: usize = 9;
+const REG_RDX: usize = 12;
+const REG_RAX: usize = 13;
 const REG_RSP: usize = 15;
 const REG_RIP: usize = 16;
 const REG_EFLAGS: usize = 17;
@@ -55,6 +62,19 @@ const SIGRETURN_TRAMPOLINE: [u8; 9] = [
     0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, // mov rax, 15
     0x0F, 0x05, // syscall
 ];
+
+/// Vibix-local `uc_flags` bit indicating that `gregs[REG_RAX / REG_RDI /
+/// REG_RSI / REG_RDX / REG_R10 / REG_R8 / REG_R9]` carry the user syscall
+/// arg registers saved at delivery time. Set by `push_signal_frame` (the
+/// syscall-return path) and **not** set by `push_fault_signal_frame` (the
+/// fault-return path, which lacks a `SyscallReturnContext` with those
+/// values). The sigreturn path restores syscall arg regs into the kernel-
+/// stack ctx only when this flag is present, avoiding a regression where
+/// fault-delivered signals would zero-fill those user GPRs after return.
+///
+/// Picked from the high half of `uc_flags` so it cannot collide with
+/// Linux's low-numbered `UC_*` flag bits.
+pub const UC_VIBIX_SYSCALL_REGS: u64 = 0x1000_0000_0000_0000;
 
 /// The signal frame pushed on the user stack before entering the handler.
 ///
@@ -92,11 +112,37 @@ pub struct SigFrame {
 const _: () = assert!(mem::size_of::<SigFrame>() % 16 == 0);
 
 /// Recovered register state from a `SigFrame`.
+///
+/// `syscall_args` is `Some` only when the frame was pushed on the syscall-
+/// return path (the `UC_VIBIX_SYSCALL_REGS` flag is set). On an SA_RESTART+
+/// handler delivery the trampoline rewound `rip` to the SYSCALL instruction;
+/// after sigreturn returns to that rewound rip, SYSCALL must see the
+/// original `(nr, a0..a5)` in those GPRs. See #499.
+///
+/// On fault-delivered signals (#PF / SIGSEGV), the flag is absent and
+/// `syscall_args` is `None` — the sigreturn path leaves the kernel-stack
+/// ctx's user GPR slots alone.
 pub struct RestoredRegs {
     pub rip: u64,
     pub rflags: u64,
     pub rsp: u64,
     pub saved_mask: u64,
+    pub syscall_args: Option<SyscallArgRegs>,
+}
+
+/// The 7 user GPRs that the Linux x86_64 syscall ABI uses — `rax` as the
+/// syscall number, `rdi/rsi/rdx/r10/r8/r9` as args 0..5. Preserved through
+/// `SigFrame::gregs` so SA_RESTART+handler restarts can replay the original
+/// syscall after sigreturn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyscallArgRegs {
+    pub rax: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub r10: u64,
+    pub r8: u64,
+    pub r9: u64,
 }
 
 /// Push a `SigFrame` onto the user stack at `user_rsp` and return the new
@@ -118,6 +164,7 @@ pub unsafe fn push_signal_frame(
     saved_rip: u64,
     saved_rflags: u64,
     saved_mask: u64,
+    syscall_args: Option<SyscallArgRegs>,
 ) -> Result<u64, ()> {
     use crate::arch::x86_64::uaccess;
 
@@ -132,13 +179,23 @@ pub unsafe fn push_signal_frame(
         return Err(());
     }
 
+    // Flag the frame with UC_VIBIX_SYSCALL_REGS only when the caller is
+    // delivering on top of an SA_RESTART-style restart — that's the one
+    // path where rip was rewound to the SYSCALL insn and the saved regs
+    // must replay on sigreturn.
+    let uc_flags = if syscall_args.is_some() {
+        UC_VIBIX_SYSCALL_REGS
+    } else {
+        0
+    };
+
     // Build the frame in kernel memory, then copy it to user space.
     let mut frame = SigFrame {
         pretcode: frame_addr + mem::offset_of!(SigFrame, trampoline_code) as u64,
         sig: sig as u32,
         _pad: 0,
         info: [0u8; 128],
-        uc_flags: 0,
+        uc_flags,
         uc_link: 0,
         uc_stack: [0u64; 3],
         gregs: [0u64; 23],
@@ -156,6 +213,17 @@ pub unsafe fn push_signal_frame(
     frame.gregs[REG_RIP] = saved_rip;
     frame.gregs[REG_EFLAGS] = saved_rflags;
     frame.gregs[REG_RSP] = user_rsp;
+    // Preserve syscall arg regs so SA_RESTART+handler restarts can replay
+    // the original syscall after sigreturn rewinds rip to the SYSCALL insn.
+    if let Some(args) = syscall_args {
+        frame.gregs[REG_RAX] = args.rax;
+        frame.gregs[REG_RDI] = args.rdi;
+        frame.gregs[REG_RSI] = args.rsi;
+        frame.gregs[REG_RDX] = args.rdx;
+        frame.gregs[REG_R10] = args.r10;
+        frame.gregs[REG_R8] = args.r8;
+        frame.gregs[REG_R9] = args.r9;
+    }
 
     // Copy frame to user stack.
     let frame_bytes =
@@ -262,11 +330,26 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
         return Err(());
     }
 
+    let syscall_args = if frame.uc_flags & UC_VIBIX_SYSCALL_REGS != 0 {
+        Some(SyscallArgRegs {
+            rax: frame.gregs[REG_RAX],
+            rdi: frame.gregs[REG_RDI],
+            rsi: frame.gregs[REG_RSI],
+            rdx: frame.gregs[REG_RDX],
+            r10: frame.gregs[REG_R10],
+            r8: frame.gregs[REG_R8],
+            r9: frame.gregs[REG_R9],
+        })
+    } else {
+        None
+    };
+
     Ok(RestoredRegs {
         rip,
         rflags: frame.gregs[REG_EFLAGS],
         rsp,
         saved_mask: frame.uc_sigmask,
+        syscall_args,
     })
 }
 
@@ -314,8 +397,35 @@ mod tests {
 
     #[test]
     fn gregs_indices_are_in_range() {
-        assert!(REG_RSP < 23);
-        assert!(REG_RIP < 23);
-        assert!(REG_EFLAGS < 23);
+        for i in [
+            REG_R8, REG_R9, REG_R10, REG_RDI, REG_RSI, REG_RDX, REG_RAX, REG_RSP, REG_RIP,
+            REG_EFLAGS,
+        ] {
+            assert!(i < 23, "greg index {i} out of range");
+        }
+    }
+
+    #[test]
+    fn syscall_arg_regs_roundtrip_through_gregs() {
+        // Populating `gregs` at the positions dictated by the Linux
+        // mcontext ABI and reading them back through `RestoredRegs` must
+        // recover the exact values. This is the invariant that keeps the
+        // SA_RESTART+handler restart path intact across sigreturn.
+        let mut gregs = [0u64; 23];
+        gregs[REG_RAX] = 0xAA;
+        gregs[REG_RDI] = 0xD1;
+        gregs[REG_RSI] = 0x51;
+        gregs[REG_RDX] = 0xD2;
+        gregs[REG_R10] = 0x10;
+        gregs[REG_R8] = 0x08;
+        gregs[REG_R9] = 0x09;
+        // Indices must all be distinct so they don't alias.
+        assert_eq!(REG_RAX, 13);
+        assert_eq!(REG_RDI, 8);
+        assert_eq!(REG_RSI, 9);
+        assert_eq!(REG_RDX, 12);
+        assert_eq!(REG_R10, 2);
+        assert_eq!(REG_R8, 0);
+        assert_eq!(REG_R9, 1);
     }
 }

@@ -706,10 +706,29 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
 
     // Handle sigreturn: restore saved context from FORK_USER_* statics.
     if crate::arch::x86_64::syscall::SIGRETURN_PENDING.load(Ordering::Relaxed) != 0 {
-        crate::arch::x86_64::syscall::SIGRETURN_PENDING.store(0, Ordering::Relaxed);
-        (*ctx).user_rip = crate::arch::x86_64::syscall::FORK_USER_RIP.load(Ordering::Relaxed);
-        (*ctx).user_rflags = crate::arch::x86_64::syscall::FORK_USER_RFLAGS.load(Ordering::Relaxed);
-        (*ctx).user_rsp = crate::arch::x86_64::syscall::FORK_USER_RSP.load(Ordering::Relaxed);
+        use crate::arch::x86_64::syscall;
+        syscall::SIGRETURN_PENDING.store(0, Ordering::Relaxed);
+        (*ctx).user_rip = syscall::FORK_USER_RIP.load(Ordering::Relaxed);
+        (*ctx).user_rflags = syscall::FORK_USER_RFLAGS.load(Ordering::Relaxed);
+        (*ctx).user_rsp = syscall::FORK_USER_RSP.load(Ordering::Relaxed);
+        // When the SigFrame was pushed on a syscall-return path, the
+        // trampoline rewound rip to the SYSCALL insn before the handler
+        // ran. After sigreturn restores that rewound rip above, the
+        // SYSCALL insn must see the original (nr, a0..a5) in user GPRs
+        // — so repopulate the saved regs in ctx and arm the trampoline's
+        // restart-restore arm so they reach the user GPRs before SYSRETQ.
+        // Fault-delivered signals skip this (the flag stays 0) and leave
+        // ctx's arg-reg slots untouched, matching pre-#499 behavior.
+        if syscall::SIGRET_HAS_SYSCALL_ARGS.swap(0, Ordering::Relaxed) != 0 {
+            (*ctx).user_rax = syscall::SIGRET_USER_RAX.load(Ordering::Relaxed);
+            (*ctx).user_rdi = syscall::SIGRET_USER_RDI.load(Ordering::Relaxed);
+            (*ctx).user_rsi = syscall::SIGRET_USER_RSI.load(Ordering::Relaxed);
+            (*ctx).user_rdx = syscall::SIGRET_USER_RDX.load(Ordering::Relaxed);
+            (*ctx).user_r10 = syscall::SIGRET_USER_R10.load(Ordering::Relaxed);
+            (*ctx).user_r8 = syscall::SIGRET_USER_R8.load(Ordering::Relaxed);
+            (*ctx).user_r9 = syscall::SIGRET_USER_R9.load(Ordering::Relaxed);
+            syscall::SYSCALL_RESTART_PENDING.store(1, Ordering::Relaxed);
+        }
         // After sigreturn still check for any newly-pending signal.
     }
 
@@ -761,8 +780,19 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
     }
     let sig_for_delivery = signal_to_deliver(decision, popped.map(|(s, d, _)| (s, d)));
 
+    // True when the handler we're about to deliver rides on top of an
+    // SA_RESTART-style restart — i.e. rip was just rewound to the SYSCALL
+    // insn and the frame will carry the original syscall arg regs so
+    // sigreturn can replay them. Only this path sets UC_VIBIX_SYSCALL_REGS.
+    let is_restart_handler = matches!(
+        decision,
+        RestartDecision::Restart {
+            deliver_handler: true
+        }
+    );
+
     if let Some(sig) = sig_for_delivery {
-        deliver_signal(sig, &mut *ctx);
+        deliver_signal(sig, &mut *ctx, is_restart_handler);
     }
     rv_out
 }
@@ -772,7 +802,7 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
 ///
 /// # Safety
 /// `ctx` must point to valid kernel-stack-saved user context.
-unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
+unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, is_restart_handler: bool) {
     let task_id = crate::task::current_id();
 
     // Capture the pre-delivery mask and block the signal in one lock window.
@@ -816,12 +846,33 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
         }
         Disposition::Handler(handler_va) => {
             // Push signal frame onto the user stack and redirect SYSRETQ.
+            // Carry the syscall arg regs through the frame only on the
+            // SA_RESTART+handler restart path — the caller rewound rip to
+            // the SYSCALL insn, and on sigreturn those regs must replay.
+            // On a non-restart handler delivery, rip points past SYSCALL
+            // and gregs[REG_RAX] would have to hold the syscall rv instead
+            // of the nr for userspace to see the right value — that's a
+            // wider rework, deliberately out of scope.
+            let args = if is_restart_handler {
+                Some(frame::SyscallArgRegs {
+                    rax: ctx.user_rax,
+                    rdi: ctx.user_rdi,
+                    rsi: ctx.user_rsi,
+                    rdx: ctx.user_rdx,
+                    r10: ctx.user_r10,
+                    r8: ctx.user_r8,
+                    r9: ctx.user_r9,
+                })
+            } else {
+                None
+            };
             let new_user_rsp = match frame::push_signal_frame(
                 ctx.user_rsp,
                 sig,
                 ctx.user_rip,
                 ctx.user_rflags,
                 pre_block_mask,
+                args,
             ) {
                 Ok(sp) => sp,
                 Err(_) => {
@@ -870,6 +921,7 @@ pub unsafe fn sys_sigreturn(user_rsp: u64) -> SigReturnRegs {
                 rip: restored.rip,
                 rflags: restored.rflags,
                 rsp: restored.rsp,
+                syscall_args: restored.syscall_args,
             }
         }
         Err(_) => {
@@ -889,6 +941,16 @@ pub struct SigReturnRegs {
     pub rip: u64,
     pub rflags: u64,
     pub rsp: u64,
+    /// Syscall arg regs saved at signal-delivery time — `Some` only when
+    /// the frame was pushed on the syscall-return path (fault-delivered
+    /// signals push through `push_fault_signal_frame`, which doesn't have
+    /// the originating user GPRs available). When `Some`, the sigreturn
+    /// path restores these into the kernel-stack `SyscallReturnContext`
+    /// and arms `SYSCALL_RESTART_PENDING` so the syscall trampoline
+    /// reloads them into user GPRs before SYSRETQ. That's what lets an
+    /// SA_RESTART+handler restart re-execute SYSCALL with the original
+    /// `(nr, a0..a5)`.
+    pub syscall_args: Option<frame::SyscallArgRegs>,
 }
 
 // ── Host-side unit tests ──────────────────────────────────────────────────

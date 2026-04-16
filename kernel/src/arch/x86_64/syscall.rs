@@ -100,6 +100,35 @@ pub static FORK_USER_RSP: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static SIGRETURN_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// Set to 1 by the SIGRETURN dispatch arm when the SigFrame carried saved
+/// user syscall arg regs (i.e. was pushed on the syscall-return path).
+/// Tells `check_and_deliver_signals` to both repopulate ctx's arg-reg
+/// slots from the `SIGRET_USER_*` statics *and* arm `SYSCALL_RESTART_PENDING`.
+/// On a fault-delivered signal's sigreturn, this stays 0 and the arg-reg
+/// slots in ctx are left alone — avoiding a spurious zero-fill of user
+/// GPRs. Cleared after consumption.
+#[no_mangle]
+pub static SIGRET_HAS_SYSCALL_ARGS: AtomicU64 = AtomicU64::new(0);
+
+/// User syscall arg regs (rax/rdi/rsi/rdx/r10/r8/r9) shuttled from
+/// `sys_sigreturn` to `check_and_deliver_signals` so the sigreturn path
+/// can repopulate the kernel-stack `SyscallReturnContext` before SYSRETQ.
+/// Only meaningful when `SIGRET_HAS_SYSCALL_ARGS == 1`.
+#[no_mangle]
+pub static SIGRET_USER_RAX: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_RDI: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_RSI: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_RDX: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_R10: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_R8: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
+pub static SIGRET_USER_R9: AtomicU64 = AtomicU64::new(0);
+
 /// Set to 1 by `check_and_deliver_signals` when a bare syscall restart
 /// (no user handler) is about to occur. The syscall trampoline checks
 /// this flag after the signal hook returns: when set, the saved user
@@ -611,6 +640,18 @@ pub unsafe extern "C" fn syscall_dispatch(
             FORK_USER_RIP.store(restored.rip, Ordering::Relaxed);
             FORK_USER_RFLAGS.store(restored.rflags, Ordering::Relaxed);
             FORK_USER_RSP.store(restored.rsp, Ordering::Relaxed);
+            if let Some(args) = restored.syscall_args {
+                SIGRET_USER_RAX.store(args.rax, Ordering::Relaxed);
+                SIGRET_USER_RDI.store(args.rdi, Ordering::Relaxed);
+                SIGRET_USER_RSI.store(args.rsi, Ordering::Relaxed);
+                SIGRET_USER_RDX.store(args.rdx, Ordering::Relaxed);
+                SIGRET_USER_R10.store(args.r10, Ordering::Relaxed);
+                SIGRET_USER_R8.store(args.r8, Ordering::Relaxed);
+                SIGRET_USER_R9.store(args.r9, Ordering::Relaxed);
+                SIGRET_HAS_SYSCALL_ARGS.store(1, Ordering::Relaxed);
+            } else {
+                SIGRET_HAS_SYSCALL_ARGS.store(0, Ordering::Relaxed);
+            }
             SIGRETURN_PENDING.store(1, Ordering::Relaxed);
             0i64
         }
