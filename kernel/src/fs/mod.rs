@@ -199,6 +199,7 @@ pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const EINTR: i64 = -4;
 pub const EIO: i64 = -5;
+pub const ENXIO: i64 = -6;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;

@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::fs::{FileBackend, FileDescription, EAGAIN, EBADF, EINVAL, EPIPE};
+use crate::fs::{FileBackend, FileDescription, EAGAIN, EBADF, EINVAL, ENXIO, EPIPE};
 use crate::poll::{PollMask, PollTable, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 // On the kernel target use IrqLock (which saves/restores RFLAGS.IF).
@@ -180,6 +180,13 @@ pub struct Pipe {
     readers: AtomicUsize,
     /// Number of live write ends (decremented by `PipeWriteEnd::drop`).
     writers: AtomicUsize,
+    /// Open-rendezvous queues for FIFOs. `open_wait_r` parks an
+    /// `O_RDONLY` opener until a writer appears; `open_wait_w` parks
+    /// an `O_WRONLY` opener until a reader appears. Unused for
+    /// anonymous pipes (where both ends are created atomically by
+    /// `Pipe::new`).
+    open_wait_r: Arc<crate::poll::WaitQueue>,
+    open_wait_w: Arc<crate::poll::WaitQueue>,
 }
 
 impl Pipe {
@@ -191,7 +198,170 @@ impl Pipe {
             wr_wait: crate::poll::WaitQueue::new(),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
+            open_wait_r: crate::poll::WaitQueue::new(),
+            open_wait_w: crate::poll::WaitQueue::new(),
         })
+    }
+
+    /// Allocate an empty pipe for a FIFO (named pipe). Both refcounts
+    /// start at zero — each successful `open(2)` through
+    /// `open_read`/`open_write` increments its side's count, and each
+    /// `close(2)` (via `PipeReadEnd::drop` / `PipeWriteEnd::drop`)
+    /// decrements it.
+    pub fn new_for_fifo() -> Arc<Self> {
+        Arc::new(Pipe {
+            ring: PipeRing::new(),
+            rd_wait: crate::poll::WaitQueue::new(),
+            wr_wait: crate::poll::WaitQueue::new(),
+            readers: AtomicUsize::new(0),
+            writers: AtomicUsize::new(0),
+            open_wait_r: crate::poll::WaitQueue::new(),
+            open_wait_w: crate::poll::WaitQueue::new(),
+        })
+    }
+
+    /// FIFO rendezvous for `O_RDONLY`.
+    ///
+    /// POSIX §open:
+    /// * `O_NONBLOCK` clear: block until a writer opens the FIFO.
+    /// * `O_NONBLOCK` set: return immediately (success).
+    ///
+    /// On a signal during the block, returns
+    /// [`crate::tty::KERN_ERESTARTSYS`] and rolls back the provisional
+    /// reader count so the refcount never leaks.
+    pub fn open_read(self: &Arc<Self>, nonblocking: bool) -> Result<Arc<PipeReadEnd>, i64> {
+        // Provisionally count ourselves as a reader so a racing writer
+        // observes us via `writers > 0`-symmetric wake and the wake_all
+        // below reaches any writer already parked on open_wait_w.
+        self.readers.fetch_add(1, Ordering::AcqRel);
+        self.open_wait_w.wake_all();
+
+        if nonblocking || self.writers.load(Ordering::Acquire) > 0 {
+            return Ok(PipeReadEnd::new_arc(self.clone(), nonblocking));
+        }
+
+        // Blocking rendezvous: wait for a writer.
+        #[cfg(target_os = "none")]
+        {
+            loop {
+                let tid = crate::task::current_id();
+                let tok = self.open_wait_r.register_wait(tid);
+                // Re-check under the latch: a writer may have arrived
+                // between the wake_all above and register_wait.
+                if self.writers.load(Ordering::Acquire) > 0 {
+                    self.open_wait_r.cancel(tok);
+                    return Ok(PipeReadEnd::new_arc(self.clone(), nonblocking));
+                }
+                crate::task::block_current();
+                self.open_wait_r.cancel(tok);
+
+                if self.writers.load(Ordering::Acquire) > 0 {
+                    return Ok(PipeReadEnd::new_arc(self.clone(), nonblocking));
+                }
+
+                if crate::process::with_signal_state_for_task(tid, |s| s.pending != 0)
+                    .unwrap_or(false)
+                {
+                    // Roll back our provisional reader count so a later
+                    // retry sees a clean state, and wake any writer that
+                    // may have parked on us.
+                    let prev = self.readers.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        self.wr_wait.wake_all();
+                    }
+                    return Err(crate::tty::KERN_ERESTARTSYS);
+                }
+                // Spurious wake — loop back and re-park.
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            // Host tests don't exercise the blocking path; match the
+            // rest of this module's host-build behavior (no signals,
+            // no scheduler). Roll back the provisional reader count
+            // so test state stays consistent across calls.
+            let prev = self.readers.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                self.wr_wait.wake_all();
+            }
+            Err(EAGAIN)
+        }
+    }
+
+    /// FIFO rendezvous for `O_WRONLY`.
+    ///
+    /// POSIX §open:
+    /// * `O_NONBLOCK` clear: block until a reader opens the FIFO.
+    /// * `O_NONBLOCK` set: return `-ENXIO` if no reader is present.
+    ///
+    /// On a signal during the block, returns
+    /// [`crate::tty::KERN_ERESTARTSYS`] and rolls back the provisional
+    /// writer count so the refcount never leaks.
+    pub fn open_write(self: &Arc<Self>, nonblocking: bool) -> Result<Arc<PipeWriteEnd>, i64> {
+        if nonblocking && self.readers.load(Ordering::Acquire) == 0 {
+            return Err(ENXIO);
+        }
+
+        self.writers.fetch_add(1, Ordering::AcqRel);
+        self.open_wait_r.wake_all();
+
+        if self.readers.load(Ordering::Acquire) > 0 {
+            return Ok(PipeWriteEnd::new_arc(self.clone(), nonblocking));
+        }
+
+        // Blocking rendezvous: wait for a reader.
+        #[cfg(target_os = "none")]
+        {
+            loop {
+                let tid = crate::task::current_id();
+                let tok = self.open_wait_w.register_wait(tid);
+                if self.readers.load(Ordering::Acquire) > 0 {
+                    self.open_wait_w.cancel(tok);
+                    return Ok(PipeWriteEnd::new_arc(self.clone(), nonblocking));
+                }
+                crate::task::block_current();
+                self.open_wait_w.cancel(tok);
+
+                if self.readers.load(Ordering::Acquire) > 0 {
+                    return Ok(PipeWriteEnd::new_arc(self.clone(), nonblocking));
+                }
+
+                if crate::process::with_signal_state_for_task(tid, |s| s.pending != 0)
+                    .unwrap_or(false)
+                {
+                    let prev = self.writers.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        self.rd_wait.wake_all();
+                    }
+                    return Err(crate::tty::KERN_ERESTARTSYS);
+                }
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let prev = self.writers.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                self.rd_wait.wake_all();
+            }
+            Err(EAGAIN)
+        }
+    }
+
+    /// FIFO rendezvous for `O_RDWR` — Linux-compatible extension
+    /// beyond POSIX. Always succeeds immediately, returning a paired
+    /// `(PipeReadEnd, PipeWriteEnd)` that both refer to the same FIFO
+    /// body. Each increments its own refcount and wakes the peer's
+    /// rendezvous queue so any blocked `O_RDONLY` / `O_WRONLY` opener
+    /// observes progress.
+    pub fn open_rdwr(self: &Arc<Self>) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
+        self.readers.fetch_add(1, Ordering::AcqRel);
+        self.writers.fetch_add(1, Ordering::AcqRel);
+        self.open_wait_r.wake_all();
+        self.open_wait_w.wake_all();
+        (
+            PipeReadEnd::new_arc(self.clone(), false),
+            PipeWriteEnd::new_arc(self.clone(), false),
+        )
     }
 }
 
@@ -212,6 +382,10 @@ impl PipeReadEnd {
             pipe,
             nonblocking: AtomicBool::new(nonblocking),
         }
+    }
+
+    pub fn new_arc(pipe: Arc<Pipe>, nonblocking: bool) -> Arc<Self> {
+        Arc::new(Self::new(pipe, nonblocking))
     }
 }
 
@@ -309,6 +483,10 @@ impl PipeWriteEnd {
             pipe,
             nonblocking: AtomicBool::new(nonblocking),
         }
+    }
+
+    pub fn new_arc(pipe: Arc<Pipe>, nonblocking: bool) -> Arc<Self> {
+        Arc::new(Self::new(pipe, nonblocking))
     }
 }
 
@@ -696,5 +874,89 @@ mod tests {
         let read = PipeReadEnd::new(pipe.clone(), false);
         let _write = PipeWriteEnd::new(pipe, false);
         assert_eq!(read.read(&mut []), Ok(0));
+    }
+
+    // ── FIFO rendezvous ───────────────────────────────────────────────────
+
+    #[test]
+    fn fifo_new_starts_with_zero_ends() {
+        let fifo = Pipe::new_for_fifo();
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_open_nonblock_rdonly_succeeds_without_writer() {
+        let fifo = Pipe::new_for_fifo();
+        let r = fifo.open_read(/* nonblocking */ true).expect("open_read");
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 1);
+        drop(r);
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_open_nonblock_wronly_enxio_without_reader() {
+        let fifo = Pipe::new_for_fifo();
+        let e = fifo.open_write(/* nonblocking */ true).unwrap_err();
+        assert_eq!(e, ENXIO);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_open_nonblock_wronly_ok_with_reader() {
+        let fifo = Pipe::new_for_fifo();
+        let r = fifo.open_read(true).expect("open_read");
+        let w = fifo.open_write(true).expect("open_write");
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 1);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 1);
+        drop(w);
+        drop(r);
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_open_rdwr_always_succeeds_both_counts_one() {
+        let fifo = Pipe::new_for_fifo();
+        let (r, w) = fifo.open_rdwr();
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 1);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 1);
+        drop(w);
+        drop(r);
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_read_write_roundtrip_via_shared_pipe() {
+        let fifo = Pipe::new_for_fifo();
+        let r = fifo.open_read(true).expect("open_read");
+        let w = fifo.open_write(true).expect("open_write");
+        assert_eq!(w.write(b"hello"), Ok(5));
+        let mut buf = [0u8; 16];
+        let n = r.read(&mut buf).expect("read");
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn fifo_blocking_rdonly_without_writer_returns_eagain_on_host() {
+        // On host (no scheduler), the blocking path bails out to EAGAIN
+        // after provisionally incrementing then rolling back the reader
+        // count. Asserts the rollback — counts must be zero again.
+        let fifo = Pipe::new_for_fifo();
+        let e = fifo.open_read(/* nonblocking */ false).unwrap_err();
+        assert_eq!(e, EAGAIN);
+        assert_eq!(fifo.readers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fifo_blocking_wronly_without_reader_returns_eagain_on_host() {
+        // Mirror of the read-side host test. When `open_write` is called
+        // without O_NONBLOCK and there is no reader, the provisional
+        // writer increment must be rolled back before returning.
+        let fifo = Pipe::new_for_fifo();
+        let e = fifo.open_write(/* nonblocking */ false).unwrap_err();
+        assert_eq!(e, EAGAIN);
+        assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
     }
 }
