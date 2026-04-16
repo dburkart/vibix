@@ -155,6 +155,18 @@ fn stack_top() -> u64 {
 /// - `stack_top` must point to a mapped, writable user-space page.
 /// - `setup_ring3_stacks` must have been called so TSS.rsp[0] is valid.
 pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
+    // #478 diagnostic: log the exact IRETQ frame values at the last
+    // kernel-side instruction before the ring-0→ring-3 transition, so
+    // smoke can tell a silent #GP/#PF from a pre-IRETQ failure when the
+    // userspace "init: hello from pid 1" marker goes missing.
+    crate::serial_println!(
+        "ring3-iretq: rip={:#x} rsp={:#x} cs={:#x} ss={:#x} rflags={:#x}",
+        entry,
+        stack_top,
+        USER_CODE_SELECTOR,
+        USER_DATA_SELECTOR,
+        0x202u64,
+    );
     core::arch::asm!(
         "push {ss}",      // SS  = user data selector (stack segment)
         "push {sp}",      // RSP = user stack top

@@ -88,6 +88,16 @@ const SMOKE_MARKERS: &[&str] = &[
     // "init: hello from pid 1" doesn't, the regression is in the ring-3
     // return path or the first userspace write, not kernel init.
     "init: iretq to ring-3",
+    // #478 diagnostic: printed from `jump_to_ring3` just before the
+    // `iretq` instruction with the full IRETQ frame (RIP/RSP/CS/SS/
+    // RFLAGS). If this is absent in a failing run, the kernel never
+    // reached the ring-3 return path at all — the regression is on
+    // the scheduling/init-process side. If present but
+    // `init: hello from pid 1` is missing, either the `iretq` itself
+    // or the first userspace instruction faulted (see the
+    // `ring3-first-fault:` diagnostic line emitted by the IDT fault
+    // handlers in that case).
+    "ring3-iretq: rip=",
     "init: hello from pid 1",
 ];
 
