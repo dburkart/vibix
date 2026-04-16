@@ -21,6 +21,7 @@
 //! `OpenFile`) when the flag is set. No special handling is needed here.
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use crate::fs::{flags as oflags, FileBackend, EINVAL, EOVERFLOW};
 
@@ -69,7 +70,12 @@ impl FileBackend for VfsBackend {
         // POSIX O_APPEND: under the offset mutex (which also serialises
         // writes through dup'd fds that share this open-file description),
         // snap the write position to end-of-file before dispatching.
-        let write_off = if self.open_file.flags & oflags::O_APPEND != 0 {
+        // Read the current O_APPEND state under the offset mutex. Using
+        // Relaxed is safe: the mutex serialises writers through this open-
+        // file description, so no acquire fence is needed to see the flag
+        // a concurrent `fcntl(F_SETFL)` just published — the next write
+        // picks it up, which is all POSIX guarantees.
+        let write_off = if self.open_file.flags.load(Ordering::Relaxed) & oflags::O_APPEND != 0 {
             self.open_file.inode.meta.read().size
         } else {
             *off
@@ -107,6 +113,31 @@ impl FileBackend for VfsBackend {
     fn getdents64(&self, buf: &mut [u8]) -> Result<usize, i64> {
         let mut off = self.open_file.offset.lock();
         self.open_file.ops.getdents(&self.open_file, buf, &mut *off)
+    }
+
+    /// Propagate a `fcntl(F_SETFL)` update into the underlying `OpenFile`.
+    ///
+    /// CAS-swaps only `O_APPEND | O_NONBLOCK | O_ASYNC` into the shared
+    /// `OpenFile.flags` atomic, preserving the access mode and creation-
+    /// time bits. The matching bits on `FileDescription.flags` are already
+    /// set by `FileDescTable::set_status_flags` — this hook exists so the
+    /// `O_APPEND` check in `write` (which reads `OpenFile.flags`, not the
+    /// description's copy) sees the new value on the very next write.
+    fn set_flags(&self, new_flags: u32) {
+        let mutable = oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_ASYNC;
+        let mut cur = self.open_file.flags.load(Ordering::Relaxed);
+        loop {
+            let next = (cur & !mutable) | (new_flags & mutable);
+            match self.open_file.flags.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 }
 
@@ -455,6 +486,97 @@ mod tests {
         // Child sees the same offset via its own fd — via the shared OpenFile.
         assert!(child.get(fd).is_ok());
         assert_eq!(*of.offset.lock(), 42);
+    }
+
+    #[test]
+    fn set_flags_toggles_o_append_and_affects_next_write() {
+        // Open without O_APPEND → first write lands at the tracked offset;
+        // set_flags(O_APPEND) → next write snaps to EOF.
+        let ops = Arc::new(RecordingWriteOps {
+            last_off: AtomicU64::new(0),
+        });
+        let of = make_open_file_with_ops_flags_meta(
+            ops.clone(),
+            0,
+            InodeMeta {
+                size: 100,
+                ..Default::default()
+            },
+        );
+        *of.offset.lock() = 7;
+        let backend = VfsBackend {
+            open_file: of.clone(),
+        };
+        backend.write(b"xyz").expect("write");
+        assert_eq!(ops.last_off.load(Ordering::SeqCst), 7);
+
+        // Reset the offset, flip O_APPEND on via set_flags (the path
+        // F_SETFL takes), and confirm the next write goes to EOF instead.
+        *of.offset.lock() = 0;
+        backend.set_flags(flags::O_APPEND);
+        backend.write(b"abcd").expect("write");
+        assert_eq!(
+            ops.last_off.load(Ordering::SeqCst),
+            100,
+            "F_SETFL(O_APPEND) must make the next write snap to inode size"
+        );
+    }
+
+    #[test]
+    fn set_flags_preserves_access_mode_bits() {
+        // Construct an OpenFile with O_RDWR | O_APPEND already set. A
+        // set_flags call that only passes O_NONBLOCK must clear O_APPEND
+        // (not in the new mask) but leave O_RDWR untouched.
+        let ops = Arc::new(CountingOps { fill_byte: 0 });
+        let of =
+            make_open_file_with_ops_flags(ops, flags::O_RDWR | flags::O_APPEND | flags::O_CLOEXEC);
+        let backend = VfsBackend {
+            open_file: of.clone(),
+        };
+        backend.set_flags(flags::O_NONBLOCK);
+        let post = of.flags.load(Ordering::Relaxed);
+        assert_eq!(post & flags::O_ACCMODE, flags::O_RDWR, "access mode kept");
+        assert_eq!(post & flags::O_APPEND, 0, "O_APPEND cleared");
+        assert_eq!(
+            post & flags::O_NONBLOCK,
+            flags::O_NONBLOCK,
+            "O_NONBLOCK set"
+        );
+        assert_eq!(
+            post & flags::O_CLOEXEC,
+            flags::O_CLOEXEC,
+            "O_CLOEXEC is not a mutable status bit"
+        );
+    }
+
+    #[test]
+    fn set_status_flags_propagates_to_vfs_backend() {
+        // End-to-end through FileDescTable: allocate a fd backed by
+        // VfsBackend, call set_status_flags(O_APPEND), confirm
+        // OpenFile.flags carries O_APPEND afterwards.
+        let ops = Arc::new(RecordingWriteOps {
+            last_off: AtomicU64::new(0),
+        });
+        let of = make_open_file_with_ops_flags_meta(
+            ops.clone(),
+            flags::O_RDWR,
+            InodeMeta {
+                size: 50,
+                ..Default::default()
+            },
+        );
+        let backend = Arc::new(VfsBackend {
+            open_file: of.clone(),
+        }) as Arc<dyn FileBackend>;
+        let mut t = FileDescTable::new();
+        let desc = Arc::new(FileDescription::new(backend, flags::O_RDWR));
+        let fd = t.alloc_fd(desc).expect("alloc_fd");
+        t.set_status_flags(fd, flags::O_APPEND)
+            .expect("set_status_flags");
+        // OpenFile.flags carries the updated status bits — not stale.
+        let post = of.flags.load(Ordering::Relaxed);
+        assert_eq!(post & flags::O_APPEND, flags::O_APPEND);
+        assert_eq!(post & flags::O_ACCMODE, flags::O_RDWR, "access mode kept");
     }
 
     #[test]

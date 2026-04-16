@@ -22,14 +22,19 @@
 //!
 //! `FileBackend::read/write` don't receive the open-file flags, so each
 //! backend stores its own `nonblocking` flag at construction time.
-//! A future `fcntl(F_SETFL)` implementation must update both the
-//! `FileDescription.flags` field and `PipeReadEnd/PipeWriteEnd.nonblocking`.
+//! `fcntl(F_SETFL)` propagates into the pipe ends via
+//! [`FileBackend::set_flags`], which mirrors the `O_NONBLOCK` bit from the
+//! description's flag word into the local `nonblocking` atomic so the next
+//! `read`/`write` sees the new state without having to look the flag up
+//! through the description on every call.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::fs::{FileBackend, FileDescription, EAGAIN, EBADF, EINVAL, ENXIO, EPIPE};
+use crate::fs::{
+    flags as oflags, FileBackend, FileDescription, EAGAIN, EBADF, EINVAL, ENXIO, EPIPE,
+};
 use crate::poll::{PollMask, PollTable, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 // On the kernel target use IrqLock (which saves/restores RFLAGS.IF).
@@ -465,6 +470,14 @@ impl FileBackend for PipeReadEnd {
         }
         mask
     }
+
+    /// Mirror `O_NONBLOCK` from the description's post-update flag word
+    /// into the local `nonblocking` atomic. Other bits (`O_APPEND`,
+    /// `O_ASYNC`) are ignored — they have no meaning on a pipe read end.
+    fn set_flags(&self, new_flags: u32) {
+        self.nonblocking
+            .store(new_flags & oflags::O_NONBLOCK != 0, Ordering::Relaxed);
+    }
 }
 
 // ── PipeWriteEnd ───────────────────────────────────────────────────────────
@@ -602,6 +615,14 @@ impl FileBackend for PipeWriteEnd {
             mask |= POLLOUT | POLLWRNORM;
         }
         mask
+    }
+
+    /// Mirror `O_NONBLOCK` from the description's post-update flag word
+    /// into the local `nonblocking` atomic. `O_APPEND`/`O_ASYNC` have no
+    /// meaning on a pipe write end and are ignored.
+    fn set_flags(&self, new_flags: u32) {
+        self.nonblocking
+            .store(new_flags & oflags::O_NONBLOCK != 0, Ordering::Relaxed);
     }
 }
 
@@ -967,5 +988,57 @@ mod tests {
         };
         assert_eq!(e, EAGAIN);
         assert_eq!(fifo.writers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pipe_set_flags_toggles_read_nonblocking() {
+        // Build a blocking read end, call set_flags(O_NONBLOCK) the way
+        // F_SETFL does, then confirm read() on an empty pipe returns
+        // EAGAIN instead of parking the caller.
+        let pipe = Pipe::new();
+        let read = PipeReadEnd::new(pipe.clone(), false);
+        let _write = PipeWriteEnd::new(pipe, false);
+        read.set_flags(oflags::O_NONBLOCK);
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            read.read(&mut buf),
+            Err(EAGAIN),
+            "F_SETFL(O_NONBLOCK) must flip the backend into non-blocking mode"
+        );
+        // Flip it back off — the nonblocking atomic must clear so the
+        // backend would block again (host test can't park, but we can
+        // at least confirm the atomic state changed).
+        read.set_flags(0);
+        assert!(!read.nonblocking.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pipe_set_flags_toggles_write_nonblocking() {
+        // Fill the ring, then flip the write end to non-blocking via
+        // set_flags. A further write must return EAGAIN (or a partial
+        // count) rather than blocking.
+        let pipe = Pipe::new();
+        let _read = PipeReadEnd::new(pipe.clone(), false);
+        let write = PipeWriteEnd::new(pipe, false);
+        // Fill the ring to capacity - 1.
+        let big = vec![0u8; PIPE_CAPACITY - 1];
+        assert_eq!(write.write(&big), Ok(PIPE_CAPACITY - 1));
+        write.set_flags(oflags::O_NONBLOCK);
+        // Write would block without O_NONBLOCK; with it we must get EAGAIN.
+        assert_eq!(write.write(b"x"), Err(EAGAIN));
+    }
+
+    #[test]
+    fn pipe_set_flags_ignores_non_o_nonblock_bits() {
+        // Ensure O_APPEND/O_ASYNC don't somehow flip the nonblocking
+        // atomic — they have no meaning on a pipe.
+        let pipe = Pipe::new();
+        let read = PipeReadEnd::new(pipe.clone(), false);
+        let _write = PipeWriteEnd::new(pipe, false);
+        read.set_flags(oflags::O_APPEND | oflags::O_ASYNC);
+        assert!(
+            !read.nonblocking.load(Ordering::Relaxed),
+            "only O_NONBLOCK should set nonblocking"
+        );
     }
 }

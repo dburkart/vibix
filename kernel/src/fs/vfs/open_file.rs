@@ -11,7 +11,7 @@
 
 use alloc::sync::Arc;
 use core::mem;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::sync::BlockingMutex;
 
@@ -27,7 +27,13 @@ pub struct OpenFile {
     /// Serialises `read`/`write`/`lseek` offset mutation — matches
     /// POSIX "one offset per open file description" semantics.
     pub offset: BlockingMutex<u64>,
-    pub flags: u32,
+    /// Open-file status flags. Interior-mutable so `fcntl(F_SETFL)` can
+    /// flip `O_APPEND`/`O_NONBLOCK`/`O_ASYNC` and have the change become
+    /// visible to every dup'd fd that shares this `Arc<OpenFile>` — POSIX
+    /// requires it. Read on every `write` (for the `O_APPEND` snap-to-EOF
+    /// check) with `Relaxed` ordering; the write-path offset mutex already
+    /// serialises writers through the same open-file description.
+    pub flags: AtomicU32,
     pub ops: Arc<dyn FileOps>,
     pub sb: Arc<SuperBlock>,
 }
@@ -56,7 +62,7 @@ impl OpenFile {
             dentry,
             inode,
             offset: BlockingMutex::new(0),
-            flags,
+            flags: AtomicU32::new(flags),
             ops,
             sb,
         })
