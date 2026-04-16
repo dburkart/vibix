@@ -99,10 +99,7 @@ pub fn encode<'b>(payload: &[u8], out: &'b mut [u8]) -> &'b [u8] {
 /// `$` and `#`, matching the RSP spec and the encoder above. Only
 /// after the checksum succeeds is the payload unescaped into
 /// `scratch`.
-pub fn decode<'s>(
-    raw: &[u8],
-    scratch: &'s mut [u8],
-) -> Result<(Packet<'s>, usize), DecodeError> {
+pub fn decode<'s>(raw: &[u8], scratch: &'s mut [u8]) -> Result<(Packet<'s>, usize), DecodeError> {
     if raw.is_empty() {
         return Err(DecodeError::Incomplete);
     }
@@ -249,7 +246,10 @@ mod tests {
     #[test]
     fn decode_bad_checksum() {
         let mut scratch = [0u8; 16];
-        assert_eq!(decode(b"$OK#00", &mut scratch), Err(DecodeError::BadChecksum));
+        assert_eq!(
+            decode(b"$OK#00", &mut scratch),
+            Err(DecodeError::BadChecksum)
+        );
     }
 
     #[test]
