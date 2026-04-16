@@ -155,14 +155,21 @@ global_asm!(
     "mov rdi, rsp",
     // rsi = &HwFrame (just above the 15 GPR pushes = 120 bytes)
     "lea rsi, [rsp + 15*8]",
-    // Align stack to 16 bytes across the call. System V requires
-    // rsp % 16 == 0 at the `call` instruction (call then pushes the
-    // 8-byte return address, so inside the callee rsp % 16 == 8).
-    // After the 15 GPR pushes (120 bytes) on top of the 5 hw pushes
-    // (40 bytes), rsp % 16 == 8 — one 8-byte sub gets us to 0.
-    "sub rsp, 8",
+    // Normalize the trap context before entering SysV Rust. An int3
+    // can fire at any instruction, so the interrupted rsp has unknown
+    // alignment mod 16 — we can't just bias by a fixed constant. Stash
+    // the live stack pointer in rbx (callee-saved, so Rust will preserve
+    // it across the call; the caller's rbx is already saved on the stack
+    // from the GPR-push block above), clear DF (SysV requires DF=0 at
+    // function entry; int3 inherits whatever DF was set at the trap),
+    // then `and rsp, -16` forces rsp % 16 == 0 at the call site. The
+    // saved-rsp restore after the call puts the pointer back on top of
+    // the GPR block so the pops unwind the right slots.
+    "mov rbx, rsp",
+    "cld",
+    "and rsp, -16",
     "call gdb_breakpoint_entry",
-    "add rsp, 8",
+    "mov rsp, rbx",
     // Restore in reverse order (low→high).
     "pop rax",
     "pop rbx",
