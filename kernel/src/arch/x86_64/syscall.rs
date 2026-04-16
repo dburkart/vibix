@@ -327,9 +327,12 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // dup(oldfd)
         DUP => {
-            let oldfd = a0 as u32;
+            let oldfd = a0 as i32;
+            if oldfd < 0 {
+                return crate::fs::EBADF;
+            }
             let tbl = crate::task::current_fd_table();
-            let result = tbl.lock().dup(oldfd);
+            let result = tbl.lock().dup(oldfd as u32);
             match result {
                 Ok(newfd) => newfd as i64,
                 Err(e) => e,
@@ -434,10 +437,13 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // dup2(oldfd, newfd)
         DUP2 => {
-            let oldfd = a0 as u32;
-            let newfd = a1 as u32;
+            let oldfd = a0 as i32;
+            let newfd = a1 as i32;
+            if oldfd < 0 || newfd < 0 {
+                return crate::fs::EBADF;
+            }
             let tbl = crate::task::current_fd_table();
-            let result = tbl.lock().dup2(oldfd, newfd);
+            let result = tbl.lock().dup2(oldfd as u32, newfd as u32);
             match result {
                 Ok(fd) => fd as i64,
                 Err(e) => e,

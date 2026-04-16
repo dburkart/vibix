@@ -10,6 +10,7 @@
 //!   touching the source fd's per-fd flags.
 //! - `dup3(_, _, unknown_flag)` returns `EINVAL`.
 //! - `dup`/`dup2`/`dup3` on a closed `oldfd` return `EBADF`.
+//! - `dup`/`dup2`/`dup3` on a negative fd return `EBADF` (not EINVAL).
 
 #![no_std]
 #![no_main]
@@ -297,7 +298,10 @@ fn dup_family_ebadf_on_closed() {
     assert_eq!(dup(9999), EBADF);
     assert_eq!(dup2(9999, 5), EBADF);
     assert_eq!(dup3(9999, 5, 0), EBADF);
-    // Linux returns EBADF (not EINVAL) for negative fds on dup3.
+    // Linux returns EBADF (not EINVAL) for negative fds across the dup family.
+    assert_eq!(dup(-1), EBADF);
+    assert_eq!(dup2(-1, 5), EBADF);
+    assert_eq!(dup2(3, -1), EBADF);
     assert_eq!(dup3(-1, 5, 0), EBADF);
     assert_eq!(dup3(3, -1, 0), EBADF);
 }
