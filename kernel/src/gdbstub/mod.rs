@@ -14,13 +14,38 @@
 //! a `gdbstub` shell builtin.
 
 pub mod framer;
+pub mod regs;
 pub mod transport;
 
 #[cfg(target_os = "none")]
 pub mod uart;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use framer::{DecodeError, ACK, EOP, MAX_PACKET, NAK, SOP};
+use regs::{GdbRegs, GDB_REGS_HEX};
 use transport::Transport;
+
+/// The int3 (#BP) handler consults this before diverting into the stub
+/// loop. Default-off so every existing kernel `int3` site (panic paths,
+/// test-harness markers, speculative breakpoints) keeps its prior
+/// behavior until something explicitly arms the stub.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arm the stub — the next #BP will drop into [`debug_entry_with_regs`].
+pub fn arm() {
+    ARMED.store(true, Ordering::Release);
+}
+
+/// Disarm the stub; #BP returns to normal semantics.
+pub fn disarm() {
+    ARMED.store(false, Ordering::Release);
+}
+
+/// Whether the int3 handler should divert into the stub on the next #BP.
+pub fn is_armed() -> bool {
+    ARMED.load(Ordering::Acquire)
+}
 
 /// The canned `S05` stop reason — SIGTRAP — we hand back on `?` until
 /// we wire real exception info through in the follow-up.
@@ -40,6 +65,15 @@ const CTRL_C: u8 = 0x03;
 /// [`Com1PollingTransport`](uart::Com1PollingTransport) and calls
 /// through here.
 pub fn debug_entry<T: Transport>(t: &mut T) {
+    let mut regs = GdbRegs::default();
+    debug_entry_with_regs(t, &mut regs);
+}
+
+/// Like [`debug_entry`] but with a caller-owned register snapshot.
+/// The stub reads `regs` for `g` replies and writes into it on `G` —
+/// the caller is responsible for pushing mutated values back into
+/// the hardware interrupt frame on resume.
+pub fn debug_entry_with_regs<T: Transport>(t: &mut T, regs: &mut GdbRegs) {
     // Wire buffer holds the full escaped packet (worst-case 2x payload
     // plus framing). `scratch` receives the unescaped payload that
     // `framer::decode` hands back as `Packet::payload`.
@@ -53,7 +87,7 @@ pub fn debug_entry<T: Transport>(t: &mut T) {
                 match framer::decode(&inbuf[..len], &mut scratch) {
                     Ok((pkt, _)) => {
                         t.write_byte(ACK);
-                        match dispatch(t, pkt.payload) {
+                        match dispatch(t, pkt.payload, regs) {
                             Action::Continue => {}
                             Action::Detach => return,
                         }
@@ -134,7 +168,7 @@ fn read_packet<T: Transport>(t: &mut T, buf: &mut [u8]) -> Result<usize, ReadErr
 
 /// Handle a single decoded packet payload. Emits the response frame
 /// via `t.write_byte` and returns whether the session should continue.
-fn dispatch<T: Transport>(t: &mut T, payload: &[u8]) -> Action {
+fn dispatch<T: Transport>(t: &mut T, payload: &[u8], regs: &mut GdbRegs) -> Action {
     match payload.first() {
         Some(b'?') => {
             send_packet(t, &stop_reply_buf(SIG_TRAP));
@@ -143,6 +177,20 @@ fn dispatch<T: Transport>(t: &mut T, payload: &[u8]) -> Action {
         Some(b'D') => {
             send_packet(t, b"OK");
             Action::Detach
+        }
+        Some(b'g') => {
+            let mut hex = [0u8; GDB_REGS_HEX];
+            let blob = regs::encode_g(regs, &mut hex);
+            send_packet(t, blob);
+            Action::Continue
+        }
+        Some(b'G') => {
+            // Payload is `G<hex...>`; strip the leading command byte.
+            match regs::decode_g(&payload[1..], regs) {
+                Ok(()) => send_packet(t, b"OK"),
+                Err(_) => send_packet(t, b"E00"),
+            }
+            Action::Continue
         }
         _ => {
             // Unknown command: RSP convention says reply with an empty
