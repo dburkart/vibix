@@ -267,3 +267,7 @@ harness = false
 [[test]]
 name = "gdbstub_loop"
 harness = false
+
+[[test]]
+name = "signal_sarestart_handler_regs"
+harness = false
