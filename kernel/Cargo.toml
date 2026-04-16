@@ -251,3 +251,7 @@ harness = false
 [[test]]
 name = "tty_sigttin_read"
 harness = false
+
+[[test]]
+name = "shell_help"
+harness = false
