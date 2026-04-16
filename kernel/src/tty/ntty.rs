@@ -123,7 +123,6 @@ impl LineBuffer {
     fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len]
     }
-
 }
 
 struct RawRing {
