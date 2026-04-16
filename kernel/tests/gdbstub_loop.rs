@@ -11,7 +11,11 @@ extern crate alloc;
 use core::panic::PanicInfo;
 use vibix::{
     exit_qemu,
-    gdbstub::{debug_entry, framer, transport::VecTransport},
+    gdbstub::{
+        debug_entry, debug_entry_with_regs, framer,
+        regs::{GdbRegs, GDB_REGS_HEX},
+        transport::VecTransport,
+    },
     serial_println,
     test_harness::{test_panic_handler, Testable},
     QemuExitCode,
@@ -35,6 +39,8 @@ fn run_tests() {
         ("framer_checksum", &(framer_checksum as fn())),
         ("question_then_detach", &(question_then_detach as fn())),
         ("unknown_returns_empty", &(unknown_returns_empty as fn())),
+        ("g_reply_is_hex_blob", &(g_reply_is_hex_blob as fn())),
+        ("big_g_writes_regs", &(big_g_writes_regs as fn())),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -58,10 +64,61 @@ fn question_then_detach() {
 }
 
 fn unknown_returns_empty() {
-    let mut t = VecTransport::with_rx(b"$g#67$D#44");
+    // `q` with no sub-command is not implemented → empty reply.
+    // checksum('q') = 0x71.
+    let mut t = VecTransport::with_rx(b"$q#71$D#44");
     debug_entry(&mut t);
     assert!(find(&t.tx, b"$#00").is_some(), "missing empty reply");
     assert!(find(&t.tx, b"$OK#9a").is_some(), "missing detach reply");
+}
+
+fn g_reply_is_hex_blob() {
+    // `g` = read all registers. checksum('g') = 0x67.
+    // With a default (all-zero) GdbRegs, the reply payload is
+    // `GDB_REGS_HEX` ASCII '0's framed as `$<hex>#<xx>`.
+    let mut t = VecTransport::with_rx(b"$g#67$D#44");
+    let mut regs = GdbRegs::default();
+    debug_entry_with_regs(&mut t, &mut regs);
+
+    // Find the `$` that starts the `g` reply, then verify its payload
+    // is exactly GDB_REGS_HEX bytes of lowercase '0'.
+    let start = find(&t.tx, b"$").expect("no outbound frame");
+    let hash = start + 1 + GDB_REGS_HEX;
+    assert!(
+        t.tx.len() > hash + 2,
+        "tx too short: {} bytes, need >{}",
+        t.tx.len(),
+        hash + 2
+    );
+    assert_eq!(t.tx[hash], b'#', "EOP not at expected offset");
+    for (k, &b) in t.tx[start + 1..hash].iter().enumerate() {
+        assert_eq!(b, b'0', "non-zero at offset {k} in g reply");
+    }
+    assert!(find(&t.tx, b"$OK#9a").is_some(), "missing detach reply");
+}
+
+fn big_g_writes_regs() {
+    // Build a `G<hex>` packet whose hex blob sets rax=0x1 (all other
+    // fields zero), then verify the stub ack'd with `OK` and actually
+    // mutated the caller's regs.
+    let mut payload = [b'0'; 1 + GDB_REGS_HEX];
+    payload[0] = b'G';
+    // rax LE first byte = 01 → hex "01" at [1..3].
+    payload[2] = b'1';
+    // Worst-case encoded size is 2 * payload.len() + 4 (none of our
+    // bytes need escaping, but framer::encode enforces that cap).
+    let mut frame = [0u8; 2 * (1 + GDB_REGS_HEX) + 4];
+    let wire = framer::encode(&payload, &mut frame);
+
+    let mut t = VecTransport::new();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+
+    let mut regs = GdbRegs::default();
+    debug_entry_with_regs(&mut t, &mut regs);
+    assert_eq!(regs.rax, 0x01, "G did not write rax");
+    assert!(find(&t.tx, b"$OK#9a").is_some(), "missing OK reply");
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
