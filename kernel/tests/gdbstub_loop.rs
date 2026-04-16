@@ -42,6 +42,13 @@ fn run_tests() {
         ("g_reply_is_hex_blob", &(g_reply_is_hex_blob as fn())),
         ("big_g_writes_regs", &(big_g_writes_regs as fn())),
         ("big_g_writes_rax", &(big_g_writes_rax as fn())),
+        ("m_reads_known_bytes", &(m_reads_known_bytes as fn())),
+        ("m_unmapped_returns_e01", &(m_unmapped_returns_e01 as fn())),
+        ("big_m_writes_buffer", &(big_m_writes_buffer as fn())),
+        (
+            "big_m_unmapped_returns_e01",
+            &(big_m_unmapped_returns_e01 as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -149,6 +156,147 @@ fn big_g_writes_rax() {
     debug_entry_with_regs(&mut t, &mut regs);
     assert_eq!(regs.rax, 0x01, "G must write rax");
     assert!(find(&t.tx, b"$OK#9a").is_some(), "missing OK reply");
+}
+
+fn m_reads_known_bytes() {
+    // Put a known pattern on the stack. The test function's stack is
+    // mapped and readable, so `m` must succeed.
+    let buf: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+    let addr = buf.as_ptr() as usize as u64;
+
+    // Build `m <addr>,4` packet.
+    let mut req = alloc::vec::Vec::new();
+    req.push(b'm');
+    // Lowercase hex addr, no 0x prefix.
+    push_hex_u64(&mut req, addr);
+    req.push(b',');
+    req.push(b'4');
+
+    let mut frame = [0u8; 64];
+    let wire = framer::encode(&req, &mut frame);
+
+    let mut t = VecTransport::new();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+    // Detach after.
+    let mut detach = [0u8; 8];
+    for &b in framer::encode(b"D", &mut detach) {
+        t.rx.push_back(b);
+    }
+
+    debug_entry(&mut t);
+    assert!(
+        find(&t.tx, b"$deadbeef#").is_some(),
+        "expected hex-encoded bytes in reply, got {:?}",
+        core::str::from_utf8(&t.tx).unwrap_or("<non-utf8>")
+    );
+}
+
+fn m_unmapped_returns_e01() {
+    // Lower-half address well past anything the kernel maps.
+    let mut t = VecTransport::with_rx(b"$m6000000000,4#00$D#44");
+    // The checksum on the `m` packet doesn't matter — decode failure
+    // would NAK, but let's make it plausible anyway:
+    let mut req = alloc::vec::Vec::new();
+    req.extend_from_slice(b"m6000000000,4");
+    let mut frame = [0u8; 32];
+    let wire = framer::encode(&req, &mut frame);
+    t.rx.clear();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+    let mut detach = [0u8; 8];
+    for &b in framer::encode(b"D", &mut detach) {
+        t.rx.push_back(b);
+    }
+
+    debug_entry(&mut t);
+    assert!(
+        find(&t.tx, b"$E01#").is_some(),
+        "expected E01 for unmapped read, got {:?}",
+        core::str::from_utf8(&t.tx).unwrap_or("<non-utf8>")
+    );
+}
+
+fn big_m_writes_buffer() {
+    let mut buf: [u8; 4] = [0; 4];
+    let addr = buf.as_mut_ptr() as usize as u64;
+
+    let mut req = alloc::vec::Vec::new();
+    req.push(b'M');
+    push_hex_u64(&mut req, addr);
+    req.push(b',');
+    req.push(b'4');
+    req.push(b':');
+    req.extend_from_slice(b"cafebabe");
+
+    let mut frame = [0u8; 64];
+    let wire = framer::encode(&req, &mut frame);
+
+    let mut t = VecTransport::new();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+    let mut detach = [0u8; 8];
+    for &b in framer::encode(b"D", &mut detach) {
+        t.rx.push_back(b);
+    }
+
+    debug_entry(&mut t);
+    assert!(
+        find(&t.tx, b"$OK#9a").is_some(),
+        "expected OK for valid M, got {:?}",
+        core::str::from_utf8(&t.tx).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        buf,
+        [0xca, 0xfe, 0xba, 0xbe],
+        "M did not land in the target buffer"
+    );
+}
+
+fn big_m_unmapped_returns_e01() {
+    let mut req = alloc::vec::Vec::new();
+    req.extend_from_slice(b"M6000000000,2:abcd");
+    // Worst-case frame size = 2 * payload + 4 framing bytes.
+    let mut frame = [0u8; 64];
+    let wire = framer::encode(&req, &mut frame);
+
+    let mut t = VecTransport::new();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+    let mut detach = [0u8; 8];
+    for &b in framer::encode(b"D", &mut detach) {
+        t.rx.push_back(b);
+    }
+
+    debug_entry(&mut t);
+    assert!(
+        find(&t.tx, b"$E01#").is_some(),
+        "expected E01 for unmapped write, got {:?}",
+        core::str::from_utf8(&t.tx).unwrap_or("<non-utf8>")
+    );
+}
+
+fn push_hex_u64(out: &mut alloc::vec::Vec<u8>, mut v: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    // Count nibbles, emit high→low.
+    let mut buf = [0u8; 16];
+    let mut i = 0;
+    while v != 0 {
+        buf[i] = HEX[(v & 0xF) as usize];
+        v >>= 4;
+        i += 1;
+    }
+    for j in (0..i).rev() {
+        out.push(buf[j]);
+    }
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

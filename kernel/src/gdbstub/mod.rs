@@ -14,6 +14,7 @@
 //! a `gdbstub` shell builtin.
 
 pub mod framer;
+pub mod mem;
 pub mod regs;
 pub mod transport;
 
@@ -204,6 +205,14 @@ fn dispatch<T: Transport>(t: &mut T, payload: &[u8], regs: &mut GdbRegs) -> Acti
             }
             Action::Continue
         }
+        Some(b'm') => {
+            handle_m(t, &payload[1..]);
+            Action::Continue
+        }
+        Some(b'M') => {
+            handle_big_m(t, &payload[1..]);
+            Action::Continue
+        }
         _ => {
             // Unknown command: RSP convention says reply with an empty
             // packet, which the debugger treats as "unsupported".
@@ -211,6 +220,77 @@ fn dispatch<T: Transport>(t: &mut T, payload: &[u8], regs: &mut GdbRegs) -> Acti
             Action::Continue
         }
     }
+}
+
+/// Handle `m addr,len` — read memory and reply with hex bytes, or
+/// `E01` if any byte of the range is unmapped/non-canonical/too big.
+fn handle_m<T: Transport>(t: &mut T, args: &[u8]) {
+    let parsed = match mem::parse_m(args) {
+        Ok(a) => a,
+        Err(_) => {
+            send_packet(t, b"E01");
+            return;
+        }
+    };
+    // Reply buffer: `2 * len` hex bytes, bounded by MAX_MEM_XFER.
+    let mut bytes = [0u8; mem::MAX_MEM_XFER];
+    let mut hex = [0u8; 2 * mem::MAX_MEM_XFER];
+    let n = parsed.len;
+    match read_memory(parsed, &mut bytes[..n]) {
+        Ok(()) => {
+            let out = mem::encode_hex(&bytes[..n], &mut hex[..2 * n]);
+            send_packet(t, out);
+        }
+        Err(()) => send_packet(t, b"E01"),
+    }
+}
+
+/// Handle `M addr,len:data` — decode hex, write bytes, reply `OK` or
+/// `E01` on any parse or access failure.
+fn handle_big_m<T: Transport>(t: &mut T, args: &[u8]) {
+    let (parsed, data_hex) = match mem::parse_big_m(args) {
+        Ok(pair) => pair,
+        Err(_) => {
+            send_packet(t, b"E01");
+            return;
+        }
+    };
+    let mut bytes = [0u8; mem::MAX_MEM_XFER];
+    let n = parsed.len;
+    if mem::decode_hex(data_hex, &mut bytes[..n]).is_err() {
+        send_packet(t, b"E01");
+        return;
+    }
+    match write_memory(parsed, &bytes[..n]) {
+        Ok(()) => send_packet(t, b"OK"),
+        Err(()) => send_packet(t, b"E01"),
+    }
+}
+
+/// Kernel-side safe read: routes through the page-walker probe.
+#[cfg(target_os = "none")]
+fn read_memory(args: mem::MemArgs, out: &mut [u8]) -> Result<(), ()> {
+    mem::safe_read(args, out).map_err(|_| ())
+}
+
+/// Kernel-side safe write: routes through the page-walker probe.
+#[cfg(target_os = "none")]
+fn write_memory(args: mem::MemArgs, data: &[u8]) -> Result<(), ()> {
+    mem::safe_write(args, data).map_err(|_| ())
+}
+
+/// Host-test fallback: no kernel page tables available, so we refuse
+/// every access. The existing host tests don't send `m`/`M`, but any
+/// future test wanting real access can override this via a test-only
+/// transport.
+#[cfg(not(target_os = "none"))]
+fn read_memory(_args: mem::MemArgs, _out: &mut [u8]) -> Result<(), ()> {
+    Err(())
+}
+
+#[cfg(not(target_os = "none"))]
+fn write_memory(_args: mem::MemArgs, _data: &[u8]) -> Result<(), ()> {
+    Err(())
 }
 
 /// Build an `Sxx` stop reply payload in a fixed-size buffer.
