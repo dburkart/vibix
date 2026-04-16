@@ -173,6 +173,12 @@ pub fn decode_hex(hex: &[u8], out: &mut [u8]) -> Result<(), MemErr> {
 /// any byte of the range is unmapped. Does not fault: the page-walker
 /// consults kernel page tables via the HHDM, never dereferences the
 /// target VA.
+///
+/// TOCTOU caveat: there is a window between the per-byte `probe_readable`
+/// and the following `read_volatile`. This is safe today because the stub
+/// runs from the int3 handler with interrupts disabled on a uniprocessor
+/// kernel — no other context can unmap the page between probe and access.
+/// SMP-safe mapper locking is a follow-up.
 #[cfg(target_os = "none")]
 pub fn safe_read(args: MemArgs, out: &mut [u8]) -> Result<(), MemErr> {
     use x86_64::VirtAddr;
@@ -196,7 +202,8 @@ pub fn safe_read(args: MemArgs, out: &mut [u8]) -> Result<(), MemErr> {
 }
 
 /// Write `data` bytes to `args.addr`. Returns `Err` if any byte is
-/// unmapped or read-only. Same fault-safety contract as [`safe_read`].
+/// unmapped or read-only. Same fault-safety and TOCTOU caveats as
+/// [`safe_read`].
 #[cfg(target_os = "none")]
 pub fn safe_write(args: MemArgs, data: &[u8]) -> Result<(), MemErr> {
     use x86_64::VirtAddr;
