@@ -867,18 +867,27 @@ mod tests {
         let n = NTty::new();
         let t = termios_canon();
         let w = CountingWake::new();
-        for _ in 0..LINE_BUF_CAP {
+        // Fill the line editor to one byte below capacity so a
+        // payload+delim commit (LINE_BUF_CAP-1 + 1 == RAW_RING_CAP) still
+        // fits atomically into the raw ring.
+        for _ in 0..(LINE_BUF_CAP - 1) {
             n.canon_input(&t, b'x', &w);
         }
-        // 4097th byte silently dropped — line buffer is full.
+        // Fill to exact capacity; the next byte must be silently dropped
+        // because the line buffer is full.
+        n.canon_input(&t, b'x', &w);
         n.canon_input(&t, b'y', &w);
         assert_eq!(w.count(), 0);
-        // Newline commits the full line (all x's).
+        // Erase one byte so the newline commit fits (payload + delim <=
+        // RAW_RING_CAP). Without this, the atomic commit is rejected —
+        // see canon_commit_line_no_partial_on_full_ring.
+        n.canon_input(&t, t.c_cc[VERASE], &w);
         n.canon_input(&t, b'\n', &w);
         assert_eq!(w.count(), 1);
         let data = raw_contents(&n);
         assert_eq!(data.len(), LINE_BUF_CAP);
-        assert!(data.iter().all(|&b| b == b'x'));
+        assert_eq!(data[data.len() - 1], b'\n');
+        assert!(data[..data.len() - 1].iter().all(|&b| b == b'x'));
     }
 
     #[test]
@@ -981,7 +990,11 @@ mod tests {
             len_before,
             "raw ring must not absorb a partial commit",
         );
-        assert_eq!(n.state.lock().line.len, 3, "line buffer preserved on failure");
+        assert_eq!(
+            n.state.lock().line.len,
+            3,
+            "line buffer preserved on failure"
+        );
         assert_eq!(w.count(), 0, "no wake when commit is rejected");
     }
 
