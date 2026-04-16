@@ -375,6 +375,140 @@ impl Default for NTty {
     }
 }
 
+#[cfg(any(target_os = "none", test))]
+impl NTty {
+    /// Drain up to `out.len()` committed bytes from the raw ring into
+    /// `out`, returning the number of bytes written. Canonical-mode
+    /// callers see only bytes past a committed newline / VEOL / VEOF;
+    /// raw-mode callers see every byte as it arrives.
+    pub fn drain_raw(&self, out: &mut [u8]) -> usize {
+        let mut st = self.state.lock();
+        let mut i = 0;
+        while i < out.len() && st.raw.head != st.raw.tail {
+            out[i] = st.raw.buf[st.raw.head & (RAW_RING_CAP - 1)];
+            st.raw.head = st.raw.head.wrapping_add(1);
+            i += 1;
+        }
+        if st.raw.head == st.raw.tail {
+            st.raw.eof_pos = None;
+        }
+        i
+    }
+
+    /// Number of committed bytes currently available in the raw ring.
+    pub fn raw_len(&self) -> usize {
+        self.state.lock().raw.len()
+    }
+}
+
+/// [`LineDiscipline`] wrapper around [`NTty`].
+///
+/// Issue #474 — this is the glue that finally wires the fully-tested
+/// N_TTY pipeline (iflag / ISIG / ICANON / OPOST) into the PS/2 and
+/// serial rx paths. A softirq-context byte arriving through
+/// `tty.ldisc.receive_byte(&tty, b)` flows through:
+///
+/// 1. `NTty::receive_signal_or_byte` — ISIG check against VINTR/VQUIT/
+///    VSUSP. Consumed signal bytes return `None`; others return `Some(b)`
+///    after iflag rewriting.
+/// 2. `NTty::canon_input` — ICANON line editor or raw ring append.
+/// 3. `NTty::queue_echo` — ECHO/ECHOE/ECHONL output, pushed through the
+///    driver's tx path so the user sees what they typed.
+///
+/// The `tty: &Tty` argument gives us access to `termios` (for the
+/// iflag/lflag snapshot) and `ctrl` (for the foreground-pgrp snapshot
+/// consumed by ISIG). `termios` is copied under its IrqLock guard —
+/// [`Termios`] is `Copy` — so no lock is held across the NTty call.
+/// `ctrl`'s `pgrp_snapshot` is a lock-free `AtomicPid`, but
+/// `receive_signal_or_byte` takes a `&JobControl`, so we hold the
+/// `ctrl` guard across the call. The critical section is short (no
+/// allocation, no further locks taken through `dispatch`) and does not
+/// invert lock order: `ctrl` sits below the process TABLE, never above.
+#[cfg(target_os = "none")]
+pub struct NTtyLdisc {
+    ntty: NTty,
+    dispatch: alloc::boxed::Box<dyn SignalDispatch + Send + Sync>,
+}
+
+#[cfg(target_os = "none")]
+impl NTtyLdisc {
+    /// Build an ldisc backed by the production [`KernelSignalDispatch`].
+    pub fn new_kernel() -> Self {
+        Self {
+            ntty: NTty::new(),
+            dispatch: alloc::boxed::Box::new(KernelSignalDispatch),
+        }
+    }
+
+    /// Build an ldisc with a caller-supplied dispatcher. Used by the
+    /// `kernel/tests/ntty_ldisc_wiring.rs` integration test.
+    pub fn with_dispatch(dispatch: alloc::boxed::Box<dyn SignalDispatch + Send + Sync>) -> Self {
+        Self {
+            ntty: NTty::new(),
+            dispatch,
+        }
+    }
+
+    /// Borrow the inner [`NTty`] for read-only observation (e.g. draining
+    /// the committed ring in tests).
+    pub fn ntty(&self) -> &NTty {
+        &self.ntty
+    }
+}
+
+#[cfg(target_os = "none")]
+struct TtyReaderWake(alloc::sync::Arc<crate::poll::WaitQueue>);
+
+#[cfg(target_os = "none")]
+impl ReaderWake for TtyReaderWake {
+    fn wake(&self) {
+        self.0.wake_all();
+    }
+}
+
+/// [`OutSink`] adapter that pushes echo bytes through a [`TtyDriver`]'s
+/// tx path. One byte at a time keeps the interface minimal; `write`
+/// holds the driver's tx lock for each byte, but echo volume is bounded
+/// by human typing rate.
+#[cfg(target_os = "none")]
+struct DriverEchoSink<'a>(&'a dyn super::TtyDriver);
+
+#[cfg(target_os = "none")]
+impl OutSink for DriverEchoSink<'_> {
+    fn push(&mut self, b: u8) {
+        self.0.write(&[b]);
+    }
+}
+
+#[cfg(target_os = "none")]
+impl super::LineDiscipline for NTtyLdisc {
+    fn receive_byte(&self, tty: &super::Tty, byte: u8) {
+        let termios_snap = *tty.termios.lock();
+        // Hold `ctrl` only across the ISIG check. `receive_signal_or_byte`
+        // reads `ctrl.pgrp_snapshot` (lock-free) and dispatches via
+        // `self.dispatch`; the guard drops before `canon_input` acquires
+        // `NTty.state`.
+        let survived = {
+            let ctrl = tty.ctrl.lock();
+            self.ntty
+                .receive_signal_or_byte(&termios_snap, &*ctrl, &*self.dispatch, byte)
+        };
+        let Some(b) = survived else {
+            return;
+        };
+        let wake = TtyReaderWake(tty.read_wait.clone());
+        self.ntty.canon_input(&termios_snap, b, &wake);
+        let mut sink = DriverEchoSink(&*tty.driver);
+        self.ntty.queue_echo(&termios_snap, b, &mut sink);
+    }
+
+    fn open(&self, _tty: &super::Tty) -> Result<(), i64> {
+        Ok(())
+    }
+
+    fn close(&self, _tty: &super::Tty) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
