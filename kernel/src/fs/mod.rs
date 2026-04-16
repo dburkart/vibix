@@ -91,6 +91,21 @@ pub trait FileBackend: Send + Sync {
     fn as_vfs(&self) -> Option<&vfs::VfsBackend> {
         None
     }
+
+    /// Propagate mutable open-file status flags into backend-local state.
+    ///
+    /// Called from [`FileDescTable::set_status_flags`] after the
+    /// `FileDescription.flags` CAS succeeds. `new_flags` is the full
+    /// post-update flag word (the description's canonical value) so that
+    /// backends holding a duplicate atomic (e.g. pipes' `nonblocking`) can
+    /// synchronise their own bits without re-deriving them.
+    ///
+    /// Only `O_APPEND`, `O_NONBLOCK`, and `O_ASYNC` will ever change here —
+    /// POSIX pins the other bits. The default is a no-op, which is correct
+    /// for backends that either read the description's flags directly on
+    /// every I/O (regular files snap `O_APPEND` from `OpenFile.flags`) or
+    /// that simply don't care about status flags (serial stdio).
+    fn set_flags(&self, _new_flags: u32) {}
 }
 
 /// Open-file flags. Values match the Linux x86_64 ABI exactly so userspace
@@ -393,16 +408,41 @@ impl FileDescTable {
         // Atomic swap under a tight loop so concurrent `F_SETFL` callers on
         // dup'd fds can't lose each other's edits.
         let mut cur = desc.flags.load(Ordering::Relaxed);
-        loop {
+        let mut desired = loop {
             let next = (cur & !mutable) | (new_flags & mutable);
             match desc
                 .flags
                 .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => break next,
                 Err(observed) => cur = observed,
             }
+        };
+        // POSIX requires the status-flag change to take effect on live I/O
+        // through the description — backends that cache flag state (pipes'
+        // `nonblocking`, VFS files' `OpenFile.flags`) need to observe the
+        // edit before the next read/write, not only after the next dup or
+        // fork. Hand the post-update flag word to the backend's hook now.
+        //
+        // Winning the CAS does not guarantee our `backend.set_flags(desired)`
+        // runs before a later, concurrent `F_SETFL` also wins its CAS and
+        // mirrors — if thread A wins the CAS with `desired_A`, is preempted,
+        // and thread B wins with `desired_B` and mirrors, A resuming here
+        // would overwrite the backend with the stale `desired_A`. Re-check
+        // the live atomic after mirroring and, if a newer edit has landed,
+        // re-mirror with that value. The loop converges because each
+        // iteration's mirror reflects the flag word observed after the
+        // previous CAS, so the final mirror always matches the winning
+        // atomic state regardless of scheduler order.
+        loop {
+            desc.backend.set_flags(desired);
+            let observed = desc.flags.load(Ordering::Relaxed);
+            if observed == desired {
+                break;
+            }
+            desired = observed;
         }
+        Ok(())
     }
 
     /// Return the per-fd flags for `fd` (`fcntl(fd, F_GETFD)`).

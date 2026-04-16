@@ -393,6 +393,10 @@ impl FileBackend for FifoRdwrBackend {
     fn poll(&self, pt: &mut crate::poll::PollTable) -> crate::poll::PollMask {
         self.read_end.poll(pt) | self.write_end.poll(pt)
     }
+    fn set_flags(&self, new_flags: u32) {
+        self.read_end.set_flags(new_flags);
+        self.write_end.set_flags(new_flags);
+    }
 }
 
 /// `stat(path, *statbuf)` (follow=true) / `lstat(path, *statbuf)`
