@@ -100,6 +100,19 @@ pub static FORK_USER_RSP: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static SIGRETURN_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// Set to 1 by `check_and_deliver_signals` when a bare syscall restart
+/// (no user handler) is about to occur. The syscall trampoline checks
+/// this flag after the signal hook returns: when set, the saved user
+/// syscall registers (rax, rdi, rsi, rdx, r10, r8, r9) are restored
+/// before SYSRETQ so the re-executed SYSCALL instruction sees the
+/// original syscall number and arguments. Cleared after consumption.
+///
+/// Not set on the SA_RESTART+handler path — that path delivers the
+/// handler first, and the restart occurs from sigreturn afterwards.
+/// Restoring arg regs through the sigreturn path is a follow-up.
+#[no_mangle]
+pub static SYSCALL_RESTART_PENDING: AtomicU64 = AtomicU64::new(0);
+
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
 pub fn init() {
@@ -1048,6 +1061,23 @@ syscall_entry:
     push r11                  // user RFLAGS (SYSRETQ restores from r11)
     push rcx                  // user RIP    (SYSRETQ jumps to rcx)
 
+    // 3a. Save the user syscall registers so a restart (rip rewound to
+    //     the SYSCALL instruction) can replay with the original syscall
+    //     number and argument registers. Pushed high→low so the struct
+    //     laid out at rsp ends up as:
+    //       [rsp+0]=rax [+8]=rdi [+16]=rsi [+24]=rdx
+    //       [+32]=r10 [+40]=r8 [+48]=r9
+    //       [+56]=user_rip [+64]=user_rflags [+72]=user_rsp
+    //     These slots are adjacent to the rip/rflags/rsp frame above so a
+    //     single pointer (rsp) addresses the whole `SyscallReturnContext`.
+    push r9
+    push r8
+    push r10
+    push rdx
+    push rsi
+    push rdi
+    push rax
+
     // 3b. Finish priming the FORK_USER_* statics so fork() can seed the
     //     child's kernel stack. fork_rsp was already written in step 1.
     mov [rip + {fork_rip}], rcx
@@ -1071,11 +1101,11 @@ syscall_entry:
     //
     //    Save r9 (a5) into the arg6 slot before the remap clobbers it.
     //    SysV requires rsp to be 16-byte aligned immediately before the
-    //    CALL instruction. The 3 preceding pushes (user RSP, RFLAGS, RIP)
-    //    leave rsp at (top-24), i.e. 8 mod 16. Reserving one 8-byte slot
-    //    for arg6 brings rsp to (top-32) — 0 mod 16, exactly what CALL
-    //    needs.
-    sub rsp, 8
+    //    CALL instruction. The 3+7 preceding pushes leave rsp at
+    //    (top-80) — already 0 mod 16. Reserving one 8-byte slot for arg6
+    //    brings rsp to (top-88), which is 8 mod 16; so we compensate with
+    //    one more 8-byte sub to land on 0 mod 16 before CALL.
+    sub rsp, 16
     mov [rsp], r9     // a5 → stack slot for arg6
     mov r9, r8        // a4 → r9 (arg5)
     mov r8, r10       // a3 → r8 (arg4)
@@ -1086,42 +1116,59 @@ syscall_entry:
 
     // 5. Call the Rust dispatcher.
     call syscall_dispatch
-    add rsp, 8
+    add rsp, 16
     // rax = return value
 
     // 5b. Check for pending signals and ERESTARTSYS before returning to
-    //     user. Pass a pointer to the saved [user_rip, user_rflags,
-    //     user_rsp] on the kernel stack as arg0 so the handler can
-    //     redirect to a signal frame or rewind rip; pass the dispatcher's
-    //     return value in rax as arg1 (rsi). The handler returns the
-    //     (possibly rewritten) return value in rax, which becomes the
-    //     value SYSRETQ delivers.
+    //     user. Pass a pointer to the saved `SyscallReturnContext` (the
+    //     10-qword block at rsp) as arg0 so the handler can redirect to a
+    //     signal frame or rewind rip; pass the dispatcher's return value
+    //     in rax as arg1 (rsi). The handler returns the (possibly
+    //     rewritten) return value in rax, which becomes the value
+    //     SYSRETQ delivers.
     //
-    //     `push rax` serves two purposes: 16-byte alignment for the CALL
-    //     (the preceding 3 pushes + dispatcher's matching sub/add leaves
-    //     rsp at top-24, i.e. 8 mod 16; one more push brings it to 0 mod
-    //     16), and it harmlessly stashes a copy of rax that we discard.
-    //     The handler returns the new rv in rax directly; we just drop
-    //     the alignment slot.
-    push rax
-    lea rdi, [rsp + 8]  // pointer to saved [rip, rflags, rsp]
+    //     Stack is at top-80 (3+7 = 10 pushes), already 0 mod 16 — no
+    //     extra alignment is needed for this CALL.
+    mov rdi, rsp        // ctx → arg0
     mov rsi, rax        // rv → arg1
     call check_and_deliver_signals
-    add rsp, 8          // drop the alignment slot; rax is the new rv
 
     // 6. Restore return-to-user context.
+    //
+    //    On the common path, the 7 saved user syscall regs are discarded
+    //    (userspace doesn't rely on them surviving a syscall, per SysV).
+    //    On a bare-restart path (SYSCALL_RESTART_PENDING set by the signal
+    //    hook when rip was rewound to the SYSCALL insn and no user
+    //    handler is about to run), reload them so the re-executed SYSCALL
+    //    sees the original (nr, a0..a5).
+    cmp qword ptr [rip + {restart_pending}], 0
+    jne 2f
+    // Normal path: drop the 7 saved-reg slots; rax already holds rv.
+    add rsp, 56
+    jmp 3f
+2:
+    // Restart path: consume flag and restore saved user syscall regs.
+    mov qword ptr [rip + {restart_pending}], 0
+    pop rax           // saved user rax (syscall nr)
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r10
+    pop r8
+    pop r9
+3:
     pop rcx           // user RIP  → rcx  (for SYSRETQ)
     pop r11           // user RFLAGS → r11 (for SYSRETQ)
-    pop r10           // user RSP  → r10
+    pop rsp           // user RSP  → rsp  (return to user stack)
 
-    // 7. Restore user RSP and return to ring-3.
-    mov rsp, r10
+    // 7. Return to ring-3.
     sysretq
     "#,
     kernel_rsp = sym SYSCALL_KERNEL_RSP,
     fork_rip = sym FORK_USER_RIP,
     fork_rflags = sym FORK_USER_RFLAGS,
     fork_rsp = sym FORK_USER_RSP,
+    restart_pending = sym SYSCALL_RESTART_PENDING,
 );
 
 /// Pinned Linux x86_64 syscall numbers used by `userspace/init`.

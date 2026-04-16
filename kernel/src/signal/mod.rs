@@ -524,16 +524,32 @@ fn deliver_fault_terminate(sig: u8) -> ! {
 /// Kernel-stack layout pushed by the `syscall_entry` asm trampoline
 /// immediately before calling `syscall_dispatch`.
 ///
-/// The trampoline pushes (in order, so lowest address is last pushed):
-///   `[rsp+0]`  = user RIP  (rcx at entry)
-///   `[rsp+8]`  = user RFLAGS (r11 at entry)
-///   `[rsp+16]` = user RSP
+/// The trampoline pushes the syscall-arg registers so a syscall restart
+/// (rip rewound to the SYSCALL instruction) can re-execute the syscall
+/// with the original `rax` (syscall number) and argument registers. Push
+/// order is high→low address; `check_and_deliver_signals` receives `rsp`
+/// as the pointer to the start of this struct (the last-pushed field).
 ///
-/// `check_and_deliver_signals` receives `rsp` as the pointer to this layout
-/// and may rewrite any of these fields to redirect the return to a signal
-/// handler.
+/// Layout (low address → high):
+///   `[rsp+0]`   = saved user `rax` (syscall nr)
+///   `[rsp+8]`   = saved user `rdi` (a0)
+///   `[rsp+16]`  = saved user `rsi` (a1)
+///   `[rsp+24]`  = saved user `rdx` (a2)
+///   `[rsp+32]`  = saved user `r10` (a3)
+///   `[rsp+40]`  = saved user `r8`  (a4)
+///   `[rsp+48]`  = saved user `r9`  (a5)
+///   `[rsp+56]`  = user RIP   (rcx at entry)
+///   `[rsp+64]`  = user RFLAGS (r11 at entry)
+///   `[rsp+72]`  = user RSP
 #[repr(C)]
 pub struct SyscallReturnContext {
+    pub user_rax: u64,
+    pub user_rdi: u64,
+    pub user_rsi: u64,
+    pub user_rdx: u64,
+    pub user_r10: u64,
+    pub user_r8: u64,
+    pub user_r9: u64,
     pub user_rip: u64,
     pub user_rflags: u64,
     pub user_rsp: u64,
@@ -626,6 +642,40 @@ pub fn restart_decision(
     }
 }
 
+/// Pure classifier: given a restart decision and the (signal, disposition)
+/// popped from the pending mask, return `Some(sig)` if `deliver_signal`
+/// should be called, or `None` if the syscall return path should skip
+/// delivery.
+///
+/// The distinction matters on the `RestartDecision::Restart` path: a bare
+/// restart must still dispatch default-action signals (SIGTERM → task
+/// exit; SIGTTOU/TSTP/TTIN → stop — currently a no-op). Only
+/// `Disposition::Ignore` and "no signal popped" skip delivery outright.
+/// On `Eintr` and `NoChange`, delivery always occurs if a signal was
+/// popped.
+pub fn signal_to_deliver(
+    decision: RestartDecision,
+    popped: Option<(u8, Disposition)>,
+) -> Option<u8> {
+    match decision {
+        RestartDecision::NoChange => popped.map(|(s, _)| s),
+        RestartDecision::Eintr => popped.map(|(s, _)| s),
+        RestartDecision::Restart { deliver_handler } => match popped {
+            None => None,
+            Some((s, disp)) => {
+                if deliver_handler {
+                    Some(s)
+                } else {
+                    match disp {
+                        Disposition::Ignore => None,
+                        _ => Some(s),
+                    }
+                }
+            }
+        },
+    }
+}
+
 /// Called from the `syscall_entry` asm trampoline between steps 5 and 6
 /// (after `syscall_dispatch` returns, before `pop rcx / sysretq`).
 ///
@@ -676,31 +726,40 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
         })
         .flatten();
 
-    let mut rv_out = rv;
-    let sig_for_delivery: Option<u8> = match restart_decision(
+    let decision = restart_decision(
         rv,
         popped.map(|(s, _, _)| s),
         popped.map(|(_, d, _)| d).unwrap_or(Disposition::Default),
         popped.map(|(_, _, f)| f).unwrap_or(0),
-    ) {
-        RestartDecision::NoChange => popped.map(|(s, _, _)| s),
-        RestartDecision::Restart { deliver_handler } => {
+    );
+    let mut rv_out = rv;
+    match decision {
+        RestartDecision::NoChange => {}
+        RestartDecision::Restart { .. } => {
             (*ctx).user_rip = (*ctx).user_rip.wrapping_sub(SYSCALL_INSN_LEN);
+            // Only signal the asm trampoline to restore user syscall regs
+            // when no handler is about to run. Handler+SA_RESTART restarts
+            // come back through sigreturn, which is a follow-up path for
+            // arg-register preservation.
+            if !matches!(
+                decision,
+                RestartDecision::Restart {
+                    deliver_handler: true
+                }
+            ) {
+                crate::arch::x86_64::syscall::SYSCALL_RESTART_PENDING
+                    .store(1, core::sync::atomic::Ordering::Relaxed);
+            }
             // Clobber rv: after restart, userspace will get the result of
             // the re-executed syscall; the stale -ERESTARTSYS must not
             // leak in case something later skips the restart.
             rv_out = 0;
-            if deliver_handler {
-                popped.map(|(s, _, _)| s)
-            } else {
-                None
-            }
         }
         RestartDecision::Eintr => {
             rv_out = crate::fs::EINTR;
-            popped.map(|(s, _, _)| s)
         }
-    };
+    }
+    let sig_for_delivery = signal_to_deliver(decision, popped.map(|(s, d, _)| (s, d)));
 
     if let Some(sig) = sig_for_delivery {
         deliver_signal(sig, &mut *ctx);

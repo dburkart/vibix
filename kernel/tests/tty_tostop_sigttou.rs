@@ -14,7 +14,8 @@ use core::panic::PanicInfo;
 
 use vibix::process::{self, test_helpers as h};
 use vibix::signal::{
-    restart_decision, sig_bit, Disposition, RestartDecision, SA_RESTART, SIGTERM, SIGTTOU,
+    restart_decision, sig_bit, signal_to_deliver, Disposition, RestartDecision, SA_RESTART,
+    SIGTERM, SIGTTOU,
 };
 use vibix::tty::{termios, tty_check_tostop, Tty, KERN_ERESTARTSYS};
 use vibix::{
@@ -77,6 +78,26 @@ fn run_tests() {
         (
             "erestartsys_no_pending_signal_unconditionally_rewinds",
             &(erestartsys_no_pending_signal_unconditionally_rewinds as fn()),
+        ),
+        (
+            "signal_to_deliver_restart_default_terminate_delivers",
+            &(signal_to_deliver_restart_default_terminate_delivers as fn()),
+        ),
+        (
+            "signal_to_deliver_restart_default_stop_delivers",
+            &(signal_to_deliver_restart_default_stop_delivers as fn()),
+        ),
+        (
+            "signal_to_deliver_restart_ignore_skips",
+            &(signal_to_deliver_restart_ignore_skips as fn()),
+        ),
+        (
+            "signal_to_deliver_restart_handler_delivers",
+            &(signal_to_deliver_restart_handler_delivers as fn()),
+        ),
+        (
+            "signal_to_deliver_eintr_and_nochange_always_deliver",
+            &(signal_to_deliver_eintr_and_nochange_always_deliver as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -259,4 +280,100 @@ fn erestartsys_no_pending_signal_unconditionally_rewinds() {
             deliver_handler: false
         }
     );
+}
+
+// ── signal_to_deliver: delivery-on-restart classifier ──────────────────
+//
+// Regression: prior to this series, `Restart{deliver_handler:false}`
+// swallowed the popped signal entirely — SIGTERM's default Terminate
+// action never fired on the restart path, and job-control Stop never
+// dispatched either. `signal_to_deliver` now separates "rewind rip" from
+// "deliver the signal".
+
+fn signal_to_deliver_restart_default_terminate_delivers() {
+    // Restart + SIGTERM + Default disposition must still dispatch the
+    // signal so `deliver_signal` can terminate the task. Swallowing it
+    // here would leave the process spinning on the restarted syscall.
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Restart {
+                deliver_handler: false,
+            },
+            Some((SIGTERM, Disposition::Default)),
+        ),
+        Some(SIGTERM)
+    );
+}
+
+fn signal_to_deliver_restart_default_stop_delivers() {
+    // Restart + SIGTTOU + Default disposition must also dispatch — the
+    // default Stop action is a no-op today but will become a real
+    // task-stop once job control lands, and at that point skipping
+    // delivery would break SIGTSTP/SIGTTOU/SIGTTIN.
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Restart {
+                deliver_handler: false,
+            },
+            Some((SIGTTOU, Disposition::Default)),
+        ),
+        Some(SIGTTOU)
+    );
+}
+
+fn signal_to_deliver_restart_ignore_skips() {
+    // Explicit Ignore is the one restart path that legitimately skips
+    // delivery — no handler to run, and default wouldn't fire either.
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Restart {
+                deliver_handler: false,
+            },
+            Some((SIGTTOU, Disposition::Ignore)),
+        ),
+        None
+    );
+    // None popped → None delivered on restart (spurious-wake case).
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Restart {
+                deliver_handler: false,
+            },
+            None,
+        ),
+        None
+    );
+}
+
+fn signal_to_deliver_restart_handler_delivers() {
+    // Restart + handler → deliver the handler on top of the rewound rip.
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Restart {
+                deliver_handler: true,
+            },
+            Some((SIGTTOU, Disposition::Handler(0x4000_0000))),
+        ),
+        Some(SIGTTOU)
+    );
+}
+
+fn signal_to_deliver_eintr_and_nochange_always_deliver() {
+    // Eintr and NoChange never mask delivery — if a signal was popped,
+    // it runs.
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::Eintr,
+            Some((SIGTTOU, Disposition::Handler(0x4000_0000))),
+        ),
+        Some(SIGTTOU)
+    );
+    assert_eq!(
+        signal_to_deliver(
+            RestartDecision::NoChange,
+            Some((SIGTERM, Disposition::Default))
+        ),
+        Some(SIGTERM)
+    );
+    assert_eq!(signal_to_deliver(RestartDecision::NoChange, None), None);
 }
