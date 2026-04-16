@@ -82,8 +82,13 @@ fn matches_cc(termios: &Termios, cc_idx: usize, c: u8) -> bool {
     cc != 0 && c == cc
 }
 
-const LINE_BUF_CAP: usize = 4096;
 const RAW_RING_CAP: usize = 4096;
+// One byte shorter than the raw ring so a full line plus its commit delimiter
+// (`\n` / VEOL) always fits atomically into the raw ring — without this gap,
+// `canon_input` would silently drop the user's last keystroke at exactly
+// `RAW_RING_CAP` chars and then reject the `\n` commit, forcing the user to
+// VERASE once before the line could land.
+const LINE_BUF_CAP: usize = RAW_RING_CAP - 1;
 
 struct LineBuffer {
     buf: [u8; LINE_BUF_CAP],
@@ -867,25 +872,17 @@ mod tests {
         let n = NTty::new();
         let t = termios_canon();
         let w = CountingWake::new();
-        // Fill the line editor to one byte below capacity so a
-        // payload+delim commit (LINE_BUF_CAP-1 + 1 == RAW_RING_CAP) still
-        // fits atomically into the raw ring.
-        for _ in 0..(LINE_BUF_CAP - 1) {
+        // Fill the line editor to its capacity; extra bytes must be
+        // silently dropped so the newline commit still fits atomically.
+        for _ in 0..LINE_BUF_CAP {
             n.canon_input(&t, b'x', &w);
         }
-        // Fill to exact capacity; the next byte must be silently dropped
-        // because the line buffer is full.
-        n.canon_input(&t, b'x', &w);
         n.canon_input(&t, b'y', &w);
         assert_eq!(w.count(), 0);
-        // Erase one byte so the newline commit fits (payload + delim <=
-        // RAW_RING_CAP). Without this, the atomic commit is rejected —
-        // see canon_commit_line_no_partial_on_full_ring.
-        n.canon_input(&t, t.c_cc[VERASE], &w);
         n.canon_input(&t, b'\n', &w);
         assert_eq!(w.count(), 1);
         let data = raw_contents(&n);
-        assert_eq!(data.len(), LINE_BUF_CAP);
+        assert_eq!(data.len(), LINE_BUF_CAP + 1);
         assert_eq!(data[data.len() - 1], b'\n');
         assert!(data[..data.len() - 1].iter().all(|&b| b == b'x'));
     }
