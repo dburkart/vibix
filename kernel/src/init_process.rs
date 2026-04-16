@@ -238,6 +238,11 @@ fn init_ring3_entry() -> ! {
         initial_rsp
     );
 
+    // Final marker before IRETQ. If smoke sees this but never sees
+    // "init: hello from pid 1", the regression is on the ring-3 side
+    // (IRETQ fault or first userspace write), not kernel init.
+    serial_println!("init: iretq to ring-3");
+
     // Drop to ring-3. Never returns.
     unsafe { syscall::jump_to_ring3(entry, initial_rsp) }
 }
