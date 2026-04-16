@@ -259,7 +259,8 @@ fn big_m_writes_buffer() {
 fn big_m_unmapped_returns_e01() {
     let mut req = alloc::vec::Vec::new();
     req.extend_from_slice(b"M6000000000,2:abcd");
-    let mut frame = [0u8; 32];
+    // Worst-case frame size = 2 * payload + 4 framing bytes.
+    let mut frame = [0u8; 64];
     let wire = framer::encode(&req, &mut frame);
 
     let mut t = VecTransport::new();
