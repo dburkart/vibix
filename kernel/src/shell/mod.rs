@@ -176,7 +176,9 @@ mod kernel_side {
     }
 
     /// Source-of-truth dispatch table. Order is alphabetical so the
-    /// `help` listing reads naturally; a host unit test enforces this.
+    /// `help` listing reads naturally — hand-maintained, since the table
+    /// only compiles under `target_os = "none"` and can't be checked by
+    /// a host-side unit test.
     const BUILTINS: &[Builtin] = &[
         Builtin {
             name: "clear",

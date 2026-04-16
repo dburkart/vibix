@@ -38,11 +38,26 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("help_no_args_lists_builtins", &(help_no_args_lists_builtins as fn())),
-        ("help_help_describes_itself", &(help_help_describes_itself as fn())),
-        ("help_known_builtins_dispatch", &(help_known_builtins_dispatch as fn())),
-        ("help_unknown_does_not_panic", &(help_unknown_does_not_panic as fn())),
-        ("help_with_extra_whitespace", &(help_with_extra_whitespace as fn())),
+        (
+            "help_no_args_lists_builtins",
+            &(help_no_args_lists_builtins as fn()),
+        ),
+        (
+            "help_help_describes_itself",
+            &(help_help_describes_itself as fn()),
+        ),
+        (
+            "help_known_builtins_dispatch",
+            &(help_known_builtins_dispatch as fn()),
+        ),
+        (
+            "help_unknown_does_not_panic",
+            &(help_unknown_does_not_panic as fn()),
+        ),
+        (
+            "help_with_extra_whitespace",
+            &(help_with_extra_whitespace as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -63,7 +78,13 @@ fn help_help_describes_itself() {
 }
 
 fn help_known_builtins_dispatch() {
-    for cmd in ["help tasks", "help echo", "help mem", "help uname", "help clear"] {
+    for cmd in [
+        "help tasks",
+        "help echo",
+        "help mem",
+        "help uname",
+        "help clear",
+    ] {
         dispatch_for_test(cmd);
     }
 }
@@ -77,6 +98,11 @@ fn help_unknown_does_not_panic() {
 }
 
 fn help_with_extra_whitespace() {
-    // Trailing whitespace inside the argument should also resolve.
-    dispatch_for_test("help tasks");
+    // `cmd_help` trims its argument, so trailing spaces and collapsed
+    // multi-space separators between `help` and its argument must still
+    // resolve to the same builtin rather than falling through to the
+    // unknown-command branch.
+    dispatch_for_test("help tasks ");
+    dispatch_for_test("help  tasks");
+    dispatch_for_test("help tasks   ");
 }
