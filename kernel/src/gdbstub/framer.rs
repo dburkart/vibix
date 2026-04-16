@@ -56,27 +56,53 @@ pub fn checksum(payload: &[u8]) -> u8 {
     s
 }
 
-/// Encode `payload` into `$<payload>#<xx>` in `out`. Caller must size
-/// `out` to at least `payload.len() + 4`. Returns the filled slice.
+/// Encode `payload` into `$<escaped payload>#<xx>` in `out`. Reserved
+/// bytes in `payload` (`$`, `#`, `}`, `*`) are byte-stuffed as `}` +
+/// (byte ^ 0x20) before hitting the wire. The checksum is computed
+/// over the *escaped* wire bytes, per the RSP spec.
+///
+/// Caller must size `out` to the worst case `2 * payload.len() + 4`.
 /// Panics only on obvious misuse (undersized buffer) — this is dev-
 /// facing kernel code, not untrusted input.
 pub fn encode<'b>(payload: &[u8], out: &'b mut [u8]) -> &'b [u8] {
-    let need = payload.len() + 4;
-    assert!(out.len() >= need, "gdbstub encode: output too small");
+    let worst = 2 * payload.len() + 4;
+    assert!(out.len() >= worst, "gdbstub encode: output too small");
     out[0] = SOP;
-    out[1..1 + payload.len()].copy_from_slice(payload);
-    out[1 + payload.len()] = EOP;
-    let [hi, lo] = to_hex(checksum(payload));
-    out[2 + payload.len()] = hi;
-    out[3 + payload.len()] = lo;
-    &out[..need]
+    let mut j = 1;
+    let mut sum: u8 = 0;
+    for &b in payload {
+        if needs_escape(b) {
+            out[j] = ESC;
+            out[j + 1] = b ^ 0x20;
+            sum = sum.wrapping_add(ESC).wrapping_add(b ^ 0x20);
+            j += 2;
+        } else {
+            out[j] = b;
+            sum = sum.wrapping_add(b);
+            j += 1;
+        }
+    }
+    out[j] = EOP;
+    let [hi, lo] = to_hex(sum);
+    out[j + 1] = hi;
+    out[j + 2] = lo;
+    &out[..j + 3]
 }
 
-/// Decode a single packet at the start of `raw`. Returns the packet
-/// plus the number of bytes consumed (so callers can advance their
-/// input cursor). Leading junk bytes before `$` are *not* skipped —
-/// the transport layer peels those off.
-pub fn decode<'a>(raw: &'a [u8]) -> Result<(Packet<'a>, usize), DecodeError> {
+/// Decode a single packet at the start of `raw`, unescaping the
+/// payload into `scratch`. Returns the packet (borrowing from
+/// `scratch`) plus the number of bytes consumed from `raw` (so callers
+/// can advance their input cursor). Leading junk bytes before `$` are
+/// *not* skipped — the transport layer peels those off.
+///
+/// The checksum is verified against the *escaped* wire bytes between
+/// `$` and `#`, matching the RSP spec and the encoder above. Only
+/// after the checksum succeeds is the payload unescaped into
+/// `scratch`.
+pub fn decode<'s>(
+    raw: &[u8],
+    scratch: &'s mut [u8],
+) -> Result<(Packet<'s>, usize), DecodeError> {
     if raw.is_empty() {
         return Err(DecodeError::Incomplete);
     }
@@ -91,8 +117,8 @@ pub fn decode<'a>(raw: &'a [u8]) -> Result<(Packet<'a>, usize), DecodeError> {
         return Err(DecodeError::Incomplete);
     }
     let payload_end = i;
-    let payload = &raw[1..payload_end];
-    if payload.len() > MAX_PACKET {
+    let wire = &raw[1..payload_end];
+    if wire.len() > 2 * MAX_PACKET {
         return Err(DecodeError::Overflow);
     }
     if raw.len() < payload_end + 3 {
@@ -101,8 +127,12 @@ pub fn decode<'a>(raw: &'a [u8]) -> Result<(Packet<'a>, usize), DecodeError> {
     let hi = hex_nibble(raw[payload_end + 1]).ok_or(DecodeError::Framing)?;
     let lo = hex_nibble(raw[payload_end + 2]).ok_or(DecodeError::Framing)?;
     let want = (hi << 4) | lo;
-    if want != checksum(payload) {
+    if want != checksum(wire) {
         return Err(DecodeError::BadChecksum);
+    }
+    let payload = unescape_into(wire, scratch)?;
+    if payload.len() > MAX_PACKET {
+        return Err(DecodeError::Overflow);
     }
     Ok((Packet { payload }, payload_end + 3))
 }
@@ -202,41 +232,97 @@ mod tests {
 
     #[test]
     fn decode_valid() {
-        let (pkt, used) = decode(b"$OK#9a").unwrap();
+        let mut scratch = [0u8; 16];
+        let (pkt, used) = decode(b"$OK#9a", &mut scratch).unwrap();
         assert_eq!(pkt.payload, b"OK");
         assert_eq!(used, 6);
     }
 
     #[test]
     fn decode_valid_with_trailing_bytes() {
-        let (pkt, used) = decode(b"$?#3f+junk").unwrap();
+        let mut scratch = [0u8; 16];
+        let (pkt, used) = decode(b"$?#3f+junk", &mut scratch).unwrap();
         assert_eq!(pkt.payload, b"?");
         assert_eq!(used, 5);
     }
 
     #[test]
     fn decode_bad_checksum() {
-        assert_eq!(decode(b"$OK#00"), Err(DecodeError::BadChecksum));
+        let mut scratch = [0u8; 16];
+        assert_eq!(decode(b"$OK#00", &mut scratch), Err(DecodeError::BadChecksum));
     }
 
     #[test]
     fn decode_framing_missing_dollar() {
-        assert_eq!(decode(b"OK#9a"), Err(DecodeError::Framing));
+        let mut scratch = [0u8; 16];
+        assert_eq!(decode(b"OK#9a", &mut scratch), Err(DecodeError::Framing));
     }
 
     #[test]
     fn decode_incomplete_no_hash() {
-        assert_eq!(decode(b"$OK"), Err(DecodeError::Incomplete));
+        let mut scratch = [0u8; 16];
+        assert_eq!(decode(b"$OK", &mut scratch), Err(DecodeError::Incomplete));
     }
 
     #[test]
     fn decode_incomplete_short_checksum() {
-        assert_eq!(decode(b"$OK#9"), Err(DecodeError::Incomplete));
+        let mut scratch = [0u8; 16];
+        assert_eq!(decode(b"$OK#9", &mut scratch), Err(DecodeError::Incomplete));
     }
 
     #[test]
     fn decode_framing_non_hex_checksum() {
-        assert_eq!(decode(b"$OK#zz"), Err(DecodeError::Framing));
+        let mut scratch = [0u8; 16];
+        assert_eq!(decode(b"$OK#zz", &mut scratch), Err(DecodeError::Framing));
+    }
+
+    #[test]
+    fn encode_escapes_reserved_bytes() {
+        // Payload contains every reserved byte; wire must have them all
+        // rewritten as `}` + (b ^ 0x20) and the checksum is over the
+        // escaped bytes.
+        let payload = b"a#b$c}d*e";
+        let mut buf = [0u8; 32];
+        let wire = encode(payload, &mut buf);
+        // Spot check: no raw reserved byte appears between `$` (index 0)
+        // and `#`.
+        let hash_pos = wire.iter().rposition(|&b| b == EOP).unwrap();
+        let inner = &wire[1..hash_pos];
+        for (i, &b) in inner.iter().enumerate() {
+            if b == ESC {
+                continue;
+            }
+            assert!(
+                !needs_escape(b) || inner.get(i.wrapping_sub(1)) == Some(&ESC),
+                "unescaped reserved byte in wire at {i}: {:#x}",
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_with_escapes() {
+        // The bytes that most need escaping also need to survive decode
+        // — this is the whole point of byte-stuffing. Encode then decode
+        // and assert the logical payload matches.
+        let payload: &[u8] = b"x$y#z}w*v";
+        let mut wire = [0u8; 32];
+        let encoded = encode(payload, &mut wire);
+        let mut scratch = [0u8; 32];
+        let (pkt, used) = decode(encoded, &mut scratch).unwrap();
+        assert_eq!(pkt.payload, payload);
+        assert_eq!(used, encoded.len());
+    }
+
+    #[test]
+    fn decode_checksums_escaped_wire() {
+        // Hand-built wire: `$}]#` + checksum-of-"}]" (= 0x7d + 0x5d = 0xda).
+        // Decoded payload must be `}` ^ 0x20 ... wait, `}` escapes the next
+        // byte with ^0x20, so `}]` decodes to `] ^ 0x20` = 0x7d = `}`.
+        let wire = b"$}]#da";
+        let mut scratch = [0u8; 4];
+        let (pkt, _) = decode(wire, &mut scratch).unwrap();
+        assert_eq!(pkt.payload, b"}");
     }
 
     #[test]

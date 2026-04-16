@@ -40,13 +40,17 @@ const CTRL_C: u8 = 0x03;
 /// [`Com1PollingTransport`](uart::Com1PollingTransport) and calls
 /// through here.
 pub fn debug_entry<T: Transport>(t: &mut T) {
-    let mut inbuf = [0u8; MAX_PACKET + 4];
+    // Wire buffer holds the full escaped packet (worst-case 2x payload
+    // plus framing). `scratch` receives the unescaped payload that
+    // `framer::decode` hands back as `Packet::payload`.
+    let mut inbuf = [0u8; 2 * MAX_PACKET + 4];
+    let mut scratch = [0u8; MAX_PACKET];
     loop {
         match read_packet(t, &mut inbuf) {
             Ok(len) => {
                 // Parse the framed packet; on success dispatch, on
                 // checksum error NAK and loop.
-                match framer::decode(&inbuf[..len]) {
+                match framer::decode(&inbuf[..len], &mut scratch) {
                     Ok((pkt, _)) => {
                         t.write_byte(ACK);
                         match dispatch(t, pkt.payload) {
@@ -81,15 +85,21 @@ enum ReadErr {
 }
 
 /// Read one `$...#xx` framed packet out of `t`, writing it into `buf`.
-/// Returns the number of bytes consumed. Bytes outside a packet (leading
-/// ack/nak) are skipped. For [`VecTransport`] a drained queue becomes
-/// `Err(Detached)` so the test drives the loop to completion without an
-/// explicit detach packet.
+/// Returns the number of bytes consumed.
+///
+/// Scanning for `$` uses the non-blocking [`Transport::try_read_byte`]
+/// so that a drained [`VecTransport`] can end a test session and, on
+/// the real UART, the packet loop has a place to notice `^C` without
+/// deadlocking on idle. Once we've committed to a packet, everything
+/// up to and including the checksum is pulled with the *blocking*
+/// [`Transport::read_byte`] — the RSP spec guarantees those bytes are
+/// coming, and treating a between-byte pause as detach would cause
+/// `Com1PollingTransport` to bail out of every packet.
 fn read_packet<T: Transport>(t: &mut T, buf: &mut [u8]) -> Result<usize, ReadErr> {
     // Skip anything that isn't SOP. For the kernel transport this is
     // where `^C` would be noticed; for now we drop it on the floor.
     loop {
-        match try_read(t) {
+        match t.try_read_byte() {
             Some(b) if b == SOP => {
                 buf[0] = SOP;
                 break;
@@ -99,44 +109,27 @@ fn read_packet<T: Transport>(t: &mut T, buf: &mut [u8]) -> Result<usize, ReadErr
         }
     }
     let mut i = 1;
-    // Read payload until `#`.
+    // Read payload until `#`. Blocking: once SOP is seen, the packet
+    // is committed and the remaining bytes must come in.
     while i < buf.len() {
-        match try_read(t) {
-            Some(b) => {
-                buf[i] = b;
-                i += 1;
-                if b == EOP {
-                    break;
-                }
-            }
-            None => return Err(ReadErr::Detached),
+        let b = t.read_byte();
+        buf[i] = b;
+        i += 1;
+        if b == EOP {
+            break;
         }
     }
-    // Read the two hex checksum bytes.
+    // Read the two hex checksum bytes (also blocking).
     for _ in 0..2 {
-        match try_read(t) {
-            Some(b) => {
-                if i >= buf.len() {
-                    // Buffer full before checksum — decode will fail
-                    // and we'll NAK. Stop here.
-                    break;
-                }
-                buf[i] = b;
-                i += 1;
-            }
-            None => return Err(ReadErr::Detached),
+        if i >= buf.len() {
+            // Buffer full before checksum — decode will fail and we'll
+            // NAK. Stop here rather than overrun.
+            break;
         }
+        buf[i] = t.read_byte();
+        i += 1;
     }
     Ok(i)
-}
-
-/// Single byte pull. Returns `None` when the transport has no more
-/// input, which in [`VecTransport`] tests means the rx queue is drained
-/// and we should end the session. Real kernel callers that need to
-/// block across idle periods will grow that behavior alongside the
-/// fault-handler wiring in the follow-up.
-fn try_read<T: Transport>(t: &mut T) -> Option<u8> {
-    t.try_read_byte()
 }
 
 /// Handle a single decoded packet payload. Emits the response frame
