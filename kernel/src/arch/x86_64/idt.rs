@@ -55,8 +55,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // prologue, making the values gdb sees useless. See #482.
     unsafe {
         idt.breakpoint.set_handler_addr(x86_64::VirtAddr::new(
-            crate::arch::x86_64::gdb_trampoline::gdb_breakpoint_trampoline as *const ()
-                as usize as u64,
+            crate::arch::x86_64::gdb_trampoline::gdb_breakpoint_trampoline as *const () as usize
+                as u64,
         ));
     }
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
@@ -113,7 +113,6 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: #UD (invalid opcode)\n{:#?}", frame);
     hang();
 }
-
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
     log_first_ring3_fault("#GP", &frame, format_args!("code={:#x}", code));
