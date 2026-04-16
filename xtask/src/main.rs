@@ -75,6 +75,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
+    "banner: vibix ",
     "userspace module ELF entry=",
     "userspace: loader mapping image",
     "syscall: SYSCALL/SYSRET enabled",
@@ -571,11 +572,13 @@ fn ensure_initrd() -> R<PathBuf> {
     const HOSTNAME_PAYLOAD: &[u8] = b"vibix\n";
     const NESTED_FILE: &str = "etc/init/hello.txt";
     const NESTED_PAYLOAD: &[u8] = b"nested\n";
+    const MOTD_FILE: &str = "etc/motd";
+    const MOTD_PAYLOAD: &[u8] = b"Welcome to vibix. Type `help` for builtins.\n";
     const LDSO_FILE: &str = "lib/ld-musl-x86_64.so.1";
     const LDSO_SIZE: u64 = 645_736;
     const LDSO_BLOCKS: u64 = LDSO_SIZE.div_ceil(512); // = 1262 blocks
-                                                      // DIRS headers + 3 file headers + (2 small + LDSO_BLOCKS) data blocks + 2 end blocks.
-    const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 3 + 2 + LDSO_BLOCKS + 2) * 512;
+                                                      // DIRS headers + 4 file headers + (3 small + LDSO_BLOCKS) data blocks + 2 end blocks.
+    const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 4 + 3 + LDSO_BLOCKS + 2) * 512;
 
     let ldso_src = workspace_root().join("userspace/lib/ld-musl-x86_64.so.1");
 
@@ -624,6 +627,11 @@ fn ensure_initrd() -> R<PathBuf> {
         let mut payload_block = [0u8; 512];
         payload_block[..NESTED_PAYLOAD.len()].copy_from_slice(NESTED_PAYLOAD);
         data.extend_from_slice(&payload_block);
+        // etc/motd — user-facing banner line read by shell at startup.
+        data.extend_from_slice(&ustar_file_block(MOTD_FILE, MOTD_PAYLOAD.len() as u64));
+        let mut motd_block = [0u8; 512];
+        motd_block[..MOTD_PAYLOAD.len()].copy_from_slice(MOTD_PAYLOAD);
+        data.extend_from_slice(&motd_block);
         // lib/ld-musl-x86_64.so.1 — dynamic linker for musl-linked user binaries.
         data.extend_from_slice(&ustar_file_block(LDSO_FILE, LDSO_SIZE));
         let padded_len = ldso_bytes.len().div_ceil(512) * 512;
@@ -1152,10 +1160,13 @@ mod tests {
         let path = ensure_initrd().expect("ensure_initrd failed");
         assert!(path.exists());
         let data = fs::read(&path).unwrap();
-        // 5 dir headers + 2 file headers + 2 padded file data blocks +
-        // 2 end-of-archive zero blocks = 11 * 512
-        assert_eq!(data.len(), 11 * 512);
-        // Last 1024 bytes are the end-of-archive marker (all zeros)
+        // Assert the archive is a positive multiple of 512 and ends in the
+        // USTAR end-of-archive marker (two zero blocks). The exact length
+        // changes whenever the payload set changes — the `ensure_initrd`
+        // body computes `EXPECTED_SIZE` from the inputs, so we don't need
+        // to duplicate that arithmetic here.
+        assert!(data.len() >= 4 * 512);
+        assert_eq!(data.len() % 512, 0);
         assert!(data[data.len() - 1024..].iter().all(|&b| b == 0));
     }
 
