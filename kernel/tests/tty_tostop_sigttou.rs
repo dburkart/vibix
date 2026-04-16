@@ -13,7 +13,9 @@ use alloc::sync::Arc;
 use core::panic::PanicInfo;
 
 use vibix::process::{self, test_helpers as h};
-use vibix::signal::{sig_bit, SIGTTOU};
+use vibix::signal::{
+    restart_decision, sig_bit, Disposition, RestartDecision, SA_RESTART, SIGTERM, SIGTTOU,
+};
 use vibix::tty::{termios, tty_check_tostop, Tty, KERN_ERESTARTSYS};
 use vibix::{
     exit_qemu, serial_println,
@@ -59,6 +61,22 @@ fn run_tests() {
         (
             "sigttou_delivered_to_every_pgrp_member",
             &(sigttou_delivered_to_every_pgrp_member as fn()),
+        ),
+        (
+            "erestartsys_sa_restart_rewinds_syscall",
+            &(erestartsys_sa_restart_rewinds_syscall as fn()),
+        ),
+        (
+            "erestartsys_without_sa_restart_yields_eintr",
+            &(erestartsys_without_sa_restart_yields_eintr as fn()),
+        ),
+        (
+            "erestartsys_default_stop_rewinds",
+            &(erestartsys_default_stop_rewinds as fn()),
+        ),
+        (
+            "erestartsys_no_pending_signal_unconditionally_rewinds",
+            &(erestartsys_no_pending_signal_unconditionally_rewinds as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -158,4 +176,92 @@ fn sigttou_delivered_to_every_pgrp_member() {
         );
     }
     assert_eq!(pending_bits_for_pid(30) & sig_bit(SIGTTOU), 0);
+}
+
+// ── ERESTARTSYS / SA_RESTART trampoline classifier ──────────────────────
+//
+// The syscall trampoline (`check_and_deliver_signals`) reacts to
+// `tty_check_tostop`'s KERN_ERESTARTSYS by consulting `restart_decision`.
+// These cases drive the classifier directly — the trampoline path itself
+// needs a live kernel-stack-backed `SyscallReturnContext` and signal
+// frame push, which is covered by the shell-level end-to-end tests.
+
+fn erestartsys_sa_restart_rewinds_syscall() {
+    // Handler installed with SA_RESTART: rv=-ERESTARTSYS must restart
+    // the syscall *and* deliver the handler on top of the restart.
+    assert_eq!(
+        restart_decision(
+            KERN_ERESTARTSYS,
+            Some(SIGTTOU),
+            Disposition::Handler(0x0000_4000_0000_0000),
+            SA_RESTART,
+        ),
+        RestartDecision::Restart {
+            deliver_handler: true
+        }
+    );
+}
+
+fn erestartsys_without_sa_restart_yields_eintr() {
+    // Handler installed without SA_RESTART: convert to -EINTR.
+    assert_eq!(
+        restart_decision(
+            KERN_ERESTARTSYS,
+            Some(SIGTTOU),
+            Disposition::Handler(0x0000_4000_0000_0000),
+            0,
+        ),
+        RestartDecision::Eintr
+    );
+    // Non-ERESTARTSYS rv is passed through untouched.
+    assert_eq!(
+        restart_decision(
+            -4, // EINTR
+            Some(SIGTTOU),
+            Disposition::Handler(0x0000_4000_0000_0000),
+            0,
+        ),
+        RestartDecision::NoChange
+    );
+}
+
+fn erestartsys_default_stop_rewinds() {
+    // Default SIGTTOU action is Stop (job-control). Restart so that when
+    // the task is resumed it re-evaluates the tostop gate and either
+    // proceeds or re-enters the wait.
+    assert_eq!(
+        restart_decision(
+            KERN_ERESTARTSYS,
+            Some(SIGTTOU),
+            Disposition::Default,
+            0, // flags irrelevant for default disposition
+        ),
+        RestartDecision::Restart {
+            deliver_handler: false
+        }
+    );
+    // Default-Terminate (e.g. SIGTERM) also rewinds; the task is about
+    // to die via deliver_signal but -512 must not leak into userspace.
+    assert_eq!(
+        restart_decision(
+            KERN_ERESTARTSYS,
+            Some(SIGTERM),
+            Disposition::Default,
+            0,
+        ),
+        RestartDecision::Restart {
+            deliver_handler: false
+        }
+    );
+}
+
+fn erestartsys_no_pending_signal_unconditionally_rewinds() {
+    // A caller that returned ERESTARTSYS but no pending signal was
+    // actually consumed (e.g. spurious wake) restarts unconditionally.
+    assert_eq!(
+        restart_decision(KERN_ERESTARTSYS, None, Disposition::Default, 0),
+        RestartDecision::Restart {
+            deliver_handler: false
+        }
+    );
 }

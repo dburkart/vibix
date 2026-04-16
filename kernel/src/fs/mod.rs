@@ -625,9 +625,9 @@ impl FileBackend for SerialBackend {
         let caller = crate::process::current_pid();
         let tty = crate::tty::console_tty();
         if let Some(rc) = crate::tty::tty_check_sigttin(&tty, caller) {
-            if rc == crate::tty::KERN_ERESTARTSYS {
-                return Err(EINTR);
-            }
+            // KERN_ERESTARTSYS is honoured by the syscall trampoline
+            // (see `signal::check_and_deliver_signals`): restart on
+            // SA_RESTART, otherwise -EINTR.
             return Err(rc);
         }
         for (i, byte) in buf.iter_mut().enumerate() {
@@ -646,18 +646,14 @@ impl FileBackend for SerialBackend {
     /// never calls `serial_println!` or re-enters the COM1 mutex.
     ///
     /// Job-control gate: if the caller's pgrp is not the console tty's
-    /// foreground pgrp and `TOSTOP` is set, raise `SIGTTOU` and fail the
-    /// write with `EINTR`. Real `ERESTARTSYS` semantics (SA_RESTART-aware
-    /// transparent restart) arrive with the syscall trampoline follow-up.
+    /// foreground pgrp and `TOSTOP` is set, raise `SIGTTOU` and return
+    /// `KERN_ERESTARTSYS`. The syscall trampoline then either rewinds
+    /// `rip` to restart the write (SA_RESTART) or converts the return
+    /// to `-EINTR`.
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
         let caller = crate::process::current_pid();
         let tty = crate::tty::console_tty();
         if let Some(rc) = crate::tty::tty_check_tostop(&tty, caller) {
-            // KERN_ERESTARTSYS → EINTR at the syscall boundary until the
-            // trampoline honours restart semantics.
-            if rc == crate::tty::KERN_ERESTARTSYS {
-                return Err(EINTR);
-            }
             return Err(rc);
         }
         crate::serial::write_bytes(buf);
