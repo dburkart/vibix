@@ -257,6 +257,10 @@ name = "tty_sigttin_read"
 harness = false
 
 [[test]]
+name = "ntty_ldisc_wiring"
+harness = false
+
+[[test]]
 name = "shell_help"
 harness = false
 

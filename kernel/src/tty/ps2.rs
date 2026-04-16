@@ -9,11 +9,11 @@
 //! forwards every decoded Unicode byte (UTF-8) into
 //! `tty.ldisc.receive_byte(&tty, b)`.
 //!
-//! The default line discipline is [`PassthroughLdisc::new`], which drops
-//! bytes on the floor. This keeps behaviour identical to the pre-#405
-//! world (the shell still reads keystrokes via [`crate::input`]'s
-//! untouched SCANCODES ring) while establishing the pipe that N_TTY
-//! (#375) will hook into once it lands.
+//! The default line discipline is [`NTtyLdisc::new_kernel`], which runs
+//! each decoded byte through the full N_TTY pipeline (ISIG / ICANON /
+//! OPOST / ECHO). The shell still reads keystrokes via [`crate::input`]'s
+//! untouched SCANCODES ring until a second consumer migrates to the
+//! ldisc's raw ring in a follow-up.
 //!
 //! A second `pc_keyboard::Keyboard` instance lives here rather than
 //! sharing the one in [`crate::input`]; the shell-side consumer and the
@@ -27,7 +27,9 @@ use crate::tty::TtyDriver;
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, PassthroughLdisc, Tty};
+use crate::tty::ntty::NTtyLdisc;
+#[cfg(target_os = "none")]
+use crate::tty::{LineDiscipline, Tty};
 #[cfg(target_os = "none")]
 use alloc::sync::Arc;
 #[cfg(target_os = "none")]
@@ -57,7 +59,7 @@ impl TtyDriver for Ps2Driver {
 static PS2_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
     Arc::new(Tty::with_driver(
         Arc::new(Ps2Driver),
-        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+        Arc::new(NTtyLdisc::new_kernel()) as Arc<dyn LineDiscipline>,
     ))
 });
 

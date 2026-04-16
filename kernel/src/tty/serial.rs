@@ -9,11 +9,11 @@
 //! drains the ring and forwards every byte into
 //! `tty.ldisc.receive_byte(&tty, b)`.
 //!
-//! The default line discipline is [`PassthroughLdisc::new`], which drops
-//! bytes on the floor. This keeps behaviour identical to the pre-#406
-//! world (shell / kernel consumers still read bytes via
-//! [`crate::serial::try_read_byte`]) while establishing the pipe that
-//! N_TTY (#375) will hook into once it lands.
+//! The default line discipline is [`NTtyLdisc::new_kernel`], which runs
+//! each byte through the full N_TTY pipeline (ISIG / ICANON / OPOST /
+//! ECHO). Shell / kernel consumers still read bytes via
+//! [`crate::serial::try_read_byte`] until a follow-up migrates them to
+//! the ldisc's committed raw ring.
 //!
 //! RTS flow control: when the ring first crosses [`WATERMARK_HIGH`] the
 //! ISR-side path clears MCR.RTS to backpressure a peer that honours
@@ -35,7 +35,9 @@ use x86_64::instructions::port::Port;
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, PassthroughLdisc, Tty};
+use crate::tty::ntty::NTtyLdisc;
+#[cfg(target_os = "none")]
+use crate::tty::{LineDiscipline, Tty};
 #[cfg(target_os = "none")]
 use spin::Lazy;
 
@@ -80,7 +82,7 @@ impl TtyDriver for SerialDriver {
 static SERIAL_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
     Arc::new(Tty::with_driver(
         Arc::new(SerialDriver),
-        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+        Arc::new(NTtyLdisc::new_kernel()) as Arc<dyn LineDiscipline>,
     ))
 });
 
