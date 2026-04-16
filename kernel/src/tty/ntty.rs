@@ -1,15 +1,16 @@
-//! N_TTY line-discipline skeleton (RFC 0003 §N_TTY input).
+//! N_TTY line discipline (RFC 0003 §N_TTY input).
 //!
-//! This slice implements only the byte-level `c_iflag` input transforms —
-//! pure functions of `Termios.c_iflag` with no signal generation, line
-//! buffering, or output path. ICANON / ISIG / OPOST / echo arrive in later
-//! sub-issues of #375.
+//! Layers implemented so far:
+//! - `c_iflag` input transforms (ISTRIP / IGNCR / ICRNL / INLCR).
+//! - ISIG signal generation (SIGINT / SIGQUIT / SIGTSTP).
+//! - `c_oflag` output transforms + echo (OPOST / ONLCR / OCRNL / ECHO / ECHOE / ECHONL).
+//! - ICANON line buffering: VERASE / VKILL / VEOF / VEOL / newline commit.
 
 use spin::Mutex;
 
 use super::termios::{
-    Termios, ECHO, ECHOE, ECHONL, ICRNL, IGNCR, INLCR, ISIG, ISTRIP, OCRNL, ONLCR, OPOST, VERASE,
-    VINTR, VQUIT, VSUSP,
+    Termios, ECHO, ECHOE, ECHONL, ICANON, ICRNL, IGNCR, INLCR, ISIG, ISTRIP, OCRNL, ONLCR, OPOST,
+    VEOF, VEOL, VERASE, VINTR, VKILL, VQUIT, VSUSP,
 };
 use super::JobControl;
 
@@ -63,23 +64,138 @@ impl SignalDispatch for KernelSignalDispatch {
     }
 }
 
-/// Interior N_TTY state. Guarded by lock class "2d" per RFC 0003 §Lock
-/// order. Kept a unit placeholder until the `DeferredByteRing` primitive
-/// (#376) lands; receive_byte does not currently need the lock but the
-/// public `NTty` type is stabilised here so follow-up PRs extend state in
-/// place without churning callers.
-#[allow(dead_code)]
-struct NTtyState;
+/// Readers waiting on committed data in the raw ring. Decouples the
+/// N_TTY line discipline from the `Tty`-level waitqueue — production
+/// wiring supplies a real implementation; tests use [`NullWake`].
+pub trait ReaderWake {
+    fn wake(&self);
+}
+
+pub struct NullWake;
+
+impl ReaderWake for NullWake {
+    fn wake(&self) {}
+}
+
+fn matches_cc(termios: &Termios, cc_idx: usize, c: u8) -> bool {
+    let cc = termios.c_cc[cc_idx];
+    cc != 0 && c == cc
+}
+
+const LINE_BUF_CAP: usize = 4096;
+const RAW_RING_CAP: usize = 4096;
+
+struct LineBuffer {
+    buf: [u8; LINE_BUF_CAP],
+    len: usize,
+}
+
+impl LineBuffer {
+    const fn new() -> Self {
+        Self {
+            buf: [0; LINE_BUF_CAP],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, b: u8) -> bool {
+        if self.len >= LINE_BUF_CAP {
+            return false;
+        }
+        self.buf[self.len] = b;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.buf[self.len])
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[allow(dead_code)]
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+struct RawRing {
+    buf: [u8; RAW_RING_CAP],
+    head: usize,
+    tail: usize,
+    eof_pos: Option<usize>,
+}
+
+impl RawRing {
+    const fn new() -> Self {
+        Self {
+            buf: [0; RAW_RING_CAP],
+            head: 0,
+            tail: 0,
+            eof_pos: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.tail.wrapping_sub(self.head)
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+
+    fn push(&mut self, b: u8) -> bool {
+        if self.len() >= RAW_RING_CAP {
+            return false;
+        }
+        self.buf[self.tail & (RAW_RING_CAP - 1)] = b;
+        self.tail = self.tail.wrapping_add(1);
+        true
+    }
+
+    fn commit_line(&mut self, src: &[u8], is_eof: bool) {
+        for &b in src {
+            if !self.push(b) {
+                break;
+            }
+        }
+        if is_eof {
+            self.eof_pos = Some(self.tail);
+        }
+    }
+}
+
+struct NTtyState {
+    line: LineBuffer,
+    raw: RawRing,
+}
+
+impl NTtyState {
+    fn commit_line(&mut self, is_eof: bool) {
+        self.raw
+            .commit_line(&self.line.buf[..self.line.len], is_eof);
+        self.line.len = 0;
+    }
+}
 
 pub struct NTty {
-    #[allow(dead_code)]
     state: Mutex<NTtyState>,
 }
 
 impl NTty {
     pub const fn new() -> Self {
         Self {
-            state: Mutex::new(NTtyState),
+            state: Mutex::new(NTtyState {
+                line: LineBuffer::new(),
+                raw: RawRing::new(),
+            }),
         }
     }
 
@@ -104,11 +220,11 @@ impl NTty {
         b: u8,
     ) -> Option<u8> {
         if termios.c_lflag & ISIG != 0 {
-            let sig = if b == termios.c_cc[VINTR] {
+            let sig = if matches_cc(termios, VINTR, b) {
                 Some(SIGINT)
-            } else if b == termios.c_cc[VQUIT] {
+            } else if matches_cc(termios, VQUIT, b) {
                 Some(SIGQUIT)
-            } else if b == termios.c_cc[VSUSP] {
+            } else if matches_cc(termios, VSUSP, b) {
                 Some(SIGTSTP)
             } else {
                 None
@@ -127,6 +243,50 @@ impl NTty {
             }
         }
         self.receive_byte(termios, b)
+    }
+
+    /// ICANON-aware input path. Routes a post-iflag byte into either the
+    /// line editor (canonical mode) or straight into the raw ring (raw
+    /// mode). Callers should feed the result of `receive_byte` (or
+    /// `receive_signal_or_byte`) into this method.
+    ///
+    /// In canonical mode: VERASE pops the last byte, VKILL clears the
+    /// line, VEOF commits the line without appending the EOF byte itself
+    /// (and records a positional EOF boundary on the raw ring), `\n` and
+    /// VEOL append and commit. All other bytes are appended to the
+    /// line-in-progress; overflow silently drops the newest byte
+    /// (matching Linux behavior).
+    ///
+    /// In raw mode (`ICANON` clear): every byte is pushed directly into
+    /// the raw ring and the reader is woken immediately.
+    pub fn canon_input(&self, termios: &Termios, c: u8, wake: &dyn ReaderWake) {
+        let should_wake;
+        {
+            let mut st = self.state.lock();
+            if termios.c_lflag & ICANON == 0 {
+                st.raw.push(c);
+                should_wake = true;
+            } else if matches_cc(termios, VEOF, c) {
+                st.commit_line(true);
+                should_wake = true;
+            } else if c == b'\n' || matches_cc(termios, VEOL, c) {
+                st.commit_line(false);
+                st.raw.push(c);
+                should_wake = true;
+            } else if matches_cc(termios, VERASE, c) {
+                st.line.pop();
+                should_wake = false;
+            } else if matches_cc(termios, VKILL, c) {
+                st.line.clear();
+                should_wake = false;
+            } else {
+                st.line.push(c);
+                should_wake = false;
+            }
+        }
+        if should_wake {
+            wake.wake();
+        }
     }
 
     /// Apply the `c_iflag` input transforms to one raw byte.
@@ -201,7 +361,7 @@ impl NTty {
         if lflag & ECHO == 0 && !(lflag & ECHONL != 0 && c == b'\n') {
             return;
         }
-        if lflag & ECHOE != 0 && c == termios.c_cc[VERASE] {
+        if lflag & ECHOE != 0 && matches_cc(termios, VERASE, c) {
             self.process_output(termios, &[0x08, b' ', 0x08], out);
             return;
         }
@@ -544,5 +704,232 @@ mod tests {
         // no delivery occurs when there's no foreground pgrp.
         assert_eq!(n.receive_signal_or_byte(&t, &ctrl, &d, t.c_cc[VINTR]), None);
         assert!(d.captures().is_empty());
+    }
+
+    // ── ICANON tests (#429) ─────────────────────────────────────────
+
+    use core::cell::Cell;
+
+    struct CountingWake(Cell<usize>);
+
+    impl CountingWake {
+        fn new() -> Self {
+            Self(Cell::new(0))
+        }
+        fn count(&self) -> usize {
+            self.0.get()
+        }
+    }
+
+    impl ReaderWake for CountingWake {
+        fn wake(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    fn termios_canon() -> Termios {
+        let mut t = Termios::sane();
+        t.c_lflag = ICANON;
+        t
+    }
+
+    fn termios_raw() -> Termios {
+        let mut t = Termios::sane();
+        t.c_lflag = 0;
+        t
+    }
+
+    fn raw_contents(n: &NTty) -> Vec<u8> {
+        let st = n.state.lock();
+        let mut out = Vec::new();
+        let mut i = st.raw.head;
+        while i != st.raw.tail {
+            out.push(st.raw.buf[i & (RAW_RING_CAP - 1)]);
+            i = i.wrapping_add(1);
+        }
+        out
+    }
+
+    #[test]
+    fn raw_mode_pushes_directly_to_ring() {
+        let n = NTty::new();
+        let t = termios_raw();
+        let w = CountingWake::new();
+        n.canon_input(&t, b'a', &w);
+        n.canon_input(&t, b'b', &w);
+        assert_eq!(raw_contents(&n), b"ab");
+        assert_eq!(w.count(), 2);
+    }
+
+    #[test]
+    fn canon_newline_commits_line() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        for &b in b"abc" {
+            n.canon_input(&t, b, &w);
+        }
+        assert!(raw_contents(&n).is_empty());
+        assert_eq!(w.count(), 0);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(raw_contents(&n), b"abc\n");
+        assert_eq!(w.count(), 1);
+    }
+
+    #[test]
+    fn canon_veol_commits_line() {
+        let mut t = termios_canon();
+        t.c_cc[VEOL] = b'|';
+        let n = NTty::new();
+        let w = CountingWake::new();
+        for &b in b"xy" {
+            n.canon_input(&t, b, &w);
+        }
+        n.canon_input(&t, b'|', &w);
+        assert_eq!(raw_contents(&n), b"xy|");
+        assert_eq!(w.count(), 1);
+    }
+
+    #[test]
+    fn canon_veof_commits_without_char() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        for &b in b"hi" {
+            n.canon_input(&t, b, &w);
+        }
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        assert_eq!(raw_contents(&n), b"hi");
+        assert!(n.state.lock().raw.eof_pos.is_some());
+        assert_eq!(w.count(), 1);
+    }
+
+    #[test]
+    fn canon_verase_pops_last() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        n.canon_input(&t, b'a', &w);
+        n.canon_input(&t, b'b', &w);
+        n.canon_input(&t, t.c_cc[VERASE], &w);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(raw_contents(&n), b"a\n");
+    }
+
+    #[test]
+    fn canon_verase_on_empty_is_noop() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        n.canon_input(&t, t.c_cc[VERASE], &w);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(raw_contents(&n), b"\n");
+    }
+
+    #[test]
+    fn canon_vkill_clears_line() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        for &b in b"abc" {
+            n.canon_input(&t, b, &w);
+        }
+        n.canon_input(&t, t.c_cc[VKILL], &w);
+        n.canon_input(&t, b'd', &w);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(raw_contents(&n), b"d\n");
+    }
+
+    #[test]
+    fn canon_line_overflow_drops_newest() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        for _ in 0..LINE_BUF_CAP {
+            n.canon_input(&t, b'x', &w);
+        }
+        // 4097th byte silently dropped — line buffer is full.
+        n.canon_input(&t, b'y', &w);
+        assert_eq!(w.count(), 0);
+        // Newline commits the full line (all x's).
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(w.count(), 1);
+        let data = raw_contents(&n);
+        assert_eq!(data.len(), LINE_BUF_CAP);
+        assert!(data.iter().all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn cc_disabled_zero_not_matched() {
+        let mut t = termios_canon();
+        t.c_cc[VEOF] = 0;
+        let n = NTty::new();
+        let w = NullWake;
+        n.canon_input(&t, 0x04, &w);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(raw_contents(&n), &[0x04, b'\n']);
+    }
+
+    #[test]
+    fn raw_ring_wraps_correctly() {
+        let n = NTty::new();
+        let t = termios_raw();
+        let w = NullWake;
+        for i in 0u8..128 {
+            n.canon_input(&t, i, &w);
+        }
+        {
+            let mut st = n.state.lock();
+            st.raw.head = st.raw.head.wrapping_add(64);
+        }
+        for i in 0u8..64 {
+            n.canon_input(&t, i, &w);
+        }
+        assert_eq!(n.state.lock().raw.len(), 128);
+    }
+
+    #[test]
+    fn eof_pos_is_positional_not_sticky() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        n.canon_input(&t, b'a', &w);
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        assert!(n.state.lock().raw.eof_pos.is_some());
+        {
+            let mut st = n.state.lock();
+            st.raw.head = st.raw.tail;
+            st.raw.eof_pos = None;
+        }
+        n.canon_input(&t, b'b', &w);
+        n.canon_input(&t, b'\n', &w);
+        assert!(n.state.lock().raw.eof_pos.is_none());
+    }
+
+    #[test]
+    fn wake_called_on_commit() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        n.canon_input(&t, b'a', &w);
+        assert_eq!(w.count(), 0);
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(w.count(), 1);
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        assert_eq!(w.count(), 2);
+    }
+
+    #[test]
+    fn multi_line_concatenation() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        for &b in b"abc\n" {
+            n.canon_input(&t, b, &w);
+        }
+        for &b in b"def\n" {
+            n.canon_input(&t, b, &w);
+        }
+        assert_eq!(raw_contents(&n), b"abc\ndef\n");
     }
 }
