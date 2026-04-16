@@ -134,11 +134,7 @@ fn vintr_flushes_committed_line_too() {
     for b in b"hello\n" {
         feed_byte(&n, &t, &ctrl, *b);
     }
-    assert_eq!(
-        n.reader_len(),
-        6,
-        "committed line should populate raw ring"
-    );
+    assert_eq!(n.reader_len(), 6, "committed line should populate raw ring");
 
     // Start a new in-progress line, then VINTR.
     for b in b"xyz" {
