@@ -330,6 +330,9 @@ pub fn raise_signal_on_pgrp(pgid: ProcessGroupId, sig: u8) -> usize {
 /// TABLE is released before the signal mutex is taken.
 pub fn is_signal_blocked_or_ignored(pid: u32, sig: u8) -> bool {
     use crate::signal::{sig_bit, Disposition};
+    if sig == 0 || sig > crate::signal::NSIG {
+        return false;
+    }
     let signals = {
         let t = TABLE.lock();
         match t.by_pid.get(&pid) {
