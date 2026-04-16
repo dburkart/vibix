@@ -262,12 +262,12 @@ impl Pipe {
                 if crate::process::with_signal_state_for_task(tid, |s| s.pending != 0)
                     .unwrap_or(false)
                 {
-                    // Roll back our provisional reader count so a later
-                    // retry sees a clean state, and wake any writer that
-                    // may have parked on us.
+                    // Roll back our provisional reader count and wake
+                    // any writer parked on the FIFO open rendezvous
+                    // queue — not wr_wait (that's for data writes).
                     let prev = self.readers.fetch_sub(1, Ordering::AcqRel);
                     if prev == 1 {
-                        self.wr_wait.wake_all();
+                        self.open_wait_w.wake_all();
                     }
                     return Err(crate::tty::KERN_ERESTARTSYS);
                 }
@@ -282,7 +282,7 @@ impl Pipe {
             // so test state stays consistent across calls.
             let prev = self.readers.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
-                self.wr_wait.wake_all();
+                self.open_wait_w.wake_all();
             }
             Err(EAGAIN)
         }
@@ -331,7 +331,7 @@ impl Pipe {
                 {
                     let prev = self.writers.fetch_sub(1, Ordering::AcqRel);
                     if prev == 1 {
-                        self.rd_wait.wake_all();
+                        self.open_wait_r.wake_all();
                     }
                     return Err(crate::tty::KERN_ERESTARTSYS);
                 }
@@ -341,7 +341,7 @@ impl Pipe {
         {
             let prev = self.writers.fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
-                self.rd_wait.wake_all();
+                self.open_wait_r.wake_all();
             }
             Err(EAGAIN)
         }
@@ -353,14 +353,14 @@ impl Pipe {
     /// body. Each increments its own refcount and wakes the peer's
     /// rendezvous queue so any blocked `O_RDONLY` / `O_WRONLY` opener
     /// observes progress.
-    pub fn open_rdwr(self: &Arc<Self>) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
+    pub fn open_rdwr(self: &Arc<Self>, nonblocking: bool) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
         self.readers.fetch_add(1, Ordering::AcqRel);
         self.writers.fetch_add(1, Ordering::AcqRel);
         self.open_wait_r.wake_all();
         self.open_wait_w.wake_all();
         (
-            PipeReadEnd::new_arc(self.clone(), false),
-            PipeWriteEnd::new_arc(self.clone(), false),
+            PipeReadEnd::new_arc(self.clone(), nonblocking),
+            PipeWriteEnd::new_arc(self.clone(), nonblocking),
         )
     }
 }
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn fifo_open_rdwr_always_succeeds_both_counts_one() {
         let fifo = Pipe::new_for_fifo();
-        let (r, w) = fifo.open_rdwr();
+        let (r, w) = fifo.open_rdwr(false);
         assert_eq!(fifo.readers.load(Ordering::Relaxed), 1);
         assert_eq!(fifo.writers.load(Ordering::Relaxed), 1);
         drop(w);

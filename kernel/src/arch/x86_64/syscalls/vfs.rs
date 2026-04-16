@@ -332,7 +332,7 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
                 // same inode retains both a reader and writer count
                 // for the caller, so a later `read`/`write` on the fd
                 // sees the ring in whichever direction is populated.
-                let (r, w) = pipe.open_rdwr();
+                let (r, w) = pipe.open_rdwr(nonblocking);
                 // Keep the write end alive alongside the read end by
                 // wrapping both in a small struct. Since an `O_RDWR`
                 // FIFO must be both readable and writable from the
@@ -626,6 +626,13 @@ fn mknod_impl(dfd: i32, path_uva: u64, mode: u32, _dev: u64) -> i64 {
     let is_absolute = path.first() == Some(&b'/');
     if dfd != AT_FDCWD && !is_absolute {
         return EINVAL;
+    }
+
+    // mknod never names a directory — a trailing slash on the leaf is
+    // invalid. split_parent strips it silently, so the check has to
+    // happen here.
+    if path.len() > 1 && path.last() == Some(&b'/') {
+        return ENOTDIR;
     }
 
     // Refuse if the target already exists. Matches Linux mknod semantics

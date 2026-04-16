@@ -914,6 +914,7 @@ mod tests {
         assert_eq!(EPERM, -1);
         assert_eq!(ENOENT, -2);
         assert_eq!(EINTR, -4);
+        assert_eq!(ENXIO, -6);
         assert_eq!(EBADF, -9);
         assert_eq!(EAGAIN, -11);
         assert_eq!(ENOMEM, -12);
