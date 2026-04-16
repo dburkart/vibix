@@ -13,6 +13,45 @@ use spin::Once;
 /// Global feature set, populated once by `init()`.
 static FEATURES: Once<Features> = Once::new();
 
+/// CPU brand string, populated once by `init()` from CPUID extended
+/// leaves `0x80000002..0x80000004`. `'static` so callers can hand the
+/// reference to any formatter without worrying about lifetime.
+static BRAND: Once<[u8; 48]> = Once::new();
+static BRAND_LEN: Once<usize> = Once::new();
+
+/// Return the CPU brand string as detected at boot, or `"unknown"`
+/// when CPUID did not report one (or when called before `init()`).
+pub fn brand() -> &'static str {
+    let (Some(buf), Some(len)) = (BRAND.get(), BRAND_LEN.get()) else {
+        return "unknown";
+    };
+    core::str::from_utf8(&buf[..*len]).unwrap_or("unknown")
+}
+
+/// Parse a 48-byte CPU brand string from CPUID leaves 0x80000002..4.
+/// Leading / trailing spaces and NULs are trimmed. Pure logic, kept
+/// out of `init()` so host unit tests can exercise it.
+pub fn brand_from_raw(buf: &[u8; 48]) -> ([u8; 48], usize) {
+    // Strip trailing NUL + ASCII whitespace.
+    let mut end = buf.len();
+    while end > 0 {
+        let b = buf[end - 1];
+        if b == 0 || b == b' ' || b == b'\t' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    // Strip leading whitespace.
+    let mut start = 0;
+    while start < end && matches!(buf[start], b' ' | b'\t') {
+        start += 1;
+    }
+    let mut out = [0u8; 48];
+    out[..end - start].copy_from_slice(&buf[start..end]);
+    (out, end - start)
+}
+
 /// Raw CPUID leaf values captured at boot.
 ///
 /// Stored as plain `u32` fields so the struct is constructable in host
@@ -164,6 +203,27 @@ pub fn init() {
     let features = Features::from_raw(l1.edx, l1.ecx, l7_ebx, l7_ecx, l7_edx, lext_edx, lext_ecx);
     FEATURES.call_once(|| features);
 
+    // CPU brand string lives in extended leaves 0x80000002..4, each
+    // packing 16 ASCII bytes across EAX/EBX/ECX/EDX. Absent leaves
+    // mean an unidentified CPU — fall back to an empty buffer.
+    if max_ext >= 0x8000_0004 {
+        let mut raw = [0u8; 48];
+        for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
+            .iter()
+            .enumerate()
+        {
+            let r = __cpuid(*leaf);
+            let base = i * 16;
+            raw[base..base + 4].copy_from_slice(&r.eax.to_le_bytes());
+            raw[base + 4..base + 8].copy_from_slice(&r.ebx.to_le_bytes());
+            raw[base + 8..base + 12].copy_from_slice(&r.ecx.to_le_bytes());
+            raw[base + 12..base + 16].copy_from_slice(&r.edx.to_le_bytes());
+        }
+        let (trimmed, len) = brand_from_raw(&raw);
+        BRAND.call_once(|| trimmed);
+        BRAND_LEN.call_once(|| len);
+    }
+
     // Print a single boot-time line listing every detected feature.
     // No heap available yet — print tokens one by one.
     crate::serial_print!("cpu:");
@@ -270,6 +330,38 @@ mod tests {
         assert!(!f.has(Feature::Smap));
         assert!(!f.has(Feature::Rdtscp));
         assert!(!f.has(Feature::Lzcnt));
+    }
+
+    #[test]
+    fn brand_trims_trailing_nul_and_spaces() {
+        let mut raw = [0u8; 48];
+        let src = b"Intel(R) Core(TM) Test CPU";
+        raw[..src.len()].copy_from_slice(src);
+        // Remainder is already 0.
+        let (out, len) = brand_from_raw(&raw);
+        assert_eq!(&out[..len], src);
+    }
+
+    #[test]
+    fn brand_trims_leading_spaces() {
+        let mut raw = [0u8; 48];
+        let src = b"          AMD EPYC";
+        raw[..src.len()].copy_from_slice(src);
+        let (out, len) = brand_from_raw(&raw);
+        assert_eq!(&out[..len], b"AMD EPYC");
+    }
+
+    #[test]
+    fn brand_empty_when_all_zero() {
+        let raw = [0u8; 48];
+        let (_out, len) = brand_from_raw(&raw);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn brand_fn_returns_unknown_before_init() {
+        // BRAND is not initialized in host tests.
+        assert_eq!(brand(), "unknown");
     }
 
     #[test]
