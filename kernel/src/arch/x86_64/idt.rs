@@ -93,9 +93,14 @@ extern "x86-interrupt" fn breakpoint(mut frame: InterruptStackFrame) {
     // `iretq` resumes at the debugger-chosen location. GPR writeback is
     // tracked separately — the int3 prologue clobbered GPRs before we
     // got here, so `regs.rax..r15` are zero and round-trip no-ops.
+    // A `G` packet from a buggy or hostile debugger could send a non-
+    // canonical rip; `VirtAddr::new` would panic there. Fall back to the
+    // original rip in that case so the kernel resumes at the int3 site
+    // rather than double-faulting on writeback.
     unsafe {
         frame.as_mut().update(|f| {
-            f.instruction_pointer = x86_64::VirtAddr::new(regs.rip);
+            f.instruction_pointer =
+                x86_64::VirtAddr::try_new(regs.rip).unwrap_or(f.instruction_pointer);
             f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(regs.eflags as u64);
         });
     }
