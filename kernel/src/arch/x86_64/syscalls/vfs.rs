@@ -302,6 +302,52 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
         }
     }
 
+    // 7a. FIFO detour: on an `InodeKind::Fifo`, `open(2)` rendezvous
+    //     semantics (POSIX §open) take over — we never build a
+    //     `VfsBackend` / `OpenFile` for the FIFO body. Instead the fd
+    //     gets a bare `PipeReadEnd` / `PipeWriteEnd` bound to the
+    //     FIFO's shared `Arc<Pipe>` via `Pipe::open_read`/`open_write`.
+    if inode.kind == InodeKind::Fifo {
+        let pipe = match inode.ops.fifo_pipe() {
+            Some(p) => p,
+            // A FIFO inode must always carry a pipe — surface the bug
+            // as ENXIO (same errno used for a write-side rendezvous
+            // failure) rather than panic.
+            None => return crate::fs::ENXIO,
+        };
+        let nonblocking = flags32 & oflags::O_NONBLOCK != 0;
+        let access = flags32 & oflags::O_ACCMODE;
+        let backend: Arc<dyn FileBackend> = match access {
+            oflags::O_RDONLY => match pipe.open_read(nonblocking) {
+                Ok(r) => r,
+                Err(e) => return e,
+            },
+            oflags::O_WRONLY => match pipe.open_write(nonblocking) {
+                Ok(w) => w,
+                Err(e) => return e,
+            },
+            oflags::O_RDWR => {
+                // Linux extension: `O_RDWR` on a FIFO always succeeds.
+                // We install the read end as the fd's backend — the
+                // same inode retains both a reader and writer count
+                // for the caller, so a later `read`/`write` on the fd
+                // sees the ring in whichever direction is populated.
+                let (r, w) = pipe.open_rdwr(nonblocking);
+                // Keep the write end alive alongside the read end by
+                // wrapping both in a small struct. Since an `O_RDWR`
+                // FIFO must be both readable and writable from the
+                // same fd, the backend needs to route `read` to `r`
+                // and `write` to `w`.
+                Arc::new(FifoRdwrBackend {
+                    read_end: r,
+                    write_end: w,
+                })
+            }
+            _ => return EINVAL,
+        };
+        return install_fd(backend, flags as u32);
+    }
+
     // 7. Build the OpenFile. The edge list in `nd` keeps the SB alive
     //    until we've successfully acquired our own `SbActiveGuard`.
     let sb = match inode.sb.upgrade() {
@@ -326,6 +372,27 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
     );
     let backend: Arc<dyn FileBackend> = Arc::new(VfsBackend { open_file: of });
     install_fd(backend, flags as u32)
+}
+
+/// FileBackend used when a FIFO is opened `O_RDWR`. Routes `read` to
+/// the held `PipeReadEnd` and `write` to the held `PipeWriteEnd`; both
+/// refer to the same underlying `Arc<Pipe>`, so a write by the caller
+/// is observable on a subsequent read (and vice versa on the same fd).
+struct FifoRdwrBackend {
+    read_end: Arc<crate::ipc::pipe::PipeReadEnd>,
+    write_end: Arc<crate::ipc::pipe::PipeWriteEnd>,
+}
+
+impl FileBackend for FifoRdwrBackend {
+    fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        self.read_end.read(buf)
+    }
+    fn write(&self, buf: &[u8]) -> Result<usize, i64> {
+        self.write_end.write(buf)
+    }
+    fn poll(&self, pt: &mut crate::poll::PollTable) -> crate::poll::PollMask {
+        self.read_end.poll(pt) | self.write_end.poll(pt)
+    }
 }
 
 /// `stat(path, *statbuf)` (follow=true) / `lstat(path, *statbuf)`
@@ -534,4 +601,83 @@ pub unsafe fn sys_getcwd(buf_uva: u64, len: u64) -> i64 {
         Ok(()) => out.len() as i64,
         Err(e) => e.as_errno(),
     }
+}
+
+/// POSIX file-type bits (mask: `S_IFMT`). Only the values we act on are
+/// spelled out — the full Linux set is larger, but `mknod` in this
+/// kernel only accepts FIFO and regular files today.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFIFO: u32 = 0o010_000;
+
+/// Shared body for `mknod(2)` / `mknodat(2)`.
+///
+/// Resolves the parent directory, splits off the leaf name, then dispatches
+/// to `InodeOps::mkfifo` (for `S_IFIFO`) or `InodeOps::create` (for
+/// `S_IFREG`). Any other type — character/block/socket nodes — returns
+/// `-EPERM` since this kernel has no devtmpfs or unix-socket support yet.
+fn mknod_impl(dfd: i32, path_uva: u64, mode: u32, _dev: u64) -> i64 {
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    // mknod never names a directory — a trailing slash on the leaf is
+    // invalid. split_parent strips it silently, so the check has to
+    // happen here.
+    if path.len() > 1 && path.last() == Some(&b'/') {
+        return ENOTDIR;
+    }
+
+    // Refuse if the target already exists. Matches Linux mknod semantics
+    // (EEXIST on pre-existing path).
+    if resolve_inode(path, /* follow */ false).is_ok() {
+        return EEXIST;
+    }
+
+    let (parent_path, leaf) = match split_parent(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if parent_inode.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    let perm = (mode & 0o7777) as u16;
+    let typ = mode & S_IFMT;
+    // A zero type field means "regular file" per POSIX.
+    let typ = if typ == 0 { S_IFREG } else { typ };
+
+    match typ {
+        S_IFIFO => match parent_inode.ops.mkfifo(&parent_inode, leaf, perm) {
+            Ok(_) => 0,
+            Err(e) => e,
+        },
+        S_IFREG => match parent_inode.ops.create(&parent_inode, leaf, perm) {
+            Ok(_) => 0,
+            Err(e) => e,
+        },
+        _ => crate::fs::EPERM,
+    }
+}
+
+/// `mknod(path, mode, dev)` — create a FIFO or regular file at `path`.
+pub unsafe fn sys_mknod_impl(path_uva: u64, mode: u64, dev: u64) -> i64 {
+    mknod_impl(AT_FDCWD, path_uva, mode as u32, dev)
+}
+
+/// `mknodat(dfd, path, mode, dev)` — like `mknod` but relative to `dfd`.
+/// Only `AT_FDCWD` and absolute paths are honored today.
+pub unsafe fn sys_mknodat_impl(dfd: i32, path_uva: u64, mode: u64, dev: u64) -> i64 {
+    mknod_impl(dfd, path_uva, mode as u32, dev)
 }

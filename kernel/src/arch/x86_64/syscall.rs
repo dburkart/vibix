@@ -598,6 +598,12 @@ pub unsafe extern "C" fn syscall_dispatch(
         // pipe2(pipefd, flags) — like pipe() but with O_NONBLOCK/O_CLOEXEC.
         PIPE2 => crate::ipc::pipe::sys_pipe2(a0, a1 as u32),
 
+        // mknod(path, mode, dev) — create a FIFO or regular file.
+        MKNOD => super::syscalls::vfs::sys_mknod_impl(a0, a1, a2),
+
+        // mknodat(dfd, path, mode, dev) — like mknod relative to dfd.
+        MKNODAT => super::syscalls::vfs::sys_mknodat_impl(a0 as i32, a1, a2, a3),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1130,6 +1136,8 @@ pub mod syscall_nr {
     pub const CHDIR: u64 = 80;
     pub const PIPE: u64 = 22;
     pub const PIPE2: u64 = 293;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1201,5 +1209,11 @@ mod tests {
         assert_eq!(syscall_nr::SETSID, 112, "SYS_setsid must be 112");
         assert_eq!(syscall_nr::GETPGID, 121, "SYS_getpgid must be 121");
         assert_eq!(syscall_nr::GETSID, 124, "SYS_getsid must be 124");
+
+        // IPC / FIFO
+        assert_eq!(syscall_nr::PIPE, 22, "SYS_pipe must be 22");
+        assert_eq!(syscall_nr::PIPE2, 293, "SYS_pipe2 must be 293");
+        assert_eq!(syscall_nr::MKNOD, 133, "SYS_mknod must be 133");
+        assert_eq!(syscall_nr::MKNODAT, 259, "SYS_mknodat must be 259");
     }
 }

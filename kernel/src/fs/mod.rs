@@ -199,6 +199,7 @@ pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
 pub const EINTR: i64 = -4;
 pub const EIO: i64 = -5;
+pub const ENXIO: i64 = -6;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;
 pub const ENOMEM: i64 = -12;
@@ -998,6 +999,7 @@ mod tests {
         assert_eq!(EPERM, -1);
         assert_eq!(ENOENT, -2);
         assert_eq!(EINTR, -4);
+        assert_eq!(ENXIO, -6);
         assert_eq!(EBADF, -9);
         assert_eq!(EAGAIN, -11);
         assert_eq!(ENOMEM, -12);
