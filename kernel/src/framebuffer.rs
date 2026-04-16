@@ -714,9 +714,17 @@ impl Console {
             // Per xterm semantics, DECRC without a prior DECSC is a no-op.
             return;
         }
+        // Mirror `toggle_cursor`: when the user is scrolled back, the live
+        // cursor isn't on screen. Update the logical state but don't paint —
+        // otherwise an `ESC 8` punches cursor glyphs into the scrolled-back
+        // viewport and corrupts the scrollback read-out.
+        let live = self.scroll_offset == 0;
+
         // Erase the cursor at its current position before moving.
-        let (cx, cy) = (self.cx, self.cy);
-        self.draw_cursor(cx, cy, false);
+        if live {
+            let (cx, cy) = (self.cx, self.cy);
+            self.draw_cursor(cx, cy, false);
+        }
 
         self.cx = self.saved_cx.min(self.cols.saturating_sub(1));
         self.cy = self.saved_cy.min(self.rows.saturating_sub(1));
@@ -724,9 +732,12 @@ impl Console {
         self.bg_base = self.saved_bg;
         self.bold = self.saved_bold;
 
-        // Draw at the new position.
-        let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
-        self.draw_cursor(cx, cy, on);
+        // Draw at the new position — only when live; otherwise the next
+        // snap-to-bottom (e.g. on next write) repaints with correct state.
+        if live {
+            let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+            self.draw_cursor(cx, cy, on);
+        }
     }
 
     // ── DEC private mode (DECSET / DECRST) ────────────────────────────────
