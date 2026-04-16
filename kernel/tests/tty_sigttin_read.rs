@@ -42,10 +42,7 @@ fn run_tests() {
             "background_pgrp_raises_sigttin",
             &(background_pgrp_raises_sigttin as fn()),
         ),
-        (
-            "no_fg_pgrp_allows_read",
-            &(no_fg_pgrp_allows_read as fn()),
-        ),
+        ("no_fg_pgrp_allows_read", &(no_fg_pgrp_allows_read as fn())),
         (
             "caller_pid_zero_allows_read",
             &(caller_pid_zero_allows_read as fn()),
