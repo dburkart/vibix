@@ -45,7 +45,10 @@ fn run_tests() {
         ("m_reads_known_bytes", &(m_reads_known_bytes as fn())),
         ("m_unmapped_returns_e01", &(m_unmapped_returns_e01 as fn())),
         ("big_m_writes_buffer", &(big_m_writes_buffer as fn())),
-        ("big_m_unmapped_returns_e01", &(big_m_unmapped_returns_e01 as fn())),
+        (
+            "big_m_unmapped_returns_e01",
+            &(big_m_unmapped_returns_e01 as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
