@@ -10,6 +10,7 @@
 //! [`line_editor`] submodule as pure logic so it's host-unit-testable.
 
 pub mod ansi;
+pub mod banner;
 pub mod line_editor;
 
 #[cfg(target_os = "none")]
@@ -36,6 +37,7 @@ mod kernel_side {
     pub fn run() -> ! {
         serial_println!("shell: prompt online");
         SHELL_ONLINE.store(true, Ordering::SeqCst);
+        super::banner::print_banner();
         prompt();
 
         let mut editor = LineEditor::new();

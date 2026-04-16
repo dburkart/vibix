@@ -75,6 +75,12 @@ const SMOKE_MARKERS: &[&str] = &[
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
+    // Front-anchored and includes the kernel release so a regression that
+    // drops either the banner prefix or the release interpolation fails
+    // smoke, not just one of the two. Relies on xtask + kernel sharing the
+    // workspace version so CARGO_PKG_VERSION matches what build_info::RELEASE
+    // stamps into the banner at build time.
+    concat!("banner: vibix ", env!("CARGO_PKG_VERSION")),
     "userspace module ELF entry=",
     "userspace: loader mapping image",
     "syscall: SYSCALL/SYSRET enabled",
@@ -571,27 +577,44 @@ fn ensure_initrd() -> R<PathBuf> {
     const HOSTNAME_PAYLOAD: &[u8] = b"vibix\n";
     const NESTED_FILE: &str = "etc/init/hello.txt";
     const NESTED_PAYLOAD: &[u8] = b"nested\n";
+    const MOTD_FILE: &str = "etc/motd";
+    const MOTD_PAYLOAD: &[u8] = b"Welcome to vibix. Type `help` for builtins.\n";
     const LDSO_FILE: &str = "lib/ld-musl-x86_64.so.1";
     const LDSO_SIZE: u64 = 645_736;
     const LDSO_BLOCKS: u64 = LDSO_SIZE.div_ceil(512); // = 1262 blocks
-                                                      // DIRS headers + 3 file headers + (2 small + LDSO_BLOCKS) data blocks + 2 end blocks.
-    const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 3 + 2 + LDSO_BLOCKS + 2) * 512;
+                                                      // DIRS headers + 4 file headers + (3 small + LDSO_BLOCKS) data blocks + 2 end blocks.
+    const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 4 + 3 + LDSO_BLOCKS + 2) * 512;
 
     let ldso_src = workspace_root().join("userspace/lib/ld-musl-x86_64.so.1");
 
-    // Size-only isn't sufficient — a file of the right length but wrong content
-    // would silently produce a bad rootfs. Also verify the USTAR magic at offset
-    // 257 (mirrors the pattern used in ensure_test_disk).
+    // Size + magic aren't sufficient — changing MOTD_PAYLOAD to another
+    // equal-or-shorter string would leave the old payload on disk (same
+    // length, same magic). Also compare the motd data block bytes so the
+    // cache invalidates when the payload changes.
+    // Layout offsets: DIRS.len() dir headers, then hostname hdr+data
+    // (2 blocks), then nested hdr+data (2 blocks), then motd header
+    // (1 block), then motd data.
+    const MOTD_DATA_OFFSET: u64 = (DIRS.len() as u64 + 2 + 2 + 1) * 512;
     let needs_write = match fs::metadata(&path) {
         Ok(m) if m.len() == EXPECTED_SIZE => {
             let mut magic = [0u8; 6];
+            let mut motd_block = [0u8; 512];
             fs::File::open(&path)
                 .and_then(|mut f| {
                     use std::io::{Read, Seek, SeekFrom};
                     f.seek(SeekFrom::Start(257))?;
-                    f.read_exact(&mut magic)
+                    f.read_exact(&mut magic)?;
+                    f.seek(SeekFrom::Start(MOTD_DATA_OFFSET))?;
+                    f.read_exact(&mut motd_block)
                 })
-                .map(|()| magic != *b"ustar\0")
+                .map(|()| {
+                    if magic != *b"ustar\0" {
+                        return true;
+                    }
+                    let plen = MOTD_PAYLOAD.len();
+                    &motd_block[..plen] != MOTD_PAYLOAD
+                        || motd_block[plen..].iter().any(|&b| b != 0)
+                })
                 .unwrap_or(true)
         }
         _ => true,
@@ -624,6 +647,11 @@ fn ensure_initrd() -> R<PathBuf> {
         let mut payload_block = [0u8; 512];
         payload_block[..NESTED_PAYLOAD.len()].copy_from_slice(NESTED_PAYLOAD);
         data.extend_from_slice(&payload_block);
+        // etc/motd — user-facing banner line read by shell at startup.
+        data.extend_from_slice(&ustar_file_block(MOTD_FILE, MOTD_PAYLOAD.len() as u64));
+        let mut motd_block = [0u8; 512];
+        motd_block[..MOTD_PAYLOAD.len()].copy_from_slice(MOTD_PAYLOAD);
+        data.extend_from_slice(&motd_block);
         // lib/ld-musl-x86_64.so.1 — dynamic linker for musl-linked user binaries.
         data.extend_from_slice(&ustar_file_block(LDSO_FILE, LDSO_SIZE));
         let padded_len = ldso_bytes.len().div_ceil(512) * 512;
@@ -1154,11 +1182,22 @@ mod tests {
         let path = ensure_initrd().expect("ensure_initrd failed");
         assert!(path.exists());
         let data = fs::read(&path).unwrap();
-        // 5 dir headers + 2 file headers + 2 padded file data blocks +
-        // 2 end-of-archive zero blocks = 11 * 512
-        assert_eq!(data.len(), 11 * 512);
-        // Last 1024 bytes are the end-of-archive marker (all zeros)
+        // Assert the archive is a positive multiple of 512 and ends in the
+        // USTAR end-of-archive marker (two zero blocks). The exact length
+        // changes whenever the payload set changes — the `ensure_initrd`
+        // body computes `EXPECTED_SIZE` from the inputs, so we don't need
+        // to duplicate that arithmetic here.
+        assert!(data.len() >= 4 * 512);
+        assert_eq!(data.len() % 512, 0);
         assert!(data[data.len() - 1024..].iter().all(|&b| b == 0));
+        // Content checks: USTAR magic is present in the first header (so
+        // we know a real tar got written, not 4 zero blocks), and the
+        // `etc/motd` filename appears somewhere in the archive.
+        assert_eq!(&data[257..263], b"ustar\0");
+        assert!(
+            data.windows(8).any(|w| w == b"etc/motd"),
+            "archive missing etc/motd entry"
+        );
     }
 
     #[test]
