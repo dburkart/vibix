@@ -186,8 +186,26 @@ fn dispatch<T: Transport>(t: &mut T, payload: &[u8], regs: &mut GdbRegs) -> Acti
         }
         Some(b'G') => {
             // Payload is `G<hex...>`; strip the leading command byte.
-            match regs::decode_g(&payload[1..], regs) {
-                Ok(()) => send_packet(t, b"OK"),
+            // Current int3 wiring only captures/writes back `rip` and
+            // `eflags`; every other field round-trips as whatever the
+            // caller seeded (zero for GPRs). Decode into a temporary
+            // and, if the debugger asked us to change *any* unsupported
+            // field, reply `E01` so it knows the write didn't take —
+            // instead of silently dropping the change and lying `OK`.
+            let mut tmp = *regs;
+            match regs::decode_g(&payload[1..], &mut tmp) {
+                Ok(()) => {
+                    let mut want = *regs;
+                    want.rip = tmp.rip;
+                    want.eflags = tmp.eflags;
+                    if tmp == want {
+                        regs.rip = tmp.rip;
+                        regs.eflags = tmp.eflags;
+                        send_packet(t, b"OK");
+                    } else {
+                        send_packet(t, b"E01");
+                    }
+                }
                 Err(_) => send_packet(t, b"E00"),
             }
             Action::Continue

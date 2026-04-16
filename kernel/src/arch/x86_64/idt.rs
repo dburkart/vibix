@@ -71,12 +71,24 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 }
 
 /// #BP (int3). Default behavior is a no-op return so that historical
-/// int3 sites keep working. When `gdbstub::is_armed()`, divert into the
-/// stub's packet loop with the interrupt frame captured into a
-/// `GdbRegs`; on resume, push any `G`-mutated `rip`/`rflags` back into
-/// the hardware frame so the `iretq` picks them up.
+/// int3 sites keep working. When `gdbstub::is_armed()` AND the trap
+/// came from ring 0, divert into the stub's packet loop with the
+/// interrupt frame captured into a `GdbRegs`; on resume, push any
+/// `G`-mutated `rip`/`rflags` back into the hardware frame so the
+/// `iretq` picks them up.
+///
+/// User-mode `#BP` (CPL != 0) is intentionally *not* diverted: we
+/// don't want a ring-3 task to be able to drop the whole kernel into
+/// a debugger shell on any COM1 byte. Treat it like historical int3
+/// and fall through to a no-op return; a future user-debug path can
+/// plug in its own handler if we ever want to support user-space
+/// breakpoints.
 extern "x86-interrupt" fn breakpoint(mut frame: InterruptStackFrame) {
     if !crate::gdbstub::is_armed() {
+        return;
+    }
+    // Low 2 bits of CS = CPL. Ring 0 only.
+    if frame.code_segment.0 & 0b11 != 0 {
         return;
     }
     let mut regs = crate::gdbstub::regs::GdbRegs {

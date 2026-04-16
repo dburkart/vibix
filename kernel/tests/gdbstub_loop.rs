@@ -41,6 +41,10 @@ fn run_tests() {
         ("unknown_returns_empty", &(unknown_returns_empty as fn())),
         ("g_reply_is_hex_blob", &(g_reply_is_hex_blob as fn())),
         ("big_g_writes_regs", &(big_g_writes_regs as fn())),
+        (
+            "big_g_rejects_unsupported_fields",
+            &(big_g_rejects_unsupported_fields as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -98,15 +102,17 @@ fn g_reply_is_hex_blob() {
 }
 
 fn big_g_writes_regs() {
-    // Build a `G<hex>` packet whose hex blob sets rax=0x1 (all other
-    // fields zero), then verify the stub ack'd with `OK` and actually
-    // mutated the caller's regs.
+    // Build a `G<hex>` packet that changes only `rip` (the 17th u64, so
+    // hex offset 256 in the payload, i.e. index 257 with the leading
+    // `G`). Every other field hex-encodes whatever the caller seeded,
+    // which for a default-zero `GdbRegs` is all '0's — so the only
+    // mutation in flight is `rip`. The stub should reply `OK` and
+    // actually update `regs.rip`.
     let mut payload = [b'0'; 1 + GDB_REGS_HEX];
     payload[0] = b'G';
-    // rax LE first byte = 01 → hex "01" at [1..3].
-    payload[2] = b'1';
-    // Worst-case encoded size is 2 * payload.len() + 4 (none of our
-    // bytes need escaping, but framer::encode enforces that cap).
+    // rip LE first byte = 0x01 → "01" at [257..259]. All other rip
+    // bytes stay '0' → rip = 0x0000_0000_0000_0001.
+    payload[1 + 256 + 1] = b'1';
     let mut frame = [0u8; 2 * (1 + GDB_REGS_HEX) + 4];
     let wire = framer::encode(&payload, &mut frame);
 
@@ -117,8 +123,31 @@ fn big_g_writes_regs() {
 
     let mut regs = GdbRegs::default();
     debug_entry_with_regs(&mut t, &mut regs);
-    assert_eq!(regs.rax, 0x01, "G did not write rax");
+    assert_eq!(regs.rip, 0x01, "G did not write rip");
     assert!(find(&t.tx, b"$OK#9a").is_some(), "missing OK reply");
+}
+
+fn big_g_rejects_unsupported_fields() {
+    // `G` that tries to change `rax` (bytes [1..3] of the payload hex)
+    // must be rejected with `E01`: the int3 handler only honors writes
+    // to `rip` and `eflags`, so silently accepting other changes would
+    // lie to the debugger.
+    let mut payload = [b'0'; 1 + GDB_REGS_HEX];
+    payload[0] = b'G';
+    payload[2] = b'1';
+    let mut frame = [0u8; 2 * (1 + GDB_REGS_HEX) + 4];
+    let wire = framer::encode(&payload, &mut frame);
+
+    let mut t = VecTransport::new();
+    for &b in wire {
+        t.rx.push_back(b);
+    }
+
+    let mut regs = GdbRegs::default();
+    debug_entry_with_regs(&mut t, &mut regs);
+    assert_eq!(regs.rax, 0, "unsupported G must not mutate rax");
+    // checksum("E01") = b'E' + b'0' + b'1' = 0x45 + 0x30 + 0x31 = 0xa6.
+    assert!(find(&t.tx, b"$E01#a6").is_some(), "missing E01 reply");
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
