@@ -145,10 +145,7 @@ mod kernel_side {
         let uptime_ms = time::uptime_ms();
 
         let mounts_vec = collect_mounts();
-        let mounts: Vec<(&str, &str)> = mounts_vec
-            .iter()
-            .map(|(p, f)| (p.as_str(), *f))
-            .collect();
+        let mounts: Vec<(&str, &str)> = mounts_vec.iter().map(|(p, f)| (p.as_str(), *f)).collect();
 
         let motd = find_motd();
 
@@ -269,12 +266,8 @@ mod kernel_side {
             if hdr.iter().all(|&b| b == 0) {
                 return None;
             }
-            let has_ustar =
-                &hdr[257..263] == b"ustar\0" || &hdr[257..263] == b"ustar ";
-            let name_end = hdr[..100]
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(100);
+            let has_ustar = &hdr[257..263] == b"ustar\0" || &hdr[257..263] == b"ustar ";
+            let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
             let base_name = &hdr[..name_end];
             let size = parse_octal(&hdr[124..135]).unwrap_or(0) as usize;
             let typeflag = hdr[156];
@@ -282,10 +275,7 @@ mod kernel_side {
             let data_end = data_off.saturating_add(size);
             // Honor ustar prefix (bytes 345..500) when present.
             let matches = if has_ustar {
-                let prefix_end = hdr[345..500]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(155);
+                let prefix_end = hdr[345..500].iter().position(|&b| b == 0).unwrap_or(155);
                 let prefix = &hdr[345..345 + prefix_end];
                 if prefix.is_empty() {
                     base_name == target
@@ -297,8 +287,7 @@ mod kernel_side {
                     let nlen = base_name.len().min(rem.saturating_sub(1));
                     if nlen + plen + 1 <= full.len() {
                         full[plen] = b'/';
-                        full[plen + 1..plen + 1 + nlen]
-                            .copy_from_slice(&base_name[..nlen]);
+                        full[plen + 1..plen + 1 + nlen].copy_from_slice(&base_name[..nlen]);
                         &full[..plen + 1 + nlen] == target
                     } else {
                         false
@@ -437,5 +426,4 @@ mod tests {
         write!(&mut s, "{}", Lossy(&[0xff, b'A', 0x00, b'z'])).unwrap();
         assert_eq!(s, "?A?z");
     }
-
 }
