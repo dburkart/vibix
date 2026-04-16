@@ -15,6 +15,7 @@ use crate::serial_println;
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_error);
+    idt.breakpoint.set_handler_fn(breakpoint);
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
     idt.general_protection_fault
         .set_handler_fn(general_protection);
@@ -67,6 +68,54 @@ extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: #UD (invalid opcode)\n{:#?}", frame);
     hang();
+}
+
+/// #BP (int3). Default behavior is a no-op return so that historical
+/// int3 sites keep working. When `gdbstub::is_armed()` AND the trap
+/// came from ring 0, divert into the stub's packet loop with the
+/// interrupt frame captured into a `GdbRegs`; on resume, push any
+/// `G`-mutated `rip`/`rflags` back into the hardware frame so the
+/// `iretq` picks them up.
+///
+/// User-mode `#BP` (CPL != 0) is intentionally *not* diverted: we
+/// don't want a ring-3 task to be able to drop the whole kernel into
+/// a debugger shell on any COM1 byte. Treat it like historical int3
+/// and fall through to a no-op return; a future user-debug path can
+/// plug in its own handler if we ever want to support user-space
+/// breakpoints.
+extern "x86-interrupt" fn breakpoint(mut frame: InterruptStackFrame) {
+    if !crate::gdbstub::is_armed() {
+        return;
+    }
+    // Low 2 bits of CS = CPL. Ring 0 only.
+    if frame.code_segment.0 & 0b11 != 0 {
+        return;
+    }
+    let mut regs = crate::gdbstub::regs::GdbRegs {
+        rip: frame.instruction_pointer.as_u64(),
+        rsp: frame.stack_pointer.as_u64(),
+        eflags: frame.cpu_flags.bits() as u32,
+        cs: frame.code_segment.0 as u32,
+        ss: frame.stack_segment.0 as u32,
+        ..Default::default()
+    };
+    let mut uart = crate::gdbstub::uart::Com1PollingTransport::new();
+    crate::gdbstub::debug_entry_with_regs(&mut uart, &mut regs);
+    // Push rip/rflags writeback from `G` back into the hardware frame so
+    // `iretq` resumes at the debugger-chosen location. GPR writeback is
+    // tracked separately — the int3 prologue clobbered GPRs before we
+    // got here, so `regs.rax..r15` are zero and round-trip no-ops.
+    // A `G` packet from a buggy or hostile debugger could send a non-
+    // canonical rip; `VirtAddr::new` would panic there. Fall back to the
+    // original rip in that case so the kernel resumes at the int3 site
+    // rather than double-faulting on writeback.
+    unsafe {
+        frame.as_mut().update(|f| {
+            f.instruction_pointer =
+                x86_64::VirtAddr::try_new(regs.rip).unwrap_or(f.instruction_pointer);
+            f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(regs.eflags as u64);
+        });
+    }
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
