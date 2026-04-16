@@ -84,6 +84,10 @@ const SMOKE_MARKERS: &[&str] = &[
     "userspace module ELF entry=",
     "userspace: loader mapping image",
     "syscall: SYSCALL/SYSRET enabled",
+    // Kernel emits this immediately before IRETQ. If it fires but
+    // "init: hello from pid 1" doesn't, the regression is in the ring-3
+    // return path or the first userspace write, not kernel init.
+    "init: iretq to ring-3",
     "init: hello from pid 1",
 ];
 
@@ -969,7 +973,6 @@ fn test_all() -> R<()> {
 
 fn smoke(opts: &BuildOpts) -> R<()> {
     use std::collections::HashSet;
-    use std::io::BufRead as _;
     use std::time::Instant;
 
     let iso = iso(opts)?;
@@ -1028,21 +1031,37 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let mut remaining: HashSet<&'static str> = SMOKE_MARKERS.iter().copied().collect();
     let mut soft_remaining: HashSet<&'static str> = SMOKE_SOFT_MARKERS.iter().copied().collect();
     let mut accumulated = String::new();
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = String::new();
     let mut panicked = false;
 
-    // Read QEMU serial output one line at a time.  read_line() blocks until
-    // a newline arrives or the pipe closes (after kill).  We check for
-    // early exit after every line — typical runs complete in a few seconds.
-    loop {
-        if Instant::now() >= deadline {
-            break;
+    // Read QEMU serial output off the main thread: `BufReader::read_line`
+    // blocks until a newline arrives, so a completion check on the main
+    // thread would park inside the read for up to HARD_CAP after the last
+    // marker arrived. Offload reads to a thread and fan lines through an
+    // mpsc channel; the main loop polls with a short timeout so it can
+    // notice completion promptly without busy-waiting.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // pipe closed (QEMU killed or exited)
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // pipe closed (QEMU killed by watchdog or exited)
-            Ok(_) => {
+    });
+
+    const TICK: Duration = Duration::from_millis(100);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(TICK) {
+            Ok(line) => {
                 accumulated.push_str(&line);
                 if line.contains(PANIC_MARKER) {
                     panicked = true;
@@ -1054,13 +1073,16 @@ fn smoke(opts: &BuildOpts) -> R<()> {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    // Ensure QEMU is dead (idempotent if watchdog already fired).
+    // Ensure QEMU is dead (idempotent if watchdog already fired). Killing
+    // the child closes the pipe, which unblocks the reader thread.
     let _ = Command::new("kill").arg(pid.to_string()).status();
     let _ = watchdog.join();
+    let _ = reader_handle.join();
     let _ = child.wait();
 
     if panicked {
@@ -1198,6 +1220,40 @@ mod tests {
             data.windows(8).any(|w| w == b"etc/motd"),
             "archive missing etc/motd entry"
         );
+    }
+
+    #[test]
+    fn smoke_markers_satisfied_only_when_every_hard_marker_seen() {
+        // Mirrors the retain+contains loop in `fn smoke`: an accumulated
+        // serial-capture string drives the hard/soft marker sets to empty.
+        // The test keeps the bar honest by feeding a complete real-looking
+        // capture and asserting drain, plus a partial capture that must
+        // still leave at least one marker outstanding.
+        use std::collections::HashSet;
+
+        let full: String = SMOKE_MARKERS
+            .iter()
+            .chain(SMOKE_SOFT_MARKERS.iter())
+            .map(|m| format!("{m}\n"))
+            .collect();
+        let mut hard: HashSet<&'static str> = SMOKE_MARKERS.iter().copied().collect();
+        let mut soft: HashSet<&'static str> = SMOKE_SOFT_MARKERS.iter().copied().collect();
+        hard.retain(|m| !full.contains(m));
+        soft.retain(|m| !full.contains(m));
+        assert!(hard.is_empty() && soft.is_empty());
+
+        // Drop the last hard marker from the capture — drain must leave it.
+        let last = SMOKE_MARKERS.last().copied().unwrap();
+        let partial: String = SMOKE_MARKERS
+            .iter()
+            .filter(|m| **m != last)
+            .chain(SMOKE_SOFT_MARKERS.iter())
+            .map(|m| format!("{m}\n"))
+            .collect();
+        let mut hard: HashSet<&'static str> = SMOKE_MARKERS.iter().copied().collect();
+        hard.retain(|m| !partial.contains(m));
+        assert_eq!(hard.len(), 1);
+        assert!(hard.contains(last));
     }
 
     #[test]
