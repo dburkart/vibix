@@ -444,6 +444,23 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // dup3(oldfd, newfd, flags) — like dup2 but returns EINVAL if
+        // oldfd == newfd and accepts an O_CLOEXEC flag for the new fd.
+        DUP3 => {
+            let oldfd = a0 as i32;
+            let newfd = a1 as i32;
+            let flags = a2 as u32;
+            if oldfd < 0 || newfd < 0 {
+                return crate::fs::EBADF;
+            }
+            let tbl = crate::task::current_fd_table();
+            let result = tbl.lock().dup3(oldfd as u32, newfd as u32, flags);
+            match result {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+
         // brk(addr) — set the program break; returns the new break on success
         // or the current (unchanged) break on failure.
         BRK => {
@@ -580,6 +597,12 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // pipe2(pipefd, flags) — like pipe() but with O_NONBLOCK/O_CLOEXEC.
         PIPE2 => crate::ipc::pipe::sys_pipe2(a0, a1 as u32),
+
+        // mknod(path, mode, dev) — create a FIFO or regular file.
+        MKNOD => super::syscalls::vfs::sys_mknod_impl(a0, a1, a2),
+
+        // mknodat(dfd, path, mode, dev) — like mknod relative to dfd.
+        MKNODAT => super::syscalls::vfs::sys_mknodat_impl(a0 as i32, a1, a2, a3),
 
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
@@ -1103,6 +1126,7 @@ pub mod syscall_nr {
     pub const CLOSE: u64 = 3;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
+    pub const DUP3: u64 = 292;
     pub const FCNTL: u64 = 72;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
@@ -1112,6 +1136,8 @@ pub mod syscall_nr {
     pub const CHDIR: u64 = 80;
     pub const PIPE: u64 = 22;
     pub const PIPE2: u64 = 293;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1144,6 +1170,7 @@ mod tests {
         assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
         assert_eq!(syscall_nr::DUP, 32, "SYS_dup must be 32");
         assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
+        assert_eq!(syscall_nr::DUP3, 292, "SYS_dup3 must be 292");
         assert_eq!(syscall_nr::FCNTL, 72, "SYS_fcntl must be 72");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
@@ -1182,5 +1209,11 @@ mod tests {
         assert_eq!(syscall_nr::SETSID, 112, "SYS_setsid must be 112");
         assert_eq!(syscall_nr::GETPGID, 121, "SYS_getpgid must be 121");
         assert_eq!(syscall_nr::GETSID, 124, "SYS_getsid must be 124");
+
+        // IPC / FIFO
+        assert_eq!(syscall_nr::PIPE, 22, "SYS_pipe must be 22");
+        assert_eq!(syscall_nr::PIPE2, 293, "SYS_pipe2 must be 293");
+        assert_eq!(syscall_nr::MKNOD, 133, "SYS_mknod must be 133");
+        assert_eq!(syscall_nr::MKNODAT, 259, "SYS_mknodat must be 259");
     }
 }

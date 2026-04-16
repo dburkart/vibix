@@ -40,6 +40,12 @@ pub mod addrspace;
 #[cfg(target_os = "none")]
 use spin::Once;
 
+/// Total bytes of USABLE physical memory reported by Limine, snapshotted
+/// before the memmap response's backing storage can be reclaimed. Surfaced
+/// by the boot banner; exposed through [`total_usable_bytes`].
+#[cfg(target_os = "none")]
+static TOTAL_USABLE_BYTES: Once<u64> = Once::new();
+
 #[cfg(target_os = "none")]
 static USERSPACE_MODULE_ELF_SUMMARY: Once<Option<(x86_64::VirtAddr, usize)>> = Once::new();
 
@@ -74,6 +80,26 @@ impl Region {
 /// active page tables in our own mapper.
 #[cfg(target_os = "none")]
 pub fn init() {
+    // Snapshot the total byte count of memory the frame allocator will
+    // eventually own. That's USABLE up front plus BOOTLOADER_RECLAIMABLE,
+    // which `paging::reclaim_bootloader_memory()` later feeds into the
+    // allocator — if we only counted USABLE, the banner would report
+    // `free > total` after reclaim. Snapshotted now because Limine's
+    // memmap response lives in BOOTLOADER_RECLAIMABLE and disappears
+    // once we release it.
+    if let Some(resp) = crate::boot::MEMMAP_REQUEST.get_response() {
+        let total: u64 = resp
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.entry_type == limine::memory_map::EntryType::USABLE
+                    || e.entry_type == limine::memory_map::EntryType::BOOTLOADER_RECLAIMABLE
+            })
+            .map(|e| e.length)
+            .sum();
+        TOTAL_USABLE_BYTES.call_once(|| total);
+    }
+
     frame::init();
 
     // Reprogram PAT before we build any PTE that sets the PAT bit.
@@ -110,6 +136,14 @@ pub fn init() {
     // and all BOOTLOADER_RECLAIMABLE regions now that we no longer need
     // the bootloader's page-table tree or its data structures.
     paging::reclaim_bootloader_memory();
+}
+
+/// Total bytes of USABLE physical memory reported by Limine at boot.
+/// Snapshotted during [`init`]; returns `0` when the memmap response
+/// was missing (host builds, tests that don't call `mem::init`).
+#[cfg(target_os = "none")]
+pub fn total_usable_bytes() -> u64 {
+    TOTAL_USABLE_BYTES.get().copied().unwrap_or(0)
 }
 
 /// Return the parsed entry point and loadable-segment count for the first

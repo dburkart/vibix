@@ -77,6 +77,12 @@ pub(super) enum RamfsBody {
     Sym {
         target: Vec<u8>,
     },
+    /// FIFO (named pipe). The `Arc<Pipe>` is the shared byte-stream
+    /// backend; opening the FIFO inode binds a `PipeReadEnd` /
+    /// `PipeWriteEnd` to it via `Pipe::open_read`/`open_write`.
+    Fifo {
+        pipe: Arc<crate::ipc::pipe::Pipe>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +570,46 @@ impl InodeOps for RamfsInode {
         Ok(child)
     }
 
+    fn mkfifo(&self, dir: &Inode, name: &[u8], mode: u16) -> Result<Arc<Inode>, i64> {
+        let sb = dir.sb.upgrade().ok_or(ENOENT)?;
+        let _guard = dir.dir_rwsem.write();
+        let key = DString::try_from_bytes(name)?;
+        {
+            let body = self.body.lock();
+            match &*body {
+                RamfsBody::Dir { children, .. } if children.contains_key(&key) => {
+                    return Err(crate::fs::EEXIST);
+                }
+                RamfsBody::Dir { .. } => {}
+                _ => return Err(ENOTDIR),
+            }
+        }
+        let child = alloc_inode(
+            &sb,
+            &self.state,
+            InodeKind::Fifo,
+            mode & 0o7777,
+            1,
+            RamfsBody::Fifo {
+                pipe: crate::ipc::pipe::Pipe::new_for_fifo(),
+            },
+        );
+        self.body
+            .lock()
+            .as_dir_mut()
+            .unwrap()
+            .insert(key, child.clone());
+        Ok(child)
+    }
+
+    fn fifo_pipe(&self) -> Option<Arc<crate::ipc::pipe::Pipe>> {
+        let body = self.body.lock();
+        match &*body {
+            RamfsBody::Fifo { pipe } => Some(pipe.clone()),
+            _ => None,
+        }
+    }
+
     fn readlink(&self, _inode: &Inode, buf: &mut [u8]) -> Result<usize, i64> {
         let body = self.body.lock();
         match &*body {
@@ -583,7 +629,7 @@ impl InodeOps for RamfsInode {
             match &*body {
                 RamfsBody::Reg { data } => data.len() as u64,
                 RamfsBody::Sym { target } => target.len() as u64,
-                RamfsBody::Dir { .. } => 0,
+                RamfsBody::Dir { .. } | RamfsBody::Fifo { .. } => 0,
             }
         };
         inode.meta.write().size = size;
@@ -600,7 +646,7 @@ impl InodeOps for RamfsInode {
                     data.resize(attr.size as usize, 0);
                 }
                 RamfsBody::Dir { .. } => return Err(EISDIR),
-                RamfsBody::Sym { .. } => return Err(EINVAL),
+                RamfsBody::Sym { .. } | RamfsBody::Fifo { .. } => return Err(EINVAL),
             }
         }
         let mut meta = inode.meta.write();
@@ -635,7 +681,11 @@ impl FileOps for RamfsInode {
                 Ok(n)
             }
             RamfsBody::Dir { .. } => Err(EISDIR),
-            RamfsBody::Sym { .. } => Err(EINVAL),
+            // FIFOs never reach the VFS read path — `open(2)` detours
+            // through `open_read`/`open_write` and hands the fd a pipe
+            // backend directly. Guard with EINVAL so any stray route
+            // through the file_ops path surfaces clearly.
+            RamfsBody::Sym { .. } | RamfsBody::Fifo { .. } => Err(EINVAL),
         }
     }
 
@@ -654,7 +704,7 @@ impl FileOps for RamfsInode {
                 Ok(buf.len())
             }
             RamfsBody::Dir { .. } => Err(EISDIR),
-            RamfsBody::Sym { .. } => Err(EINVAL),
+            RamfsBody::Sym { .. } | RamfsBody::Fifo { .. } => Err(EINVAL),
         }
     }
 
@@ -666,6 +716,7 @@ impl FileOps for RamfsInode {
                 RamfsBody::Reg { data } => data.len() as i64,
                 RamfsBody::Dir { children, .. } => children.len() as i64,
                 RamfsBody::Sym { target } => target.len() as i64,
+                RamfsBody::Fifo { .. } => return Err(crate::fs::ESPIPE),
             }
         };
         let new_off = match whence {

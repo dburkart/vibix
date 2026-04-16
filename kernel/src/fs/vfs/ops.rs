@@ -232,6 +232,21 @@ pub trait InodeOps: Send + Sync {
     fn permission(&self, inode: &Inode, cred: &Credential, access: Access) -> Result<(), i64> {
         default_permission(inode, cred, access)
     }
+
+    /// Create a new FIFO (named pipe) inode under `dir` with the given
+    /// `name` and `mode`. Regular filesystems return `EPERM`; only
+    /// in-memory FSes that support `InodeKind::Fifo` override this.
+    fn mkfifo(&self, _dir: &Inode, _name: &[u8], _mode: u16) -> Result<Arc<Inode>, i64> {
+        Err(EPERM)
+    }
+
+    /// If this inode is a FIFO, return the shared `Arc<Pipe>` backing
+    /// it. Used by `open(2)` on a `InodeKind::Fifo` inode to bind a
+    /// `PipeReadEnd` / `PipeWriteEnd` to the caller's fd. Any filesystem
+    /// that ever stores a `InodeKind::Fifo` inode must override this.
+    fn fifo_pipe(&self) -> Option<Arc<crate::ipc::pipe::Pipe>> {
+        None
+    }
 }
 
 /// Per-open-file operations. Regular-file I/O, directory reading,
