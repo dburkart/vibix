@@ -155,11 +155,11 @@ global_asm!(
     "mov rdi, rsp",
     // rsi = &HwFrame (just above the 15 GPR pushes = 120 bytes)
     "lea rsi, [rsp + 15*8]",
-    // Align stack to 16 bytes across the call: 15 u64 pushes + 5 hw
-    // pushes = 20 u64 = 160 bytes = already 16-byte aligned on entry.
-    // But System V ABI requires rsp % 16 == 8 *before* the call
-    // instruction (call pushes 8). So we need an extra push to get
-    // there.
+    // Align stack to 16 bytes across the call. System V requires
+    // rsp % 16 == 0 at the `call` instruction (call then pushes the
+    // 8-byte return address, so inside the callee rsp % 16 == 8).
+    // After the 15 GPR pushes (120 bytes) on top of the 5 hw pushes
+    // (40 bytes), rsp % 16 == 8 — one 8-byte sub gets us to 0.
     "sub rsp, 8",
     "call gdb_breakpoint_entry",
     "add rsp, 8",
