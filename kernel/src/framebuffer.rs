@@ -29,6 +29,51 @@ use spin::Mutex;
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 8;
 
+// ─── unicode glyph fallback ────────────────────────────────────────────────
+
+/// Final fallback used when neither the requested code point nor U+FFFD is
+/// covered by any linked font8x8 table. A 2×2 dotted check pattern is
+/// distinct enough from any letterform that the user can tell rendering
+/// failed without it dominating the screen.
+const REPLACEMENT_GLYPH: [u8; 8] = [0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA];
+
+/// Resolve `c` to an 8×8 glyph by trying every linked font8x8 table in turn,
+/// then U+FFFD, then [`REPLACEMENT_GLYPH`]. Tables are searched in roughly
+/// "most likely" order so the common ASCII path resolves on the first
+/// lookup.
+fn lookup_glyph(c: char) -> [u8; 8] {
+    if let Some(g) = font8x8::BASIC_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::LATIN_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::BOX_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::BLOCK_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::GREEK_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::HIRAGANA_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::MISC_FONTS.get(c) {
+        return g;
+    }
+    if let Some(g) = font8x8::SGA_FONTS.get(c) {
+        return g;
+    }
+    if c != '\u{FFFD}' {
+        if let Some(g) = font8x8::MISC_FONTS.get('\u{FFFD}') {
+            return g;
+        }
+    }
+    REPLACEMENT_GLYPH
+}
+
 // ─── default colours ───────────────────────────────────────────────────────
 
 const DEFAULT_FG: u32 = 0x00E0_E0E0; // near-white
@@ -239,9 +284,7 @@ impl Console {
 
     /// Render a single `Cell` to the framebuffer at grid position (col, row).
     fn render_cell_at(&mut self, col: usize, row: usize, cell: Cell) {
-        let glyph = font8x8::BASIC_FONTS
-            .get(cell.ch)
-            .unwrap_or_else(|| font8x8::BASIC_FONTS.get(' ').unwrap());
+        let glyph = lookup_glyph(cell.ch);
         let px = col * GLYPH_W;
         let py = row * GLYPH_H;
         for (dy, bits) in glyph.iter().enumerate() {
