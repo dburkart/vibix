@@ -444,6 +444,23 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // dup3(oldfd, newfd, flags) — like dup2 but returns EINVAL if
+        // oldfd == newfd and accepts an O_CLOEXEC flag for the new fd.
+        DUP3 => {
+            let oldfd = a0 as i32;
+            let newfd = a1 as i32;
+            let flags = a2 as u32;
+            if oldfd < 0 || newfd < 0 {
+                return crate::fs::EBADF;
+            }
+            let tbl = crate::task::current_fd_table();
+            let result = tbl.lock().dup3(oldfd as u32, newfd as u32, flags);
+            match result {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+
         // brk(addr) — set the program break; returns the new break on success
         // or the current (unchanged) break on failure.
         BRK => {
@@ -1103,6 +1120,7 @@ pub mod syscall_nr {
     pub const CLOSE: u64 = 3;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
+    pub const DUP3: u64 = 292;
     pub const FCNTL: u64 = 72;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
@@ -1144,6 +1162,7 @@ mod tests {
         assert_eq!(syscall_nr::CLOSE, 3, "SYS_close must be 3");
         assert_eq!(syscall_nr::DUP, 32, "SYS_dup must be 32");
         assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
+        assert_eq!(syscall_nr::DUP3, 292, "SYS_dup3 must be 292");
         assert_eq!(syscall_nr::FCNTL, 72, "SYS_fcntl must be 72");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
