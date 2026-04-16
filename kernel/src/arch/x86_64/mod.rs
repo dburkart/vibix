@@ -2,6 +2,7 @@ pub mod apic;
 pub mod backtrace;
 pub mod csprng;
 pub mod fpu;
+pub mod gdb_trampoline;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

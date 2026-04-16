@@ -186,25 +186,19 @@ fn dispatch<T: Transport>(t: &mut T, payload: &[u8], regs: &mut GdbRegs) -> Acti
         }
         Some(b'G') => {
             // Payload is `G<hex...>`; strip the leading command byte.
-            // Current int3 wiring only captures/writes back `rip` and
-            // `eflags`; every other field round-trips as whatever the
-            // caller seeded (zero for GPRs). Decode into a temporary
-            // and, if the debugger asked us to change *any* unsupported
-            // field, reply `E01` so it knows the write didn't take —
-            // instead of silently dropping the change and lying `OK`.
+            // The int3 trampoline now captures the full GPR set before
+            // Rust runs (#482), so `G` writes to rax..r15 + rip/eflags
+            // round-trip through the trampoline's saved block on resume.
+            // Segment-register writes are still accepted into the in-
+            // memory snapshot (a follow-up `g` reads them back) but the
+            // trampoline deliberately does not push cs/ss/rsp back into
+            // the hardware frame: changing those without a coordinated
+            // task switch is unsound. Gdb rarely mutates them.
             let mut tmp = *regs;
             match regs::decode_g(&payload[1..], &mut tmp) {
                 Ok(()) => {
-                    let mut want = *regs;
-                    want.rip = tmp.rip;
-                    want.eflags = tmp.eflags;
-                    if tmp == want {
-                        regs.rip = tmp.rip;
-                        regs.eflags = tmp.eflags;
-                        send_packet(t, b"OK");
-                    } else {
-                        send_packet(t, b"E01");
-                    }
+                    *regs = tmp;
+                    send_packet(t, b"OK");
                 }
                 Err(_) => send_packet(t, b"E00"),
             }

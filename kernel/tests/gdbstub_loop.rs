@@ -41,10 +41,7 @@ fn run_tests() {
         ("unknown_returns_empty", &(unknown_returns_empty as fn())),
         ("g_reply_is_hex_blob", &(g_reply_is_hex_blob as fn())),
         ("big_g_writes_regs", &(big_g_writes_regs as fn())),
-        (
-            "big_g_rejects_unsupported_fields",
-            &(big_g_rejects_unsupported_fields as fn()),
-        ),
+        ("big_g_writes_rax", &(big_g_writes_rax as fn())),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -127,11 +124,11 @@ fn big_g_writes_regs() {
     assert!(find(&t.tx, b"$OK#9a").is_some(), "missing OK reply");
 }
 
-fn big_g_rejects_unsupported_fields() {
-    // `G` that tries to change `rax` (bytes [1..3] of the payload hex)
-    // must be rejected with `E01`: the int3 handler only honors writes
-    // to `rip` and `eflags`, so silently accepting other changes would
-    // lie to the debugger.
+fn big_g_writes_rax() {
+    // With the int3 trampoline capturing full GPR state (#482), `G`
+    // writes to rax..r15 are honored — they round-trip through the
+    // dispatch path and a subsequent `g` reads back the mutated value.
+    // Build a `G` that sets rax = 0x01 (byte 0 of the payload hex).
     let mut payload = [b'0'; 1 + GDB_REGS_HEX];
     payload[0] = b'G';
     payload[2] = b'1';
@@ -142,12 +139,16 @@ fn big_g_rejects_unsupported_fields() {
     for &b in wire {
         t.rx.push_back(b);
     }
+    // Append a `D` detach so the loop terminates cleanly.
+    let mut detach = [0u8; 8];
+    for &b in framer::encode(b"D", &mut detach) {
+        t.rx.push_back(b);
+    }
 
     let mut regs = GdbRegs::default();
     debug_entry_with_regs(&mut t, &mut regs);
-    assert_eq!(regs.rax, 0, "unsupported G must not mutate rax");
-    // checksum("E01") = b'E' + b'0' + b'1' = 0x45 + 0x30 + 0x31 = 0xa6.
-    assert!(find(&t.tx, b"$E01#a6").is_some(), "missing E01 reply");
+    assert_eq!(regs.rax, 0x01, "G must write rax");
+    assert!(find(&t.tx, b"$OK#9a").is_some(), "missing OK reply");
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
