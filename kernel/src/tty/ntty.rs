@@ -220,11 +220,11 @@ impl NTty {
         b: u8,
     ) -> Option<u8> {
         if termios.c_lflag & ISIG != 0 {
-            let sig = if b == termios.c_cc[VINTR] {
+            let sig = if matches_cc(termios, VINTR, b) {
                 Some(SIGINT)
-            } else if b == termios.c_cc[VQUIT] {
+            } else if matches_cc(termios, VQUIT, b) {
                 Some(SIGQUIT)
-            } else if b == termios.c_cc[VSUSP] {
+            } else if matches_cc(termios, VSUSP, b) {
                 Some(SIGTSTP)
             } else {
                 None
@@ -260,32 +260,33 @@ impl NTty {
     /// In raw mode (`ICANON` clear): every byte is pushed directly into
     /// the raw ring and the reader is woken immediately.
     pub fn canon_input(&self, termios: &Termios, c: u8, wake: &dyn ReaderWake) {
-        let mut st = self.state.lock();
-        if termios.c_lflag & ICANON == 0 {
-            st.raw.push(c);
+        let should_wake;
+        {
+            let mut st = self.state.lock();
+            if termios.c_lflag & ICANON == 0 {
+                st.raw.push(c);
+                should_wake = true;
+            } else if matches_cc(termios, VEOF, c) {
+                st.commit_line(true);
+                should_wake = true;
+            } else if c == b'\n' || matches_cc(termios, VEOL, c) {
+                st.commit_line(false);
+                st.raw.push(c);
+                should_wake = true;
+            } else if matches_cc(termios, VERASE, c) {
+                st.line.pop();
+                should_wake = false;
+            } else if matches_cc(termios, VKILL, c) {
+                st.line.clear();
+                should_wake = false;
+            } else {
+                st.line.push(c);
+                should_wake = false;
+            }
+        }
+        if should_wake {
             wake.wake();
-            return;
         }
-        if matches_cc(termios, VEOF, c) {
-            st.commit_line(true);
-            wake.wake();
-            return;
-        }
-        if c == b'\n' || matches_cc(termios, VEOL, c) {
-            st.commit_line(false);
-            st.raw.push(c);
-            wake.wake();
-            return;
-        }
-        if matches_cc(termios, VERASE, c) {
-            st.line.pop();
-            return;
-        }
-        if matches_cc(termios, VKILL, c) {
-            st.line.clear();
-            return;
-        }
-        st.line.push(c);
     }
 
     /// Apply the `c_iflag` input transforms to one raw byte.
@@ -360,7 +361,7 @@ impl NTty {
         if lflag & ECHO == 0 && !(lflag & ECHONL != 0 && c == b'\n') {
             return;
         }
-        if lflag & ECHOE != 0 && c == termios.c_cc[VERASE] {
+        if lflag & ECHOE != 0 && matches_cc(termios, VERASE, c) {
             self.process_output(termios, &[0x08, b' ', 0x08], out);
             return;
         }
