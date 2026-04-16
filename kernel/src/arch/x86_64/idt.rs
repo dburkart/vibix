@@ -95,10 +95,8 @@ extern "x86-interrupt" fn breakpoint(mut frame: InterruptStackFrame) {
     // got here, so `regs.rax..r15` are zero and round-trip no-ops.
     unsafe {
         frame.as_mut().update(|f| {
-            f.instruction_pointer =
-                x86_64::VirtAddr::new(regs.rip);
-            f.cpu_flags =
-                x86_64::registers::rflags::RFlags::from_bits_truncate(regs.eflags as u64);
+            f.instruction_pointer = x86_64::VirtAddr::new(regs.rip);
+            f.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(regs.eflags as u64);
         });
     }
 }

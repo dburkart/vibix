@@ -254,8 +254,9 @@ mod tests {
 
     #[test]
     fn unknown_command_empty_reply() {
-        // `g` = read registers; we don't support it yet → empty reply.
-        let mut t = VecTransport::with_rx(b"$g#67$D#44");
+        // `q` with no sub-command is not implemented → empty reply.
+        // checksum('q') = 0x71.
+        let mut t = VecTransport::with_rx(b"$q#71$D#44");
         debug_entry(&mut t);
         // Expect: ACK, `$#00`, ACK, `$OK#9a`.
         assert!(find(&t.tx, b"$#00").is_some());
