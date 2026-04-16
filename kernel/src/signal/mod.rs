@@ -33,7 +33,9 @@
 //!
 //! - FPU state (`fpstate_ptr` in `SigFrame`) is always null — signals
 //!   delivered to a task using SSE/x87 will see corrupted FP registers.
-//! - `SA_NODEFER` and `SA_RESTART` flags are not honoured.
+//! - `SA_NODEFER` is not honoured. `SA_RESTART` is honoured by the
+//!   syscall trampoline's `KERN_ERESTARTSYS` path; other `sa_flags`
+//!   bits round-trip through `sigaction(2)` but are otherwise ignored.
 //! - Real-time signals (`SIGRTMIN`..`SIGRTMAX`) are not implemented.
 //! - `sigaltstack` is not implemented.
 //! - Multi-threaded signal delivery is not implemented (single-CPU, single-
@@ -78,6 +80,13 @@ pub const NSIG: u8 = 64;
 pub const SIG_DFL: u64 = 0;
 /// `SIG_IGN` — ignore the signal.
 pub const SIG_IGN: u64 = 1;
+
+// ── Sigaction flags (Linux values) ────────────────────────────────────────
+
+/// `SA_RESTART` — restart syscalls that return `KERN_ERESTARTSYS` when this
+/// signal is delivered via a user handler. Without this flag, the syscall
+/// is converted to `-EINTR` instead.
+pub const SA_RESTART: u64 = 0x1000_0000;
 
 /// Per-signal disposition.
 #[derive(Clone, Copy, Debug)]
@@ -171,6 +180,10 @@ pub struct SignalState {
     pub blocked: u64,
     /// Per-signal disposition table (indexed 0 = signal 1).
     pub dispositions: [Disposition; NSIG as usize],
+    /// Per-signal `sa_flags` (Linux `struct sigaction.sa_flags`). Only
+    /// `SA_RESTART` is honoured today; other bits round-trip through
+    /// `sigaction(2)` but are otherwise ignored.
+    pub sa_flags: [u64; NSIG as usize],
 }
 
 impl SignalState {
@@ -183,6 +196,7 @@ impl SignalState {
             pending: 0,
             blocked: 0,
             dispositions,
+            sa_flags: [0; NSIG as usize],
         }
     }
 
@@ -294,8 +308,10 @@ pub fn send_to_pgrp(pgid: u32, sig: u8) -> i64 {
 ///
 /// `act_uva` and `oldact_uva` are user pointers to `struct sigaction`
 /// (Linux x86_64 layout: `sa_handler: u64, sa_flags: u64, sa_restorer: u64,
-/// sa_mask: u64`).  Only `sa_handler` is read / written; the rest are stored
-/// as zero for now (no SA_RESTART / SA_SIGINFO support).
+/// sa_mask: u64`).  `sa_handler` and `sa_flags` round-trip through the
+/// kernel; `sa_restorer` and `sa_mask` are read/written as zero. Of the
+/// flag bits only `SA_RESTART` is honoured (by the syscall trampoline's
+/// `KERN_ERESTARTSYS` path).
 ///
 /// # Safety
 /// `act_uva` and `oldact_uva` are user VA pointers validated via
@@ -309,12 +325,14 @@ pub unsafe fn sys_sigaction(sig: u64, act_uva: u64, oldact_uva: u64) -> i64 {
     let task_id = crate::task::current_id();
     let result = crate::process::with_signal_state_for_task(task_id, |state| {
         let old_disp = state.dispositions[(sig - 1) as usize];
+        let old_flags = state.sa_flags[(sig - 1) as usize];
 
         // Write old disposition to userspace if requested.
         if oldact_uva != 0 {
             let mut sa: [u8; 32] = [0u8; 32];
             let handler_ptr = old_disp.to_handler_ptr();
             sa[..8].copy_from_slice(&handler_ptr.to_ne_bytes());
+            sa[8..16].copy_from_slice(&old_flags.to_ne_bytes());
             if uaccess::copy_to_user(oldact_uva as usize, &sa).is_err() {
                 return -14i64; // EFAULT
             }
@@ -327,7 +345,9 @@ pub unsafe fn sys_sigaction(sig: u64, act_uva: u64, oldact_uva: u64) -> i64 {
                 return -14i64; // EFAULT
             }
             let handler_ptr = u64::from_ne_bytes(sa[..8].try_into().unwrap());
+            let flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
             state.dispositions[(sig - 1) as usize] = Disposition::from_handler_ptr(handler_ptr);
+            state.sa_flags[(sig - 1) as usize] = flags;
         }
 
         0i64
@@ -519,25 +539,119 @@ pub struct SyscallReturnContext {
     pub user_rsp: u64,
 }
 
+/// Length of the `SYSCALL` opcode (0x0F 0x05) in bytes. Rewinding
+/// `user_rip` by this amount re-enters the syscall on SYSRETQ.
+pub const SYSCALL_INSN_LEN: u64 = 2;
+
+/// Decision returned by [`restart_decision`] — a pure classifier over
+/// `(rv, sig_opt, disp, sa_flags)` that the trampoline executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartDecision {
+    /// Leave `rv` and `rip` alone. Continue with normal signal delivery.
+    NoChange,
+    /// Rewind `rip` by the syscall insn length and clobber `rv` so
+    /// userspace sees the restarted syscall's fresh return value. Still
+    /// deliver the signal handler afterwards when `deliver_handler` is
+    /// true (handler + SA_RESTART case).
+    Restart { deliver_handler: bool },
+    /// Replace `rv` with `-EINTR`. Still deliver the signal handler.
+    Eintr,
+}
+
+/// Classify what the syscall-return path should do given the dispatcher's
+/// return value, the signal (if any) that was just popped, its disposition,
+/// and its `sa_flags`.
+///
+/// Mirrors the Linux `get_signal` / `do_signal` interaction for
+/// `ERESTARTSYS`:
+/// - If `rv` is not `KERN_ERESTARTSYS`, nothing to do.
+/// - No signal consumed this tick (caller returned `ERESTARTSYS` but the
+///   pending mask was empty — e.g. a spurious wake or a race where the
+///   signal had already been consumed): **unconditional restart**. Matches
+///   Linux's behaviour when an interruptible sleep is unwound with no
+///   signal actually raised.
+/// - Signal whose disposition is `Default` with `DefaultAction::Stop` or
+///   `Ignore`: restart unconditionally (no handler will run, so EINTR
+///   would strand the syscall and the task would never make progress on
+///   the job-control condition the caller just hit).
+/// - Signal with `Disposition::Ignore` or a default-Terminate: restart
+///   (Linux restarts for `ERESTARTSYS` + no handler).
+/// - Signal with `Disposition::Handler` + `SA_RESTART`: restart **and**
+///   deliver the handler on top of the restarted syscall.
+/// - Signal with `Disposition::Handler` and no `SA_RESTART`: convert to
+///   `-EINTR` and deliver the handler.
+pub fn restart_decision(
+    rv: i64,
+    sig: Option<u8>,
+    disp: Disposition,
+    sa_flags: u64,
+) -> RestartDecision {
+    if rv != crate::tty::KERN_ERESTARTSYS {
+        return RestartDecision::NoChange;
+    }
+    match sig {
+        None => RestartDecision::Restart {
+            deliver_handler: false,
+        },
+        Some(s) => match disp {
+            Disposition::Handler(_) => {
+                if sa_flags & SA_RESTART != 0 {
+                    RestartDecision::Restart {
+                        deliver_handler: true,
+                    }
+                } else {
+                    RestartDecision::Eintr
+                }
+            }
+            Disposition::Ignore => RestartDecision::Restart {
+                deliver_handler: false,
+            },
+            Disposition::Default => match default_action(s) {
+                // Stop/Ignore/Continue with no handler: restart the
+                // syscall. Once the task is stopped/woken, re-entering
+                // the syscall will re-check the gate condition.
+                DefaultAction::Stop | DefaultAction::Ignore | DefaultAction::Continue => {
+                    RestartDecision::Restart {
+                        deliver_handler: false,
+                    }
+                }
+                // Default-terminate: the task is about to be killed by
+                // `deliver_signal`. Restart is academic — pick it to
+                // match Linux rather than leaving a dangling -512 in rax.
+                DefaultAction::Terminate => RestartDecision::Restart {
+                    deliver_handler: false,
+                },
+            },
+        },
+    }
+}
+
 /// Called from the `syscall_entry` asm trampoline between steps 5 and 6
 /// (after `syscall_dispatch` returns, before `pop rcx / sysretq`).
 ///
-/// Two responsibilities:
+/// Three responsibilities:
 ///
 /// 1. **sigreturn**: if `SIGRETURN_PENDING` is set (syscall 15 just ran),
 ///    overwrite `ctx` with the restored user context from `FORK_USER_*`
 ///    statics and clear the flag.
 ///
-/// 2. **signal delivery**: if a signal is pending for the current process,
-///    pop the lowest pending signal, look up its disposition, and either
-///    push a `SigFrame` + redirect `ctx->user_rip` (user handler), exit the
-///    process (default terminate), or do nothing (ignored).
+/// 2. **ERESTARTSYS handling**: if the dispatcher returned
+///    `KERN_ERESTARTSYS`, consult [`restart_decision`]. On restart, rewind
+///    `ctx.user_rip` by the syscall insn length and clobber `rv` so the
+///    caller sees the freshly-restarted syscall's result.
+///
+/// 3. **signal delivery**: if a signal was popped (either by step 2's
+///    lookup or a fresh pop after sigreturn), look up its disposition and
+///    either push a `SigFrame` + redirect `ctx->user_rip` (user handler),
+///    exit the process (default terminate), or do nothing (ignored).
+///
+/// The returned value replaces `rax` for SYSRETQ.
 ///
 /// # Safety
 /// `ctx` must point to the [`SyscallReturnContext`] fields on the current
 /// task's kernel stack.  Called only from `syscall_entry` with IF disabled.
 #[no_mangle]
-pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContext) {
+pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContext, rv: i64) -> i64 {
     use core::sync::atomic::Ordering;
 
     // Handle sigreturn: restore saved context from FORK_USER_* statics.
@@ -550,13 +664,48 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
     }
 
     let task_id = crate::task::current_id();
-    let sig =
-        match crate::process::with_signal_state_for_task(task_id, |state| state.pop_next_pending())
-        {
-            Some(Some(sig)) => sig,
-            _ => return, // no pending signal or no process entry
-        };
-    deliver_signal(sig, &mut *ctx);
+    // Peek the next deliverable signal and its (disposition, sa_flags) in
+    // a single lock window so the restart-decision classifier sees a
+    // consistent snapshot.
+    let popped: Option<(u8, Disposition, u64)> =
+        crate::process::with_signal_state_for_task(task_id, |state| {
+            state.pop_next_pending().map(|s| {
+                let i = (s - 1) as usize;
+                (s, state.dispositions[i], state.sa_flags[i])
+            })
+        })
+        .flatten();
+
+    let mut rv_out = rv;
+    let sig_for_delivery: Option<u8> = match restart_decision(
+        rv,
+        popped.map(|(s, _, _)| s),
+        popped.map(|(_, d, _)| d).unwrap_or(Disposition::Default),
+        popped.map(|(_, _, f)| f).unwrap_or(0),
+    ) {
+        RestartDecision::NoChange => popped.map(|(s, _, _)| s),
+        RestartDecision::Restart { deliver_handler } => {
+            (*ctx).user_rip = (*ctx).user_rip.wrapping_sub(SYSCALL_INSN_LEN);
+            // Clobber rv: after restart, userspace will get the result of
+            // the re-executed syscall; the stale -ERESTARTSYS must not
+            // leak in case something later skips the restart.
+            rv_out = 0;
+            if deliver_handler {
+                popped.map(|(s, _, _)| s)
+            } else {
+                None
+            }
+        }
+        RestartDecision::Eintr => {
+            rv_out = crate::fs::EINTR;
+            popped.map(|(s, _, _)| s)
+        }
+    };
+
+    if let Some(sig) = sig_for_delivery {
+        deliver_signal(sig, &mut *ctx);
+    }
+    rv_out
 }
 
 /// Deliver signal `sig` by either redirecting return-to-user context to the
@@ -795,5 +944,139 @@ mod tests {
             s.dispositions[(SIGCHLD - 1) as usize],
             Disposition::Ignore
         ));
+    }
+
+    // ── restart_decision classifier ───────────────────────────────────
+
+    #[test]
+    fn restart_noop_when_rv_is_not_erestartsys() {
+        // Any non-ERESTARTSYS rv is passed through untouched even if a
+        // signal is queued with SA_RESTART clear.
+        assert_eq!(
+            restart_decision(-4, Some(SIGTTOU), Disposition::Handler(0x1000), 0),
+            RestartDecision::NoChange
+        );
+        assert_eq!(
+            restart_decision(0, None, Disposition::Default, 0),
+            RestartDecision::NoChange
+        );
+    }
+
+    #[test]
+    fn restart_without_signal_rewinds_unconditionally() {
+        // ERESTARTSYS with no pending signal (e.g. spurious wake) must
+        // rewind rip so the syscall re-runs; no handler to deliver.
+        assert_eq!(
+            restart_decision(crate::tty::KERN_ERESTARTSYS, None, Disposition::Default, 0),
+            RestartDecision::Restart {
+                deliver_handler: false
+            }
+        );
+    }
+
+    #[test]
+    fn restart_handler_with_sa_restart_rewinds_and_delivers() {
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTTOU),
+                Disposition::Handler(0x4000_0000),
+                SA_RESTART
+            ),
+            RestartDecision::Restart {
+                deliver_handler: true
+            }
+        );
+    }
+
+    #[test]
+    fn restart_handler_without_sa_restart_returns_eintr() {
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTTOU),
+                Disposition::Handler(0x4000_0000),
+                0
+            ),
+            RestartDecision::Eintr
+        );
+    }
+
+    #[test]
+    fn restart_handler_with_other_flags_still_needs_sa_restart() {
+        // SA_NODEFER alone doesn't enable restart.
+        let sa_nodefer: u64 = 0x4000_0000;
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTTOU),
+                Disposition::Handler(0x4000_0000),
+                sa_nodefer
+            ),
+            RestartDecision::Eintr
+        );
+    }
+
+    #[test]
+    fn restart_ignored_signal_rewinds() {
+        // SIG_IGN on an ERESTARTSYS-returning syscall: restart (no
+        // handler to run, nothing for userspace to see).
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTTOU),
+                Disposition::Ignore,
+                0
+            ),
+            RestartDecision::Restart {
+                deliver_handler: false
+            }
+        );
+    }
+
+    #[test]
+    fn restart_default_stop_rewinds_no_handler() {
+        // Default SIGTTOU/SIGTTIN/SIGTSTP is Stop — the caller will
+        // re-enter the syscall after wake; don't convert to EINTR.
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTTOU),
+                Disposition::Default,
+                0
+            ),
+            RestartDecision::Restart {
+                deliver_handler: false
+            }
+        );
+    }
+
+    #[test]
+    fn restart_default_terminate_rewinds_no_handler() {
+        // Default-terminate (e.g. SIGTERM): the task is about to die
+        // via deliver_signal → task::exit. Picking Restart (rather than
+        // NoChange) ensures -512 never leaks into userspace if the
+        // terminate path is ever made non-fatal.
+        assert_eq!(
+            restart_decision(
+                crate::tty::KERN_ERESTARTSYS,
+                Some(SIGTERM),
+                Disposition::Default,
+                0
+            ),
+            RestartDecision::Restart {
+                deliver_handler: false
+            }
+        );
+    }
+
+    #[test]
+    fn sigaction_flags_roundtrip_in_state() {
+        // The SignalState machinery itself (not sys_sigaction, which
+        // requires a live process entry) stores sa_flags per signal.
+        let mut s = SignalState::new();
+        s.sa_flags[(SIGTTOU - 1) as usize] = SA_RESTART;
+        assert_eq!(s.sa_flags[(SIGTTOU - 1) as usize], SA_RESTART);
+        assert_eq!(s.sa_flags[(SIGTERM - 1) as usize], 0);
     }
 }

@@ -1089,15 +1089,25 @@ syscall_entry:
     add rsp, 8
     // rax = return value
 
-    // 5b. Check for pending signals before returning to user.
-    //     Pass a pointer to the saved [user_rip, user_rflags, user_rsp]
-    //     on the kernel stack so check_and_deliver_signals can redirect
-    //     the return to a signal handler if needed.
-    //     Save rax across the call (it holds the syscall return value).
+    // 5b. Check for pending signals and ERESTARTSYS before returning to
+    //     user. Pass a pointer to the saved [user_rip, user_rflags,
+    //     user_rsp] on the kernel stack as arg0 so the handler can
+    //     redirect to a signal frame or rewind rip; pass the dispatcher's
+    //     return value in rax as arg1 (rsi). The handler returns the
+    //     (possibly rewritten) return value in rax, which becomes the
+    //     value SYSRETQ delivers.
+    //
+    //     `push rax` serves two purposes: 16-byte alignment for the CALL
+    //     (the preceding 3 pushes + dispatcher's matching sub/add leaves
+    //     rsp at top-24, i.e. 8 mod 16; one more push brings it to 0 mod
+    //     16), and it harmlessly stashes a copy of rax that we discard.
+    //     The handler returns the new rv in rax directly; we just drop
+    //     the alignment slot.
     push rax
-    lea rdi, [rsp + 8]   // pointer to saved [rip, rflags, rsp]
+    lea rdi, [rsp + 8]  // pointer to saved [rip, rflags, rsp]
+    mov rsi, rax        // rv → arg1
     call check_and_deliver_signals
-    pop rax
+    add rsp, 8          // drop the alignment slot; rax is the new rv
 
     // 6. Restore return-to-user context.
     pop rcx           // user RIP  → rcx  (for SYSRETQ)

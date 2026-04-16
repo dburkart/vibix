@@ -284,9 +284,9 @@ const ENOTTY: i64 = -25;
 pub const EIO: i64 = -5;
 
 /// Linux-internal "restart this syscall" sentinel. Not user-visible: the
-/// syscall trampoline either restarts the call transparently (SA_RESTART)
-/// or converts it to `EINTR` (-4). Until the trampoline lands (tracked as
-/// a follow-up to #434), callers translate this to `EINTR` directly.
+/// syscall trampoline (`signal::check_and_deliver_signals`) either
+/// restarts the call transparently (when the delivered signal has
+/// `SA_RESTART`) or converts it to `EINTR` (-4).
 pub const KERN_ERESTARTSYS: i64 = -512;
 
 /// `TIOCSCTTY(force)` — acquire `tty` as the caller session's controlling
