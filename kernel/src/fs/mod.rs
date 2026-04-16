@@ -503,6 +503,37 @@ impl FileDescTable {
         self.slots[newfd as usize] = Some((desc, 0));
         Ok(newfd)
     }
+
+    /// Like [`dup2`], but:
+    /// - Returns `EINVAL` if `oldfd == newfd` (POSIX `dup3`).
+    /// - Accepts a `flags` argument; only `O_CLOEXEC` is legal. Any other
+    ///   bit returns `EINVAL`. When `O_CLOEXEC` is set, `newfd` is created
+    ///   with `FD_CLOEXEC`; the source fd's per-fd flags are untouched.
+    ///
+    /// Returns `EBADF` if `oldfd` is not open, `EINVAL` if
+    /// `newfd >= MAX_FD`.
+    pub fn dup3(&mut self, oldfd: u32, newfd: u32, flags: u32) -> Result<u32, i64> {
+        if oldfd == newfd {
+            return Err(EINVAL);
+        }
+        if flags & !flags::O_CLOEXEC != 0 {
+            return Err(EINVAL);
+        }
+        if newfd as usize >= MAX_FD {
+            return Err(EINVAL);
+        }
+        let desc = self.get_desc(oldfd)?;
+        while self.slots.len() <= newfd as usize {
+            self.slots.push(None);
+        }
+        let fd_flags = if flags & flags::O_CLOEXEC != 0 {
+            flags::O_CLOEXEC
+        } else {
+            0
+        };
+        self.slots[newfd as usize] = Some((desc, fd_flags));
+        Ok(newfd)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +842,60 @@ mod tests {
     fn dup2_einval_newfd_too_large() {
         let mut t = make_table();
         assert_eq!(t.dup2(1, MAX_FD as u32), Err(EINVAL));
+    }
+
+    #[test]
+    fn dup3_einval_on_equal_fd() {
+        let mut t = make_table();
+        assert_eq!(t.dup3(1, 1, 0), Err(EINVAL));
+        // Even with O_CLOEXEC: dup3(fd, fd, _) is always EINVAL.
+        assert_eq!(t.dup3(1, 1, flags::O_CLOEXEC), Err(EINVAL));
+    }
+
+    #[test]
+    fn dup3_sets_cloexec_only_on_new_fd() {
+        let mut t = make_table();
+        // dup3(1, 5, O_CLOEXEC): fd 5 gets FD_CLOEXEC, fd 1 does not.
+        assert_eq!(t.dup3(1, 5, flags::O_CLOEXEC).unwrap(), 5);
+        assert_eq!(t.get_fd_flags(5).unwrap(), FD_CLOEXEC);
+        assert_eq!(t.get_fd_flags(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn dup3_without_cloexec_clears_fd_flags() {
+        let mut t = make_table();
+        assert_eq!(t.dup3(1, 5, 0).unwrap(), 5);
+        assert_eq!(t.get_fd_flags(5).unwrap(), 0);
+    }
+
+    #[test]
+    fn dup3_einval_on_unknown_flag() {
+        let mut t = make_table();
+        // O_NONBLOCK is valid on pipe2 but not on dup3.
+        assert_eq!(t.dup3(1, 5, flags::O_NONBLOCK), Err(EINVAL));
+        // An entirely unknown bit also returns EINVAL.
+        assert_eq!(t.dup3(1, 5, 0x1), Err(EINVAL));
+    }
+
+    #[test]
+    fn dup3_closes_newfd_if_open() {
+        let mut t = make_table();
+        // fd 2 is open; dup3(1, 2, _) silently replaces it.
+        assert_eq!(t.dup3(1, 2, 0).unwrap(), 2);
+        assert!(t.get(2).is_ok());
+    }
+
+    #[test]
+    fn dup3_ebadf_on_closed_oldfd() {
+        let mut t = make_table();
+        t.close_fd(2).unwrap();
+        assert_eq!(t.dup3(2, 5, 0), Err(EBADF));
+    }
+
+    #[test]
+    fn dup3_einval_newfd_too_large() {
+        let mut t = make_table();
+        assert_eq!(t.dup3(1, MAX_FD as u32, 0), Err(EINVAL));
     }
 
     #[test]
