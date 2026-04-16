@@ -122,10 +122,8 @@ impl<const LINES: usize> Cache<LINES> {
         while cur < end {
             let page_lba = cur & !(LINE_SECTORS - 1);
             let intra_sector = (cur - page_lba) as usize;
-            let sectors_in_page = core::cmp::min(
-                LINE_SECTORS as usize - intra_sector,
-                (end - cur) as usize,
-            );
+            let sectors_in_page =
+                core::cmp::min(LINE_SECTORS as usize - intra_sector, (end - cur) as usize);
             let bytes = sectors_in_page * SECTOR_SIZE;
             let src_off = intra_sector * SECTOR_SIZE;
 
