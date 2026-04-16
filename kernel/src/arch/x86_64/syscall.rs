@@ -447,11 +447,14 @@ pub unsafe extern "C" fn syscall_dispatch(
         // dup3(oldfd, newfd, flags) — like dup2 but returns EINVAL if
         // oldfd == newfd and accepts an O_CLOEXEC flag for the new fd.
         DUP3 => {
-            let oldfd = a0 as u32;
-            let newfd = a1 as u32;
+            let oldfd = a0 as i32;
+            let newfd = a1 as i32;
             let flags = a2 as u32;
+            if oldfd < 0 || newfd < 0 {
+                return crate::fs::EBADF;
+            }
             let tbl = crate::task::current_fd_table();
-            let result = tbl.lock().dup3(oldfd, newfd, flags);
+            let result = tbl.lock().dup3(oldfd as u32, newfd as u32, flags);
             match result {
                 Ok(fd) => fd as i64,
                 Err(e) => e,

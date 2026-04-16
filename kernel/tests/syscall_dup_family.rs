@@ -184,8 +184,11 @@ fn dup_returns_lowest_free_fd() {
     assert!(fd >= 3, "open /etc/hostname failed: {}", fd);
     // dup(fd) must allocate the lowest free fd, which is fd+1 here.
     let new_fd = dup(fd);
-    assert!(new_fd >= 3);
-    assert_ne!(new_fd, fd);
+    assert_eq!(
+        new_fd,
+        fd + 1,
+        "dup must return the lowest-numbered free fd"
+    );
     // Both fds must be readable.
     let mut buf = [0u8; 6];
     assert_eq!(read_bytes(new_fd, &mut buf), HOSTNAME_CONTENT.len() as i64);
@@ -294,4 +297,7 @@ fn dup_family_ebadf_on_closed() {
     assert_eq!(dup(9999), EBADF);
     assert_eq!(dup2(9999, 5), EBADF);
     assert_eq!(dup3(9999, 5, 0), EBADF);
+    // Linux returns EBADF (not EINVAL) for negative fds on dup3.
+    assert_eq!(dup3(-1, 5, 0), EBADF);
+    assert_eq!(dup3(3, -1, 0), EBADF);
 }
