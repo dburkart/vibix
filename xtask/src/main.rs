@@ -980,12 +980,14 @@ fn smoke(opts: &BuildOpts) -> R<()> {
 
     // Hard ceiling: a watchdog thread kills QEMU after HARD_CAP so that a
     // blocking read_line() on a stalled kernel cannot hang indefinitely.
-    // 90 s was borderline on un-accelerated CI QEMU (no KVM on ubuntu-latest):
-    // fork+exec markers intermittently arrived past the cap even though the
-    // kernel was healthy. The loop exits as soon as every marker appears or
-    // the kernel prints a panic marker, so a generous ceiling only affects
-    // genuine hangs.
-    const HARD_CAP: Duration = Duration::from_secs(180);
+    // 90 s was borderline on un-accelerated CI QEMU (no KVM on ubuntu-latest);
+    // 180 s was then borderline too — the "init: hello from pid 1" marker
+    // (emitted by the ring-3 init binary's first write() syscall) intermittently
+    // arrived past the cap on loaded GitHub runners even though the kernel was
+    // healthy. 300 s gives a ~2× safety margin over observed worst-case timing.
+    // The loop exits as soon as every marker appears or the kernel prints a
+    // panic marker, so a generous ceiling only affects genuine hangs.
+    const HARD_CAP: Duration = Duration::from_secs(300);
     // Kernel panic marker printed by the panic_handler in kernel/src/main.rs.
     // Seeing this means the kernel has already lost — don't wait out HARD_CAP.
     const PANIC_MARKER: &str = "KERNEL PANIC:";
