@@ -243,12 +243,7 @@ fn erestartsys_default_stop_rewinds() {
     // Default-Terminate (e.g. SIGTERM) also rewinds; the task is about
     // to die via deliver_signal but -512 must not leak into userspace.
     assert_eq!(
-        restart_decision(
-            KERN_ERESTARTSYS,
-            Some(SIGTERM),
-            Disposition::Default,
-            0,
-        ),
+        restart_decision(KERN_ERESTARTSYS, Some(SIGTERM), Disposition::Default, 0,),
         RestartDecision::Restart {
             deliver_handler: false
         }
