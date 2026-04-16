@@ -82,8 +82,13 @@ fn matches_cc(termios: &Termios, cc_idx: usize, c: u8) -> bool {
     cc != 0 && c == cc
 }
 
-const LINE_BUF_CAP: usize = 4096;
 const RAW_RING_CAP: usize = 4096;
+// One byte shorter than the raw ring so a full line plus its commit delimiter
+// (`\n` / VEOL) always fits atomically into the raw ring — without this gap,
+// `canon_input` would silently drop the user's last keystroke at exactly
+// `RAW_RING_CAP` chars and then reject the `\n` commit, forcing the user to
+// VERASE once before the line could land.
+const LINE_BUF_CAP: usize = RAW_RING_CAP - 1;
 
 struct LineBuffer {
     buf: [u8; LINE_BUF_CAP],
@@ -160,15 +165,28 @@ impl RawRing {
         true
     }
 
-    fn commit_line(&mut self, src: &[u8], is_eof: bool) {
+    /// Atomically commit a line payload plus optional delimiter and/or
+    /// EOF boundary into the raw ring. Returns `false` without mutating
+    /// any state if the ring lacks capacity for the whole unit; returns
+    /// `true` after pushing every byte otherwise. Callers rely on the
+    /// all-or-nothing contract to leave the line editor intact on
+    /// back-pressure instead of emitting a split line.
+    fn commit_line(&mut self, src: &[u8], delim: Option<u8>, is_eof: bool) -> bool {
+        let need = src.len() + delim.is_some() as usize;
+        let free = RAW_RING_CAP - self.len();
+        if need > free {
+            return false;
+        }
         for &b in src {
-            if !self.push(b) {
-                break;
-            }
+            self.push(b);
+        }
+        if let Some(d) = delim {
+            self.push(d);
         }
         if is_eof {
             self.eof_pos = Some(self.tail);
         }
+        true
     }
 }
 
@@ -178,10 +196,22 @@ struct NTtyState {
 }
 
 impl NTtyState {
-    fn commit_line(&mut self, is_eof: bool) {
-        self.raw
-            .commit_line(&self.line.buf[..self.line.len], is_eof);
-        self.line.len = 0;
+    /// Attempt to commit the in-progress line to the raw ring with an
+    /// optional trailing delimiter (`\n` / VEOL) and optional EOF mark
+    /// (VEOF). Returns `true` and clears the line buffer on success;
+    /// returns `false` and leaves the line buffer untouched if the raw
+    /// ring lacks capacity for the whole unit, so a subsequent reader
+    /// drain can unblock and a retry will succeed.
+    fn commit_line(&mut self, delim: Option<u8>, is_eof: bool) -> bool {
+        if self
+            .raw
+            .commit_line(&self.line.buf[..self.line.len], delim, is_eof)
+        {
+            self.line.len = 0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -267,12 +297,9 @@ impl NTty {
                 st.raw.push(c);
                 should_wake = true;
             } else if matches_cc(termios, VEOF, c) {
-                st.commit_line(true);
-                should_wake = true;
+                should_wake = st.commit_line(None, true);
             } else if c == b'\n' || matches_cc(termios, VEOL, c) {
-                st.commit_line(false);
-                st.raw.push(c);
-                should_wake = true;
+                should_wake = st.commit_line(Some(c), false);
             } else if matches_cc(termios, VERASE, c) {
                 st.line.pop();
                 should_wake = false;
@@ -845,18 +872,19 @@ mod tests {
         let n = NTty::new();
         let t = termios_canon();
         let w = CountingWake::new();
+        // Fill the line editor to its capacity; extra bytes must be
+        // silently dropped so the newline commit still fits atomically.
         for _ in 0..LINE_BUF_CAP {
             n.canon_input(&t, b'x', &w);
         }
-        // 4097th byte silently dropped — line buffer is full.
         n.canon_input(&t, b'y', &w);
         assert_eq!(w.count(), 0);
-        // Newline commits the full line (all x's).
         n.canon_input(&t, b'\n', &w);
         assert_eq!(w.count(), 1);
         let data = raw_contents(&n);
-        assert_eq!(data.len(), LINE_BUF_CAP);
-        assert!(data.iter().all(|&b| b == b'x'));
+        assert_eq!(data.len(), LINE_BUF_CAP + 1);
+        assert_eq!(data[data.len() - 1], b'\n');
+        assert!(data[..data.len() - 1].iter().all(|&b| b == b'x'));
     }
 
     #[test]
@@ -931,5 +959,67 @@ mod tests {
             n.canon_input(&t, b, &w);
         }
         assert_eq!(raw_contents(&n), b"abc\ndef\n");
+    }
+
+    #[test]
+    fn canon_commit_line_no_partial_on_full_ring() {
+        // Fill the raw ring to RAW_RING_CAP - 2, leaving room for
+        // exactly 2 bytes. Then queue a 3-byte line ("abc") + '\n'
+        // delimiter = 4 bytes of commit payload; it must not fit, so
+        // the commit must be rejected atomically — raw unchanged, line
+        // buffer preserved, no wake.
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        {
+            let mut st = n.state.lock();
+            for _ in 0..(RAW_RING_CAP - 2) {
+                assert!(st.raw.push(b'p'));
+            }
+        }
+        for &b in b"abc" {
+            n.canon_input(&t, b, &w);
+        }
+        let len_before = n.state.lock().raw.len();
+        n.canon_input(&t, b'\n', &w);
+        assert_eq!(
+            n.state.lock().raw.len(),
+            len_before,
+            "raw ring must not absorb a partial commit",
+        );
+        assert_eq!(
+            n.state.lock().line.len,
+            3,
+            "line buffer preserved on failure"
+        );
+        assert_eq!(w.count(), 0, "no wake when commit is rejected");
+    }
+
+    #[test]
+    fn canon_commit_veof_no_partial_on_full_ring() {
+        // Same pre-condition with VEOF: a 3-byte line with no delimiter
+        // needs 3 free bytes; with only 2 free, the commit must be
+        // rejected without setting eof_pos or clearing the line buffer.
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = CountingWake::new();
+        {
+            let mut st = n.state.lock();
+            for _ in 0..(RAW_RING_CAP - 2) {
+                assert!(st.raw.push(b'p'));
+            }
+        }
+        for &b in b"abc" {
+            n.canon_input(&t, b, &w);
+        }
+        let len_before = n.state.lock().raw.len();
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        assert_eq!(n.state.lock().raw.len(), len_before);
+        assert!(
+            n.state.lock().raw.eof_pos.is_none(),
+            "EOF mark must not be set on a rejected commit",
+        );
+        assert_eq!(n.state.lock().line.len, 3);
+        assert_eq!(w.count(), 0);
     }
 }
