@@ -10,6 +10,14 @@
 //!   30-37 (set fg), 39 (default fg), 40-47 (set bg), 49 (default bg).
 //! - Control characters `\r`, `\t`, `\n`.
 //!
+//! DEC private and extended VT100 sequences handled:
+//! - `ESC 7` / `ESC 8` (DECSC / DECRC): save / restore cursor + SGR state.
+//! - `CSI ? Pm h` / `CSI ? Pm l` (DECSET / DECRST): set / reset DEC private
+//!   modes. Known modes `?1` (cursor-keys app), `?7` (auto-wrap), `?12`
+//!   (cursor blink), `?25` (cursor visible), and `?1049` (alt-screen) are
+//!   accepted as no-ops so real terminal applications (vim, less, htop) do
+//!   not see sequences rejected; unrecognized modes are silently ignored.
+//!
 //! A blinking cursor is drawn at the write position.  The blink rate is
 //! driven by the kernel task spawned in `main.rs` via [`toggle_cursor`].
 //!
@@ -137,6 +145,54 @@ enum Ansi {
     Normal,
     Esc,
     Csi,
+    /// CSI with DEC private-mode introducer `?` already consumed; digits
+    /// and `;` accumulate into `params` until a final `h` or `l` dispatches
+    /// DECSET / DECRST.
+    CsiPrivate,
+}
+
+/// Classification of a DEC private-mode code for DECSET (`h`) / DECRST (`l`).
+///
+/// Modes that vibix doesn't implement but wants to accept silently (so
+/// applications that toggle them don't see sequences ping-ponging back as
+/// literal text) return [`DecMode::NoOp`].  Unknown modes fall through to
+/// [`DecMode::Unknown`] — the caller discards them.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub(crate) enum DecMode {
+    /// Application cursor keys (mode 1). Accepted, not yet honored.
+    CursorKeys,
+    /// Auto-wrap at right margin (mode 7). Accepted; wrap is the only
+    /// behavior vibix currently implements, so this is a no-op.
+    AutoWrap,
+    /// Cursor blinking (mode 12). The console already blinks; no-op.
+    CursorBlink,
+    /// Cursor visibility (mode 25). Accepted; gating the actual draw is a
+    /// follow-up.
+    CursorVisible,
+    /// Alt-screen buffer (mode 1049). Stub — implemented in follow-up #458.
+    AltScreen,
+    /// Recognized as safe-to-ignore so apps don't break.
+    NoOp,
+    /// Not in the recognized set; caller discards silently.
+    Unknown,
+}
+
+/// Look up a DEC private-mode numeric code.  Pure: no side effects, so it
+/// is easy to unit-test without standing up a [`Console`] instance.
+pub(crate) fn classify_dec_mode(code: u32) -> DecMode {
+    match code {
+        1 => DecMode::CursorKeys,
+        7 => DecMode::AutoWrap,
+        12 => DecMode::CursorBlink,
+        25 => DecMode::CursorVisible,
+        1049 => DecMode::AltScreen,
+        // Commonly-seen modes whose absence is harmless: keypad
+        // application mode (?66), bracketed-paste (?2004), mouse tracking
+        // (?1000/?1002/?1003/?1006). Accept without logging — xterm apps
+        // spray these during init.
+        66 | 1000 | 1002 | 1003 | 1006 | 2004 => DecMode::NoOp,
+        _ => DecMode::Unknown,
+    }
 }
 
 // ─── Console ───────────────────────────────────────────────────────────────
@@ -184,6 +240,15 @@ pub struct Console {
     params: [u32; 8], // accumulated CSI parameter values
     nparams: usize,   // params filled so far
     cur_param: u32,   // digit accumulator for the current parameter
+
+    // DECSC / DECRC saved state.  `saved_valid == false` means DECRC is a
+    // no-op (xterm behavior for a never-saved slot).
+    saved_cx: usize,
+    saved_cy: usize,
+    saved_fg: Option<u8>,
+    saved_bg: Option<u8>,
+    saved_bold: bool,
+    saved_valid: bool,
 }
 
 // SAFETY: the framebuffer pointer is stable for the kernel lifetime;
@@ -233,6 +298,12 @@ impl Console {
             params: [0; 8],
             nparams: 0,
             cur_param: 0,
+            saved_cx: 0,
+            saved_cy: 0,
+            saved_fg: None,
+            saved_bg: None,
+            saved_bold: false,
+            saved_valid: false,
         }
     }
 
@@ -627,6 +698,51 @@ impl Console {
         }
     }
 
+    // ── DECSC / DECRC cursor + SGR save / restore ─────────────────────────
+
+    fn save_cursor(&mut self) {
+        self.saved_cx = self.cx;
+        self.saved_cy = self.cy;
+        self.saved_fg = self.fg_base;
+        self.saved_bg = self.bg_base;
+        self.saved_bold = self.bold;
+        self.saved_valid = true;
+    }
+
+    fn restore_cursor(&mut self) {
+        if !self.saved_valid {
+            // Per xterm semantics, DECRC without a prior DECSC is a no-op.
+            return;
+        }
+        // Erase the cursor at its current position before moving.
+        let (cx, cy) = (self.cx, self.cy);
+        self.draw_cursor(cx, cy, false);
+
+        self.cx = self.saved_cx.min(self.cols.saturating_sub(1));
+        self.cy = self.saved_cy.min(self.rows.saturating_sub(1));
+        self.fg_base = self.saved_fg;
+        self.bg_base = self.saved_bg;
+        self.bold = self.saved_bold;
+
+        // Draw at the new position.
+        let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+        self.draw_cursor(cx, cy, on);
+    }
+
+    // ── DEC private mode (DECSET / DECRST) ────────────────────────────────
+
+    fn apply_dec_private(&mut self, _set: bool) {
+        // Empty param list (`\x1b[?h`) is treated as no mode — do nothing.
+        let n = self.nparams;
+        for i in 0..n {
+            // Classify for future hookup; all recognized modes are no-ops
+            // until follow-up issues (#458 alt-screen, #457 scroll region)
+            // wire real behavior here.  The classification keeps unknown
+            // modes quiet rather than dumping them to the framebuffer.
+            let _ = classify_dec_mode(self.params[i]);
+        }
+    }
+
     // ── public character writer ───────────────────────────────────────────
 
     pub fn write_char(&mut self, c: char) {
@@ -664,19 +780,39 @@ impl Console {
                 }
             },
 
-            Ansi::Esc => {
-                if c == '[' {
+            Ansi::Esc => match c {
+                '[' => {
                     self.ansi = Ansi::Csi;
                     self.params = [0; 8];
                     self.nparams = 0;
                     self.cur_param = 0;
-                } else {
+                }
+                '7' => {
+                    // DECSC — save cursor position and SGR state.
+                    self.save_cursor();
+                    self.ansi = Ansi::Normal;
+                }
+                '8' => {
+                    // DECRC — restore.
+                    self.restore_cursor();
+                    self.ansi = Ansi::Normal;
+                }
+                _ => {
                     // Unrecognised escape — discard and resume normal parsing.
                     self.ansi = Ansi::Normal;
                 }
-            }
+            },
 
             Ansi::Csi => match c {
+                '?' => {
+                    // DEC private-mode introducer must appear before any
+                    // digits; already-accumulated params (none at this
+                    // point for a well-formed sequence) are cleared.
+                    self.params = [0; 8];
+                    self.nparams = 0;
+                    self.cur_param = 0;
+                    self.ansi = Ansi::CsiPrivate;
+                }
                 '0'..='9' => {
                     self.cur_param = self
                         .cur_param
@@ -701,6 +837,34 @@ impl Console {
                 }
                 _ => {
                     // Unrecognised final byte — discard the sequence.
+                    self.ansi = Ansi::Normal;
+                }
+            },
+
+            Ansi::CsiPrivate => match c {
+                '0'..='9' => {
+                    self.cur_param = self
+                        .cur_param
+                        .saturating_mul(10)
+                        .saturating_add(c as u32 - '0' as u32);
+                }
+                ';' => {
+                    if self.nparams < self.params.len() {
+                        self.params[self.nparams] = self.cur_param;
+                        self.nparams += 1;
+                    }
+                    self.cur_param = 0;
+                }
+                'h' | 'l' => {
+                    if self.nparams < self.params.len() {
+                        self.params[self.nparams] = self.cur_param;
+                        self.nparams += 1;
+                    }
+                    self.apply_dec_private(c == 'h');
+                    self.ansi = Ansi::Normal;
+                }
+                _ => {
+                    // Unknown final byte for a private sequence; drop.
                     self.ansi = Ansi::Normal;
                 }
             },
@@ -772,4 +936,36 @@ macro_rules! print {
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_dec_mode, DecMode};
+
+    #[test]
+    fn named_modes_classify() {
+        assert_eq!(classify_dec_mode(1), DecMode::CursorKeys);
+        assert_eq!(classify_dec_mode(7), DecMode::AutoWrap);
+        assert_eq!(classify_dec_mode(12), DecMode::CursorBlink);
+        assert_eq!(classify_dec_mode(25), DecMode::CursorVisible);
+        assert_eq!(classify_dec_mode(1049), DecMode::AltScreen);
+    }
+
+    #[test]
+    fn common_ignored_modes_are_noop() {
+        for code in [66u32, 1000, 1002, 1003, 1006, 2004] {
+            assert_eq!(
+                classify_dec_mode(code),
+                DecMode::NoOp,
+                "mode {code} should be NoOp",
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_modes_are_unknown() {
+        assert_eq!(classify_dec_mode(0), DecMode::Unknown);
+        assert_eq!(classify_dec_mode(999), DecMode::Unknown);
+        assert_eq!(classify_dec_mode(u32::MAX), DecMode::Unknown);
+    }
 }
