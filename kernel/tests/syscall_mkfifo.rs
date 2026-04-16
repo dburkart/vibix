@@ -19,6 +19,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
+use vibix::fs::vfs::ops::Stat;
 use vibix::fs::{EEXIST, ENXIO, EPERM};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
@@ -33,8 +34,11 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_FSTAT: u64 = 5;
 const SYS_MKNOD: u64 = 133;
 const SYS_MKNODAT: u64 = 259;
+
+const S_IFMT: u32 = 0o170_000;
 
 const AT_FDCWD: i64 = -100;
 
@@ -89,6 +93,10 @@ fn run_tests() {
         (
             "mknod_unsupported_type_eperm",
             &(mknod_unsupported_type_eperm as fn()),
+        ),
+        (
+            "fstat_on_open_fifo_returns_ififo",
+            &(fstat_on_open_fifo_returns_ififo as fn()),
         ),
     ];
     for (name, t) in tests {
@@ -186,6 +194,19 @@ fn read_bytes(fd: i64, out: &mut [u8]) -> i64 {
     n
 }
 
+fn statbuf_uva() -> u64 {
+    install_user_staging_vma();
+    USER_PAGE_VA as u64 + 3 * 4096
+}
+
+fn read_stat() -> Stat {
+    unsafe { ptr::read_volatile(statbuf_uva() as *const Stat) }
+}
+
+fn fstat(fd: i64) -> i64 {
+    unsafe { syscall_dispatch(SYS_FSTAT, fd as u64, statbuf_uva(), 0, 0, 0, 0) }
+}
+
 // --- Tests ---------------------------------------------------------------
 
 fn mknod_creates_fifo() {
@@ -256,4 +277,28 @@ fn mknod_unsupported_type_eperm() {
     // S_IFCHR is not supported — no devtmpfs yet.
     let r = mknod(b"/tmp/char-dev", S_IFCHR | 0o644);
     assert_eq!(r, EPERM, "mknod(S_IFCHR) must return EPERM, got {}", r);
+}
+
+/// Regression for #473: a path-opened FIFO fd must route fd-keyed
+/// inode syscalls through `as_vfs()`. Before the fix, the FIFO
+/// branch of `sys_openat_impl` installed a bare `PipeReadEnd` /
+/// `PipeWriteEnd` / `FifoRdwrBackend` whose `as_vfs()` returned
+/// `None`, so `fstat(fifo_fd)` returned `-EINVAL`. The new
+/// `FifoOpenBackend` wraps a real `VfsBackend` and `fstat` now
+/// returns the FIFO inode's `st_mode` with `S_IFIFO` set.
+fn fstat_on_open_fifo_returns_ififo() {
+    let r = mknod(b"/tmp/fifo-fstat", S_IFIFO | 0o644);
+    assert_eq!(r, 0, "mknod failed: {}", r);
+    let fd = open(b"/tmp/fifo-fstat", O_RDONLY | O_NONBLOCK);
+    assert!(fd >= 3, "open(O_RDONLY|O_NONBLOCK) failed: {}", fd);
+    let r = fstat(fd);
+    assert_eq!(r, 0, "fstat on open FIFO fd must succeed, got {}", r);
+    let st = read_stat();
+    assert_eq!(
+        st.st_mode & S_IFMT,
+        S_IFIFO as u32,
+        "fstat st_mode must carry S_IFIFO, got {:#o}",
+        st.st_mode
+    );
+    close(fd);
 }

@@ -303,10 +303,11 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
     }
 
     // 7a. FIFO detour: on an `InodeKind::Fifo`, `open(2)` rendezvous
-    //     semantics (POSIX §open) take over — we never build a
-    //     `VfsBackend` / `OpenFile` for the FIFO body. Instead the fd
-    //     gets a bare `PipeReadEnd` / `PipeWriteEnd` bound to the
-    //     FIFO's shared `Arc<Pipe>` via `Pipe::open_read`/`open_write`.
+    //     semantics (POSIX §open) take over. The fd gets a
+    //     `FifoOpenBackend` that wraps the pipe end(s) alongside an
+    //     `Arc<OpenFile>` — the latter pins the inode + SB (via a
+    //     transferred `SbActiveGuard`) and lets fd-keyed inode syscalls
+    //     (`fstat` etc.) route through `as_vfs`.
     if inode.kind == InodeKind::Fifo {
         let pipe = match inode.ops.fifo_pipe() {
             Some(p) => p,
@@ -317,34 +318,52 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
         };
         let nonblocking = flags32 & oflags::O_NONBLOCK != 0;
         let access = flags32 & oflags::O_ACCMODE;
-        let backend: Arc<dyn FileBackend> = match access {
+        // Acquire the pipe end(s) first — O_WRONLY-without-reader
+        // returns ENXIO here, and we do not want to have acquired an
+        // SbActiveGuard only to immediately drop it on that failure.
+        let (read_end, write_end) = match access {
             oflags::O_RDONLY => match pipe.open_read(nonblocking) {
-                Ok(r) => r,
+                Ok(r) => (Some(r), None),
                 Err(e) => return e,
             },
             oflags::O_WRONLY => match pipe.open_write(nonblocking) {
-                Ok(w) => w,
+                Ok(w) => (None, Some(w)),
                 Err(e) => return e,
             },
             oflags::O_RDWR => {
                 // Linux extension: `O_RDWR` on a FIFO always succeeds.
-                // We install the read end as the fd's backend — the
-                // same inode retains both a reader and writer count
-                // for the caller, so a later `read`/`write` on the fd
-                // sees the ring in whichever direction is populated.
+                // Both ends hang off the same `Arc<Pipe>`, so a write
+                // through the fd is observable on a later read.
                 let (r, w) = pipe.open_rdwr(nonblocking);
-                // Keep the write end alive alongside the read end by
-                // wrapping both in a small struct. Since an `O_RDWR`
-                // FIFO must be both readable and writable from the
-                // same fd, the backend needs to route `read` to `r`
-                // and `write` to `w`.
-                Arc::new(FifoRdwrBackend {
-                    read_end: r,
-                    write_end: w,
-                })
+                (Some(r), Some(w))
             }
             _ => return EINVAL,
         };
+        // Pin the inode + superblock for the fd's lifetime by building
+        // an `OpenFile` around them, the same dance every other
+        // path-opened fd goes through (see step 7 below). `OpenFile`'s
+        // `Drop` releases the `sb_active` pin.
+        let sb = match inode.sb.upgrade() {
+            Some(s) => s,
+            None => return ENOENT,
+        };
+        let guard = match SbActiveGuard::try_acquire(&sb) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
+        let of = OpenFile::new(
+            nd.path.dentry.clone(),
+            inode.clone(),
+            inode.file_ops.clone(),
+            sb.clone(),
+            flags as u32,
+            guard,
+        );
+        let backend: Arc<dyn FileBackend> = Arc::new(FifoOpenBackend {
+            vfs: VfsBackend { open_file: of },
+            read_end,
+            write_end,
+        });
         return install_fd(backend, flags as u32);
     }
 
@@ -374,28 +393,60 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
     install_fd(backend, flags as u32)
 }
 
-/// FileBackend used when a FIFO is opened `O_RDWR`. Routes `read` to
-/// the held `PipeReadEnd` and `write` to the held `PipeWriteEnd`; both
-/// refer to the same underlying `Arc<Pipe>`, so a write by the caller
-/// is observable on a subsequent read (and vice versa on the same fd).
-struct FifoRdwrBackend {
-    read_end: Arc<crate::ipc::pipe::PipeReadEnd>,
-    write_end: Arc<crate::ipc::pipe::PipeWriteEnd>,
+/// FileBackend for a path-opened FIFO fd.
+///
+/// Holds the pipe end(s) matching the open's access mode alongside an
+/// inner [`VfsBackend`] over the FIFO's inode. The `VfsBackend` pins
+/// the inode + superblock (via the `SbActiveGuard` transferred into
+/// its `OpenFile`), and `as_vfs` returns `Some(&self.vfs)` so fd-keyed
+/// inode syscalls (`fstat`, `fstatat` with `AT_EMPTY_PATH`, etc.) see
+/// the FIFO's inode rather than falling through to `-EINVAL`.
+///
+/// `read`/`write` bypass the inner `VfsBackend` and route directly to
+/// the pipe ends — FIFO I/O is ring-based rendezvous, not an offset-
+/// tracked inode body. `read` on a write-only open returns `EBADF`
+/// (mirroring `PipeWriteEnd::read`), and vice versa.
+struct FifoOpenBackend {
+    /// Inner VFS backend — purely for `as_vfs`/SB pinning. Its `read`/
+    /// `write` are never called through this outer backend.
+    vfs: VfsBackend,
+    read_end: Option<Arc<crate::ipc::pipe::PipeReadEnd>>,
+    write_end: Option<Arc<crate::ipc::pipe::PipeWriteEnd>>,
 }
 
-impl FileBackend for FifoRdwrBackend {
+impl FileBackend for FifoOpenBackend {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
-        self.read_end.read(buf)
+        match self.read_end.as_ref() {
+            Some(r) => r.read(buf),
+            None => Err(EBADF),
+        }
     }
     fn write(&self, buf: &[u8]) -> Result<usize, i64> {
-        self.write_end.write(buf)
+        match self.write_end.as_ref() {
+            Some(w) => w.write(buf),
+            None => Err(EBADF),
+        }
     }
     fn poll(&self, pt: &mut crate::poll::PollTable) -> crate::poll::PollMask {
-        self.read_end.poll(pt) | self.write_end.poll(pt)
+        let mut mask: crate::poll::PollMask = 0;
+        if let Some(r) = self.read_end.as_ref() {
+            mask |= r.poll(pt);
+        }
+        if let Some(w) = self.write_end.as_ref() {
+            mask |= w.poll(pt);
+        }
+        mask
     }
     fn set_flags(&self, new_flags: u32) {
-        self.read_end.set_flags(new_flags);
-        self.write_end.set_flags(new_flags);
+        if let Some(r) = self.read_end.as_ref() {
+            r.set_flags(new_flags);
+        }
+        if let Some(w) = self.write_end.as_ref() {
+            w.set_flags(new_flags);
+        }
+    }
+    fn as_vfs(&self) -> Option<&VfsBackend> {
+        Some(&self.vfs)
     }
 }
 
