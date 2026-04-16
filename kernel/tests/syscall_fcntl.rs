@@ -20,8 +20,7 @@ use core::ptr;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
 use vibix::fs::{
-    EAGAIN, EBADF, EINVAL, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
-    F_SETFL,
+    EAGAIN, EBADF, EINVAL, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL,
 };
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;

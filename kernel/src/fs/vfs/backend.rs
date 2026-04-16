@@ -528,10 +528,8 @@ mod tests {
         // set_flags call that only passes O_NONBLOCK must clear O_APPEND
         // (not in the new mask) but leave O_RDWR untouched.
         let ops = Arc::new(CountingOps { fill_byte: 0 });
-        let of = make_open_file_with_ops_flags(
-            ops,
-            flags::O_RDWR | flags::O_APPEND | flags::O_CLOEXEC,
-        );
+        let of =
+            make_open_file_with_ops_flags(ops, flags::O_RDWR | flags::O_APPEND | flags::O_CLOEXEC);
         let backend = VfsBackend {
             open_file: of.clone(),
         };
@@ -539,7 +537,11 @@ mod tests {
         let post = of.flags.load(Ordering::Relaxed);
         assert_eq!(post & flags::O_ACCMODE, flags::O_RDWR, "access mode kept");
         assert_eq!(post & flags::O_APPEND, 0, "O_APPEND cleared");
-        assert_eq!(post & flags::O_NONBLOCK, flags::O_NONBLOCK, "O_NONBLOCK set");
+        assert_eq!(
+            post & flags::O_NONBLOCK,
+            flags::O_NONBLOCK,
+            "O_NONBLOCK set"
+        );
         assert_eq!(
             post & flags::O_CLOEXEC,
             flags::O_CLOEXEC,
