@@ -2,6 +2,8 @@
 //! during early boot. Each handler logs to serial then halts — we don't
 //! have a panic-unwind story yet, so there's nothing to return to.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::paging::PageTableFlags;
@@ -11,6 +13,38 @@ use crate::arch::x86_64::interrupts::{
     keyboard_interrupt, serial_interrupt, timer_interrupt, InterruptIndex,
 };
 use crate::serial_println;
+
+/// #478 diagnostic latch: the first CPL=3 fault of the session logs a
+/// `ring3-first-fault:` line with full frame state before the handler
+/// runs its normal path. Subsequent ring-3 faults are common (SIGSEGV
+/// delivery etc.) and must not flood the log. One-shot by design.
+static FIRST_RING3_FAULT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Emit one `ring3-first-fault:` line on the first CPL=3 fault ever
+/// observed. `extra` is vector-specific trailer (e.g. `code=0x0` for #GP,
+/// `cr2=0x400000 code=PROTECTION` for #PF) — no user memory is touched
+/// while formatting, only scalars copied out of the hardware frame.
+fn log_first_ring3_fault(vector: &str, frame: &InterruptStackFrame, extra: core::fmt::Arguments) {
+    if (frame.code_segment.0 & 0b11) == 0 {
+        return;
+    }
+    if FIRST_RING3_FAULT_LOGGED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    serial_println!(
+        "ring3-first-fault: {} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} rflags={:#x} {}",
+        vector,
+        frame.instruction_pointer.as_u64(),
+        frame.stack_pointer.as_u64(),
+        frame.code_segment.0,
+        frame.stack_segment.0,
+        frame.cpu_flags.bits(),
+        extra,
+    );
+}
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -66,6 +100,7 @@ extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    log_first_ring3_fault("#UD", &frame, format_args!(""));
     serial_println!("EXCEPTION: #UD (invalid opcode)\n{:#?}", frame);
     hang();
 }
@@ -119,6 +154,7 @@ extern "x86-interrupt" fn breakpoint(mut frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
+    log_first_ring3_fault("#GP", &frame, format_args!("code={:#x}", code));
     serial_println!("EXCEPTION: #GP code={:#x}\n{:#?}", code, frame);
     hang();
 }
@@ -138,6 +174,12 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
         unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
     }
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
+
+    log_first_ring3_fault(
+        "#PF",
+        &frame,
+        format_args!("cr2={:#x} code={:?}", addr_u64, code),
+    );
 
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
         use crate::test_harness::{exit_qemu, QemuExitCode};
