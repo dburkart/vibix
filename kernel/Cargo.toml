@@ -263,3 +263,7 @@ harness = false
 [[test]]
 name = "syscall_mkfifo"
 harness = false
+
+[[test]]
+name = "gdbstub_loop"
+harness = false
