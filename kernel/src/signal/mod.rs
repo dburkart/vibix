@@ -732,6 +732,14 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
         // After sigreturn still check for any newly-pending signal.
     }
 
+    // Snapshot whether a restart is armed right now (set by the sigreturn
+    // block above, or by an earlier restart hop). If we end up delivering a
+    // fresh handler in this same call, the args must ride on the new frame
+    // — otherwise the frame's sigreturn won't re-arm them and the eventual
+    // SYSCALL replay will see handler-clobbered GPRs.
+    let restart_already_pending =
+        crate::arch::x86_64::syscall::SYSCALL_RESTART_PENDING.load(Ordering::Relaxed) != 0;
+
     let task_id = crate::task::current_id();
     // Peek the next deliverable signal and its (disposition, sa_flags) in
     // a single lock window so the restart-decision classifier sees a
@@ -784,14 +792,34 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
     // SA_RESTART-style restart — i.e. rip was just rewound to the SYSCALL
     // insn and the frame will carry the original syscall arg regs so
     // sigreturn can replay them. Only this path sets UC_VIBIX_SYSCALL_REGS.
+    //
+    // Two distinct sources feed this: (a) the current decision is a
+    // handler-restart, (b) a prior sigreturn in this same call just armed
+    // SYSCALL_RESTART_PENDING and we're about to deliver a fresh signal on
+    // top of it. In case (b), ctx.user_rip already points at the rewound
+    // SYSCALL and ctx.user_rax..r9 already hold the original syscall args
+    // — exactly the invariant case (a) sets up.
     let is_restart_handler = matches!(
         decision,
         RestartDecision::Restart {
             deliver_handler: true
         }
-    );
+    ) || (restart_already_pending && sig_for_delivery.is_some());
 
     if let Some(sig) = sig_for_delivery {
+        // Consume any pending restart before pushing the new frame. The
+        // args are now riding on the pushed frame; the eventual sigreturn
+        // of this new frame will re-arm SYSCALL_RESTART_PENDING from the
+        // frame's UC_VIBIX_SYSCALL_REGS. Leaving it armed now would make
+        // the asm epilogue pop ctx.user_rax..r9 into handler entry regs —
+        // cosmetically harmless for a signal handler (which reads its
+        // signum from its own stack-based trampoline) but it also consumes
+        // the flag, which is the real hazard: no one re-arms it until the
+        // nested sigreturn runs, so the eventual SYSCALL replay would see
+        // whatever handler-clobbered rax..r9 are in ctx at that point.
+        if restart_already_pending {
+            crate::arch::x86_64::syscall::SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
+        }
         deliver_signal(sig, &mut *ctx, is_restart_handler);
     }
     rv_out

@@ -91,6 +91,10 @@ fn run_tests() {
             "non_restart_handler_frame_yields_no_syscall_args",
             &(non_restart_handler_frame_yields_no_syscall_args as fn()),
         ),
+        (
+            "nested_delivery_propagates_syscall_args",
+            &(nested_delivery_propagates_syscall_args as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -190,6 +194,57 @@ fn push_preserves_rip_rflags_rsp_alongside_args() {
     assert_eq!(restored.rflags, saved_rflags);
     assert_eq!(restored.rsp, user_rsp);
     assert_eq!(restored.saved_mask, saved_mask);
+}
+
+fn nested_delivery_propagates_syscall_args() {
+    // Pins the round-trip underlying the #499 nested-delivery fix: when a
+    // sigreturn restores syscall args and then check_and_deliver_signals
+    // pops a fresh signal in the same call, the new handler frame must
+    // carry the same args through UC_VIBIX_SYSCALL_REGS so *its* sigreturn
+    // re-arms SYSCALL_RESTART_PENDING with the right values. Pre-fix, the
+    // second frame was pushed with args=None and the eventual SYSCALL
+    // replay saw handler-clobbered GPRs.
+    //
+    // Simulate the two hops at the frame layer: push A with Some(args),
+    // restore it to recover the args, then push B with those same args
+    // (what deliver_signal now does on the restart-pending path) and
+    // verify they round-trip through the second frame verbatim.
+    let args = SyscallArgRegs {
+        rax: 0xa1,
+        rdi: 0xa2,
+        rsi: 0xa3,
+        rdx: 0xa4,
+        r10: 0xa5,
+        r8: 0xa6,
+        r9: 0xa7,
+    };
+    let rsp_a = STACK_TOP - 16;
+    let frame_a = unsafe {
+        push_signal_frame(rsp_a, 22, 0x0000_4000_0010_0100, 0x202, 0, Some(args))
+            .expect("push A ok")
+    };
+    let restored_a = unsafe { restore_signal_frame(frame_a).expect("restore A ok") };
+    let propagated = restored_a
+        .syscall_args
+        .expect("hop A must carry UC_VIBIX_SYSCALL_REGS");
+    assert_eq!(propagated, args, "hop A must round-trip verbatim");
+
+    // Push hop B on top of the *restored* rsp (what sigreturn handed back),
+    // with the args we just recovered — exactly the propagation the fix
+    // performs in deliver_signal() when SYSCALL_RESTART_PENDING is armed.
+    let rsp_b = restored_a.rsp;
+    let frame_b = unsafe {
+        push_signal_frame(rsp_b, 15, 0x0000_4000_0020_0200, 0x202, 0, Some(propagated))
+            .expect("push B ok")
+    };
+    let restored_b = unsafe { restore_signal_frame(frame_b).expect("restore B ok") };
+    let got = restored_b
+        .syscall_args
+        .expect("hop B must carry UC_VIBIX_SYSCALL_REGS");
+    assert_eq!(
+        got, args,
+        "nested-delivery propagation must preserve syscall args across two frames"
+    );
 }
 
 fn fault_frame_yields_no_syscall_args() {
