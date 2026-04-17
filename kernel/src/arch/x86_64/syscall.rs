@@ -43,6 +43,23 @@ use x86_64::registers::model_specific::Msr;
 use super::gdt::{set_tss_rsp0, STAR_KERNEL_CS_BASE, STAR_USER_CS_BASE};
 use super::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
+/// Diagnostic instrumentation along the fork(2) syscall path (epic #501 /
+/// issue #502). Expands to `serial_println!` when the `fork-trace` feature
+/// is enabled at build time; otherwise compiles to nothing. Paired entry/
+/// exit probes let the last surviving print pinpoint where the kernel
+/// wedges in the fork path.
+#[cfg(feature = "fork-trace")]
+#[macro_export]
+macro_rules! fork_trace {
+    ($($arg:tt)*) => ($crate::serial_println!($($arg)*));
+}
+
+#[cfg(not(feature = "fork-trace"))]
+#[macro_export]
+macro_rules! fork_trace {
+    ($($arg:tt)*) => {};
+}
+
 /// MSR addresses.
 const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
@@ -505,17 +522,63 @@ pub unsafe extern "C" fn syscall_dispatch(
             let user_rflags = FORK_USER_RFLAGS.load(Ordering::Relaxed);
             let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
 
+            // #502 probe: dump the current RFLAGS at fork-dispatch entry.
+            // Expected: IF (bit 9) = 0, masked by MSR_FMASK's IF bit on
+            // SYSCALL entry. If IF is ever observed = 1 here, FMASK
+            // programming has regressed or something re-enabled IRQs
+            // before dispatch.
+            #[cfg(feature = "fork-trace")]
+            {
+                let rflags_now = x86_64::registers::rflags::read_raw();
+                crate::fork_trace!(
+                    "fork-trace: [syscall:FORK enter] parent_task={} user_rip={:#x} \
+                     user_rflags={:#x} user_rsp={:#x} kernel_rflags={:#x} IF={}",
+                    crate::task::current_id(),
+                    user_rip,
+                    user_rflags,
+                    user_rsp,
+                    rflags_now,
+                    (rflags_now >> 9) & 1,
+                );
+            }
+
             let parent_pid = crate::process::current_pid();
+            crate::fork_trace!(
+                "fork-trace: [syscall:FORK] parent_pid={} (pre-fork)",
+                parent_pid
+            );
             if parent_pid == 0 {
+                crate::fork_trace!("fork-trace: [syscall:FORK] parent_pid=0 — bailing -EPERM");
                 return -1; // not a registered process
             }
 
+            crate::fork_trace!("fork-trace: [syscall:FORK] → fork_current_task()");
             let child_task_id =
                 match crate::task::fork_current_task(user_rip, user_rflags, user_rsp) {
-                    Ok(id) => id,
-                    Err(_) => return -12, // ENOMEM
+                    Ok(id) => {
+                        crate::fork_trace!(
+                            "fork-trace: [syscall:FORK] ← fork_current_task() child_task_id={}",
+                            id
+                        );
+                        id
+                    }
+                    Err(_) => {
+                        crate::fork_trace!(
+                            "fork-trace: [syscall:FORK] ← fork_current_task() ERR=ENOMEM"
+                        );
+                        return -12; // ENOMEM
+                    }
                 };
+            crate::fork_trace!(
+                "fork-trace: [syscall:FORK] → process::register(task_id={}, parent_pid={})",
+                child_task_id,
+                parent_pid
+            );
             let child_pid = crate::process::register(child_task_id, parent_pid);
+            crate::fork_trace!(
+                "fork-trace: [syscall:FORK] ← process::register child_pid={} — returning to user",
+                child_pid
+            );
             child_pid as i64
         }
 

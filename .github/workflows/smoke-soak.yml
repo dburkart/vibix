@@ -1,0 +1,305 @@
+name: smoke-soak
+
+# Runs the fork+exec+wait smoke test many times back-to-back to surface
+# low-rate flakes (see epic #501, issue #507). The current fork/exec/wait
+# path hangs ~50% of the time locally; a single smoke run per CI invocation
+# masked that for weeks. This job's existence is the wave-1 deliverable —
+# the "green in CI for 3 consecutive nightly runs" acceptance gate is met
+# later, once the structural fixes in #504 and #505 land.
+#
+# Triggers:
+#   - nightly schedule (catches regressions without blocking PR velocity).
+#   - manual workflow_dispatch (lets humans stress a branch on demand).
+#   - pull_request, but only when the `filter` job decides the PR is
+#     relevant — either it is labeled `area:userspace` / `track:posix`,
+#     or its diff touches the implicated kernel paths. That decision is
+#     made in a small filter job so we can OR paths and labels cleanly
+#     (the event-level `paths:` filter can only AND with label types).
+
+on:
+  schedule:
+    # 08:17 UTC nightly — off-peak for the default runner pool, staggered
+    # away from other daily jobs in this repo.
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'Number of smoke runs to execute'
+        required: false
+        default: '100'
+      min_pass_rate:
+        description: 'Minimum pass rate (percent) required for the job to succeed'
+        required: false
+        default: '80'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # Separate the concurrency group by event so a manual `workflow_dispatch`
+  # on `main` does not cancel an in-flight `schedule`-triggered nightly run
+  # (both would otherwise share the same `github.ref`, and losing a nightly
+  # mid-soak poisons the history the 3-green-nights acceptance gate in
+  # epic #501 depends on). Per-PR concurrency still collapses duplicate
+  # runs of the same PR.
+  group: smoke-soak-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap gate that decides whether the expensive soak job should run for
+  # a pull_request event. For `schedule` and `workflow_dispatch`, this
+  # job trivially outputs `should_run=true`.
+  filter:
+    name: decide soak eligibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        # For the path diff we need both sides of the PR. Shallow works
+        # for dorny/paths-filter since it queries the GitHub API, not
+        # git history, but we fetch a modest depth so other future steps
+        # can inspect the diff if needed.
+        with:
+          fetch-depth: 2
+
+      # Label-based trigger: run if the PR carries any of these labels.
+      # Evaluated directly from the event payload — no API call needed.
+      - name: Check labels
+        id: labels
+        if: github.event_name == 'pull_request'
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -u
+          if echo "${LABELS}" | grep -qE '"(area:userspace|track:posix)"'; then
+            echo "matched=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "matched=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # Path-based trigger: run if the PR diff touches the implicated
+      # kernel files — these are the surfaces PR #206 introduced and
+      # that epic #501 is actively de-risking.
+      - name: Check changed paths
+        id: paths
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          # The fork/exec surface PR #206 introduced and epic #501 is
+          # actively de-risking, plus the smoke harness itself — a change
+          # to `cargo xtask smoke`'s marker list or timeout logic could
+          # silently invalidate the soak, so it must trigger too.
+          # Deliberately does NOT include this workflow file — a
+          # workflow-only edit should be validated via `workflow_dispatch`,
+          # not by forcing every docs/config tweak through a 1-3h soak.
+          filters: |
+            fork_exec_surface:
+              - 'kernel/src/arch/x86_64/syscall.rs'
+              - 'kernel/src/task/**'
+              - 'kernel/src/process/**'
+              - 'xtask/src/main.rs'
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          LABELS_MATCHED: ${{ steps.labels.outputs.matched }}
+          PATHS_MATCHED: ${{ steps.paths.outputs.fork_exec_surface }}
+        run: |
+          set -u
+          if [ "${EVENT}" = "schedule" ] || [ "${EVENT}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            echo "reason=${EVENT}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [ "${LABELS_MATCHED:-false}" = "true" ] || [ "${PATHS_MATCHED:-false}" = "true" ]; then
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            echo "reason=labels=${LABELS_MATCHED:-false} paths=${PATHS_MATCHED:-false}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_run=false" >> "${GITHUB_OUTPUT}"
+            echo "reason=PR is neither labeled area:userspace/track:posix nor touches the fork/exec kernel surface" >> "${GITHUB_OUTPUT}"
+          fi
+
+  soak:
+    name: 100× smoke soak
+    needs: filter
+    if: needs.filter.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    # 6h is the max a single GitHub-hosted job can run. A healthy soak
+    # (post-#504/#505) should finish in well under an hour; the generous
+    # cap exists so the job does not get killed mid-run while the flake
+    # is still present today.
+    timeout-minutes: 360
+    env:
+      # Per-run wall-clock cap for a single `cargo xtask smoke` invocation.
+      # `cargo xtask smoke` has its own internal HARD_CAP (~300s, see #460)
+      # but a wedge in QEMU can still hold the process open; `timeout`
+      # gives us a belt-and-suspenders kill switch so one bad run does
+      # not burn the whole 6h job budget.
+      SMOKE_RUN_TIMEOUT_SECS: '300'
+      # Total runs and pass-rate threshold. workflow_dispatch can override.
+      SOAK_COUNT: ${{ github.event.inputs.count || '100' }}
+      # Permissive for wave 1 — the underlying flake is known to be real
+      # today (see epic #501). Once #504 and #505 land and the soak is
+      # expected to be deterministic, bump this to 100 per the acceptance
+      # gate in issue #420.
+      SOAK_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate || '80' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso build-essential coreutils
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          # Share the smoke job's cache key so the ISO build is warm on
+          # the first run of the soak.
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
+
+      # Build the ISO once up front so each per-run iteration only pays
+      # the QEMU-boot cost, not the kernel-build cost. `cargo xtask smoke`
+      # is a no-op build when the artifacts are already current.
+      - name: Pre-build ISO
+        run: cargo xtask build
+
+      - name: Run smoke soak
+        id: soak
+        # TODO(#507): once issue #506's deterministic fork-loop harness
+        # lands (`userspace/repro_fork/` + `scripts/...`), swap this loop
+        # to invoke that harness instead. Using `cargo xtask smoke` as
+        # the v1 amplifier — it's what exists today.
+        run: |
+          set -u
+          mkdir -p soak-logs
+          count="${SOAK_COUNT}"
+          per_run_timeout="${SMOKE_RUN_TIMEOUT_SECS}"
+          min_rate="${SOAK_MIN_PASS_RATE}"
+
+          # `count` and `min_rate` come from `workflow_dispatch` inputs,
+          # which are free-form strings. Reject non-integers up front so
+          # we don't divide-by-zero on `count=0` or blow up `seq` / the
+          # later `-lt` comparison on non-numeric junk.
+          case "${count}" in
+            ''|*[!0-9]*)
+              echo "::error::count must be a positive integer (got: '${count}')"
+              exit 1
+              ;;
+          esac
+          case "${min_rate}" in
+            ''|*[!0-9]*)
+              echo "::error::min_pass_rate must be an integer 0-100 (got: '${min_rate}')"
+              exit 1
+              ;;
+          esac
+          if [ "${count}" -le 0 ]; then
+            echo "::error::count must be > 0 (got: ${count})"
+            exit 1
+          fi
+          if [ "${min_rate}" -lt 0 ] || [ "${min_rate}" -gt 100 ]; then
+            echo "::error::min_pass_rate must be between 0 and 100 (got: ${min_rate})"
+            exit 1
+          fi
+
+          echo "== smoke-soak: count=${count} per_run_timeout=${per_run_timeout}s min_pass_rate=${min_rate}% =="
+
+          passes=0
+          fails=0
+          timeouts=0
+          printf 'run\tresult\tduration_s\n' > soak-logs/summary.tsv
+
+          for i in $(seq 1 "${count}"); do
+            log="soak-logs/run-$(printf '%03d' "${i}").log"
+            start_ns=$(date +%s%N)
+            # `timeout` returns 124 on SIGTERM kill, 137 on SIGKILL kill.
+            # Any non-zero exit counts as a failure for pass-rate
+            # accounting; timeouts are tracked separately so a
+            # post-mortem can distinguish "wedged in QEMU" from
+            # "marker missing".
+            if timeout --kill-after=30s "${per_run_timeout}s" \
+                 cargo xtask smoke > "${log}" 2>&1; then
+              status="pass"
+              passes=$((passes + 1))
+            else
+              rc=$?
+              if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
+                status="timeout"
+                timeouts=$((timeouts + 1))
+              else
+                status="fail"
+              fi
+              fails=$((fails + 1))
+            fi
+            end_ns=$(date +%s%N)
+            dur_ms=$(( (end_ns - start_ns) / 1000000 ))
+            dur_s=$(awk "BEGIN { printf \"%.1f\", ${dur_ms} / 1000.0 }")
+            printf '%s\t%s\t%s\n' "${i}" "${status}" "${dur_s}" >> soak-logs/summary.tsv
+            echo "[run ${i}/${count}] ${status} (${dur_s}s)"
+          done
+
+          total=$((passes + fails))
+          # Integer percentage: (passes * 100) / total, compared to
+          # `min_rate` using the same integer scale.
+          pass_rate=$(( passes * 100 / total ))
+
+          {
+            echo "## smoke-soak results"
+            echo ""
+            echo "- runs: ${total}"
+            echo "- passed: ${passes}"
+            echo "- failed: ${fails} (of which ${timeouts} were timeouts)"
+            echo "- pass rate: ${pass_rate}% (threshold: ${min_rate}%)"
+          } | tee soak-logs/summary.md
+
+          # Surface numbers on the job summary and as step outputs so a
+          # failed soak shows up cleanly in the Actions UI.
+          {
+            echo "# smoke-soak"
+            echo ""
+            cat soak-logs/summary.md
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "passes=${passes}" >> "${GITHUB_OUTPUT}"
+          echo "fails=${fails}"   >> "${GITHUB_OUTPUT}"
+          echo "total=${total}"   >> "${GITHUB_OUTPUT}"
+          echo "pass_rate=${pass_rate}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${pass_rate}" -lt "${min_rate}" ]; then
+            echo "::error::smoke-soak pass rate ${pass_rate}% below threshold ${min_rate}%"
+            exit 1
+          fi
+
+      # Always upload logs — even on soak success, a nonzero fail count
+      # is the signal that the underlying flake is still present and the
+      # next wave (structural fixes) should look at the failing runs.
+      - name: Upload soak logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-soak-logs
+          path: soak-logs/
+          if-no-files-found: warn
+          retention-days: 14

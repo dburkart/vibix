@@ -39,6 +39,16 @@ ist-overflow-test = []
 # store to the timer ISR and spawns a bench task at boot that prints a
 # summary table over serial. Off by default so normal boots stay quiet.
 bench = []
+# Enable serial-print instrumentation along the fork(2) syscall path:
+# SYSCALL entry → dispatch arm 57 → fork_current_task → fork_address_space →
+# Task::new_forked → process::register → fork_child_sysret. Each probe is
+# paired entry/exit so the last surviving print pinpoints where the kernel
+# wedges. IF state is dumped on fork-dispatch entry (expected 0, masked by
+# MSR_FMASK). Canary for future regressions of the fork hang surface
+# tracked in epic #501 / diagnostic #502. Off by default; release builds
+# never ship it. Enable with `cargo xtask run --features fork-trace` (or
+# `--features fork-trace` on any xtask subcommand).
+fork-trace = []
 
 [[test]]
 name = "basic_boot"
