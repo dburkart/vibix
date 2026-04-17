@@ -23,7 +23,7 @@ symptom appears.
 
 Captured by the reporter against `vibix.iso` at HEAD (epic #501 body):
 
-```
+```text
 vibix> init: switched to process PML4
 init: entering ring-3 entry=0x400000 stack=0x80000000
 init: hello from pid 1
@@ -31,8 +31,8 @@ init: hello from pid 1
 ```
 
 The last userspace instruction before the hang is `syscall(57) = fork()`.
-The shell prompt (`vibix> `) is on screen, but keystrokes on both PS/2 and
-COM1 produce no echo and no visible kernel reaction.
+The shell prompt (`vibix>` followed by a space) is on screen, but keystrokes
+on both PS/2 and COM1 produce no echo and no visible kernel reaction.
 
 ## Hypothesis going in (from #503 body)
 
@@ -72,7 +72,7 @@ captured serial log lives at
 [`docs/incident-logs/502-fork-trace-boot.log`](../incident-logs/502-fork-trace-boot.log).
 The first fork-trace line reads:
 
-```
+```text
 fork-trace: [syscall:FORK enter] parent_task=4 user_rip=0x400025
   user_rflags=0x212 user_rsp=0x7fffff4c kernel_rflags=0x87 IF=0
 ```
@@ -87,7 +87,7 @@ calls) runs with IRQs masked.
 
 Boot-time wiring (from the trace log):
 
-```
+```text
 PIC remapped to 0x20/0x28 and masked
 ioapic: IRQ0 -> gsi 2 -> vec 0x20 on lapic 0 (ioapic 0)
 ioapic: IRQ1 -> gsi 1 -> vec 0x21 on lapic 0 (ioapic 0)
@@ -197,7 +197,7 @@ pattern remains the right tool; it is just unnecessary for this issue.
 
 The entire causal chain is:
 
-```
+```text
 fork syscall enters with IF=0 (by design, MSR_FMASK)
     → fork_current_task() spins somewhere
     → IF never restored (SYSRETQ never reached)
