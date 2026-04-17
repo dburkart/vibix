@@ -156,11 +156,13 @@ consumer can't run.
 The #503 body asked for an audit of `input.rs` to rule out ring-fullness or
 lock-ordering bugs that could drop bytes *even if* IRQs do fire. Findings:
 
-- **Ring size** is 128 bytes (`kernel/src/input.rs:82`). A typist can't fill
-  it faster than the shell drains it (shell drain is per-keypress, ring
-  overflow would take ~128 keystrokes in a single scheduler slice).
-  `scancode_overflows()` exposes the counter if this ever does happen; it
-  is zero in every known trace.
+- **Ring size** is 128 bytes (`kernel/src/input.rs:82`). Under expected
+  interactive typing rates, a human can't fill it faster than the shell
+  drains it (shell drain is per-keypress, so ring overflow would take ~128
+  keystrokes in a single scheduler slice). Adversarial input — e.g. a
+  stuck-key firmware repeat storm or a scripted serial flood — could still
+  overflow, so this isn't a strict guarantee; `scancode_overflows()` exposes
+  the counter if it does happen. It is zero in every known trace.
 - **Lock type** is `IrqLock<RingBuffer>`, the repo's IF-aware wrapper. It
   disables IRQs in `lock()` and restores on drop. This is the correct choice
   for a structure shared between an ISR producer and a task consumer;
