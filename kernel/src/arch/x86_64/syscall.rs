@@ -530,8 +530,8 @@ pub unsafe extern "C" fn syscall_dispatch(
             let child_task_id =
                 match crate::task::fork_current_task(user_rip, user_rflags, user_rsp) {
                     Ok(id) => id,
-                    Err(_) => {
-                        crate::fork_trace!("fork: fork_current_task err -ENOMEM");
+                    Err(e) => {
+                        crate::fork_trace!("fork: fork_current_task err {:?} -> -ENOMEM", e);
                         return -12; // ENOMEM
                     }
                 };

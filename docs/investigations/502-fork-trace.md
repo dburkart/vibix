@@ -38,7 +38,7 @@ lock whose holder needs interrupts to release.
 `vibix.iso` under QEMU-TCG (no-KVM) on the local host. The full
 `ftrace:` sequence:
 
-```
+```text
 ftrace: fork: enter dispatch rflags=0x87 (IF=0) user_rip=0x400025 ...
 ftrace: fork: calling fork_current_task parent_pid=1
 ftrace: fork_current_task: enter ...
@@ -83,7 +83,7 @@ Three things to notice:
    first `serial_println!` newline. This confirms the child's kernel
    stack priming works correctly and `context_switch` delivers the
    child to its first ring-0 instruction.
-3. Every lock acquisition is bracketed; the full walk through
+3. Every lock acquisition is bracketed; the full walk-through
    `fork_current_task → fork_address_space → Task::new_forked →
    process::register` completes.
 
