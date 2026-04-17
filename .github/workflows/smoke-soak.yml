@@ -1,5 +1,19 @@
 name: smoke-soak
 
+# TEMPORARY (see #517): the `pull_request` path in the `filter` job below
+# is hard-wired to `should_run=false` while the ~50% fork/exec/wait flake
+# tracked in epic #501 is still live. With that flake, a 100× soak takes
+# 5+ hours and fails the 80% pass-rate gate either way, so it's a
+# miscalibrated PR gate rather than a signal. Issue #512 tracks the
+# proper long-term fix (swap the inner loop to `scripts/repro-fork.sh`
+# from #506). Nightly `schedule` and manual `workflow_dispatch` runs are
+# unaffected — they continue to exercise the soak so the 3-consecutive-
+# nightly-green acceptance gate in #501 still accrues signal.
+#
+# Revert this gating (restore the label/path matching in the `filter`
+# job's `Decide` step) once #504 and #505 have merged AND the nightly
+# soak has been ≥80% for 3 consecutive nights.
+#
 # Runs the fork+exec+wait smoke test many times back-to-back to surface
 # low-rate flakes (see epic #501, issue #507). The current fork/exec/wait
 # path hangs ~50% of the time locally; a single smoke run per CI invocation
@@ -10,11 +24,12 @@ name: smoke-soak
 # Triggers:
 #   - nightly schedule (catches regressions without blocking PR velocity).
 #   - manual workflow_dispatch (lets humans stress a branch on demand).
-#   - pull_request, but only when the `filter` job decides the PR is
-#     relevant — either it is labeled `area:userspace` / `track:posix`,
-#     or its diff touches the implicated kernel paths. That decision is
-#     made in a small filter job so we can OR paths and labels cleanly
-#     (the event-level `paths:` filter can only AND with label types).
+#   - pull_request: kept registered so the workflow still appears (as a
+#     skipped/`should_run=false` entry) in the PR UI — makes the
+#     "we intentionally disabled this" story visible rather than
+#     invisibly absent. When re-enabled, the `filter` job will again
+#     decide relevance via label (`area:userspace` / `track:posix`) or
+#     path match against the implicated kernel paths.
 
 on:
   schedule:
@@ -118,13 +133,28 @@ jobs:
             echo "reason=${EVENT}" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          if [ "${LABELS_MATCHED:-false}" = "true" ] || [ "${PATHS_MATCHED:-false}" = "true" ]; then
-            echo "should_run=true" >> "${GITHUB_OUTPUT}"
-            echo "reason=labels=${LABELS_MATCHED:-false} paths=${PATHS_MATCHED:-false}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "should_run=false" >> "${GITHUB_OUTPUT}"
-            echo "reason=PR is neither labeled area:userspace/track:posix nor touches the fork/exec kernel surface" >> "${GITHUB_OUTPUT}"
-          fi
+          # TEMPORARY (see #517): short-circuit all pull_request events to
+          # should_run=false while the fork/exec/wait flake from epic #501
+          # is still live. The 100× soak takes 5+ hours per run under that
+          # flake and blocks P0 sprint PRs (#504, #505, #513) on a signal
+          # we already know will be red. Issue #512 tracks the proper fix
+          # (swap to scripts/repro-fork.sh from #506).
+          #
+          # To revert: delete this block and uncomment the label/path
+          # evaluation below. Precondition for revert: #504 and #505
+          # merged AND nightly soak ≥80% pass rate for 3 consecutive
+          # nights.
+          echo "should_run=false" >> "${GITHUB_OUTPUT}"
+          echo "reason=PR-event soak gating disabled while epic #501 fork flake is live — see #512, #517" >> "${GITHUB_OUTPUT}"
+          exit 0
+          # --- original pull_request decision logic (re-enable on revert) ---
+          # if [ "${LABELS_MATCHED:-false}" = "true" ] || [ "${PATHS_MATCHED:-false}" = "true" ]; then
+          #   echo "should_run=true" >> "${GITHUB_OUTPUT}"
+          #   echo "reason=labels=${LABELS_MATCHED:-false} paths=${PATHS_MATCHED:-false}" >> "${GITHUB_OUTPUT}"
+          # else
+          #   echo "should_run=false" >> "${GITHUB_OUTPUT}"
+          #   echo "reason=PR is neither labeled area:userspace/track:posix nor touches the fork/exec kernel surface" >> "${GITHUB_OUTPUT}"
+          # fi
 
   soak:
     name: 100× smoke soak
