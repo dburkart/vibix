@@ -75,6 +75,19 @@ this harness and in the tracking issues that consume it (#504, #505).
 - **Does not wire itself into CI yaml.**  Issue #507 owns `.github/`.
   The wrapper script exists at a stable path so #507 can call it.
 - **Does not claim deterministic reproduction of the #206 flake.**
+
+## CI integration
+
+The `smoke-soak` workflow (`.github/workflows/smoke-soak.yml`) drives
+`scripts/repro-fork.sh` in a loop as its amplifier — one script
+invocation per iteration, with `SOAK_COUNT` iterations per job run
+(default 100) and a `SOAK_MIN_PASS_RATE` threshold (default 80 %).
+Nightly `schedule` and manual `workflow_dispatch` runs exercise this
+path today; the `pull_request` trigger is still gated off while the
+fork flake is live (see #517).  Changes to this harness — either the
+wrapper script or `userspace/repro_fork/` — trigger the workflow's
+path filter so the soak runs on any PR that touches them.
+
   The harness amplifies opportunity to hit the hang; whether it trips
   on clean `main` depends on the underlying rate.  If a follow-up
   discovers the harness needs `serial_println!` instrumentation from
