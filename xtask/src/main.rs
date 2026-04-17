@@ -113,6 +113,7 @@ fn main() -> R<()> {
     let fault_test = take_flag(&mut args, "--fault-test");
     let panic_test = take_flag(&mut args, "--panic-test");
     let bench = take_flag(&mut args, "--bench");
+    let fork_trace = take_flag(&mut args, "--fork-trace");
 
     let cmd = args
         .first()
@@ -125,6 +126,7 @@ fn main() -> R<()> {
         fault_test,
         panic_test,
         bench,
+        fork_trace,
     };
 
     match cmd.as_str() {
@@ -155,7 +157,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench]"
+                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -177,6 +179,10 @@ struct BuildOpts {
     fault_test: bool,
     panic_test: bool,
     bench: bool,
+    /// Compile the kernel with `--features fork-trace` to light up the
+    /// serial-print instrumentation along the fork(2) syscall path (see
+    /// `kernel/Cargo.toml`). Off by default; canary for epic #501 / #502.
+    fork_trace: bool,
 }
 
 fn workspace_root() -> PathBuf {
@@ -311,6 +317,9 @@ fn build(opts: &BuildOpts) -> R<PathBuf> {
     }
     if opts.bench {
         cmd.arg("--features").arg("bench");
+    }
+    if opts.fork_trace {
+        cmd.arg("--features").arg("fork-trace");
     }
     check(cmd.status()?)?;
     let bin = kernel_binary(opts);
