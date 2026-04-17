@@ -331,14 +331,24 @@ impl Task {
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
         child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
     ) -> Result<Self, crate::mem::addrspace::ForkError> {
+        crate::fork_trace!("Task::new_forked: enter, allocating stack slot");
         // Allocate a fresh guard+stack slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
         let guard_base = slot_va;
         let stack_base = slot_va + GUARD_SIZE;
+        crate::fork_trace!(
+            "Task::new_forked: stack slot guard={:#x} stack_base={:#x}",
+            guard_base,
+            stack_base
+        );
 
         Page::<Size4KiB>::from_start_address(VirtAddr::new(stack_base as u64))
             .expect("forked task stack base must be page aligned");
         let stack_page_count = (STACK_SIZE / 4096) as u64;
+        crate::fork_trace!(
+            "Task::new_forked: map_range for {} stack pages",
+            stack_page_count
+        );
         let mut flusher = crate::mem::tlb::Flusher::new_active();
         // Propagate map_range failure (typically frame-allocator exhaustion)
         // as ForkError::OutOfMemory so fork() returns -ENOMEM instead of
@@ -351,6 +361,7 @@ impl Task {
         );
         flusher.finish();
         map_result.map_err(|_| crate::mem::addrspace::ForkError::OutOfMemory)?;
+        crate::fork_trace!("Task::new_forked: map_range ok, priming child kernel stack");
 
         let top = stack_base + STACK_SIZE;
 
@@ -373,12 +384,18 @@ impl Task {
         }
 
         let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        crate::fork_trace!(
+            "Task::new_forked: stack primed, child_task_id={} fork_child_sysret={:#x}",
+            id,
+            fork_child_sysret as *const () as usize
+        );
 
         // Copy the parent's FPU state into a fresh area.
         let mut fpu = FpuArea::new_initialized();
         unsafe {
             core::ptr::copy_nonoverlapping(parent_fpu, &mut *fpu as *mut _, 1);
         }
+        crate::fork_trace!("Task::new_forked: FPU cloned, exit ok");
 
         Ok(Self {
             id,

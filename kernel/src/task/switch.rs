@@ -108,6 +108,27 @@ fork_child_sysret:
     // transitions to ring-3. An explicit sti before the RSP switch would
     // allow an IRQ to fire with a kernel-mode CS but a user-mode RSP,
     // corrupting the user stack.
+
+    // #502 diagnostic: push a single marker byte ('C' = child) straight to
+    // COM1 before any Rust-level state is touched. The regular
+    // `serial_println!` path isn't safe here — this trampoline runs with
+    // an ad-hoc primed stack and no saved/restored rax/rdx around a call.
+    // Port I/O ('spin on THRE, then out') is the minimal IRQ-safe probe:
+    // it clobbers rax/rdx but we overwrite both below before SYSRETQ
+    // (rax=0, rdx is scratch in SysV AMD64).
+    //
+    // If this byte reaches the serial log, context_switch delivered the
+    // child to ring-0 successfully and the hang (if any) is downstream
+    // of SYSRETQ, in userspace. If it never appears, the child never ran.
+    mov dx, 0x3FD          // COM1 LSR (line status register)
+1:
+    in al, dx
+    test al, 0x20          // bit 5 = THR-empty
+    jz 1b
+    mov dx, 0x3F8          // COM1 THR (transmit holding register)
+    mov al, 'C'
+    out dx, al
+
     mov rcx, r12      // user RIP
     mov r11, rbx      // user RFLAGS (IF=1 → interrupts re-enabled by SYSRETQ)
     xor eax, eax      // return 0 — fork() child path

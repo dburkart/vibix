@@ -113,8 +113,15 @@ pub fn register_init(task_id: usize) {
 /// harness), the new entry starts with `session_id == pgrp_id == pid`
 /// and no controlling tty — i.e. its own session.
 pub fn register(task_id: usize, parent_pid: u32) -> u32 {
+    crate::fork_trace!(
+        "process::register: enter task_id={} parent_pid={}",
+        task_id,
+        parent_pid
+    );
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    crate::fork_trace!("process::register: acquiring TABLE lock");
     let mut t = TABLE.lock();
+    crate::fork_trace!("process::register: TABLE acquired, inserting pid={}", pid);
     let (session_id, pgrp_id, controlling_tty) = t
         .by_pid
         .get(&parent_pid)
@@ -135,6 +142,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
         },
     );
     t.pid_of.insert(task_id, pid);
+    crate::fork_trace!("process::register: exit ok pid={}", pid);
     pid
 }
 

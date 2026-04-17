@@ -139,8 +139,15 @@ pub fn fork_current_task(
     use alloc::sync::Arc;
     use spin::{Mutex, RwLock};
 
+    crate::fork_trace!(
+        "fork_current_task: enter user_rip={:#x} user_rflags={:#x} user_rsp={:#x}",
+        user_rip,
+        user_rflags,
+        user_rsp,
+    );
     // Snapshot everything needed from the current task while holding
     // SCHED, then release it before calling fork_address_space.
+    crate::fork_trace!("fork_current_task: acquiring SCHED lock for snapshot");
     let (
         parent_address_space,
         parent_fd_table,
@@ -150,6 +157,7 @@ pub fn fork_current_task(
         parent_fpu_ptr,
     ) = {
         let mut sched = SCHED.lock();
+        crate::fork_trace!("fork_current_task: SCHED acquired, saving FPU state");
         let cur = sched
             .current
             .as_mut()
@@ -180,18 +188,27 @@ pub fn fork_current_task(
         )
     };
 
+    crate::fork_trace!("fork_current_task: snapshot done, entering fork_address_space");
     // CoW-clone the address space (requires AddressSpace write lock).
     let child_aspace = {
         let mut tlb = crate::mem::tlb::Flusher::new_active();
+        crate::fork_trace!("fork_current_task: acquiring parent AddressSpace write lock");
         let child = parent_address_space.write().fork_address_space(&mut tlb)?;
+        crate::fork_trace!("fork_current_task: fork_address_space ok, flushing TLB");
         tlb.finish();
         child
     };
     let child_cr3 = child_aspace.page_table_frame();
     let child_aspace = Arc::new(RwLock::new(child_aspace));
+    crate::fork_trace!(
+        "fork_current_task: child AS wrapped Arc, child_cr3={:#x}",
+        child_cr3.start_address().as_u64()
+    );
 
     // Clone the fd table (slot-independent, description-shared).
+    crate::fork_trace!("fork_current_task: cloning fd table");
     let child_fd = Arc::new(Mutex::new(parent_fd_table.lock().clone_for_fork()));
+    crate::fork_trace!("fork_current_task: fd clone ok, entering Task::new_forked");
 
     // SAFETY: parent_fpu_ptr was snapshotted while SCHED was held; the
     // parent task is the currently-running task and cannot be removed while
@@ -211,11 +228,14 @@ pub fn fork_current_task(
         )
     }?;
     let child_id = child.id;
+    crate::fork_trace!("fork_current_task: Task::new_forked ok child_id={}", child_id);
     let child_box = Box::new(child);
     let new_prio = child_box.priority;
+    crate::fork_trace!("fork_current_task: pushing child to SCHED ready queue");
     let mut sched = SCHED.lock();
     sched.push_ready(child_box);
     maybe_preempt_current_for_priority(&mut sched, new_prio);
+    crate::fork_trace!("fork_current_task: exit ok child_id={}", child_id);
     Ok(child_id)
 }
 

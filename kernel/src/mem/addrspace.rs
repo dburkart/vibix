@@ -756,8 +756,13 @@ impl AddressSpace {
         use alloc::sync::Arc;
         use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 
+        crate::fork_trace!("fork_address_space: enter, allocating child PML4");
         // Allocate child PML4 + copy kernel upper half.
         let mut child = AddressSpace::try_new_empty()?;
+        crate::fork_trace!(
+            "fork_address_space: child PML4 allocated at {:#x}",
+            child.page_table.start_address().as_u64()
+        );
         // Inherit brk/mmap layout from parent.
         child.mmap_base = self.mmap_base;
         child.brk_start = self.brk_start;
@@ -794,6 +799,10 @@ impl AddressSpace {
                 )
             })
             .collect();
+        crate::fork_trace!(
+            "fork_address_space: vma snapshot ok, {} VMAs to CoW-clone",
+            vma_snapshot.len()
+        );
 
         // Parent PTEs we W-stripped during this fork. If any later
         // iteration fails we walk this list to restore the original
@@ -913,6 +922,7 @@ impl AddressSpace {
         })();
 
         if let Err(e) = result {
+            crate::fork_trace!("fork_address_space: CoW walk failed, rolling back parent PTEs");
             // Restore every parent PTE we W-stripped so the parent is
             // unchanged from the caller's perspective. Uses the original
             // flags captured at the time of the strip. unmap_in_pml4 +
@@ -936,6 +946,7 @@ impl AddressSpace {
             return Err(e);
         }
 
+        crate::fork_trace!("fork_address_space: exit ok");
         Ok(child)
     }
 }

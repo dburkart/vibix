@@ -501,21 +501,49 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // fork() — clone the calling process; parent returns child PID, child returns 0.
         FORK => {
+            // #502 diagnostic: record IF-mask state and saved user context
+            // at the very first instruction of the fork dispatch arm. If
+            // init's fork hangs later, the *presence* of this probe tells
+            // us the syscall entry trampoline reached syscall_dispatch and
+            // the hang is downstream; its *absence* tells us the hang is
+            // in the trampoline or MSR setup itself.
+            let rflags_on_entry = super::fork_trace::read_rflags();
             let user_rip = FORK_USER_RIP.load(Ordering::Relaxed);
             let user_rflags = FORK_USER_RFLAGS.load(Ordering::Relaxed);
             let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
+            crate::fork_trace!(
+                "fork: enter dispatch rflags={:#x} (IF={}) user_rip={:#x} user_rflags={:#x} user_rsp={:#x}",
+                rflags_on_entry,
+                (rflags_on_entry >> 9) & 1,
+                user_rip,
+                user_rflags,
+                user_rsp,
+            );
 
             let parent_pid = crate::process::current_pid();
             if parent_pid == 0 {
+                crate::fork_trace!("fork: exit nr=57 -EPERM (no process entry)");
                 return -1; // not a registered process
             }
+            crate::fork_trace!("fork: calling fork_current_task parent_pid={}", parent_pid);
 
             let child_task_id =
                 match crate::task::fork_current_task(user_rip, user_rflags, user_rsp) {
                     Ok(id) => id,
-                    Err(_) => return -12, // ENOMEM
+                    Err(_) => {
+                        crate::fork_trace!("fork: fork_current_task err -ENOMEM");
+                        return -12; // ENOMEM
+                    }
                 };
+            crate::fork_trace!(
+                "fork: fork_current_task ok child_task_id={}, calling process::register",
+                child_task_id
+            );
             let child_pid = crate::process::register(child_task_id, parent_pid);
+            crate::fork_trace!(
+                "fork: exit dispatch child_pid={} (parent returning)",
+                child_pid
+            );
             child_pid as i64
         }
 
@@ -525,13 +553,26 @@ pub unsafe extern "C" fn syscall_dispatch(
         // success. On failure the old address space is preserved so the
         // caller continues running and observes the `-ENOEXEC` return.
         EXECVE => {
+            // #502 diagnostic: execve is the child's next syscall after
+            // fork(). Probing entry/exit here tells us whether the child
+            // actually runs after a successful fork() — if we see
+            // `fork: exit dispatch` but never `execve: enter`, the child
+            // never scheduled.
+            crate::fork_trace!("execve: enter dispatch");
             let elf_bytes = match crate::mem::userspace_hello_elf_bytes() {
                 Some(b) => b,
-                None => return -8, // ENOEXEC — hello module not present
+                None => {
+                    crate::fork_trace!("execve: no hello module, -ENOEXEC");
+                    return -8; // ENOEXEC — hello module not present
+                }
             };
+            crate::fork_trace!("execve: calling exec_atomic");
             match exec_atomic(elf_bytes) {
                 Ok(never) => match never {},
-                Err(e) => e,
+                Err(e) => {
+                    crate::fork_trace!("execve: exec_atomic err {}", e);
+                    e
+                }
             }
         }
 
@@ -552,11 +593,23 @@ pub unsafe extern "C" fn syscall_dispatch(
             let target_pid = a0 as i32;
             let wstatus_ptr = a1 as usize;
             let parent_pid = crate::process::current_pid();
+            // #502 diagnostic: wait4 is the parent's next syscall after
+            // fork(). Entry here confirms the parent resumed from SYSCALL
+            // after fork; absence of this probe tells us the parent hung
+            // inside fork_current_task and never returned to userspace.
+            crate::fork_trace!(
+                "wait4: enter dispatch target_pid={} wstatus_ptr={:#x} parent_pid={}",
+                target_pid,
+                wstatus_ptr,
+                parent_pid,
+            );
 
             if parent_pid == 0 {
+                crate::fork_trace!("wait4: exit -ECHILD (no process entry)");
                 return -10; // ECHILD — not a registered process
             }
             if !crate::process::has_children(parent_pid) {
+                crate::fork_trace!("wait4: exit -ECHILD (no children)");
                 return -10; // ECHILD
             }
             // Validate status pointer early (zero means "don't write").
@@ -574,9 +627,15 @@ pub unsafe extern "C" fn syscall_dispatch(
             // wait_while returns at once, letting us loop back to reap.
             loop {
                 let snap = crate::process::exit_event_count();
+                crate::fork_trace!("wait4: reap_child snap={}", snap);
                 if let Some((child_pid, exit_status)) =
                     crate::process::reap_child(parent_pid, target_pid)
                 {
+                    crate::fork_trace!(
+                        "wait4: reaped child_pid={} status={}",
+                        child_pid,
+                        exit_status
+                    );
                     if wstatus_ptr != 0 {
                         // Linux wait4: wstatus = (exit_code & 0xFF) << 8
                         let encoded = ((exit_status & 0xFF) << 8) as u32;
@@ -585,11 +644,14 @@ pub unsafe extern "C" fn syscall_dispatch(
                     return child_pid as i64;
                 }
                 if !crate::process::has_children(parent_pid) {
+                    crate::fork_trace!("wait4: exit -ECHILD (child raced away)");
                     return -10; // ECHILD — last child was reaped by another path
                 }
                 // Park while no new exit event has occurred.
+                crate::fork_trace!("wait4: CHILD_WAIT.wait_while snap={}", snap);
                 crate::process::CHILD_WAIT
                     .wait_while(|| crate::process::exit_event_count() == snap);
+                crate::fork_trace!("wait4: wake from CHILD_WAIT");
             }
         }
 

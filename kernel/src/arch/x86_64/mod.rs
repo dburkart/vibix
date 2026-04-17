@@ -1,6 +1,7 @@
 pub mod apic;
 pub mod backtrace;
 pub mod csprng;
+pub mod fork_trace;
 pub mod fpu;
 pub mod gdb_trampoline;
 pub mod gdt;
