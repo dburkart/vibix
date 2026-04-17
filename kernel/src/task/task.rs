@@ -331,14 +331,29 @@ impl Task {
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
         child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
     ) -> Result<Self, crate::mem::addrspace::ForkError> {
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked enter] user_rip={:#x} user_rsp={:#x}",
+            user_rip,
+            user_rsp
+        );
         // Allocate a fresh guard+stack slot.
         let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
         let guard_base = slot_va;
         let stack_base = slot_va + GUARD_SIZE;
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked] slot_va={:#x} guard_base={:#x} stack_base={:#x}",
+            slot_va,
+            guard_base,
+            stack_base
+        );
 
         Page::<Size4KiB>::from_start_address(VirtAddr::new(stack_base as u64))
             .expect("forked task stack base must be page aligned");
         let stack_page_count = (STACK_SIZE / 4096) as u64;
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked] → paging::map_range({} pages)",
+            stack_page_count
+        );
         let mut flusher = crate::mem::tlb::Flusher::new_active();
         // Propagate map_range failure (typically frame-allocator exhaustion)
         // as ForkError::OutOfMemory so fork() returns -ENOMEM instead of
@@ -350,6 +365,10 @@ impl Task {
             &mut flusher,
         );
         flusher.finish();
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked] ← map_range ok={}",
+            map_result.is_ok()
+        );
         map_result.map_err(|_| crate::mem::addrspace::ForkError::OutOfMemory)?;
 
         let top = stack_base + STACK_SIZE;
@@ -373,13 +392,30 @@ impl Task {
         }
 
         let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked] child stack primed rsp={:#x} sysret_rip={:#x} \
+             sysret_rsp={:#x} sysret_rflags={:#x} fork_child_sysret={:#x} child_id={}",
+            rsp,
+            user_rip,
+            user_rsp,
+            user_rflags,
+            fork_child_sysret as *const () as usize,
+            id
+        );
 
         // Copy the parent's FPU state into a fresh area.
+        crate::fork_trace!("fork-trace: [Task::new_forked] → copy parent FPU state");
         let mut fpu = FpuArea::new_initialized();
         unsafe {
             core::ptr::copy_nonoverlapping(parent_fpu, &mut *fpu as *mut _, 1);
         }
+        crate::fork_trace!("fork-trace: [Task::new_forked] ← copy parent FPU state");
 
+        crate::fork_trace!(
+            "fork-trace: [Task::new_forked exit] id={} syscall_stack_top={:#x}",
+            id,
+            (stack_base + STACK_SIZE) as u64
+        );
         Ok(Self {
             id,
             guard_base,
