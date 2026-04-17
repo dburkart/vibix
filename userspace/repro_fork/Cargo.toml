@@ -1,0 +1,10 @@
+[package]
+name = "userspace_repro_fork"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "userspace_repro_fork"
+path = "src/main.rs"

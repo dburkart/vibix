@@ -8,6 +8,7 @@
 //!   test          — run host unit tests + QEMU integration tests
 //!   test-runner   — (internal) boot a pre-built test kernel ELF in QEMU
 //!   smoke         — boot the kernel and assert on expected serial markers
+//!   repro-fork    — boot with the fork-loop reproducer harness as PID 1 (issue #506)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   clean         — remove build artifacts
@@ -147,6 +148,7 @@ fn main() -> R<()> {
             test_runner(Path::new(kernel))?;
         }
         "smoke" => smoke(&opts)?,
+        "repro-fork" => repro_fork(&opts)?,
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "initrd" => {
@@ -157,7 +159,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|repro-fork|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -290,6 +292,15 @@ fn build_userspace_init() -> R<PathBuf> {
 /// Links at 0x400000 (lower half) just like init so load_user_elf accepts it.
 fn build_userspace_hello() -> R<PathBuf> {
     build_userspace_binary("userspace_hello", "userspace/hello/link.ld")
+}
+
+/// Build the fork-loop reproducer harness (issue #506).
+///
+/// Shipped as `userspace_init.elf` when `cargo xtask repro-fork` is used —
+/// this binary runs a tight fork+exec+wait loop as PID 1 to amplify the
+/// ~50 %-rate flake bisected to PR #206 into a deterministic repro.
+fn build_userspace_repro_fork() -> R<PathBuf> {
+    build_userspace_binary("userspace_repro_fork", "userspace/repro_fork/link.ld")
 }
 
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
@@ -710,8 +721,18 @@ fn ensure_limine() -> R<PathBuf> {
 /// `staging` names a subdirectory under `build/` to use as scratch
 /// (so parallel test runs don't stomp each other).
 fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
-    let limine = ensure_limine()?;
     let userspace_init = build_userspace_init()?;
+    make_iso_with_init(kernel, &userspace_init, iso_out, staging)
+}
+
+/// Variant of [`make_iso`] that publishes a caller-supplied binary as
+/// `/boot/userspace_init.elf`.  Used by the `repro-fork` subcommand to
+/// substitute the reproducer harness for the normal PID 1 init binary
+/// without touching the kernel's module-lookup path or the Limine
+/// config.  All other ISO contents (`userspace_hello.elf`, the rootfs
+/// tarball, ld-musl) are identical to a normal boot.
+fn make_iso_with_init(kernel: &Path, init_bin: &Path, iso_out: &Path, staging: &str) -> R<()> {
+    let limine = ensure_limine()?;
     let userspace_hello = build_userspace_hello()?;
     let initrd = ensure_initrd()?;
     let iso_root = workspace_root().join("build").join(staging);
@@ -720,7 +741,7 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     fs::create_dir_all(iso_root.join("EFI/BOOT"))?;
 
     fs::copy(kernel, iso_root.join("boot/vibix"))?;
-    fs::copy(userspace_init, iso_root.join("boot/userspace_init.elf"))?;
+    fs::copy(init_bin, iso_root.join("boot/userspace_init.elf"))?;
     fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
     fs::copy(&initrd, iso_root.join("boot/rootfs.tar"))?;
     fs::copy(
@@ -1130,6 +1151,216 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         missing.sort_unstable();
         eprintln!("--- captured serial ---\n{accumulated}\n-----------------------");
         Err(format!("smoke: missing markers {:?}", missing).into())
+    }
+}
+
+/// Build + boot the fork-loop reproducer ISO under QEMU with a
+/// heartbeat-aware watchdog.  Issue #506 / epic #501.
+///
+/// Replaces `/boot/userspace_init.elf` in the ISO with the
+/// `userspace_repro_fork` binary (see `userspace/repro_fork/`).  That
+/// binary runs `CYCLES` fork+exec+wait iterations, emitting
+/// `repro: cycle K alive` every 50 cycles and `repro: fork loop
+/// complete` on success.  The loop in this function follows those
+/// markers and enforces a heartbeat-gap watchdog: if no new
+/// `repro: ...` line appears within `REPRO_HEARTBEAT_GAP`, QEMU is
+/// killed and the subcommand exits non-zero.
+///
+/// Returns `Ok(())` iff we saw `repro: fork loop complete` before any
+/// stall/error marker.  Any `WATCHDOG`, `fork failed`, `wait4 failed`,
+/// or `KERNEL PANIC:` line is a definitive failure.
+fn repro_fork(opts: &BuildOpts) -> R<()> {
+    use std::collections::VecDeque;
+    use std::io::BufRead as _;
+    use std::time::Instant;
+
+    /// Any single gap between `repro:` heartbeat lines that exceeds
+    /// this duration is a stall.  60 s is generous under unaccelerated
+    /// CI QEMU (a single fork/exec/wait round has been measured at a
+    /// few hundred ms there) and tight enough to fail fast on a real
+    /// hang.
+    const REPRO_HEARTBEAT_GAP: Duration = Duration::from_secs(60);
+
+    /// Absolute ceiling for the whole reproducer boot.  Even 500 clean
+    /// cycles finish well inside this; exceeding it means the last
+    /// heartbeat watchdog somehow missed a stall (or CYCLES was
+    /// bumped into the thousands).  Prevents a runaway CI job.
+    const REPRO_HARD_CAP: Duration = Duration::from_secs(900);
+
+    const SUCCESS_MARKER: &str = "repro: fork loop complete";
+    const PANIC_MARKER: &str = "KERNEL PANIC:";
+    /// Any line containing a terminal-failure token from the harness.
+    const FAIL_TOKENS: &[&str] = &[
+        "repro: WATCHDOG",
+        "repro: fork failed",
+        "repro: wait4 failed",
+        "repro: execve returned in child",
+        "repro: harness panic",
+    ];
+
+    // Build the kernel and the reproducer init binary, then assemble
+    // an ISO with the reproducer substituted for userspace_init.elf.
+    let kernel = build(opts)?;
+    let repro_init = build_userspace_repro_fork()?;
+    let iso = workspace_root().join("target").join("vibix-repro-fork.iso");
+    make_iso_with_init(&kernel, &repro_init, &iso, "iso_repro_fork")?;
+    println!("→ repro-fork iso: {}", iso.display());
+
+    let disk = ensure_test_disk()?;
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M",
+            "q35",
+            "-cpu",
+            "max",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .args(virtio_blk_args(&disk))
+        .arg("-cdrom")
+        .arg(&iso)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+
+    // Absolute-deadline watchdog thread — independent of the
+    // heartbeat-gap check below.  Kills QEMU if the whole run
+    // somehow stretches past REPRO_HARD_CAP.  We can't `.join()` this
+    // thread on the fast path (success tends to arrive well inside
+    // REPRO_HARD_CAP), so we set up a cancel channel: the main loop
+    // drops the sender on the way out, which wakes the watchdog's
+    // `recv_timeout` with Disconnected and lets it exit cleanly.
+    let hard_pid = pid;
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let hard_watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            cancel_rx.recv_timeout(REPRO_HARD_CAP)
+        {
+            let _ = Command::new("kill").arg(hard_pid.to_string()).status();
+        }
+    });
+
+    // Reader thread: fan serial lines into an mpsc channel so the
+    // main loop can poll with a short timeout and enforce the
+    // heartbeat-gap watchdog without blocking inside read_line.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let mut success = false;
+    let mut failure: Option<String> = None;
+    // Keep the last few lines of serial captured so a failure summary
+    // has immediate context; the full log lives on stdout already.
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(32);
+    const TICK: Duration = Duration::from_millis(200);
+
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(line) => {
+                // Mirror the serial to our stdout so humans (and CI
+                // log collectors) see the heartbeat stream live.
+                print!("{line}");
+                if tail.len() == 32 {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
+
+                if line.contains(PANIC_MARKER) {
+                    failure = Some(format!("kernel panic: {}", line.trim_end()));
+                    break;
+                }
+                if let Some(tok) = FAIL_TOKENS.iter().find(|t| line.contains(*t)) {
+                    failure = Some(format!("harness failure ({}): {}", tok, line.trim_end()));
+                    break;
+                }
+                if line.contains("repro:") {
+                    last_heartbeat = Instant::now();
+                }
+                if line.contains(SUCCESS_MARKER) {
+                    success = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if last_heartbeat.elapsed() > REPRO_HEARTBEAT_GAP {
+                    failure = Some(format!(
+                        "heartbeat stalled: no `repro:` marker in {:?}",
+                        REPRO_HEARTBEAT_GAP
+                    ));
+                    break;
+                }
+                if start.elapsed() > REPRO_HARD_CAP {
+                    failure = Some(format!(
+                        "hard cap exceeded ({:?}) without success",
+                        REPRO_HARD_CAP
+                    ));
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !success && failure.is_none() {
+                    failure = Some("QEMU exited before `repro: fork loop complete`".to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    // Ensure QEMU is dead whether we succeeded, failed, or timed out.
+    // Kill first so the reader pipe closes and the reader thread's
+    // `read_line` returns Ok(0); then drop the cancel sender so the
+    // hard watchdog wakes and exits; then collect the threads and
+    // reap the child.
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(cancel_tx);
+    let _ = hard_watchdog.join();
+    let _ = reader_handle.join();
+    let _ = child.wait();
+
+    match (success, failure) {
+        (true, _) => {
+            println!(
+                "→ repro-fork: fork loop completed in {:?} ✓",
+                start.elapsed()
+            );
+            Ok(())
+        }
+        (false, Some(msg)) => {
+            eprintln!("--- captured serial (tail) ---");
+            for line in &tail {
+                eprint!("{line}");
+            }
+            eprintln!("------------------------------");
+            Err(format!("repro-fork: {msg}").into())
+        }
+        (false, None) => Err("repro-fork: terminated with no success and no failure marker".into()),
     }
 }
 
