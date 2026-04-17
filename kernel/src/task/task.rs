@@ -28,6 +28,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::fpu::FpuArea;
+use crate::fork_abi::prime_fork_child_stack;
 use crate::fs::FileDescTable;
 use crate::mem::addrspace::AddressSpace;
 use crate::mem::paging;
@@ -373,23 +374,24 @@ impl Task {
 
         let top = stack_base + STACK_SIZE;
 
-        // Prime the stack so context_switch restores:
-        //   r15=0, r14=0, r13=0,
-        //   r12 = user_rip    → rcx for SYSRETQ
-        //   rbp = user_rsp    → rsp before SYSRETQ
-        //   rbx = user_rflags → r11 for SYSRETQ
-        //   ret = fork_child_sysret
-        let rsp = top - 7 * 8;
-        let slots = rsp as *mut usize;
-        unsafe {
-            slots.add(0).write(0); // r15
-            slots.add(1).write(0); // r14
-            slots.add(2).write(0); // r13
-            slots.add(3).write(user_rip as usize); // r12 → rcx
-            slots.add(4).write(user_rsp as usize); // rbp → rsp
-            slots.add(5).write(user_rflags as usize); // rbx → r11
-            slots.add(6).write(fork_child_sysret as *const () as usize); // ret
-        }
+        // Prime the stack so the first context_switch into the child
+        // returns into `fork_child_sysret` with the parent's saved user
+        // register context in the callee-saved regs. Extracted into
+        // `prime_fork_child_stack` so the layout can be exercised by a
+        // host unit test that doesn't need a live kernel stack.
+        //
+        // SAFETY: the 56 bytes at the top of the freshly-mapped stack
+        // were just made valid by `map_range` above and are owned
+        // exclusively by this Task until the first context switch.
+        let rsp = unsafe {
+            prime_fork_child_stack(
+                top,
+                user_rip,
+                user_rflags,
+                user_rsp,
+                fork_child_sysret as *const () as usize,
+            )
+        };
 
         let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
         crate::fork_trace!(

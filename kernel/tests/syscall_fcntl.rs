@@ -140,20 +140,53 @@ fn stage(bytes: &[u8]) -> u64 {
 
 fn open_with_flags(path: &[u8], flags: u32) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(SYS_OPEN, uva, flags as u64, 0, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_OPEN,
+            uva,
+            flags as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn open_rw(path: &[u8], flags: u32, mode: u32) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(SYS_OPEN, uva, flags as u64, mode as u64, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_OPEN,
+            uva,
+            flags as u64,
+            mode as u64,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn close(fd: i64) -> i64 {
-    unsafe { syscall_dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
 }
 
 fn fcntl(fd: i64, cmd: u32, arg: u64) -> i64 {
-    unsafe { syscall_dispatch(SYS_FCNTL, fd as u64, cmd as u64, arg, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_FCNTL,
+            fd as u64,
+            cmd as u64,
+            arg,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 /// Copy `bytes` into a scratch region of the staging page that won't
@@ -173,13 +206,35 @@ fn stage_payload(bytes: &[u8]) -> u64 {
 
 fn write_bytes(fd: i64, bytes: &[u8]) -> i64 {
     let uva = stage_payload(bytes);
-    unsafe { syscall_dispatch(SYS_WRITE, fd as u64, uva, bytes.len() as u64, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_WRITE,
+            fd as u64,
+            uva,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn read_bytes(fd: i64, out: &mut [u8]) -> i64 {
     install_user_staging_vma();
     let buf_va = USER_PAGE_VA as u64 + 2 * 4096;
-    let n = unsafe { syscall_dispatch(SYS_READ, fd as u64, buf_va, out.len() as u64, 0, 0, 0) };
+    let n = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_READ,
+            fd as u64,
+            buf_va,
+            out.len() as u64,
+            0,
+            0,
+            0,
+        )
+    };
     if n > 0 {
         unsafe {
             let src = buf_va as *const u8;
@@ -203,7 +258,18 @@ fn pipe2(flags: u32) -> (i32, i32) {
         ptr::write_volatile(p, 0);
         ptr::write_volatile(p.add(1), 0);
     }
-    let r = unsafe { syscall_dispatch(SYS_PIPE2, fds_va, flags as u64, 0, 0, 0, 0) };
+    let r = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_PIPE2,
+            fds_va,
+            flags as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
     assert_eq!(r, 0, "pipe2 failed: {}", r);
     unsafe {
         let p = fds_va as *const i32;
@@ -407,7 +473,18 @@ fn fcntl_setfl_o_nonblock_on_pipe_read_returns_eagain() {
     // so we can check the errno.
     install_user_staging_vma();
     let buf_va = USER_PAGE_VA as u64 + 2 * 4096;
-    let n = unsafe { syscall_dispatch(SYS_READ, rfd as u64, buf_va, 8, 0, 0, 0) };
+    let n = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_READ,
+            rfd as u64,
+            buf_va,
+            8,
+            0,
+            0,
+            0,
+        )
+    };
     assert_eq!(
         n, EAGAIN,
         "F_SETFL(O_NONBLOCK) must make pipe read return EAGAIN on empty pipe, got {}",

@@ -154,15 +154,26 @@ fn stage_path(bytes: &[u8]) -> u64 {
 
 fn open(path: &[u8], flags: u32) -> i64 {
     let uva = stage_path(path);
-    unsafe { syscall_dispatch(2, uva, flags as u64, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 2, uva, flags as u64, 0, 0, 0, 0) }
 }
 
 fn close(fd: u32) -> i64 {
-    unsafe { syscall_dispatch(3, fd as u64, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 3, fd as u64, 0, 0, 0, 0, 0) }
 }
 
 fn mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i64, off: u64) -> i64 {
-    unsafe { syscall_dispatch(9, addr, len, prot as u64, flags as u64, fd as u64, off) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            9,
+            addr,
+            len,
+            prot as u64,
+            flags as u64,
+            fd as u64,
+            off,
+        )
+    }
 }
 
 // --- open() tests --------------------------------------------------------
@@ -180,7 +191,18 @@ fn open_unknown_returns_enoent() {
 
 fn open_bad_user_ptr_returns_efault() {
     // Kernel-half VA — check_user_range rejects it up front.
-    let r = unsafe { syscall_dispatch(2, 0xffff_ffff_8000_0000, 0, 0, 0, 0, 0) };
+    let r = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            2,
+            0xffff_ffff_8000_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
     assert_eq!(r, -14, "bad user ptr must return EFAULT, got {}", r);
 }
 
@@ -199,7 +221,8 @@ fn open_path_not_terminated() {
             i += 1;
         }
     }
-    let r = unsafe { syscall_dispatch(2, USER_PAGE_VA as u64, 0, 0, 0, 0, 0) };
+    let r =
+        unsafe { syscall_dispatch(core::ptr::null_mut(), 2, USER_PAGE_VA as u64, 0, 0, 0, 0, 0) };
     assert_eq!(
         r, ENAMETOOLONG,
         "unterminated path must return ENAMETOOLONG, got {}",
@@ -331,7 +354,18 @@ fn read_write_via_new_fd() {
             ptr::write_volatile(dst.add(i), *b);
         }
     }
-    let n = unsafe { syscall_dispatch(1, fd as u64, buf_va, msg.len() as u64, 0, 0, 0) };
+    let n = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            1,
+            fd as u64,
+            buf_va,
+            msg.len() as u64,
+            0,
+            0,
+            0,
+        )
+    };
     assert_eq!(n, msg.len() as i64, "write returned {}", n);
     assert_eq!(close(fd as u32), 0);
 }
@@ -339,6 +373,6 @@ fn read_write_via_new_fd() {
 fn unknown_syscall_returns_enosys() {
     // Any syscall number not in the dispatcher's match returns -ENOSYS.
     // Using a high number well above anything we might implement soon.
-    let r = unsafe { syscall_dispatch(9999, 0, 0, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), 9999, 0, 0, 0, 0, 0, 0) };
     assert_eq!(r, -38, "expected ENOSYS, got {}", r);
 }
