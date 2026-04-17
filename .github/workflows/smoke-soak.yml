@@ -39,7 +39,13 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: smoke-soak-${{ github.ref }}
+  # Separate the concurrency group by event so a manual `workflow_dispatch`
+  # on `main` does not cancel an in-flight `schedule`-triggered nightly run
+  # (both would otherwise share the same `github.ref`, and losing a nightly
+  # mid-soak poisons the history the 3-green-nights acceptance gate in
+  # epic #501 depends on). Per-PR concurrency still collapses duplicate
+  # runs of the same PR.
+  group: smoke-soak-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -86,15 +92,18 @@ jobs:
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         with:
           # The fork/exec surface PR #206 introduced and epic #501 is
-          # actively de-risking. Deliberately does NOT include the
-          # workflow file itself — a workflow-only edit should be
-          # validated via `workflow_dispatch`, not by forcing every
-          # docs/config tweak through a 1-3h soak.
+          # actively de-risking, plus the smoke harness itself — a change
+          # to `cargo xtask smoke`'s marker list or timeout logic could
+          # silently invalidate the soak, so it must trigger too.
+          # Deliberately does NOT include this workflow file — a
+          # workflow-only edit should be validated via `workflow_dispatch`,
+          # not by forcing every docs/config tweak through a 1-3h soak.
           filters: |
             fork_exec_surface:
               - 'kernel/src/arch/x86_64/syscall.rs'
               - 'kernel/src/task/**'
               - 'kernel/src/process/**'
+              - 'xtask/src/main.rs'
 
       - name: Decide
         id: decide
@@ -190,6 +199,31 @@ jobs:
           count="${SOAK_COUNT}"
           per_run_timeout="${SMOKE_RUN_TIMEOUT_SECS}"
           min_rate="${SOAK_MIN_PASS_RATE}"
+
+          # `count` and `min_rate` come from `workflow_dispatch` inputs,
+          # which are free-form strings. Reject non-integers up front so
+          # we don't divide-by-zero on `count=0` or blow up `seq` / the
+          # later `-lt` comparison on non-numeric junk.
+          case "${count}" in
+            ''|*[!0-9]*)
+              echo "::error::count must be a positive integer (got: '${count}')"
+              exit 1
+              ;;
+          esac
+          case "${min_rate}" in
+            ''|*[!0-9]*)
+              echo "::error::min_pass_rate must be an integer 0-100 (got: '${min_rate}')"
+              exit 1
+              ;;
+          esac
+          if [ "${count}" -le 0 ]; then
+            echo "::error::count must be > 0 (got: ${count})"
+            exit 1
+          fi
+          if [ "${min_rate}" -lt 0 ] || [ "${min_rate}" -gt 100 ]; then
+            echo "::error::min_pass_rate must be between 0 and 100 (got: ${min_rate})"
+            exit 1
+          fi
 
           echo "== smoke-soak: count=${count} per_run_timeout=${per_run_timeout}s min_pass_rate=${min_rate}% =="
 
