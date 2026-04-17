@@ -228,7 +228,10 @@ pub fn fork_current_task(
         )
     }?;
     let child_id = child.id;
-    crate::fork_trace!("fork_current_task: Task::new_forked ok child_id={}", child_id);
+    crate::fork_trace!(
+        "fork_current_task: Task::new_forked ok child_id={}",
+        child_id
+    );
     let child_box = Box::new(child);
     let new_prio = child_box.priority;
     crate::fork_trace!("fork_current_task: pushing child to SCHED ready queue");
