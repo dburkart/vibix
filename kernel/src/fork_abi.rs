@@ -8,17 +8,22 @@
 //! the test doesn't need a live kernel stack.
 //!
 //! The layout written by [`prime_fork_child_stack`] matches the pop
-//! sequence at the tail of `context_switch` followed by the
-//! `fork_child_sysret` trampoline's `pop`s:
+//! sequence at the tail of `context_switch`. The subsequent `ret`
+//! jumps into `fork_child_sysret`, which reads the same callee-saved
+//! registers — just loaded from these stack slots — via `mov` (not
+//! `pop`) and builds the SYSRETQ state from them:
 //!
 //! ```text
-//!   rsp+0x00  r15 = 0
-//!   rsp+0x08  r14 = 0
-//!   rsp+0x10  r13 = 0
-//!   rsp+0x18  r12 = user_rip        → rcx for SYSRETQ
-//!   rsp+0x20  rbp = user_rsp        → rsp before SYSRETQ
-//!   rsp+0x28  rbx = user_rflags     → r11 for SYSRETQ
-//!   rsp+0x30  ret = fork_child_sysret_addr
+//!   rsp+0x00  r15 = 0                 ← context_switch: pop r15
+//!   rsp+0x08  r14 = 0                 ← context_switch: pop r14
+//!   rsp+0x10  r13 = 0                 ← context_switch: pop r13
+//!   rsp+0x18  r12 = user_rip          ← context_switch: pop r12
+//!                                       fork_child_sysret: mov rcx, r12
+//!   rsp+0x20  rbp = user_rsp          ← context_switch: pop rbp
+//!                                       fork_child_sysret: mov rsp, rbp
+//!   rsp+0x28  rbx = user_rflags       ← context_switch: pop rbx
+//!                                       fork_child_sysret: mov r11, rbx
+//!   rsp+0x30  ret = fork_child_sysret ← context_switch: ret
 //! ```
 //!
 //! See issue #504 — replacing `FORK_USER_*` globals with per-task
