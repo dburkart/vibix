@@ -9,7 +9,7 @@ context.
 
 | File | Issue | What it shows |
 |---|---|---|
-| `502-fork-trace-boot.log` | [#502](https://github.com/dburkart/vibix/issues/502) | Full `fork-trace` probe stream from one clean boot — fork(2) syscall path instrumented end-to-end, all probes fire, `IF=0` confirmed at dispatch, `[C]` marker shows the child reached `fork_child_sysret`. |
+| `502-fork-trace-boot.log` | [#502](https://github.com/dburkart/vibix/issues/502) | Full `fork-trace` probe stream from one clean boot — fork(2) syscall path instrumented end-to-end, all probes fire, `IF=0` confirmed at dispatch, `[C]` marker shows the child reached `fork_child_sysret`. Also used as the primary evidence source for the #503 typing-dead write-up (`../fork-hang/typing-dead.md`). |
 
 ## Reproducing a capture
 
