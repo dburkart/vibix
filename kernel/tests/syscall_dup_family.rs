@@ -138,7 +138,18 @@ fn stage(bytes: &[u8]) -> u64 {
 
 fn open_ro(path: &[u8]) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPEN, uva, O_RDONLY as u64, 0, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_OPEN,
+            uva,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn close(fd: i64) -> i64 {
@@ -150,25 +161,80 @@ fn dup(fd: i64) -> i64 {
 }
 
 fn dup2(oldfd: i64, newfd: i64) -> i64 {
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_DUP2, oldfd as u64, newfd as u64, 0, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_DUP2,
+            oldfd as u64,
+            newfd as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn dup3(oldfd: i64, newfd: i64, flags: u32) -> i64 {
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_DUP3, oldfd as u64, newfd as u64, flags as u64, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_DUP3,
+            oldfd as u64,
+            newfd as u64,
+            flags as u64,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn fcntl(fd: i64, cmd: u32, arg: u64) -> i64 {
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_FCNTL, fd as u64, cmd as u64, arg, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_FCNTL,
+            fd as u64,
+            cmd as u64,
+            arg,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn lseek(fd: i64, off: i64, whence: u64) -> i64 {
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_LSEEK, fd as u64, off as u64, whence, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_LSEEK,
+            fd as u64,
+            off as u64,
+            whence,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn read_bytes(fd: i64, out: &mut [u8]) -> i64 {
     // Stash the read at USER_PAGE_VA + 256 so it doesn't clobber the path.
     let buf_va = USER_PAGE_VA as u64 + 256;
-    let n = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_READ, fd as u64, buf_va, out.len() as u64, 0, 0, 0) };
+    let n = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_READ,
+            fd as u64,
+            buf_va,
+            out.len() as u64,
+            0,
+            0,
+            0,
+        )
+    };
     if n > 0 {
         unsafe {
             let src = buf_va as *const u8;

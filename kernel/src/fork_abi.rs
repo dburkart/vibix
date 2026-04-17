@@ -78,9 +78,8 @@ mod tests {
         let user_rsp: u64 = 0x0000_7FFF_C0DE_0000;
         let sysret_addr: usize = 0x0000_FFFF_FACE_B00C;
 
-        let rsp = unsafe {
-            prime_fork_child_stack(top, user_rip, user_rflags, user_rsp, sysret_addr)
-        };
+        let rsp =
+            unsafe { prime_fork_child_stack(top, user_rip, user_rflags, user_rsp, sysret_addr) };
 
         assert_eq!(rsp, top - 7 * 8, "rsp must leave 7 qwords on the stack");
 
@@ -126,12 +125,10 @@ mod tests {
         let top_a = unsafe { buf_a.as_mut_ptr().add(buf_a.len()) } as usize;
         let top_b = unsafe { buf_b.as_mut_ptr().add(buf_b.len()) } as usize;
 
-        let rsp_a = unsafe {
-            prime_fork_child_stack(top_a, 0x1111_1111, 0x202, 0xAAAA_AAAA, 0xF00D_F00D)
-        };
-        let rsp_b = unsafe {
-            prime_fork_child_stack(top_b, 0x2222_2222, 0x246, 0xBBBB_BBBB, 0xF00D_F00D)
-        };
+        let rsp_a =
+            unsafe { prime_fork_child_stack(top_a, 0x1111_1111, 0x202, 0xAAAA_AAAA, 0xF00D_F00D) };
+        let rsp_b =
+            unsafe { prime_fork_child_stack(top_b, 0x2222_2222, 0x246, 0xBBBB_BBBB, 0xF00D_F00D) };
 
         let a = rsp_a as *const usize;
         let b = rsp_b as *const usize;

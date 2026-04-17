@@ -163,7 +163,18 @@ fn mknod(path: &[u8], mode: u64) -> i64 {
 
 fn mknodat(dfd: i64, path: &[u8], mode: u64) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_MKNODAT, dfd as u64, uva, mode, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_MKNODAT,
+            dfd as u64,
+            uva,
+            mode,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn open(path: &[u8], flags: u64) -> i64 {
@@ -177,12 +188,34 @@ fn close(fd: i64) -> i64 {
 
 fn write_bytes(fd: i64, bytes: &[u8]) -> i64 {
     let uva = stage_payload(bytes);
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_WRITE, fd as u64, uva, bytes.len() as u64, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_WRITE,
+            fd as u64,
+            uva,
+            bytes.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 fn read_bytes(fd: i64, out: &mut [u8]) -> i64 {
     let buf_va = USER_PAGE_VA as u64 + 2 * 4096;
-    let n = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_READ, fd as u64, buf_va, out.len() as u64, 0, 0, 0) };
+    let n = unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_READ,
+            fd as u64,
+            buf_va,
+            out.len() as u64,
+            0,
+            0,
+            0,
+        )
+    };
     if n > 0 {
         unsafe {
             let src = buf_va as *const u8;
@@ -204,7 +237,18 @@ fn read_stat() -> Stat {
 }
 
 fn fstat(fd: i64) -> i64 {
-    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_FSTAT, fd as u64, statbuf_uva(), 0, 0, 0, 0) }
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_FSTAT,
+            fd as u64,
+            statbuf_uva(),
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 // --- Tests ---------------------------------------------------------------
