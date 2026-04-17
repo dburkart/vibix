@@ -127,15 +127,15 @@ fn stage(bytes: &[u8]) -> u64 {
 
 fn open_ro(path: &[u8]) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(SYS_OPEN, uva, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPEN, uva, 0, 0, 0, 0, 0) }
 }
 
 fn close(fd: i64) -> i64 {
-    unsafe { syscall_dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
 }
 
 fn lseek(fd: i64, off: i64, whence: u64) -> i64 {
-    unsafe { syscall_dispatch(SYS_LSEEK, fd as u64, off as u64, whence, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_LSEEK, fd as u64, off as u64, whence, 0, 0, 0) }
 }
 
 /// Read up to `len` bytes into a scratch region of the user page, then
@@ -144,7 +144,7 @@ fn read_bytes(fd: i64, out: &mut [u8]) -> i64 {
     // Stash the read at USER_PAGE_VA + 256 so it doesn't clobber the
     // path we just used for open.
     let buf_va = USER_PAGE_VA as u64 + 256;
-    let n = unsafe { syscall_dispatch(SYS_READ, fd as u64, buf_va, out.len() as u64, 0, 0, 0) };
+    let n = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_READ, fd as u64, buf_va, out.len() as u64, 0, 0, 0) };
     if n > 0 {
         unsafe {
             let src = buf_va as *const u8;

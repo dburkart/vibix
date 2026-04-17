@@ -18,6 +18,8 @@ pub mod block;
 pub mod build_info;
 pub mod cpu;
 #[cfg(any(test, target_os = "none"))]
+pub mod fork_abi;
+#[cfg(any(test, target_os = "none"))]
 pub mod fs;
 #[cfg(any(test, target_os = "none"))]
 pub mod gdbstub;

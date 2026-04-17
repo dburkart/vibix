@@ -97,25 +97,44 @@ static mut INIT_KERNEL_STACK: AlignedStack = AlignedStack([0u8; 16 * 1024]);
 #[no_mangle]
 pub static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// Ring-3 RIP saved by the SYSCALL entry trampoline for use by fork().
-/// Stashed before argument registers are remapped, so it reflects the
-/// exact instruction the parent will resume at after fork() returns.
+/// One-qword scratch slot used by `syscall_entry` to spill the user RSP
+/// while it swaps to the kernel stack.
+///
+/// Touched only inside the non-preemptible SYSCALL entry sequence
+/// (between entry and the first Rust call). Every live syscall-arg
+/// register is occupied by its Linux syscall ABI meaning at that point,
+/// and rbx/rbp/r12-r15 are callee-saved under the syscall ABI — no
+/// GPR is free to hold user_rsp across the two instructions of the
+/// stack swap, so we spill through this memory slot.
+///
+/// **Not** a cross-syscall hand-off: the slot is written and read within
+/// the same short non-interruptible sequence, so it can never be
+/// observed by any later syscall path. This is structurally distinct
+/// from the old FORK_USER_* globals (issue #504) that lived across
+/// syscalls and raced with concurrent fork callers.
 #[no_mangle]
-pub static FORK_USER_RIP: AtomicU64 = AtomicU64::new(0);
+pub static SYSCALL_SCRATCH_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// Ring-3 RFLAGS (saved from r11 by the CPU) for use by fork().
-#[no_mangle]
-pub static FORK_USER_RFLAGS: AtomicU64 = AtomicU64::new(0);
-
-/// Ring-3 RSP (saved before switching to kernel stack) for use by fork().
-#[no_mangle]
-pub static FORK_USER_RSP: AtomicU64 = AtomicU64::new(0);
-
-/// Set to 1 by `sys_sigreturn` to tell `check_and_deliver_signals` to
-/// overwrite the saved user context with the restored register values
-/// rather than pushing a new signal frame.  Cleared after consumption.
-#[no_mangle]
-pub static SIGRETURN_PENDING: AtomicU64 = AtomicU64::new(0);
+// Historical note (issue #504, epic #501):
+//
+// Earlier revisions of this file carried three `AtomicU64` statics —
+// `FORK_USER_RIP`, `FORK_USER_RFLAGS`, `FORK_USER_RSP` — plus a
+// `SIGRETURN_PENDING` flag. The SYSCALL trampoline wrote the user-saved
+// register context into those globals on every syscall entry; the FORK
+// handler, `sigreturn`, and the return-path signal hook all read them
+// back asynchronously. That was racy by construction: any syscall that
+// yielded before the reader loaded the globals could be clobbered by a
+// second syscall landing on the same CPU, and the child of a fork
+// racing another syscall would SYSRETQ into a garbage RIP.
+//
+// The fix (option A from the epic): the user RIP/RFLAGS/RSP already live
+// on the per-task kernel stack as part of the [`SyscallReturnContext`]
+// frame that the asm trampoline pushes before invoking
+// `syscall_dispatch`. `syscall_dispatch` now receives a pointer to that
+// frame as its first argument and hands it to FORK and SIGRETURN, so
+// both read the caller's own saved context directly. The globals, and
+// the SIGRETURN_PENDING hand-off flag, are no longer necessary and have
+// been deleted.
 
 /// Set to 1 by `check_and_deliver_signals` when a bare syscall restart
 /// (no user handler) is about to occur. The syscall trampoline checks
@@ -216,16 +235,26 @@ use super::uaccess;
 
 /// Syscall handler called from the `syscall_entry` trampoline.
 ///
-/// Takes the six Linux x86_64 syscall argument registers. Handlers
-/// that only need fewer args simply ignore the extras.
+/// `ctx` points to the caller's own [`SyscallReturnContext`] on its
+/// kernel stack, built by the asm trampoline before this call. FORK and
+/// SIGRETURN read/write user RIP/RFLAGS/RSP through it rather than
+/// through shared globals (see issue #504 for the race that motivated
+/// the rework).
+///
+/// The remaining args are the six Linux x86_64 syscall argument
+/// registers. Handlers that only need fewer args simply ignore the
+/// extras.
 ///
 /// # Safety
 /// Called only from `syscall_entry` with the kernel stack active and
-/// interrupts disabled. User pointer arguments are validated and
-/// marshalled via `uaccess::copy_from_user` / `copy_to_user` before
-/// any dereference.
+/// interrupts disabled. `ctx` must point at valid, aligned storage that
+/// lives for the duration of this call (the asm trampoline owns it
+/// until SYSRETQ). User pointer arguments are validated and marshalled
+/// via `uaccess::copy_from_user` / `copy_to_user` before any
+/// dereference.
 #[no_mangle]
 pub unsafe extern "C" fn syscall_dispatch(
+    ctx: *mut crate::signal::SyscallReturnContext,
     nr: u64,
     a0: u64,
     a1: u64,
@@ -518,9 +547,13 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // fork() — clone the calling process; parent returns child PID, child returns 0.
         FORK => {
-            let user_rip = FORK_USER_RIP.load(Ordering::Relaxed);
-            let user_rflags = FORK_USER_RFLAGS.load(Ordering::Relaxed);
-            let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
+            // Read the parent's saved user context straight out of its
+            // own SyscallReturnContext on the kernel stack. Per-task by
+            // construction: no cross-task races vs. the old FORK_USER_*
+            // globals (issue #504).
+            let user_rip = (*ctx).user_rip;
+            let user_rflags = (*ctx).user_rflags;
+            let user_rsp = (*ctx).user_rsp;
 
             // #502 probe: dump the current RFLAGS at fork-dispatch entry.
             // Expected: IF (bit 9) = 0, masked by MSR_FMASK's IF bit on
@@ -663,18 +696,18 @@ pub unsafe extern "C" fn syscall_dispatch(
         SIGPROCMASK => crate::signal::sys_sigprocmask(a0, a1, a2),
 
         // sigreturn() — restore context from signal frame.
-        // The user RSP at syscall entry (saved by the trampoline in
-        // FORK_USER_RSP) points at the SigFrame on the user stack.
-        // We restore the saved [rip, rflags, rsp] and stash them in
-        // FORK_USER_* so check_and_deliver_signals can apply them to
-        // the kernel-stack-saved context before SYSRETQ.
+        // The user RSP at syscall entry points at the SigFrame on the
+        // user stack. Read it out of the caller's own SyscallReturnContext
+        // and write the restored [rip, rflags, rsp] straight back into the
+        // same frame, so SYSRETQ lands on the pre-signal user PC instead
+        // of the sigreturn-trampoline. No cross-task hand-off via globals
+        // (issue #504).
         SIGRETURN => {
-            let user_rsp = FORK_USER_RSP.load(Ordering::Relaxed);
+            let user_rsp = (*ctx).user_rsp;
             let restored = crate::signal::sys_sigreturn(user_rsp);
-            FORK_USER_RIP.store(restored.rip, Ordering::Relaxed);
-            FORK_USER_RFLAGS.store(restored.rflags, Ordering::Relaxed);
-            FORK_USER_RSP.store(restored.rsp, Ordering::Relaxed);
-            SIGRETURN_PENDING.store(1, Ordering::Relaxed);
+            (*ctx).user_rip = restored.rip;
+            (*ctx).user_rflags = restored.rflags;
+            (*ctx).user_rsp = restored.rsp;
             0i64
         }
 
@@ -1109,20 +1142,32 @@ syscall_entry:
     // IF is cleared by SFMASK. Every GP register that isn't rsp is
     // load-bearing: all Linux syscall args or SYSRETQ state.
 
-    // 1. Stash user RSP straight into fork_rsp so we don't need a
-    //    scratch register — r10 is the Linux syscall ABI's `a3` and
-    //    must not be clobbered.
-    mov [rip + {fork_rsp}], rsp
+    // 1. Stash user RSP onto the (about-to-be-active) kernel stack via a
+    //    tiny scratch slot below the kernel-stack top. The scratch slot
+    //    lives one qword below the top so we can read it back after the
+    //    stack swap.
+    //
+    //    We can't use any of rax / rdi / rsi / rdx / r10 / r8 / r9 as
+    //    scratch — they hold Linux syscall args (nr + a0..a5) and must
+    //    reach `syscall_dispatch` intact. rcx (user RIP) and r11 (user
+    //    RFLAGS) are still live and will be pushed below. That leaves
+    //    no free GPR without spilling through memory, so we use the
+    //    scratch slot at [kernel_rsp_top - 8] directly. The kernel stack
+    //    is never used for anything but SYSCALL frames between ring-3
+    //    entries, so reusing this qword across syscalls is safe.
+    mov [rip + {syscall_scratch_rsp}], rsp
 
     // 2. Load kernel RSP: lea gives us the address of the static;
     //    the second mov dereferences it to get the stack-top value.
     lea rsp, [rip + {kernel_rsp}]
     mov rsp, [rsp]
 
-    // 3. Save return-to-user context on the kernel stack.
-    push [rip + {fork_rsp}]   // user RSP (already stashed above)
-    push r11                  // user RFLAGS (SYSRETQ restores from r11)
-    push rcx                  // user RIP    (SYSRETQ jumps to rcx)
+    // 3. Save return-to-user context on the kernel stack (high→low
+    //    address so the struct at rsp is laid out as in
+    //    `SyscallReturnContext`).
+    push [rip + {syscall_scratch_rsp}]  // user RSP (stashed above)
+    push r11                             // user RFLAGS (SYSRETQ restores from r11)
+    push rcx                             // user RIP    (SYSRETQ jumps to rcx)
 
     // 3a. Save the user syscall registers so a restart (rip rewound to
     //     the SYSCALL instruction) can replay with the original syscall
@@ -1133,6 +1178,9 @@ syscall_entry:
     //       [+56]=user_rip [+64]=user_rflags [+72]=user_rsp
     //     These slots are adjacent to the rip/rflags/rsp frame above so a
     //     single pointer (rsp) addresses the whole `SyscallReturnContext`.
+    //     The FORK and SIGRETURN handlers read/write their own saved
+    //     user_rip/rflags/rsp through this `ctx` pointer (issue #504,
+    //     replacing the old FORK_USER_* globals).
     push r9
     push r8
     push r10
@@ -1141,41 +1189,42 @@ syscall_entry:
     push rdi
     push rax
 
-    // 3b. Finish priming the FORK_USER_* statics so fork() can seed the
-    //     child's kernel stack. fork_rsp was already written in step 1.
-    mov [rip + {fork_rip}], rcx
-    mov [rip + {fork_rflags}], r11
-
-    // 4. Build syscall_dispatch(nr, a0, a1, a2, a3, a4, a5) in SysV AMD64
-    //    registers. Linux syscall ABI:  rax=nr  rdi=a0 rsi=a1 rdx=a2
-    //                                   r10=a3  r8=a4  r9=a5
-    //    SysV C ABI (7 int args):       rdi=arg0 rsi=arg1 rdx=arg2
-    //                                   rcx=arg3 r8=arg4  r9=arg5
-    //                                   [rsp]=arg6 (passed on the stack)
+    // 4. Build syscall_dispatch(ctx, nr, a0, a1, a2, a3, a4, a5) in SysV
+    //    AMD64 registers. Linux syscall ABI:
+    //        rax=nr  rdi=a0 rsi=a1 rdx=a2  r10=a3  r8=a4  r9=a5
+    //    SysV C ABI (8 int args):
+    //        rdi=arg0 rsi=arg1 rdx=arg2 rcx=arg3 r8=arg4 r9=arg5
+    //        [rsp+0]=arg6  [rsp+8]=arg7
     //
-    //    Mapping (nr, a0..a5) → (arg0..arg6):
-    //      nr:  rax → rdi   (arg0)
-    //      a0:  rdi → rsi   (arg1)
-    //      a1:  rsi → rdx   (arg2)
-    //      a2:  rdx → rcx   (arg3)   rcx was user RIP, now on stack
-    //      a3:  r10 → r8    (arg4)   trampled old Linux a4 — must save first
-    //      a4:  r8  → r9    (arg5)   trampled old Linux a5 — must save first
-    //      a5:  r9  → [rsp] (arg6)   passed on the stack
+    //    Mapping (ctx, nr, a0..a5) → (arg0..arg7):
+    //      ctx: rsp       → rdi     (arg0)
+    //      nr:  rax       → rsi     (arg1)
+    //      a0:  rdi       → rdx     (arg2)
+    //      a1:  rsi       → rcx     (arg3)
+    //      a2:  rdx       → r8      (arg4)
+    //      a3:  r10       → r9      (arg5)
+    //      a4:  r8        → [rsp+0] (arg6)   — spilled before clobber
+    //      a5:  r9        → [rsp+8] (arg7)   — spilled before clobber
     //
-    //    Save r9 (a5) into the arg6 slot before the remap clobbers it.
     //    SysV requires rsp to be 16-byte aligned immediately before the
     //    CALL instruction. The 3+7 preceding pushes leave rsp at
-    //    (top-80) — already 0 mod 16. Reserving one 8-byte slot for arg6
-    //    brings rsp to (top-88), which is 8 mod 16; so we compensate with
-    //    one more 8-byte sub to land on 0 mod 16 before CALL.
+    //    (top-80) — already 0 mod 16. Reserving two 8-byte slots for
+    //    arg6 and arg7 keeps rsp 0 mod 16 when the CALL executes.
+    //
+    //    ctx-pointer capture: the SyscallReturnContext is at the *current*
+    //    rsp before we allocate the arg6/arg7 slots. We save it into r11
+    //    (already consumed — user RFLAGS was pushed above) as a scratch,
+    //    then restore it into rdi after the remap.
+    mov r11, rsp       // r11 = &SyscallReturnContext (ctx)
     sub rsp, 16
-    mov [rsp], r9     // a5 → stack slot for arg6
-    mov r9, r8        // a4 → r9 (arg5)
-    mov r8, r10       // a3 → r8 (arg4)
-    mov rcx, rdx      // a2 → rcx (arg3)
-    mov rdx, rsi      // a1 → rdx (arg2)
-    mov rsi, rdi      // a0 → rsi (arg1)
-    mov rdi, rax      // nr → rdi (arg0)
+    mov [rsp + 0], r8  // a4 → arg6 slot
+    mov [rsp + 8], r9  // a5 → arg7 slot
+    mov r9, r10        // a3 → r9  (arg5)
+    mov r8, rdx        // a2 → r8  (arg4)
+    mov rcx, rsi       // a1 → rcx (arg3)
+    mov rdx, rdi       // a0 → rdx (arg2)
+    mov rsi, rax       // nr → rsi (arg1)
+    mov rdi, r11       // ctx → rdi (arg0)
 
     // 5. Call the Rust dispatcher.
     call syscall_dispatch
@@ -1228,9 +1277,7 @@ syscall_entry:
     sysretq
     "#,
     kernel_rsp = sym SYSCALL_KERNEL_RSP,
-    fork_rip = sym FORK_USER_RIP,
-    fork_rflags = sym FORK_USER_RFLAGS,
-    fork_rsp = sym FORK_USER_RSP,
+    syscall_scratch_rsp = sym SYSCALL_SCRATCH_RSP,
     restart_pending = sym SYSCALL_RESTART_PENDING,
 );
 

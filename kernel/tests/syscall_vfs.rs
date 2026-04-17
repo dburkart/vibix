@@ -173,7 +173,7 @@ fn read_stat() -> Stat {
 
 fn stat_root_returns_dir() {
     let path = stage_path(b"/");
-    let r = unsafe { syscall_dispatch(SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r, 0, "stat(\"/\") should succeed, got {}", r);
     let st = read_stat();
     // S_IFDIR == 0o040_000.
@@ -187,12 +187,12 @@ fn stat_root_returns_dir() {
 
 fn stat_enoent_on_missing() {
     let path = stage_path(b"/no-such-thing");
-    let r = unsafe { syscall_dispatch(SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r, ENOENT, "expected ENOENT, got {}", r);
 }
 
 fn fstat_ebadf_on_closed() {
-    let r = unsafe { syscall_dispatch(SYS_FSTAT, 9999, statbuf_uva(), 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_FSTAT, 9999, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r, EBADF, "expected EBADF on closed fd, got {}", r);
 }
 
@@ -200,9 +200,9 @@ fn openat_atfdcwd_absolute() {
     // /dev/serial is a legacy-compat path, served by the SerialBackend
     // fast path in both `open` and `openat`.
     let path = stage_path(b"/dev/serial");
-    let fd = unsafe { syscall_dispatch(SYS_OPENAT, AT_FDCWD_U64, path, 2, 0, 0, 0) };
+    let fd = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPENAT, AT_FDCWD_U64, path, 2, 0, 0, 0) };
     assert!(fd >= 3, "openat(/dev/serial) should give fd>=3, got {}", fd);
-    let cr = unsafe { syscall_dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) };
+    let cr = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) };
     assert_eq!(cr, 0, "close fresh fd failed: {}", cr);
 }
 
@@ -210,7 +210,7 @@ fn openat_rejects_relative_without_atfdcwd() {
     // dfd != AT_FDCWD and path is relative: no per-process cwd yet, so
     // return EINVAL rather than silently treating dfd as ignored.
     let path = stage_path(b"relative/path");
-    let r = unsafe { syscall_dispatch(SYS_OPENAT, 5u64, path, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPENAT, 5u64, path, 0, 0, 0, 0) };
     assert_eq!(r, EINVAL, "expected EINVAL, got {}", r);
 }
 
@@ -218,7 +218,7 @@ fn newfstatat_rejects_unknown_flag() {
     // 0x40000 is AT_RECURSIVE — not a flag we know, must be rejected.
     let path = stage_path(b"/");
     let r = unsafe {
-        syscall_dispatch(
+        syscall_dispatch(core::ptr::null_mut(), 
             SYS_NEWFSTATAT,
             AT_FDCWD_U64,
             path,
@@ -234,7 +234,7 @@ fn newfstatat_rejects_unknown_flag() {
 fn newfstatat_empty_path_needs_at_empty_path() {
     // Empty path without AT_EMPTY_PATH → ENOENT from path_walk.
     let path = stage_path(b"");
-    let r = unsafe { syscall_dispatch(SYS_NEWFSTATAT, AT_FDCWD_U64, path, statbuf_uva(), 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_NEWFSTATAT, AT_FDCWD_U64, path, statbuf_uva(), 0, 0, 0) };
     assert_eq!(
         r, ENOENT,
         "empty path without AT_EMPTY_PATH → ENOENT, got {}",
@@ -245,12 +245,12 @@ fn newfstatat_empty_path_needs_at_empty_path() {
 fn lstat_same_as_stat_on_dir() {
     // With no symlinks in play, lstat(/) == stat(/).
     let path = stage_path(b"/");
-    let r1 = unsafe { syscall_dispatch(SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
+    let r1 = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_STAT, path, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r1, 0);
     let st1 = read_stat();
 
     let path2 = stage_path(b"/");
-    let r2 = unsafe { syscall_dispatch(SYS_LSTAT, path2, statbuf_uva(), 0, 0, 0, 0) };
+    let r2 = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_LSTAT, path2, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r2, 0);
     let st2 = read_stat();
     assert_eq!(st1.st_ino, st2.st_ino);
@@ -277,7 +277,7 @@ fn stat_enametoolong_on_overlong_path() {
         // ENAMETOOLONG before ever reading this byte.
         ptr::write_volatile(dst.add(OVERLONG), 0);
     }
-    let r = unsafe { syscall_dispatch(SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(r, ENAMETOOLONG, "expected ENAMETOOLONG, got {}", r);
 }
 
@@ -307,7 +307,7 @@ fn stat_pathmax_boundary_is_accepted() {
         }
         ptr::write_volatile(dst.add(PATH_MAX), 0);
     }
-    let r = unsafe { syscall_dispatch(SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_STAT, path_uva, statbuf_uva(), 0, 0, 0, 0) };
     assert_eq!(
         r, ENOENT,
         "PATH_MAX-length non-existent path must be ENOENT (accept side), got {}",
@@ -326,7 +326,7 @@ fn open_o_directory_on_nondir_enotdir() {
     // return ENOTDIR.
     const O_DIRECTORY: u64 = 0o200000;
     let path = stage_path(b"/dev/null");
-    let r = unsafe { syscall_dispatch(SYS_OPEN, path, O_DIRECTORY, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPEN, path, O_DIRECTORY, 0, 0, 0, 0) };
     assert_eq!(
         r, ENOTDIR,
         "O_DIRECTORY on char file must be ENOTDIR, got {}",
@@ -345,7 +345,7 @@ fn cwdbuf_uva() -> u64 {
 fn getcwd_returns_root() {
     // At boot, no chdir has been called, so cwd falls back to the VFS root.
     // getcwd should return "/\0" (2 bytes), return value 2.
-    let r = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
     assert!(r > 0, "getcwd should succeed, got {}", r);
     let buf = cwdbuf_uva() as *const u8;
     let first = unsafe { ptr::read_volatile(buf) };
@@ -369,7 +369,7 @@ fn getcwd_returns_root() {
 
 fn getcwd_enametoolong() {
     // Buffer length 1 is too small for even "/\0" (needs 2).
-    let r = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 1, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETCWD, cwdbuf_uva(), 1, 0, 0, 0, 0) };
     let enametoolong: i64 = -36;
     assert_eq!(
         r, enametoolong,
@@ -382,10 +382,10 @@ fn chdir_changes_cwd() {
     // chdir to /dev (which is mounted as devfs) should succeed and
     // cause getcwd to return "/dev\0".
     let path = stage_path(b"/dev");
-    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CHDIR, path, 0, 0, 0, 0, 0) };
     assert_eq!(r, 0, "chdir(\"/dev\") should succeed, got {}", r);
 
-    let r2 = unsafe { syscall_dispatch(SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
+    let r2 = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETCWD, cwdbuf_uva(), 4096, 0, 0, 0, 0) };
     assert!(r2 > 0, "getcwd after chdir should succeed, got {}", r2);
 
     let expected = b"/dev\0";
@@ -397,14 +397,14 @@ fn chdir_changes_cwd() {
 
     // Restore cwd to root for subsequent tests.
     let root_path = stage_path(b"/");
-    let _ = unsafe { syscall_dispatch(SYS_CHDIR, root_path, 0, 0, 0, 0, 0) };
+    let _ = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CHDIR, root_path, 0, 0, 0, 0, 0) };
 }
 
 fn chdir_rejects_non_directory() {
     // chdir to a non-directory (e.g. /dev/null is a char inode) must
     // return ENOTDIR.
     let path = stage_path(b"/dev/null");
-    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CHDIR, path, 0, 0, 0, 0, 0) };
     assert_eq!(
         r, ENOTDIR,
         "chdir to non-dir must return ENOTDIR, got {}",
@@ -414,7 +414,7 @@ fn chdir_rejects_non_directory() {
 
 fn chdir_enoent_on_missing() {
     let path = stage_path(b"/no-such-dir");
-    let r = unsafe { syscall_dispatch(SYS_CHDIR, path, 0, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CHDIR, path, 0, 0, 0, 0, 0) };
     assert_eq!(
         r, ENOENT,
         "chdir to missing path must return ENOENT, got {}",

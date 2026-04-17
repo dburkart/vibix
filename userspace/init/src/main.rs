@@ -29,11 +29,15 @@
 //! |     61 | wait4   | pid          | *wstatus     | options | *rusage |
 //!
 //! ### fork() invariants
-//! The kernel reads `FORK_USER_RIP`, `FORK_USER_RFLAGS`, `FORK_USER_RSP`
-//! from the SYSCALL entry trampoline before `syscall_dispatch(57, ...)` is
-//! called.  Those statics are set by inline assembly in the entry path and
-//! hold the saved userspace register values.  The child task resumes at
-//! the SYSRET return address with rax=0; the parent gets the child PID.
+//! The SYSCALL entry trampoline pushes the caller's user-mode register
+//! context (user RIP/RFLAGS/RSP + the six syscall-arg regs) onto the
+//! caller's own kernel stack as a `SyscallReturnContext`, and passes a
+//! pointer to that struct as the first argument of `syscall_dispatch`.
+//! The fork handler reads the parent's user RIP/RFLAGS/RSP straight out
+//! of that struct, so the values are per-task by construction — no
+//! cross-syscall global state, no races with other CPUs (see issue
+//! #504). The child task resumes at the SYSRET return address with
+//! rax=0; the parent gets the child PID.
 //!
 //! ### execve() invariants
 //! The kernel ignores path/argv/envp (rdi/rsi/rdx) for now: it loads the

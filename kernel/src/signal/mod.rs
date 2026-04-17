@@ -679,40 +679,29 @@ pub fn signal_to_deliver(
 /// Called from the `syscall_entry` asm trampoline between steps 5 and 6
 /// (after `syscall_dispatch` returns, before `pop rcx / sysretq`).
 ///
-/// Three responsibilities:
+/// Two responsibilities:
 ///
-/// 1. **sigreturn**: if `SIGRETURN_PENDING` is set (syscall 15 just ran),
-///    overwrite `ctx` with the restored user context from `FORK_USER_*`
-///    statics and clear the flag.
-///
-/// 2. **ERESTARTSYS handling**: if the dispatcher returned
+/// 1. **ERESTARTSYS handling**: if the dispatcher returned
 ///    `KERN_ERESTARTSYS`, consult [`restart_decision`]. On restart, rewind
 ///    `ctx.user_rip` by the syscall insn length and clobber `rv` so the
 ///    caller sees the freshly-restarted syscall's result.
 ///
-/// 3. **signal delivery**: if a signal was popped (either by step 2's
-///    lookup or a fresh pop after sigreturn), look up its disposition and
-///    either push a `SigFrame` + redirect `ctx->user_rip` (user handler),
-///    exit the process (default terminate), or do nothing (ignored).
+/// 2. **signal delivery**: if a signal was popped, look up its
+///    disposition and either push a `SigFrame` + redirect `ctx->user_rip`
+///    (user handler), exit the process (default terminate), or do
+///    nothing (ignored).
 ///
 /// The returned value replaces `rax` for SYSRETQ.
+///
+/// `sigreturn(2)` (syscall 15) restores `ctx->user_{rip,rflags,rsp}`
+/// directly from inside `syscall_dispatch`, so no cross-call fix-up is
+/// needed here (issue #504 removed the former FORK_USER_* hand-off).
 ///
 /// # Safety
 /// `ctx` must point to the [`SyscallReturnContext`] fields on the current
 /// task's kernel stack.  Called only from `syscall_entry` with IF disabled.
 #[no_mangle]
 pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContext, rv: i64) -> i64 {
-    use core::sync::atomic::Ordering;
-
-    // Handle sigreturn: restore saved context from FORK_USER_* statics.
-    if crate::arch::x86_64::syscall::SIGRETURN_PENDING.load(Ordering::Relaxed) != 0 {
-        crate::arch::x86_64::syscall::SIGRETURN_PENDING.store(0, Ordering::Relaxed);
-        (*ctx).user_rip = crate::arch::x86_64::syscall::FORK_USER_RIP.load(Ordering::Relaxed);
-        (*ctx).user_rflags = crate::arch::x86_64::syscall::FORK_USER_RFLAGS.load(Ordering::Relaxed);
-        (*ctx).user_rsp = crate::arch::x86_64::syscall::FORK_USER_RSP.load(Ordering::Relaxed);
-        // After sigreturn still check for any newly-pending signal.
-    }
-
     let task_id = crate::task::current_id();
     // Peek the next deliverable signal and its (disposition, sa_flags) in
     // a single lock window so the restart-decision classifier sees a

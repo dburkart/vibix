@@ -134,19 +134,19 @@ fn read_user_byte(uva: usize) -> u8 {
 }
 
 fn mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i64, off: u64) -> i64 {
-    unsafe { syscall_dispatch(9, addr, len, prot as u64, flags as u64, fd as u64, off) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 9, addr, len, prot as u64, flags as u64, fd as u64, off) }
 }
 
 fn mprotect(addr: u64, len: u64, prot: u32) -> i64 {
-    unsafe { syscall_dispatch(10, addr, len, prot as u64, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 10, addr, len, prot as u64, 0, 0, 0) }
 }
 
 fn munmap(addr: u64, len: u64) -> i64 {
-    unsafe { syscall_dispatch(11, addr, len, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 11, addr, len, 0, 0, 0, 0) }
 }
 
 fn madvise(addr: u64, len: u64, advice: i32) -> i64 {
-    unsafe { syscall_dispatch(28, addr, len, advice as u64, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), 28, addr, len, advice as u64, 0, 0, 0) }
 }
 
 fn anon_rw(len: u64) -> u64 {

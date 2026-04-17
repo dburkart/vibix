@@ -115,11 +115,11 @@ fn stage(bytes: &[u8]) -> u64 {
 
 fn open_ro(path: &[u8]) -> i64 {
     let uva = stage(path);
-    unsafe { syscall_dispatch(SYS_OPEN, uva, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPEN, uva, 0, 0, 0, 0, 0) }
 }
 
 fn close(fd: i64) -> i64 {
-    unsafe { syscall_dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
 }
 
 /// Invoke getdents64 writing into a scratch region of the user page, then
@@ -136,7 +136,7 @@ fn getdents(fd: i64, len: usize) -> (i64, Vec<u8>) {
             ptr::write_volatile(dst.add(i), 0);
         }
     }
-    let n = unsafe { syscall_dispatch(SYS_GETDENTS64, fd as u64, buf_va, len as u64, 0, 0, 0) };
+    let n = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETDENTS64, fd as u64, buf_va, len as u64, 0, 0, 0) };
     let mut out = Vec::new();
     if n > 0 {
         out.reserve(n as usize);
@@ -284,7 +284,7 @@ fn getdents_zero_len_einval() {
     let fd = open_ro(ETC_PATH);
     assert!(fd >= 3);
     let buf_va = USER_PAGE_VA as u64 + 256;
-    let r = unsafe { syscall_dispatch(SYS_GETDENTS64, fd as u64, buf_va, 0, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETDENTS64, fd as u64, buf_va, 0, 0, 0, 0) };
     assert_eq!(r, EINVAL, "getdents64 with len=0 must return EINVAL");
     close(fd);
 }
@@ -294,7 +294,7 @@ fn getdents_bad_ptr_efault() {
     assert!(fd >= 3);
     // Kernel-half pointer — unambiguously outside the user range.
     let bad_va: u64 = 0xFFFF_8000_0000_0000;
-    let r = unsafe { syscall_dispatch(SYS_GETDENTS64, fd as u64, bad_va, 256, 0, 0, 0) };
+    let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_GETDENTS64, fd as u64, bad_va, 256, 0, 0, 0) };
     assert_eq!(r, EFAULT, "getdents64 with bad ptr must return EFAULT");
     close(fd);
 }
