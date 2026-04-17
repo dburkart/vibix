@@ -1,25 +1,23 @@
 name: smoke-soak
 
-# TEMPORARY (see #517): the `pull_request` path in the `filter` job below
-# is hard-wired to `should_run=false` while the ~50% fork/exec/wait flake
-# tracked in epic #501 is still live. With that flake, a 100× soak takes
-# 5+ hours and fails the 80% pass-rate gate either way, so it's a
-# miscalibrated PR gate rather than a signal. Issue #512 tracks the
-# proper long-term fix (swap the inner loop to `scripts/repro-fork.sh`
-# from #506). Nightly `schedule` and manual `workflow_dispatch` runs are
-# unaffected — they continue to exercise the soak so the 3-consecutive-
-# nightly-green acceptance gate in #501 still accrues signal.
+# Runs the deterministic fork-loop reproducer harness
+# (`scripts/repro-fork.sh`, from #506) many times back-to-back to surface
+# the low-rate fork/exec/wait flake tracked in epic #501. Each boot
+# executes 500 fork+exec+wait cycles inside a single QEMU, so one
+# reproducer run amplifies the per-boot hit rate dramatically over the
+# old `cargo xtask smoke` loop. This is #512's wave-2 deliverable — the
+# "green in CI for 3 consecutive nightly runs" acceptance gate (#501)
+# still accrues signal from the nightly run.
 #
+# TEMPORARY (see #517): the `pull_request` path in the `filter` job
+# below is hard-wired to `should_run=false` while the ~50% fork/exec/
+# wait flake tracked in epic #501 is still live. Even with the faster
+# harness, the 80% pass-rate gate can't be met pre-merge while the
+# underlying structural fixes (#504, #505) are open. Nightly
+# `schedule` and manual `workflow_dispatch` runs are unaffected.
 # Revert this gating (restore the label/path matching in the `filter`
 # job's `Decide` step) once #504 and #505 have merged AND the nightly
 # soak has been ≥80% for 3 consecutive nights.
-#
-# Runs the fork+exec+wait smoke test many times back-to-back to surface
-# low-rate flakes (see epic #501, issue #507). The current fork/exec/wait
-# path hangs ~50% of the time locally; a single smoke run per CI invocation
-# masked that for weeks. This job's existence is the wave-1 deliverable —
-# the "green in CI for 3 consecutive nightly runs" acceptance gate is met
-# later, once the structural fixes in #504 and #505 land.
 #
 # Triggers:
 #   - nightly schedule (catches regressions without blocking PR velocity).
@@ -107,18 +105,22 @@ jobs:
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         with:
           # The fork/exec surface PR #206 introduced and epic #501 is
-          # actively de-risking, plus the smoke harness itself — a change
-          # to `cargo xtask smoke`'s marker list or timeout logic could
-          # silently invalidate the soak, so it must trigger too.
+          # actively de-risking, plus the reproducer harness itself — a
+          # change to `scripts/repro-fork.sh`, `userspace/repro_fork/`,
+          # or the `repro-fork` xtask subcommand could silently
+          # invalidate the soak, so it must trigger too.
           # Deliberately does NOT include this workflow file — a
           # workflow-only edit should be validated via `workflow_dispatch`,
-          # not by forcing every docs/config tweak through a 1-3h soak.
+          # not by forcing every docs/config tweak through a multi-minute
+          # soak.
           filters: |
             fork_exec_surface:
               - 'kernel/src/arch/x86_64/syscall.rs'
               - 'kernel/src/task/**'
               - 'kernel/src/process/**'
               - 'xtask/src/main.rs'
+              - 'scripts/repro-fork.sh'
+              - 'userspace/repro_fork/**'
 
       - name: Decide
         id: decide
@@ -161,24 +163,30 @@ jobs:
     needs: filter
     if: needs.filter.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-    # 6h is the max a single GitHub-hosted job can run. A healthy soak
-    # (post-#504/#505) should finish in well under an hour; the generous
-    # cap exists so the job does not get killed mid-run while the flake
-    # is still present today.
-    timeout-minutes: 360
+    # Each `scripts/repro-fork.sh` boot runs 500 fork+exec+wait cycles
+    # inside one QEMU. Clean boots finish in ~15-60 s on CI; a flake-hit
+    # boot trips the xtask heartbeat watchdog inside ~60 s. At 100 runs
+    # that's ~25-100 min in the steady state; 120 min gives headroom
+    # without the absurd 6 h cap the old `cargo xtask smoke` loop
+    # needed. A runaway single run can't exceed the xtask's internal
+    # 900 s hard cap.
+    timeout-minutes: 120
     env:
-      # Per-run wall-clock cap for a single `cargo xtask smoke` invocation.
-      # `cargo xtask smoke` has its own internal HARD_CAP (~300s, see #460)
-      # but a wedge in QEMU can still hold the process open; `timeout`
-      # gives us a belt-and-suspenders kill switch so one bad run does
-      # not burn the whole 6h job budget.
-      SMOKE_RUN_TIMEOUT_SECS: '300'
+      # Per-run wall-clock cap for one `scripts/repro-fork.sh` (== one
+      # `cargo xtask repro-fork`) invocation. The xtask has its own
+      # internal HARD_CAP (900 s) plus a 60 s heartbeat-gap watchdog,
+      # so in practice it self-terminates long before this. The outer
+      # `timeout` is a belt-and-suspenders kill switch that also
+      # covers the case where the xtask itself wedges before reaching
+      # its watchdog (e.g. a cargo build hang), so we set this a bit
+      # above the xtask hard cap.
+      SOAK_RUN_TIMEOUT_SECS: '960'
       # Total runs and pass-rate threshold. workflow_dispatch can override.
       SOAK_COUNT: ${{ github.event.inputs.count || '100' }}
-      # Permissive for wave 1 — the underlying flake is known to be real
-      # today (see epic #501). Once #504 and #505 land and the soak is
-      # expected to be deterministic, bump this to 100 per the acceptance
-      # gate in issue #420.
+      # Permissive for wave 2 — the underlying flake is known to be
+      # real today (see epic #501). Once #504 and #505 land and the
+      # soak is expected to be deterministic, bump this to 100 per the
+      # acceptance gate in issue #420.
       SOAK_MIN_PASS_RATE: ${{ github.event.inputs.min_pass_rate || '80' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -211,23 +219,27 @@ jobs:
             ${{ runner.os }}-cargo-smoke-
             ${{ runner.os }}-cargo-
 
-      # Build the ISO once up front so each per-run iteration only pays
-      # the QEMU-boot cost, not the kernel-build cost. `cargo xtask smoke`
-      # is a no-op build when the artifacts are already current.
-      - name: Pre-build ISO
-        run: cargo xtask build
+      # Pre-build the kernel + reproducer ISO once up front so each
+      # per-run iteration only pays the QEMU-boot cost, not the
+      # build cost. `cargo xtask repro-fork` is a no-op rebuild when
+      # the artifacts are already current, but an explicit pre-build
+      # here also surfaces build failures in their own step rather
+      # than charged against run 1's pass/fail accounting.
+      - name: Pre-build reproducer ISO
+        run: cargo xtask repro-fork
+        # One full run costs ~15-60 s on a clean kernel; even with the
+        # flake-hit 60 s heartbeat watchdog it stays under the outer
+        # SOAK_RUN_TIMEOUT_SECS. Done here so the first iteration of
+        # the loop below sees warm artifacts.
+        timeout-minutes: 20
 
       - name: Run smoke soak
         id: soak
-        # TODO(#507): once issue #506's deterministic fork-loop harness
-        # lands (`userspace/repro_fork/` + `scripts/...`), swap this loop
-        # to invoke that harness instead. Using `cargo xtask smoke` as
-        # the v1 amplifier — it's what exists today.
         run: |
           set -u
           mkdir -p soak-logs
           count="${SOAK_COUNT}"
-          per_run_timeout="${SMOKE_RUN_TIMEOUT_SECS}"
+          per_run_timeout="${SOAK_RUN_TIMEOUT_SECS}"
           min_rate="${SOAK_MIN_PASS_RATE}"
 
           # `count` and `min_rate` come from `workflow_dispatch` inputs,
@@ -269,9 +281,13 @@ jobs:
             # Any non-zero exit counts as a failure for pass-rate
             # accounting; timeouts are tracked separately so a
             # post-mortem can distinguish "wedged in QEMU" from
-            # "marker missing".
+            # "marker missing". We drive one `scripts/repro-fork.sh`
+            # boot per iteration (each boot = 500 fork+exec+wait
+            # cycles) rather than passing --runs N, because the
+            # script itself fails-fast on the first bad boot and
+            # would collapse pass-rate accounting.
             if timeout --kill-after=30s "${per_run_timeout}s" \
-                 cargo xtask smoke > "${log}" 2>&1; then
+                 scripts/repro-fork.sh > "${log}" 2>&1; then
               status="pass"
               passes=$((passes + 1))
             else
