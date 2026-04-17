@@ -722,12 +722,7 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
 /// without touching the kernel's module-lookup path or the Limine
 /// config.  All other ISO contents (`userspace_hello.elf`, the rootfs
 /// tarball, ld-musl) are identical to a normal boot.
-fn make_iso_with_init(
-    kernel: &Path,
-    init_bin: &Path,
-    iso_out: &Path,
-    staging: &str,
-) -> R<()> {
+fn make_iso_with_init(kernel: &Path, init_bin: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let limine = ensure_limine()?;
     let userspace_hello = build_userspace_hello()?;
     let initrd = ensure_initrd()?;
