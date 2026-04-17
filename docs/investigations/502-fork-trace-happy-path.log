@@ -1,0 +1,106 @@
+limine: Loading executable `boot():/boot/vibix`...
+limine: Loading module `boot():/boot/userspace_init.elf`...
+limine: Loading module `boot():/boot/userspace_init.elf`...
+limine: Loading module `boot():/boot/userspace_hello.elf`...
+limine: Loading module `boot():/boot/rootfs.tar`...
+limine: Loading module `boot():/boot/ld-musl-x86_64.so.1`...
+vibix booting…
+memory map: 28 entries, 244 MiB usable
+hhdm offset: 0xffff800000000000
+rsdp: 0xf52b0
+cpu: SSE SSE2 SSE4.1 SSE4.2 AVX AVX2 XSAVE PAT SMEP SMAP FSGSBASE RDTSCP POPCNT LZCNT RDRAND RDSEED
+uaccess: smep=on smap=on
+fpu: FXSAVE context switch online
+syscall: SYSCALL/SYSRET enabled
+PIC remapped to 0x20/0x28 and masked
+GDT + IDT loaded
+paging: mapper online
+heap: 1024 KiB @ 0xffffc00000000000 (reserved 16384 KiB, grows in 64 KiB chunks)
+paging: IST guard installed @ 0xffffffff804f0000
+paging: switched to kernel PML4
+paging: reclaimed 4132 KiB bootloader memory (17 L3/L2/L1 intermediate table frames, PML4=0xff43000)
+acpi: MADT parsed (cpus=1, ioapics=1, overrides=5, lapic=0xfee00000)
+apic: BSP online (lapic_id=0)
+ioapic: initialized (1 controller(s))
+ioapic: IRQ0 -> gsi 2 -> vec 0x20 on lapic 0 (ioapic 0)
+ioapic: IRQ1 -> gsi 1 -> vec 0x21 on lapic 0 (ioapic 0)
+ioapic: IRQ4 -> gsi 4 -> vec 0x24 on lapic 0 (ioapic 0)
+serial: rx irq enabled
+hpet: initialized (period=10000000fs, timers=3, base=0xfed00000)
+hpet: periodic timer armed (100 Hz, 1000000 ticks/period)
+timer: 100 Hz
+rtc: 2026-04-17 14:35:32
+pci: 7 device(s) on bus 0
+pci:   00:00.0 8086:29c0 class 06:00 pi=00 (host-bridge)
+pci:   00:01.0 1234:1111 class 03:00 pi=00 (vga)
+pci:   00:02.0 8086:10d3 class 02:00 pi=00 (network)
+pci:   00:03.0 1af4:1001 class 01:00 pi=00 (scsi)
+pci:   00:1f.0 8086:2918 class 06:01 pi=00 (isa-bridge)
+pci:   00:1f.2 8086:2922 class 01:06 pi=01 (sata)
+pci:   00:1f.3 8086:2930 class 0c:05 pi=00 (serial-bus)
+block: virtio-blk ready (io_base=0xc000, queue_size=256)
+block: lba0[0..16]=[56, 49, 42, 49, 58, 2a, 4c, 4b, 30, 00, 00, 00, 00, 00, 00, 00]
+block: write+readback ok at lba 2047
+framebuffer: 1280x800 @ 32 bpp, pitch=5120 bytes
+vibix online.
+interrupts enabled
+timer: TSC 2419 MHz
+userspace module ELF entry=0x400000 load_segments=2
+tasks: scheduler online
+userspace: loader mapping image (8728 bytes)
+init: new PML4 at phys=0x15000
+init: ELF loaded entry=0x400000 segments=2
+init: user stack at virt=0x7ffff000 top=0x80000000
+shell: prompt online
+banner: vibix 0.1.0 (86e696a0f869, built 2026-04-17T09:27:31Z, debug) x86_64
+cpu: QEMU TCG CPU version 2.5+ x1
+mem: 249 MiB total, 247 MiB free
+boot: 112 ms
+Welcome to vibix. Type `help` for builtins.
+vibix> init: auxv written, initial rsp=0x7fffff58
+init: ring-3 entry task spawned (task_id=4, pid=1)
+init: switched to process PML4
+init: entering ring-3 entry=0x400000 rsp=0x7fffff58
+init: iretq to ring-3
+ring3-iretq: rip=0x400000 rsp=0x7fffff58 cs=0x23 ss=0x1b rflags=0x202
+init: hello from pid 1
+ftrace: fork: enter dispatch rflags=0x87 (IF=0) user_rip=0x400025 user_rflags=0x212 user_rsp=0x7fffff4c
+ftrace: fork: calling fork_current_task parent_pid=1
+ftrace: fork_current_task: enter user_rip=0x400025 user_rflags=0x212 user_rsp=0x7fffff4c
+ftrace: fork_current_task: acquiring SCHED lock for snapshot
+ftrace: fork_current_task: SCHED acquired, saving FPU state
+ftrace: fork_current_task: snapshot done, entering fork_address_space
+ftrace: fork_current_task: acquiring parent AddressSpace write lock
+ftrace: fork_address_space: enter, allocating child PML4
+ftrace: fork_address_space: child PML4 allocated at 0x22000
+ftrace: fork_address_space: vma snapshot ok, 4 VMAs to CoW-clone
+ftrace: fork_address_space: exit ok
+ftrace: fork_current_task: fork_address_space ok, flushing TLB
+ftrace: fork_current_task: child AS wrapped Arc, child_cr3=0x22000
+ftrace: fork_current_task: cloning fd table
+ftrace: fork_current_task: fd clone ok, entering Task::new_forked
+ftrace: Task::new_forked: enter, allocating stack slot
+ftrace: Task::new_forked: stack slot guard=0xffffd00000014000 stack_base=0xffffd00000015000
+ftrace: Task::new_forked: map_range for 4 stack pages
+ftrace: Task::new_forked: map_range ok, priming child kernel stack
+ftrace: Task::new_forked: stack primed, child_task_id=5 fork_child_sysret=0xffffffff8004d380
+ftrace: Task::new_forked: FPU cloned, exit ok
+ftrace: fork_current_task: Task::new_forked ok child_id=5
+ftrace: fork_current_task: pushing child to SCHED ready queue
+ftrace: fork_current_task: exit ok child_id=5
+ftrace: fork: fork_current_task ok child_task_id=5, calling process::register
+ftrace: process::register: enter task_id=5 parent_pid=1
+ftrace: process::register: acquiring TABLE lock
+ftrace: process::register: TABLE acquired, inserting pid=2
+ftrace: process::register: exit ok pid=2
+ftrace: fork: exit dispatch child_pid=2 (parent returning)
+Cftrace: execve: enter dispatch
+ftrace: execve: calling exec_atomic
+ring3-iretq: rip=0x400000 rsp=0x7fffff58 cs=0x23 ss=0x1b rflags=0x202
+ring3-first-fault: #PF rip=0x40002f rsp=0x7fffff4c cs=0x23 ss=0x1b rflags=0x202 cr2=0x7fffff4c code=PageFaultErrorCode(PROTECTION_VIOLATION | CAUSED_BY_WRITE | USER_MODE)
+hello: hello from execed child
+ftrace: wait4: enter dispatch target_pid=2 wstatus_ptr=0x7fffff4c parent_pid=1
+ftrace: wait4: reap_child snap=1
+ftrace: wait4: reaped child_pid=2 status=0
+init: fork+exec+wait ok
+tasks: reaped task 5 (stack VA slot 0xffffd00000014000..0xffffd00000019000 leaked)
