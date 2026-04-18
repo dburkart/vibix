@@ -23,6 +23,10 @@ Also read the sibling skills you'll call into:
 
 - `.claude/skills/file-issue/SKILL.md` — used in phase 1 for every sub-issue filed.
 - `.claude/skills/auto-engineer/SKILL.md` — hard dependency; phase 4 is meaningless without it.
+- `.claude/skills/os-researcher/SKILL.md` — optional upstream of phase 1. For topics whose
+  design isn't locked, running `/os-researcher <topic>` produces an accepted RFC and files
+  the implementation issues directly, replacing auto-manager's phases 1–2. See the RFC gate
+  below.
 
 ## Hard requirements
 
@@ -42,6 +46,61 @@ Accept any of:
 - **Fuzzy scope** — a topic string (`/auto-manager ship GA refusal handling`, `"harden the review app"`, `"close out the factorial epic's P2 follow-ups"`). Run phase 0 first.
 
 If the input is fuzzy, do not skip phase 0 — the user hasn't given you a filed anchor, so you have to build one.
+
+---
+
+## RFC gate — do we need `/os-researcher` first?
+
+Before phase 0 (or phase 1, if the input was hard scope), judge whether the topic needs an
+RFC. `/os-researcher` drives the deep-research + simulated-peer-review + accepted-RFC flow
+and, in its phase 7, files the implementation issues via `/file-issue`. When it runs,
+auto-manager's phases 1–2 are effectively done by os-researcher's phase 7 — auto-manager
+picks up from phase 2 (refine) or phase 3 (plan) against the filed issues.
+
+Route to `/os-researcher` first when any of these are true:
+
+- **Novel or foundational OS work** — new abstractions, cross-cutting redesigns, or design
+  surfaces with real trade-offs (VFS layer, SMP scheduler, demand paging, signals, IPC,
+  ABI changes). The same heuristics `/os-researcher` uses for 2–4 defense cycles apply here.
+- **Design isn't locked** — the user has a topic but hasn't decided the approach. An RFC
+  forces the trade-off conversation before implementation issues are filed.
+- **Spec is missing or thin** — even a hard-scope epic issue may warrant an RFC when the
+  body is a one-liner and the design space is wide.
+
+Stay in the plain auto-manager flow (skip os-researcher) when:
+
+- **Execution-only work** — "close out the factorial P2 follow-ups", "ship the remaining
+  GA work for refusal handling", "harden the review app". Scope is backlog-driven, not
+  design-driven.
+- **Narrow, well-precedented change** — adding a syscall number, exposing an existing
+  subsystem, a single new data structure where os-researcher would only warrant 1 cycle.
+- **Hard-scope epic with a detailed spec already attached** — the design conversation
+  already happened; don't re-run it.
+
+Decision protocol:
+
+1. State the call explicitly before proceeding (e.g. *"RFC gate: routing through
+   /os-researcher — this is a new VFS design with no existing spec."* or *"RFC gate:
+   skipping — this is execution of already-filed P2 follow-ups."*).
+2. If routing to `/os-researcher`, spawn it as an `Agent` subagent — same isolation
+   discipline as phase 4's auto-engineer spawns:
+   - `subagent_type: "general-purpose"` (os-researcher needs full tool surface —
+     WebSearch, WebFetch, mcp__github__*, Bash, Edit, Write).
+   - `isolation: "worktree"` (mandatory — os-researcher creates a `rfc/<NNNN>-<slug>`
+     branch and pushes; keep that off the orchestrator's working tree).
+   - `run_in_background: false` — auto-manager blocks on the RFC because phases 1–2
+     can't run until the RFC is accepted and the implementation issues are filed.
+   - `description`: e.g. `"os-researcher: <topic>"`.
+   - Prompt must pass the topic verbatim and any `--defense-cycles` / `--extra-archetypes`
+     overrides the user specified. Ask for a completion report listing the merged RFC
+     PR number, the RFC doc path, and the filed implementation issue URLs.
+   When the subagent returns, re-enter auto-manager at phase 2 against the filed issues,
+   using the merged RFC PR as the parent epic anchor.
+3. If the user disagrees with the call, they can override by saying "skip the RFC" or
+   "run os-researcher first" — treat either as authoritative.
+
+Never run `/os-researcher` and phase 1 filing in parallel — os-researcher owns issue
+filing when it's in the loop.
 
 ---
 
