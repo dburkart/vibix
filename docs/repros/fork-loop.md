@@ -35,6 +35,26 @@ scripts/repro-fork.sh
 scripts/repro-fork.sh --runs 20   # local soak — fails fast on first hang
 ```
 
+### Build-only variant
+
+```bash
+cargo xtask repro-fork-build
+```
+
+Compiles the kernel, the `userspace_repro_fork` binary, and the
+reproducer ISO — the same artifacts as `repro-fork` — but exits
+without booting QEMU.  Use this when you want to warm the build
+artifacts and catch compile errors without also exercising the
+harness.
+
+The `smoke-soak` workflow uses `repro-fork-build` for its "Pre-build
+reproducer ISO" step.  Driving `repro-fork` there instead would run
+the full harness during pre-build and, if the first boot flaked,
+would prevent the 100× soak loop below from executing at all
+(see issue #526, workflow run 24593451935).  `repro-fork-build` has
+no QEMU dependency, so it cannot fail for flake reasons — any failure
+is a genuine build error.
+
 Success: a final `repro: fork loop complete cycles=500` line and QEMU
 exits 0.  Failure: any of —
 

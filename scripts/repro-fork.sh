@@ -12,6 +12,14 @@
 #   2. forward its serial log verbatim to the caller's stdout,
 #   3. exit non-zero on any stall/panic/failure detected by xtask.
 #
+# Artifact reuse: the per-run path delegates to `cargo xtask
+# repro-fork`, which internally calls the same build helpers as
+# `cargo xtask repro-fork-build`.  On a warm workspace cargo no-ops
+# the compile step and the ISO is reassembled from already-built
+# inputs — the 100× smoke-soak in CI pre-warms via `repro-fork-build`
+# before this script is called, so the per-iteration cost is dominated
+# by QEMU boot time, not rebuild time (issue #526).
+#
 # Usage:
 #   scripts/repro-fork.sh                 # single run
 #   scripts/repro-fork.sh --runs N        # N sequential runs; fail on
