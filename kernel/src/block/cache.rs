@@ -207,11 +207,17 @@ impl BlockCache {
     /// gain. Catch-on-overflow preserves correctness without bloating
     /// the hot map key.
     pub fn register_device(&self) -> DeviceId {
-        let id = self.next_device_id.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            id != u32::MAX,
-            "BlockCache: exhausted 2^32 DeviceId space — mount churn is far above design",
-        );
+        // CAS-style bump: if a panic-catcher ever swallows the
+        // exhaustion panic, the counter must not have already wrapped
+        // to 0 — otherwise the next `register_device` call would hand
+        // out `DeviceId(0)`, aliasing whichever mount owned it first.
+        // `fetch_update` leaves the atomic untouched on `None`.
+        let id = self
+            .next_device_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.checked_add(1)
+            })
+            .expect("BlockCache: exhausted 2^32 DeviceId space — mount churn is far above design");
         DeviceId(id)
     }
 
@@ -495,23 +501,25 @@ mod tests {
 
     #[test]
     fn default_cache_singleton_round_trip() {
-        // `init_default_cache` is a `Once`, so this test is only
-        // meaningful on the first call within a test binary — other
-        // test-runs that already installed a cache will see that
-        // cache, not ours. Guard by inspecting the current state and
-        // only asserting the shape we know holds.
-        if default_cache().is_none() {
-            let cache = stub_cache(512);
-            init_default_cache(cache.clone());
-            let fetched = default_cache().expect("default cache present after init");
-            assert!(Arc::ptr_eq(&fetched, &cache));
-        } else {
-            // Something else already installed a cache in this test
-            // binary. Just assert the getter is idempotent.
-            let a = default_cache().unwrap();
-            let b = default_cache().unwrap();
-            assert!(Arc::ptr_eq(&a, &b));
-        }
+        // `DEFAULT_CACHE` is a process-wide `Once`, so parallel host
+        // tests share the slot. Checking `default_cache().is_none()`
+        // up front and then calling `init_default_cache` is racy — a
+        // sibling test could install between the check and the init.
+        //
+        // Assert the only thing that's actually guaranteed: after a
+        // best-effort init (no-op if the slot was already claimed),
+        // the getter returns `Some`, and repeated calls observe the
+        // exact same `Arc`. That holds whether our init or a
+        // sibling's init won the race.
+        let our_cache = stub_cache(512);
+        init_default_cache(our_cache);
+
+        let a = default_cache().expect("default cache present after init");
+        let b = default_cache().expect("default cache still present");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "default_cache() must return the same Arc on every call",
+        );
     }
 
     /// Smoke-sanity that `Vec` is in scope — keeps the test file tight
