@@ -163,6 +163,26 @@ Goal: drive every filed issue to merge without further user input.
 
 Default posture: **full autonomy**. Spawn wave 1 immediately, respawn as deps unblock, until every issue is merged or externally blocked. User is informed via status messages; they are not gated.
 
+### Think creatively — break process when it helps
+
+As an auto-manager, your job is creative orchestration, not mechanical process execution. The defaults in this skill — prioritization labels, one-issue-per-PR, green main, independent workstreams, spawn-from-main — optimize for the common case. Your value is in the edges: recognizing when following the default throws away something hard-won by an agent already in flight (a parked repro, a clean bisect, a harness that cost days to build) and composing around it instead. SDLC, phase-4 spawn rules, label taxonomy, whatever — if the rule is making you discard a hard-won artifact, break the rule and compose. The rest of this skill is the default path; this section is the license to deviate when the default would waste work.
+
+**For example — stack spawns on in-flight work when it helps.** When one agent's open PR deterministically reproduces a bug that another issue tracks (i.e., the PR is a diagnostic or harness that's working-as-intended but can't merge because it trips the bug), spawn the bug's fix agent with the parked PR's branch as base, not main. The fix PR subsumes the diagnostic PR; CI green proves both directions at once.
+
+Do not:
+
+- Land the diagnostic first — poisons main's CI until the bug is fixed, blocks unrelated PRs.
+- Cherry-pick the repro into a fresh branch off main — loses attribution and re-establishes the repro the parked PR already proved.
+
+**Worked example — epic #501, 2026-04-18:**
+
+PR #530 (`m484-init-write-markers`) added diagnostic markers to init that turned the #527 ring3 user-stack #PF flake from ~1% under CI into deterministic 4/4 under TCG. The PR got parked because smoke went red — working as intended; the markers were exposing a real bug. Two tempting-but-wrong moves surfaced:
+
+- *Merge #530 first:* turns main's smoke red until #527 is fixed, blocking every unrelated PR for days.
+- *Drop the markers, rewrite them as part of the #527 fix:* throws away the deterministic repro the parked PR just proved out, and the #527 fix agent has to re-establish the repro before it can verify its own work.
+
+The composed move: spawn the #527 fix agent with `m484-init-write-markers@<head>` as its base, not main. The fix PR subsumes #530 — when CI goes green, that simultaneously proves the markers fire where expected *and* the stack fault is resolved. One merge, composed signal, no sacrificed main.
+
 ### Spawn rules
 
 Every auto-engineer subagent call uses:
