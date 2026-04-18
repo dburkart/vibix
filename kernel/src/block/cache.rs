@@ -157,7 +157,28 @@ impl BlockCache {
     /// Construct an empty cache bound to `device` with entries sized at
     /// `block_size`. Caps the resident entry count at `max_buffers`; the
     /// cap is enforced by the eviction follow-up (#553), not here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `block_size` is zero or not a whole multiple of
+    /// `device.block_size()`. Every future `bread` / `sync_dirty_buffer`
+    /// call would translate a cache-block index into a byte offset of
+    /// `blk * block_size`, and the device's `read_at` / `write_at`
+    /// reject any non-device-aligned offset with
+    /// [`BlockError::BadAlign`](super::BlockError::BadAlign). Catching
+    /// the geometry mismatch at construction is the difference between
+    /// "cache can never do I/O" (silent) and "misuse is caught at mount
+    /// time" (loud). Panicking is acceptable: `BlockCache::new` runs
+    /// only on the boot / mount paths, never inside a syscall.
     pub fn new(device: Arc<dyn BlockDevice>, block_size: u32, max_buffers: usize) -> Arc<Self> {
+        assert!(block_size > 0, "BlockCache: block_size must be non-zero");
+        let dev_bs = device.block_size();
+        assert!(
+            dev_bs > 0 && block_size % dev_bs == 0,
+            "BlockCache: cache block_size ({}) must be a whole multiple of device block_size ({})",
+            block_size,
+            dev_bs,
+        );
         Arc::new(Self {
             device,
             next_device_id: AtomicU32::new(0),
@@ -173,8 +194,25 @@ impl BlockCache {
     /// backed by this cache calls `register_device` once at mount time;
     /// the returned id is stamped into every subsequent `(DeviceId, u64)`
     /// key so parallel mounts don't collide.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `u32` id space has been exhausted. `AtomicU32::fetch_add`
+    /// would otherwise wrap and silently alias a freshly-handed-out
+    /// `DeviceId` with an already-resident one, violating the
+    /// "two mounts don't alias" invariant (RFC 0004 §Buffer cache). At
+    /// one mount per `register_device` call, 2³² ≈ 4.3 B is an extreme
+    /// upper bound we do not expect to reach; widening to `AtomicU64`
+    /// would double the `(DeviceId, u64)` key width for no practical
+    /// gain. Catch-on-overflow preserves correctness without bloating
+    /// the hot map key.
     pub fn register_device(&self) -> DeviceId {
-        DeviceId(self.next_device_id.fetch_add(1, Ordering::Relaxed))
+        let id = self.next_device_id.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            id != u32::MAX,
+            "BlockCache: exhausted 2^32 DeviceId space — mount churn is far above design",
+        );
+        DeviceId(id)
     }
 
     /// Logical block size in bytes.
@@ -481,5 +519,54 @@ mod tests {
     #[test]
     fn imports_compile() {
         let _: Vec<u8> = Vec::new();
+    }
+
+    /// Zero `block_size` is rejected at construction — otherwise every
+    /// future `bread` would translate to an offset-0 read that silently
+    /// no-ops.
+    #[test]
+    #[should_panic(expected = "block_size must be non-zero")]
+    fn new_rejects_zero_block_size() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(StubDevice {
+            block_size: 512,
+            capacity: 1 << 20,
+        });
+        let _ = BlockCache::new(dev, 0, 64);
+    }
+
+    /// A cache block size that is not a whole multiple of the device
+    /// block size would produce device-misaligned I/O on every
+    /// follow-up `bread`, which the `BlockDevice` layer already
+    /// rejects with `BadAlign`. Fail loudly at mount time instead.
+    #[test]
+    #[should_panic(expected = "whole multiple of device block_size")]
+    fn new_rejects_incompatible_block_size() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(StubDevice {
+            block_size: 512,
+            capacity: 1 << 20,
+        });
+        // 1023 is not a multiple of 512.
+        let _ = BlockCache::new(dev, 1023, 64);
+    }
+
+    /// Equal block_size and multiple-of-512 are both accepted — locks
+    /// in the "whole multiple, including 1x" contract.
+    #[test]
+    fn new_accepts_compatible_block_sizes() {
+        // Exactly equal.
+        let dev: Arc<dyn BlockDevice> = Arc::new(StubDevice {
+            block_size: 512,
+            capacity: 1 << 20,
+        });
+        let cache = BlockCache::new(dev, 512, 16);
+        assert_eq!(cache.block_size(), 512);
+
+        // 8× device block size (ext2-4KiB-on-512-sector case).
+        let dev: Arc<dyn BlockDevice> = Arc::new(StubDevice {
+            block_size: 512,
+            capacity: 1 << 20,
+        });
+        let cache = BlockCache::new(dev, 4096, 16);
+        assert_eq!(cache.block_size(), 4096);
     }
 }
