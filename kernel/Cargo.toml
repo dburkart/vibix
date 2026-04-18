@@ -287,6 +287,10 @@ name = "syscall_mkdir"
 harness = false
 
 [[test]]
+name = "syscall_rmdir"
+harness = false
+
+[[test]]
 name = "ntty_sigint_flush"
 harness = false
 

@@ -847,3 +847,83 @@ pub unsafe fn sys_mkdir_impl(path_uva: u64, mode: u64) -> i64 {
 pub unsafe fn sys_mkdirat_impl(dfd: i32, path_uva: u64, mode: u64) -> i64 {
     mkdir_impl(dfd, path_uva, mode as u32)
 }
+
+/// `rmdir(path)` — remove an empty directory.
+///
+/// RFC 0004 — Workstream A: wires the syscall to
+/// [`crate::fs::vfs::ops::InodeOps::rmdir`] on the parent directory's
+/// inode. The trait implementation is responsible for verifying the
+/// target is a directory, that it is empty (non-empty → `-ENOTEMPTY`),
+/// taking `dir_rwsem` for the parent, and decrementing the parent's
+/// `nlink` for the removed `..` backlink.
+///
+/// Shaping done here (POSIX deltas that the per-FS op can't see):
+/// - Empty path → `-ENOENT`.
+/// - Bare `/` → `-EBUSY` (removing the mount root is always refused).
+/// - Leaf of `.` (e.g. `rmdir(".")` or `rmdir("foo/.")`) → `-EINVAL`.
+/// - Leaf of `..` (e.g. `rmdir("..")` or `rmdir("foo/..")`) →
+///   `-ENOTEMPTY`, matching Linux. Kept separate from `.` so callers
+///   can tell "current directory" from "parent of".
+/// - Parent not a directory → `-ENOTDIR`.
+///
+/// Credential is `Credential::kernel()` until Workstream B (#546)
+/// lands per-task credentials.
+pub unsafe fn sys_rmdir_impl(path_uva: u64) -> i64 {
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    if path.is_empty() {
+        return ENOENT;
+    }
+    // `rmdir("/")` never succeeds — the FS root is a mountpoint that
+    // cannot be removed. Return EBUSY per Linux's root-removal errno.
+    if path == b"/" {
+        return crate::fs::EBUSY;
+    }
+
+    // Strip trailing slash so ".../foo/" and ".../foo" share the leaf
+    // check. Keep bare "/" handled above since `split_parent` rejects it.
+    let trimmed: &[u8] = if path.len() > 1 && *path.last().unwrap() == b'/' {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+
+    // Locate the leaf to enforce POSIX's `.` / `..` rejection before
+    // committing to a full path walk. The resolver below would
+    // otherwise resolve `.` / `..` silently and mis-target an ancestor.
+    let leaf_after_slash = trimmed
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map(|i| &trimmed[i + 1..])
+        .unwrap_or(trimmed);
+    if leaf_after_slash == b"." {
+        // POSIX: rmdir(".") is always EINVAL.
+        return EINVAL;
+    }
+    if leaf_after_slash == b".." {
+        // Linux: rmdir("..") returns ENOTEMPTY because the parent
+        // directory has `.` and children referring back.
+        return crate::fs::ENOTEMPTY;
+    }
+
+    let (parent_path, leaf) = match split_parent(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if parent_inode.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    match parent_inode.ops.rmdir(&parent_inode, leaf) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}

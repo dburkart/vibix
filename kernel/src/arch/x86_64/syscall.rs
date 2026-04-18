@@ -814,6 +814,10 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         MKDIRAT => super::syscalls::vfs::sys_mkdirat_impl(a0 as i32, a1, a2),
 
+        // rmdir(path) — remove an empty directory. Dispatches to
+        // InodeOps::rmdir on the parent after path-walking to the leaf.
+        RMDIR => super::syscalls::vfs::sys_rmdir_impl(a0),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1408,6 +1412,7 @@ pub mod syscall_nr {
     pub const MKNODAT: u64 = 259;
     pub const MKDIR: u64 = 83;
     pub const MKDIRAT: u64 = 258;
+    pub const RMDIR: u64 = 84;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1487,5 +1492,8 @@ mod tests {
         assert_eq!(syscall_nr::MKNODAT, 259, "SYS_mknodat must be 259");
         assert_eq!(syscall_nr::MKDIR, 83, "SYS_mkdir must be 83");
         assert_eq!(syscall_nr::MKDIRAT, 258, "SYS_mkdirat must be 258");
+
+        // Directory removal
+        assert_eq!(syscall_nr::RMDIR, 84, "SYS_rmdir must be 84");
     }
 }
