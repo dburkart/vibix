@@ -28,10 +28,10 @@ use crate::fs::vfs::ops::{meta_into_stat, Stat};
 use crate::fs::vfs::ops::{SetAttr, SetAttrMask};
 use crate::fs::vfs::path_walk::{path_walk, LookupFlags, MountResolver, NameIdata, PATH_MAX};
 use crate::fs::vfs::super_block::SbActiveGuard;
-use crate::fs::vfs::Credential;
 use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
+use crate::fs::vfs::{Access, Credential};
 use crate::fs::{
     flags as oflags, FileBackend, FileDescription, EBADF, EEXIST, EINVAL, EISDIR, ENAMETOOLONG,
     ENOENT, ENOMEM, ENOTDIR,
@@ -735,4 +735,110 @@ pub unsafe fn sys_mknod_impl(path_uva: u64, mode: u64, dev: u64) -> i64 {
 /// Only `AT_FDCWD` and absolute paths are honored today.
 pub unsafe fn sys_mknodat_impl(dfd: i32, path_uva: u64, mode: u64, dev: u64) -> i64 {
     mknod_impl(dfd, path_uva, mode as u32, dev)
+}
+
+/// Shared body for `mkdir(2)` / `mkdirat(2)`.
+///
+/// Resolves the parent directory, checks the caller holds `W|X` on it,
+/// then dispatches to [`crate::fs::vfs::ops::InodeOps::mkdir`]. Errors
+/// are surfaced per RFC 0004 §Kernel-Userspace Interface:
+///
+/// - `EEXIST` — final component already exists.
+/// - `ENOTDIR` — a non-terminal path component is not a directory, or
+///   the final component has a trailing slash and the parent isn't one.
+/// - `ENOENT` — a path component doesn't exist.
+/// - `EACCES` — caller lacks `W|X` on the parent directory.
+/// - `ENAMETOOLONG` — path or a component exceeds POSIX caps.
+///
+/// `ENOTEMPTY` and `EBUSY` are emitted by sibling write-syscalls
+/// (rmdir / unlink) that operate on populated / pinned directories;
+/// they are mentioned in the errno table for completeness of the
+/// POSIX mkdir(2) + rmdir(2) surface but do not arise from mkdir
+/// itself.
+///
+/// Per-process umask application is deferred: this kernel has no
+/// umask field on the task struct yet (tracked as a follow-up to
+/// RFC 0004 Workstream B). The mode is therefore passed through
+/// after masking off non-permission bits (`& 0o7777`), matching
+/// how `mknod_impl` handles `mode` today. When umask plumbing lands,
+/// the masked mode becomes `mode & ~umask & 0o7777` — a mechanical
+/// one-line change here.
+fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    // Per-process cwd / fd-rooted walks don't exist yet — accept only
+    // AT_FDCWD for relative paths (same precondition as openat/mknodat).
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    // `split_parent` strips a trailing slash from the leaf. Directories
+    // are the one kind of thing where a trailing slash on the path is
+    // legitimate — `mkdir("/foo/")` is the same as `mkdir("/foo")` per
+    // POSIX — so no equivalent of `mknod_impl`'s trailing-slash rejection
+    // is needed here.
+
+    // Refuse if the target already exists. The pre-check races with a
+    // concurrent creator, but the authoritative check is the FS driver's
+    // own duplicate-insert path — RamFs returns EEXIST under the dir
+    // rwsem (see `ramfs::InodeOps::mkdir`). The pre-walk just avoids
+    // the more expensive permission-check + parent-resolution round-trip
+    // when we already know the answer.
+    if resolve_inode(path, /* follow */ false).is_ok() {
+        return EEXIST;
+    }
+
+    let (parent_path, leaf) = match split_parent(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if parent_inode.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    // DAC check: POSIX `mkdir(2)` requires write + search (execute bit
+    // on a directory) on the parent. Goes through `InodeOps::permission`
+    // so ACL-style overrides can take effect once an FS driver implements
+    // them. Until Workstream B plumbs per-task credentials, the caller
+    // is always `Credential::kernel()` (root) — the dispatch arm is
+    // feature-gated so this placeholder is never reachable from ring-3.
+    let cred = Credential::kernel();
+    let access = Access::WRITE | Access::EXECUTE;
+    if let Err(e) = parent_inode.ops.permission(&parent_inode, &cred, access) {
+        return e;
+    }
+
+    // Strip non-permission bits from `mode` (caller may have spuriously
+    // OR'd in S_IF* constants per some libc idioms). The driver is
+    // responsible for setting the `S_IFDIR` type bit on the new inode.
+    let perm = (mode & 0o7777) as u16;
+    match parent_inode.ops.mkdir(&parent_inode, leaf, perm) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `mkdir(path, mode)` — create a directory at `path`.
+///
+/// Dispatches through [`mkdir_impl`] with `dfd = AT_FDCWD`.
+pub unsafe fn sys_mkdir_impl(path_uva: u64, mode: u64) -> i64 {
+    mkdir_impl(AT_FDCWD, path_uva, mode as u32)
+}
+
+/// `mkdirat(dfd, path, mode)` — like `mkdir` but relative to `dfd`.
+///
+/// Honors `AT_FDCWD` (use the current working directory) and absolute
+/// paths; a real fd with a relative path returns `EINVAL` until
+/// per-process fd-rooted walks land (issue #239).
+pub unsafe fn sys_mkdirat_impl(dfd: i32, path_uva: u64, mode: u64) -> i64 {
+    mkdir_impl(dfd, path_uva, mode as u32)
 }

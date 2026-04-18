@@ -13,6 +13,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # RFC 0004 Workstream A ↔ B gate: the `vfs_creds` feature must not be
+  # the default until Workstream B lands `Task::credentials`. Without
+  # per-task credentials, every VFS write syscall runs as root
+  # (`Credential::kernel()`) — enabling the feature before B merges
+  # would expose an unauthenticated full-DAC bypass. This is a
+  # belt-and-suspenders second line of defense behind the compile-time
+  # feature gate in `kernel/src/arch/x86_64/syscall.rs`.
+  #
+  # Rule:
+  #   - If `Task::credentials` is absent from the tree, `default` in
+  #     `kernel/Cargo.toml` must not contain `vfs_creds`.
+  #   - If `Task::credentials` is present, the gate is satisfied;
+  #     enabling `vfs_creds` by default is allowed.
+  vfs-creds-gate:
+    name: RFC 0004 vfs_creds gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check vfs_creds is not default-on without Task::credentials
+        run: |
+          set -euo pipefail
+          # Workstream B sentinel: presence of `Task::credentials` as a
+          # field or method declaration in kernel sources.
+          if grep -rE '(pub[[:space:]]+)?credentials[[:space:]]*:[[:space:]]*.*Credential' kernel/src >/dev/null 2>&1 \
+             || grep -rE 'fn[[:space:]]+credentials[[:space:]]*\(' kernel/src >/dev/null 2>&1; then
+            echo "Task::credentials present — gate satisfied."
+            exit 0
+          fi
+          # Sentinel absent: verify `vfs_creds` is not on by default.
+          default_line=$(awk '/^\[features\]/,/^\[/' kernel/Cargo.toml \
+                        | grep -E '^default[[:space:]]*=' || true)
+          if echo "$default_line" | grep -q 'vfs_creds'; then
+            echo "ERROR: vfs_creds is default-on but Task::credentials is absent." >&2
+            echo "This would expose an unauthenticated DAC-bypass window (RFC 0004 §Security)." >&2
+            exit 1
+          fi
+          echo "vfs_creds is gated off and Task::credentials is absent — consistent."
+
   # Fast lane: formatting, clippy (host-only), and release build sanity.
   # Does not need QEMU, so it finishes well ahead of the kernel test jobs.
   fmt-build:

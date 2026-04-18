@@ -49,6 +49,14 @@ bench = []
 # never ship it. Enable with `cargo xtask run --features fork-trace` (or
 # `--features fork-trace` on any xtask subcommand).
 fork-trace = []
+# Workstream A ↔ B gate (RFC 0004). When off, POSIX write-side VFS
+# syscalls added by Workstream A (mkdir/mkdirat today; rmdir/unlink/…
+# in sibling PRs) compile to `-ENOSYS`. Workstream B flips this on in
+# the same PR that lands `Task::credentials`, so per-task credentials
+# are always available at every DAC-sensitive call site. Keeps a
+# partially-landed Workstream A from exposing an unauthenticated
+# DAC-bypass window.
+vfs_creds = []
 
 [[test]]
 name = "basic_boot"
@@ -272,6 +280,10 @@ harness = false
 
 [[test]]
 name = "syscall_mkfifo"
+harness = false
+
+[[test]]
+name = "syscall_mkdir"
 harness = false
 
 [[test]]
