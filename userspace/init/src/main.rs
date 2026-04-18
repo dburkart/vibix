@@ -61,9 +61,33 @@ const HELLO_MSG: &[u8] = b"init: hello from pid 1\n";
 /// Emitted after the parent collects the child's exit status.
 const DONE_MSG: &[u8] = b"init: fork+exec+wait ok\n";
 
+/// Diagnostic marker for #484 / #527. Emitted on fd=2 as the very first
+/// userspace action — i.e. after `iretq` into ring 3 but before the first
+/// `write(1, HELLO_MSG)`. If the kernel-side `ring3-iretq:` marker fires but
+/// this one doesn't, the first SYSCALL instruction or the entry trampoline
+/// silently faulted before the handler ran. If this fires but
+/// `init: hello from pid 1` doesn't, the failure is specific to the fd=1
+/// write path, not ring-3 entry.
+const PRE_WRITE_MSG: &[u8] = b"init: pre-write marker\n";
+
+/// Diagnostic marker for #484 / #527. Emitted on fd=1 immediately after the
+/// first `write(1, HELLO_MSG)` returns. If `init: hello from pid 1` fires
+/// but this marker doesn't, the write syscall return path (SYSRET / restore
+/// of user context) is the culprit, not the write itself.
+const POST_WRITE_MSG: &[u8] = b"init: post-write marker\n";
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Pre-write diagnostic marker — see #484 / #527. Emitted on fd=2 so it
+    // exercises the syscall path but writes to a distinct stream from
+    // HELLO_MSG, making it easy to grep from the serial log.
+    write(2, PRE_WRITE_MSG);
+
     write(1, HELLO_MSG);
+
+    // Post-write diagnostic marker — see #484 / #527. Emitted immediately
+    // after the first `write(1, HELLO_MSG)` returns, before any further work.
+    write(1, POST_WRITE_MSG);
 
     // fork() — child PID returned to parent; 0 returned to child.
     let fork_ret: i64;

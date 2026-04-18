@@ -101,7 +101,17 @@ const SMOKE_MARKERS: &[&str] = &[
     // `ring3-first-fault:` diagnostic line emitted by the IDT fault
     // handlers in that case).
     "ring3-iretq: rip=",
+    // #484 diagnostic: emitted from `_start` before the first
+    // `write(1, HELLO_MSG)`. If `ring3-iretq:` fires but this doesn't, the
+    // first SYSCALL instruction or the entry trampoline silently faulted
+    // before the syscall handler ran — not a fd=1 write bug.
+    "init: pre-write marker",
     "init: hello from pid 1",
+    // #484 diagnostic: emitted immediately after the first
+    // `write(1, HELLO_MSG)` returns. If `init: hello from pid 1` fires but
+    // this doesn't, the write syscall return path (SYSRET / user-context
+    // restore) is the culprit, not the write itself.
+    "init: post-write marker",
 ];
 
 /// Markers for the fork+exec+wait flow. These are flakey under un-accelerated
