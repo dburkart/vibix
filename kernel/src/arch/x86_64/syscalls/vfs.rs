@@ -86,6 +86,25 @@ fn copy_user_path(path_uva: u64) -> Result<Vec<u8>, i64> {
 /// `NameIdata`'s `edges` vector so the caller's `Arc<SuperBlock>`
 /// references keep the SB alive for the duration of the `getattr` call.
 fn resolve_inode(path: &[u8], follow: bool) -> Result<(Arc<Inode>, NameIdata), i64> {
+    resolve_inode_as(path, follow, Credential::kernel())
+}
+
+/// Like [`resolve_inode`] but walks the path using `cred` for
+/// every intermediate `may_lookup` (search-permission) check.
+///
+/// Syscalls that make DAC decisions about the resolved inode —
+/// `chmod`/`chown` and friends — pass the caller's per-task credential
+/// here so that a non-root caller is rejected with `-EACCES` on an
+/// unsearchable ancestor, instead of silently resolving as root and
+/// then failing the subsequent ownership check with a misleading
+/// errno. Read-only syscalls (`stat`/`open`) keep using the root
+/// placeholder until Workstream B plumbs per-task credentials through
+/// every call site in one go.
+fn resolve_inode_as(
+    path: &[u8],
+    follow: bool,
+    cred: Credential,
+) -> Result<(Arc<Inode>, NameIdata), i64> {
     let root = vfs_root().ok_or(ENOENT)?;
     // For relative paths, walk from the per-process cwd. For absolute
     // paths, path_walk reseats at root on the first `/` component so
@@ -102,7 +121,7 @@ fn resolve_inode(path: &[u8], follow: bool) -> Result<(Arc<Inode>, NameIdata), i
     } else {
         flags = flags | LookupFlags::NOFOLLOW;
     }
-    let mut nd = NameIdata::new(root, cwd, Credential::kernel(), flags)?;
+    let mut nd = NameIdata::new(root, cwd, cred, flags)?;
     path_walk(&mut nd, path, &GlobalMountResolver)?;
     let inode = nd.path.inode.clone();
     Ok((inode, nd))
@@ -1105,4 +1124,287 @@ pub unsafe fn sys_unlink_impl(path_uva: u64) -> i64 {
 /// arm). See [`sys_unlink_impl`] for the test-path convention.
 pub unsafe fn sys_unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
     unlinkat_impl(dfd, path_uva, flags)
+}
+
+// ---------------------------------------------------------------------------
+// chmod / fchmod / fchmodat + chown / fchown / fchownat / lchown (issue #541)
+//
+// Wires the POSIX metadata-mutation syscalls to `InodeOps::setattr`. The
+// permission model lives here rather than in the per-FS driver so every
+// backend (RamFs, TarFs, ext2 when it lands) inherits the same rules —
+// drivers only decide how to persist the requested mutation.
+//
+// Rules (RFC 0004 §Permission model, POSIX.1-2017 §chmod/§chown):
+//   - `chmod`: only the file's owner (`euid == meta.uid`) or root
+//     (`euid == 0`) may change mode. Anyone else gets `-EPERM`.
+//   - `chown`: only root may change `uid`. The owner may change `gid`
+//     but only to a group they are a member of (`egid` or
+//     `supplementary groups`). Anyone else gets `-EPERM`.
+//   - `fchown(fd, -1, -1)` (no-op) returns 0.
+//   - `chown` on a regular file by a non-root caller *clears*
+//     `S_ISUID` / `S_ISGID` (when exec-group is set) on success, per
+//     POSIX and Linux. Root-initiated chown preserves the bits.
+//   - `fchmodat(AT_SYMLINK_NOFOLLOW)` is unsupported on Linux for the
+//     mode mutation; we accept the flag and ignore it (chmod always
+//     follows the symlink) to match Linux's de-facto behaviour.
+//   - `fchownat(AT_SYMLINK_NOFOLLOW)` operates on the symlink itself —
+//     this is the primitive `lchown` is built on.
+// ---------------------------------------------------------------------------
+
+/// `S_ISUID` — set-user-ID bit on a file's mode word. Cleared on a
+/// non-root `chown` per POSIX.
+const S_ISUID: u16 = 0o4000;
+/// `S_ISGID` — set-group-ID bit on a file's mode word. Cleared on a
+/// non-root `chown` **only** when the group-exec bit is set (the usual
+/// idiom: `S_ISGID` without `S_IXGRP` signals mandatory locking on
+/// Linux, not a setgid binary, and must be preserved).
+const S_ISGID: u16 = 0o2000;
+/// `S_IXGRP` — group-execute bit. Used alongside `S_ISGID` to
+/// distinguish a setgid binary (`S_ISGID | S_IXGRP`) from a mandatory-
+/// locking marker (`S_ISGID` alone).
+const S_IXGRP: u16 = 0o0010;
+
+/// Shared chmod body. Applies `mode & 0o7777` to `inode`'s metadata
+/// via `InodeOps::setattr`, after checking the caller owns the file
+/// or is root.
+///
+/// `inode` is the resolved target (post-path-walk for path-based
+/// callers, post-fd-lookup for `fchmod`). `cred` is the caller's
+/// per-task credential snapshot.
+fn do_chmod(inode: &Arc<Inode>, mode: u16, cred: &Credential) -> i64 {
+    // Ownership gate. POSIX: only the owner or a process with
+    // appropriate privileges (root) may change mode.
+    let owner_uid = inode.meta.read().uid;
+    if cred.euid != 0 && cred.euid != owner_uid {
+        return EPERM;
+    }
+    let attr = SetAttr {
+        mask: SetAttrMask::MODE,
+        mode: mode & 0o7777,
+        ..SetAttr::default()
+    };
+    match inode.ops.setattr(inode, &attr) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Shared chown body. Applies `uid` / `gid` changes (when they are not
+/// the "don't change" sentinel `u32::MAX`, matching the C `-1` cast)
+/// via `InodeOps::setattr`, enforcing POSIX's narrow ownership /
+/// group-membership rules.
+///
+/// Clears the set-user-ID bit (and the set-group-ID bit when group-exec
+/// is set) on a regular file whenever the chown is performed by a
+/// non-root caller — POSIX §chown. A root-initiated chown preserves
+/// the bits.
+fn do_chown(inode: &Arc<Inode>, uid: u32, gid: u32, cred: &Credential) -> i64 {
+    // Linux / POSIX: -1 (interpreted as u32::MAX) means "don't change".
+    let change_uid = uid != u32::MAX;
+    let change_gid = gid != u32::MAX;
+    if !change_uid && !change_gid {
+        // Nothing to do. Per POSIX fchown(2) §Application Usage: this
+        // is a success no-op (matches `fchown(fd, -1, -1)`).
+        return 0;
+    }
+
+    let (cur_uid, cur_gid, cur_mode) = {
+        let meta = inode.meta.read();
+        (meta.uid, meta.gid, meta.mode)
+    };
+
+    // uid-side rules.
+    if change_uid {
+        // Only root may change the owning uid. An owner is not allowed
+        // to "give away" their file to another user.
+        if cred.euid != 0 {
+            return EPERM;
+        }
+    }
+
+    // gid-side rules.
+    if change_gid {
+        if cred.euid != 0 {
+            // Non-root: must own the file AND the target gid must be
+            // in the caller's group set (egid or supplementary).
+            if cred.euid != cur_uid {
+                return EPERM;
+            }
+            let in_group =
+                cred.egid == gid || cred.groups.iter().any(|&g| g == gid);
+            if !in_group {
+                return EPERM;
+            }
+        }
+    }
+
+    // Compute the post-chown mode. POSIX: a successful chown by a
+    // non-root caller clears S_ISUID and (conditionally) S_ISGID on
+    // a regular file. The S_ISGID-without-S_IXGRP case is the
+    // mandatory-locking marker on Linux and must be preserved.
+    let mut new_mode = cur_mode;
+    let mut clear_setid = false;
+    if inode.kind == InodeKind::Reg && cred.euid != 0 {
+        if new_mode & S_ISUID != 0 {
+            new_mode &= !S_ISUID;
+            clear_setid = true;
+        }
+        if new_mode & S_ISGID != 0 && new_mode & S_IXGRP != 0 {
+            new_mode &= !S_ISGID;
+            clear_setid = true;
+        }
+    }
+
+    let mut mask = SetAttrMask::default();
+    if change_uid {
+        mask = mask | SetAttrMask::UID;
+    }
+    if change_gid {
+        mask = mask | SetAttrMask::GID;
+    }
+    if clear_setid {
+        mask = mask | SetAttrMask::MODE;
+    }
+    let attr = SetAttr {
+        mask,
+        mode: new_mode,
+        uid: if change_uid { uid } else { cur_uid },
+        gid: if change_gid { gid } else { cur_gid },
+        ..SetAttr::default()
+    };
+    match inode.ops.setattr(inode, &attr) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// Resolve the inode behind an fd for the fchmod/fchown family. Returns
+/// `EBADF` on an out-of-range fd, or on any backend that doesn't expose
+/// a VFS inode (e.g. a pure `SerialBackend`) since there is nothing to
+/// mutate there.
+fn fd_to_inode(fd_raw: u64) -> Result<Arc<Inode>, i64> {
+    if fd_raw > u32::MAX as u64 {
+        return Err(EBADF);
+    }
+    let fd = fd_raw as u32;
+    let tbl = crate::task::current_fd_table();
+    let backend = tbl.lock().get(fd).map_err(|_| EBADF)?;
+    match backend.as_vfs() {
+        Some(v) => Ok(v.open_file.inode.clone()),
+        None => Err(EBADF),
+    }
+}
+
+/// Shared path-mode chmod body. Used by `sys_chmod_impl` and
+/// `sys_fchmodat_impl`; `dfd` is honored only for `AT_FDCWD` /
+/// absolute paths until per-fd walks land (#239).
+fn chmodat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
+    // Only `AT_SYMLINK_NOFOLLOW` is a recognised flag for fchmodat on
+    // Linux, and even there it is not supported — Linux returns
+    // `EOPNOTSUPP`. We mirror Linux's de-facto behaviour: accept the
+    // flag bit, but the trailing-symlink semantics are always "follow"
+    // (`chmod` on a symlink chases it). Any other bit is rejected so
+    // future additions are whitelisted explicitly.
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return EINVAL;
+    }
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    let cred = crate::task::current_credentials();
+    // chmod always resolves through a trailing symlink — the target
+    // file is what gets its mode updated. `AT_SYMLINK_NOFOLLOW` on
+    // Linux returns EOPNOTSUPP; we accept-and-ignore it for simplicity
+    // since the only sensible answer on an in-memory symlink is to
+    // follow (there's nothing on a symlink inode to chmod).
+    let (inode, _nd) = match resolve_inode_as(path, /* follow */ true, (*cred).clone()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_chmod(&inode, mode as u16, &cred)
+}
+
+/// `chmod(path, mode)` — change the mode bits of `path`.
+pub unsafe fn sys_chmod_impl(path_uva: u64, mode: u64) -> i64 {
+    chmodat_impl(AT_FDCWD, path_uva, mode as u32, 0)
+}
+
+/// `fchmod(fd, mode)` — change the mode bits of the file behind an
+/// already-open fd.
+pub unsafe fn sys_fchmod_impl(fd_raw: u64, mode: u64) -> i64 {
+    let inode = match fd_to_inode(fd_raw) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let cred = crate::task::current_credentials();
+    do_chmod(&inode, mode as u16, &cred)
+}
+
+/// `fchmodat(dfd, path, mode, flags)` — `*at` form of chmod.
+pub unsafe fn sys_fchmodat_impl(dfd: i32, path_uva: u64, mode: u64, flags: u32) -> i64 {
+    chmodat_impl(dfd, path_uva, mode as u32, flags)
+}
+
+/// Shared path-mode chown body. Used by `sys_chown_impl`, `sys_lchown_impl`,
+/// and `sys_fchownat_impl`. `follow` controls whether a terminal
+/// symlink is chased (chown vs lchown).
+fn chownat_impl(dfd: i32, path_uva: u64, uid: u32, gid: u32, flags: u32) -> i64 {
+    // `fchownat` only recognises `AT_SYMLINK_NOFOLLOW` today. Future
+    // additions like `AT_EMPTY_PATH` need to be whitelisted explicitly.
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return EINVAL;
+    }
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    let cred = crate::task::current_credentials();
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (inode, _nd) = match resolve_inode_as(path, follow, (*cred).clone()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_chown(&inode, uid, gid, &cred)
+}
+
+/// `chown(path, uid, gid)` — change owner/group; follows symlinks.
+pub unsafe fn sys_chown_impl(path_uva: u64, uid: u64, gid: u64) -> i64 {
+    chownat_impl(AT_FDCWD, path_uva, uid as u32, gid as u32, 0)
+}
+
+/// `fchown(fd, uid, gid)` — change owner/group of an open fd's file.
+pub unsafe fn sys_fchown_impl(fd_raw: u64, uid: u64, gid: u64) -> i64 {
+    let inode = match fd_to_inode(fd_raw) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let cred = crate::task::current_credentials();
+    do_chown(&inode, uid as u32, gid as u32, &cred)
+}
+
+/// `lchown(path, uid, gid)` — change owner/group; does **not** follow a
+/// terminal symlink. Equivalent to
+/// `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)`.
+pub unsafe fn sys_lchown_impl(path_uva: u64, uid: u64, gid: u64) -> i64 {
+    chownat_impl(AT_FDCWD, path_uva, uid as u32, gid as u32, AT_SYMLINK_NOFOLLOW)
+}
+
+/// `fchownat(dfd, path, uid, gid, flags)` — `*at` form of chown.
+pub unsafe fn sys_fchownat_impl(dfd: i32, path_uva: u64, uid: u64, gid: u64, flags: u32) -> i64 {
+    chownat_impl(dfd, path_uva, uid as u32, gid as u32, flags)
 }

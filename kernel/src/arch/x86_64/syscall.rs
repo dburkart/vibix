@@ -831,6 +831,41 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         UNLINKAT => super::syscalls::vfs::sys_unlinkat_impl(a0 as i32, a1, a2 as u32),
 
+        // chmod / chown family (issue #541, RFC 0004 §Permission model).
+        // Every arm is gated behind `vfs_creds` — these syscalls make DAC
+        // decisions against the caller's credentials, so until Workstream
+        // B flips the feature on they must remain unreachable from ring-3.
+        // Integration tests call `sys_*_impl` directly, mirroring the
+        // mkdir/unlink convention.
+
+        // chmod(path, mode) — change the mode bits of `path`.
+        #[cfg(feature = "vfs_creds")]
+        CHMOD => super::syscalls::vfs::sys_chmod_impl(a0, a1),
+
+        // fchmod(fd, mode) — change the mode bits of an open fd's file.
+        #[cfg(feature = "vfs_creds")]
+        FCHMOD => super::syscalls::vfs::sys_fchmod_impl(a0, a1),
+
+        // fchmodat(dfd, path, mode, flags) — `*at` form of chmod.
+        #[cfg(feature = "vfs_creds")]
+        FCHMODAT => super::syscalls::vfs::sys_fchmodat_impl(a0 as i32, a1, a2, a3 as u32),
+
+        // chown(path, uid, gid) — change owner/group of `path`.
+        #[cfg(feature = "vfs_creds")]
+        CHOWN => super::syscalls::vfs::sys_chown_impl(a0, a1, a2),
+
+        // fchown(fd, uid, gid) — change owner/group of an open fd's file.
+        #[cfg(feature = "vfs_creds")]
+        FCHOWN => super::syscalls::vfs::sys_fchown_impl(a0, a1, a2),
+
+        // lchown(path, uid, gid) — change owner/group, stop on a symlink.
+        #[cfg(feature = "vfs_creds")]
+        LCHOWN => super::syscalls::vfs::sys_lchown_impl(a0, a1, a2),
+
+        // fchownat(dfd, path, uid, gid, flags) — `*at` form of chown.
+        #[cfg(feature = "vfs_creds")]
+        FCHOWNAT => super::syscalls::vfs::sys_fchownat_impl(a0 as i32, a1, a2, a3, a4 as u32),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1441,6 +1476,13 @@ pub mod syscall_nr {
     pub const RMDIR: u64 = 84;
     pub const UNLINK: u64 = 87;
     pub const UNLINKAT: u64 = 263;
+    pub const CHMOD: u64 = 90;
+    pub const FCHMOD: u64 = 91;
+    pub const CHOWN: u64 = 92;
+    pub const FCHOWN: u64 = 93;
+    pub const LCHOWN: u64 = 94;
+    pub const FCHOWNAT: u64 = 260;
+    pub const FCHMODAT: u64 = 268;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1535,5 +1577,14 @@ mod tests {
         assert_eq!(syscall_nr::RMDIR, 84, "SYS_rmdir must be 84");
         assert_eq!(syscall_nr::UNLINK, 87, "SYS_unlink must be 87");
         assert_eq!(syscall_nr::UNLINKAT, 263, "SYS_unlinkat must be 263");
+
+        // Metadata mutation (issue #541)
+        assert_eq!(syscall_nr::CHMOD, 90, "SYS_chmod must be 90");
+        assert_eq!(syscall_nr::FCHMOD, 91, "SYS_fchmod must be 91");
+        assert_eq!(syscall_nr::CHOWN, 92, "SYS_chown must be 92");
+        assert_eq!(syscall_nr::FCHOWN, 93, "SYS_fchown must be 93");
+        assert_eq!(syscall_nr::LCHOWN, 94, "SYS_lchown must be 94");
+        assert_eq!(syscall_nr::FCHOWNAT, 260, "SYS_fchownat must be 260");
+        assert_eq!(syscall_nr::FCHMODAT, 268, "SYS_fchmodat must be 268");
     }
 }
