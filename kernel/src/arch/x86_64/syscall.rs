@@ -857,6 +857,19 @@ pub unsafe extern "C" fn syscall_dispatch(
         // pgrp when pid==0.
         GETPGID => crate::process::sys_getpgid(a0 as u32),
 
+        // getuid() — return the caller's real user ID. Wait-free Arc
+        // snapshot of `Task::credentials`; infallible per POSIX.
+        GETUID => super::syscalls::creds::sys_getuid(),
+
+        // geteuid() — return the caller's effective user ID.
+        GETEUID => super::syscalls::creds::sys_geteuid(),
+
+        // getgid() — return the caller's real group ID.
+        GETGID => super::syscalls::creds::sys_getgid(),
+
+        // getegid() — return the caller's effective group ID.
+        GETEGID => super::syscalls::creds::sys_getegid(),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -1436,6 +1449,10 @@ pub mod syscall_nr {
     pub const SETSID: u64 = 112;
     pub const GETPGID: u64 = 121;
     pub const GETSID: u64 = 124;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
 }
 
 #[cfg(test)]
@@ -1499,6 +1516,12 @@ mod tests {
         assert_eq!(syscall_nr::SETSID, 112, "SYS_setsid must be 112");
         assert_eq!(syscall_nr::GETPGID, 121, "SYS_getpgid must be 121");
         assert_eq!(syscall_nr::GETSID, 124, "SYS_getsid must be 124");
+
+        // Credential queries (issue #547, RFC 0004 Workstream B)
+        assert_eq!(syscall_nr::GETUID, 102, "SYS_getuid must be 102");
+        assert_eq!(syscall_nr::GETGID, 104, "SYS_getgid must be 104");
+        assert_eq!(syscall_nr::GETEUID, 107, "SYS_geteuid must be 107");
+        assert_eq!(syscall_nr::GETEGID, 108, "SYS_getegid must be 108");
 
         // IPC / FIFO
         assert_eq!(syscall_nr::PIPE, 22, "SYS_pipe must be 22");

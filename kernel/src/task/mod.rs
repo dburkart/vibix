@@ -407,6 +407,39 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::fs::FileDescTab
         .clone()
 }
 
+/// Snapshot the currently-running task's `Arc<Credential>` — the
+/// wait-free read path consumed by `getuid(2)` / `geteuid(2)` /
+/// `getgid(2)` / `getegid(2)` and by any VFS syscall that needs the
+/// caller's DAC identity.
+///
+/// Locks `SCHED` only long enough to reach `current`, then takes the
+/// per-task credentials rwlock in read mode, clones the inner `Arc`,
+/// and drops both locks before returning. A concurrent `setuid(2)`
+/// writer swaps the `Arc` in place; because `Credential` is immutable
+/// once constructed, the returned snapshot remains valid and race-free
+/// for the lifetime of its owner (RFC 0004 §Credential model).
+///
+/// # Panics
+/// Panics if called before [`init`] (no running task yet).
+pub fn current_credentials() -> alloc::sync::Arc<crate::fs::vfs::Credential> {
+    let sched = SCHED.lock();
+    let cur = sched
+        .current
+        .as_ref()
+        .expect("current_credentials: no running task");
+    // Inner scope forces the `RwLockReadGuard` to drop before the
+    // outer `sched` (`IrqLockGuard`) does. Without it Rust drops the
+    // inline temporary after `sched` and the borrow checker rejects
+    // the expression: the guard would outlive the scheduler lock it
+    // was reached through.
+    let snapshot = {
+        let guard = cur.credentials.read();
+        alloc::sync::Arc::clone(&*guard)
+    };
+    drop(sched);
+    snapshot
+}
+
 /// Return the per-process current working directory dentry, or `None`
 /// if no cwd has been set (bootstrap / kernel-only tasks). Callers
 /// should fall back to [`crate::fs::vfs::root`] on `None`.
