@@ -37,7 +37,7 @@ scripts/repro-fork.sh --runs 20   # local soak — fails fast on first hang
 
 ### Build-only variant
 
-```
+```bash
 cargo xtask repro-fork-build
 ```
 

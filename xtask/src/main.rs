@@ -1760,8 +1760,17 @@ harness = false
             source.contains("\"repro-fork-build\" =>"),
             "main() must dispatch \"repro-fork-build\""
         );
+        // CodeRabbit on PR #529: a bare `contains("repro-fork-build")`
+        // check always passes because the dispatcher arm, comments,
+        // and this very test all contain that substring.  Pin the
+        // assertion to the literal usage banner so a future edit that
+        // drops the token from the `eprintln!` arm actually fails.
         assert!(
-            source.contains("repro-fork-build"),
+            source.contains(
+                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|\
+                 test-integration|smoke|repro-fork|repro-fork-build|lint|\
+                 isr-audit|clean]"
+            ),
             "usage string must list repro-fork-build"
         );
     }
