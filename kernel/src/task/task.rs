@@ -29,9 +29,11 @@ use x86_64::VirtAddr;
 
 use crate::arch::x86_64::fpu::FpuArea;
 use crate::fork_abi::prime_fork_child_stack;
+use crate::fs::vfs::Credential;
 use crate::fs::FileDescTable;
 use crate::mem::addrspace::AddressSpace;
 use crate::mem::paging;
+use crate::sync::BlockingRwLock;
 
 use super::priority::{AFFINITY_ALL, DEFAULT_PRIORITY};
 use super::switch::{fork_child_sysret, task_entry_trampoline};
@@ -143,6 +145,28 @@ pub(super) struct Task {
     /// it unchanged.
     pub cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
 
+    /// Per-task POSIX credentials (uid/euid/suid + gid/egid/sgid +
+    /// supplementary groups). Stored as `Arc<Credential>` behind a
+    /// blocking rwlock so:
+    ///
+    /// - Syscall entries take a single `read()` snapshot of the `Arc`
+    ///   and drop the lock before walking the path. A concurrent
+    ///   `setuid(2)` on a sibling thread swaps the inner `Arc` but
+    ///   cannot tear the in-flight read — the snapshot keeps the old
+    ///   `Credential` alive for the duration of the syscall (RFC 0004
+    ///   §Credential model).
+    /// - `setuid`-family syscalls take `write()`, build a fresh
+    ///   `Credential`, and replace the `Arc`. They never mutate the
+    ///   `Credential` in place; immutability is what makes the snapshot
+    ///   read race-free.
+    ///
+    /// Defaults to `Credential::kernel()` (root) — every task spawned
+    /// today is a kernel task or a fork descendant of `init`, both of
+    /// which run as root. The `setuid`-family syscalls and exec of a
+    /// setuid binary will be the first call sites that produce a
+    /// non-root snapshot here (Workstream B follow-ups).
+    pub credentials: BlockingRwLock<Arc<Credential>>,
+
     /// Top of this task's dedicated SYSCALL kernel stack (set when this
     /// task runs in ring-3 and needs its own syscall entry point).
     ///
@@ -185,6 +209,7 @@ impl Task {
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
             cwd: None,
+            credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0,
         }
     }
@@ -275,6 +300,7 @@ impl Task {
             fpu: FpuArea::new_initialized(),
             fd_table: Arc::new(Mutex::new(FileDescTable::new_with_stdio())),
             cwd: None,
+            credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0, // kernel-only task — no ring-3 syscall stack needed yet
         }
     }
@@ -331,6 +357,7 @@ impl Task {
         child_cr3: PhysFrame<Size4KiB>,
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
         child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
+        child_credentials: Arc<Credential>,
     ) -> Result<Self, crate::mem::addrspace::ForkError> {
         crate::fork_trace!(
             "fork-trace: [Task::new_forked enter] user_rip={:#x} user_rsp={:#x}",
@@ -432,6 +459,7 @@ impl Task {
             fpu,
             fd_table: child_fd_table,
             cwd: child_cwd,
+            credentials: BlockingRwLock::new(child_credentials),
             // The child task runs in ring-3; it needs its own SYSCALL stack
             // so it doesn't clobber the parent's saved SYSCALL context on the
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.

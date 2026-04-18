@@ -278,13 +278,16 @@ pub trait FileOps: Send + Sync {
 }
 
 /// Default POSIX permission check: owner / group / other bits in
-/// `InodeMeta.mode`. uid 0 (root) bypasses all checks. The `execute`
-/// bit on a directory is interpreted as "search" per POSIX §4.5.
+/// `InodeMeta.mode`. DAC decisions consult the **effective** IDs
+/// (`euid`, `egid`, supplementary `groups`) per POSIX.1-2017 §2.4 —
+/// `uid` and `gid` (real IDs) are not read here. `euid == 0` (root)
+/// bypasses all checks. The `execute` bit on a directory is
+/// interpreted as "search" per POSIX §4.5.
 ///
 /// Drivers that need richer semantics (ACLs, capabilities) override
 /// `InodeOps::permission` directly.
 pub fn default_permission(inode: &Inode, cred: &Credential, access: Access) -> Result<(), i64> {
-    if cred.uid == 0 {
+    if cred.euid == 0 {
         // Root bypass, with one twist: POSIX requires EXECUTE to still
         // fail on a non-dir file with no execute bits set anywhere, so
         // root can't "run" a data file. Matches Linux `generic_permission`.
@@ -299,9 +302,13 @@ pub fn default_permission(inode: &Inode, cred: &Credential, access: Access) -> R
 
     let meta = inode.meta.read();
     let mode = meta.mode as u32;
-    let bits = if cred.uid == meta.uid {
+    // POSIX §4.4.2 "File Access Permissions": once a class matches, its
+    // bits decide the result — even if a later class (other) would be
+    // more permissive. The first-match terminates semantics falls out
+    // of the if/else-if chain below.
+    let bits = if cred.euid == meta.uid {
         (mode >> 6) & 0o7
-    } else if cred.gid == meta.gid || cred.groups.iter().any(|&g| g == meta.gid) {
+    } else if cred.egid == meta.gid || cred.groups.iter().any(|&g| g == meta.gid) {
         (mode >> 3) & 0o7
     } else {
         mode & 0o7
@@ -362,6 +369,60 @@ pub(crate) fn meta_into_stat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::vfs::FsId;
+    use crate::fs::vfs::super_block::{SbFlags, SuperBlock};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    struct StubInodeOps;
+    impl InodeOps for StubInodeOps {
+        fn getattr(&self, _inode: &Inode, _out: &mut Stat) -> Result<(), i64> {
+            Ok(())
+        }
+    }
+
+    struct StubFileOps;
+    impl FileOps for StubFileOps {}
+
+    struct StubSuper;
+    impl SuperOps for StubSuper {
+        fn root_inode(&self) -> Arc<Inode> {
+            unreachable!()
+        }
+        fn statfs(&self) -> Result<StatFs, i64> {
+            Ok(StatFs::default())
+        }
+        fn unmount(&self) {}
+    }
+
+    /// Build a regular-file inode with the given mode/uid/gid for
+    /// driving `default_permission` in the tests below. Anchors a real
+    /// `SuperBlock` so the inode's `Weak<SuperBlock>` stays live for
+    /// the duration of the closure.
+    fn with_inode<R>(mode: u16, uid: u32, gid: u32, f: impl FnOnce(&Inode) -> R) -> R {
+        let sb = Arc::new(SuperBlock::new(
+            FsId(1),
+            Arc::new(StubSuper),
+            "stub",
+            512,
+            SbFlags::default(),
+        ));
+        let ino = Inode::new(
+            1,
+            Arc::downgrade(&sb),
+            Arc::new(StubInodeOps),
+            Arc::new(StubFileOps),
+            InodeKind::Reg,
+            InodeMeta {
+                mode,
+                uid,
+                gid,
+                nlink: 1,
+                ..Default::default()
+            },
+        );
+        f(&ino)
+    }
 
     #[test]
     fn meta_into_stat_saturates_u64_max_size_and_blocks() {
@@ -390,5 +451,154 @@ mod tests {
         assert_eq!(st.st_size, 1_234_567);
         assert_eq!(st.st_blocks, 2_400);
         assert_eq!(st.st_blksize, 4096);
+    }
+
+    // ---- Credential constructor + default_permission DAC tests ----
+
+    #[test]
+    fn credential_from_task_ids_populates_every_field() {
+        let cred = Credential::from_task_ids(10, 11, 12, 20, 21, 22, vec![100, 101]);
+        assert_eq!(cred.uid, 10);
+        assert_eq!(cred.euid, 11);
+        assert_eq!(cred.suid, 12);
+        assert_eq!(cred.gid, 20);
+        assert_eq!(cred.egid, 21);
+        assert_eq!(cred.sgid, 22);
+        assert_eq!(cred.groups, vec![100, 101]);
+    }
+
+    #[test]
+    fn credential_kernel_is_root_on_every_id() {
+        let cred = Credential::kernel();
+        assert_eq!(cred.uid, 0);
+        assert_eq!(cred.euid, 0);
+        assert_eq!(cred.suid, 0);
+        assert_eq!(cred.gid, 0);
+        assert_eq!(cred.egid, 0);
+        assert_eq!(cred.sgid, 0);
+        assert!(cred.groups.is_empty());
+    }
+
+    #[test]
+    fn permission_owner_class_uses_euid_not_uid() {
+        // File 0o600 owned by uid 1000. Caller has real uid != 1000 but
+        // effective uid == 1000 (i.e. ran a setuid binary owned by 1000).
+        // POSIX requires the effective ID to win — owner class matches.
+        with_inode(0o600, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(42, 1000, 42, 99, 99, 99, vec![]);
+            assert!(default_permission(inode, &cred, Access::READ).is_ok());
+            assert!(default_permission(inode, &cred, Access::WRITE).is_ok());
+            // No execute bit → EXECUTE denied even for owner.
+            assert_eq!(
+                default_permission(inode, &cred, Access::EXECUTE),
+                Err(EACCES)
+            );
+        });
+    }
+
+    #[test]
+    fn permission_group_class_uses_egid_not_gid() {
+        // File 0o040 (group-read only) owned by uid 1000, gid 2000.
+        // Caller's real gid is unrelated, but effective gid matches.
+        with_inode(0o040, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(50, 50, 50, 7777, 2000, 2000, vec![]);
+            assert!(default_permission(inode, &cred, Access::READ).is_ok());
+            // Group has no write bit → write denied via group class
+            // (owner class doesn't match euid != 1000), and "other" is
+            // 0 so the fall-through also denies.
+            assert_eq!(
+                default_permission(inode, &cred, Access::WRITE),
+                Err(EACCES)
+            );
+        });
+    }
+
+    #[test]
+    fn permission_supplementary_groups_match_group_class() {
+        // File 0o050 (group r-x) gid 2000. Caller's egid is something
+        // else but 2000 is in the supplementary list → group class.
+        with_inode(0o050, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(50, 50, 50, 60, 60, 60, vec![1500, 2000, 3000]);
+            assert!(default_permission(inode, &cred, Access::READ).is_ok());
+            assert!(default_permission(inode, &cred, Access::EXECUTE).is_ok());
+            assert_eq!(
+                default_permission(inode, &cred, Access::WRITE),
+                Err(EACCES)
+            );
+        });
+    }
+
+    #[test]
+    fn permission_other_class_when_neither_owner_nor_group_match() {
+        // File 0o604: owner rw, group ---, world r--. Caller is none of
+        // owner/group/supplementary → falls through to "other" bits.
+        with_inode(0o604, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(50, 50, 50, 60, 60, 60, vec![70, 80]);
+            assert!(default_permission(inode, &cred, Access::READ).is_ok());
+            assert_eq!(
+                default_permission(inode, &cred, Access::WRITE),
+                Err(EACCES)
+            );
+        });
+    }
+
+    #[test]
+    fn permission_owner_class_terminates_even_when_other_is_more_permissive() {
+        // POSIX §4.4.2 first-match-terminates: if owner matches and
+        // owner has --x, the caller is denied READ even though
+        // "other" grants r--. (Linux-conformant behaviour.)
+        with_inode(0o104, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(50, 1000, 50, 60, 60, 60, vec![]);
+            assert_eq!(
+                default_permission(inode, &cred, Access::READ),
+                Err(EACCES),
+                "owner class is consulted first; world r-- must not rescue the caller"
+            );
+            assert!(default_permission(inode, &cred, Access::EXECUTE).is_ok());
+        });
+    }
+
+    #[test]
+    fn permission_root_bypasses_via_euid_not_uid() {
+        // euid==0 root bypass. The caller's *real* uid is non-zero
+        // (post-`setuid(0)` from a setuid-root binary, before saved-uid
+        // recovery) but effective uid is 0 → root powers apply.
+        with_inode(0o000, 4242, 4242, |inode| {
+            let cred = Credential::from_task_ids(1234, 0, 1234, 5678, 5678, 5678, vec![]);
+            assert!(default_permission(inode, &cred, Access::READ).is_ok());
+            assert!(default_permission(inode, &cred, Access::WRITE).is_ok());
+        });
+    }
+
+    #[test]
+    fn permission_root_execute_still_requires_one_x_bit_on_files() {
+        // Linux generic_permission: even root cannot "execute" a regular
+        // file with 0 execute bits anywhere. Mirrors that.
+        with_inode(0o644, 1, 1, |inode| {
+            let cred = Credential::kernel();
+            assert_eq!(
+                default_permission(inode, &cred, Access::EXECUTE),
+                Err(EACCES)
+            );
+        });
+        // One execute bit anywhere → root execute allowed.
+        with_inode(0o744, 1, 1, |inode| {
+            let cred = Credential::kernel();
+            assert!(default_permission(inode, &cred, Access::EXECUTE).is_ok());
+        });
+    }
+
+    #[test]
+    fn permission_real_uid_alone_does_not_grant_owner_class() {
+        // Caller's real uid matches the file owner but euid does not.
+        // Owner class must NOT match — POSIX consults effective IDs.
+        with_inode(0o600, 1000, 2000, |inode| {
+            let cred = Credential::from_task_ids(1000, 50, 1000, 60, 60, 60, vec![]);
+            assert_eq!(
+                default_permission(inode, &cred, Access::READ),
+                Err(EACCES),
+                "owner DAC must be gated on euid, not uid"
+            );
+        });
     }
 }
