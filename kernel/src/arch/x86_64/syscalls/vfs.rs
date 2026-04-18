@@ -1230,8 +1230,7 @@ fn do_chown(inode: &Arc<Inode>, uid: u32, gid: u32, cred: &Credential) -> i64 {
             if cred.euid != cur_uid {
                 return EPERM;
             }
-            let in_group =
-                cred.egid == gid || cred.groups.iter().any(|&g| g == gid);
+            let in_group = cred.egid == gid || cred.groups.iter().any(|&g| g == gid);
             if !in_group {
                 return EPERM;
             }
@@ -1401,7 +1400,13 @@ pub unsafe fn sys_fchown_impl(fd_raw: u64, uid: u64, gid: u64) -> i64 {
 /// terminal symlink. Equivalent to
 /// `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)`.
 pub unsafe fn sys_lchown_impl(path_uva: u64, uid: u64, gid: u64) -> i64 {
-    chownat_impl(AT_FDCWD, path_uva, uid as u32, gid as u32, AT_SYMLINK_NOFOLLOW)
+    chownat_impl(
+        AT_FDCWD,
+        path_uva,
+        uid as u32,
+        gid as u32,
+        AT_SYMLINK_NOFOLLOW,
+    )
 }
 
 /// `fchownat(dfd, path, uid, gid, flags)` — `*at` form of chown.

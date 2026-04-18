@@ -88,10 +88,7 @@ fn run_tests() {
             "chmod_by_non_owner_eperm",
             &(chmod_by_non_owner_eperm as fn()),
         ),
-        (
-            "chmod_by_root_succeeds",
-            &(chmod_by_root_succeeds as fn()),
-        ),
+        ("chmod_by_root_succeeds", &(chmod_by_root_succeeds as fn())),
         ("chown_by_root_succeeds", &(chown_by_root_succeeds as fn())),
         (
             "chown_by_non_root_eperm",
@@ -302,11 +299,7 @@ fn chmod_by_non_owner_eperm() {
     // Caller is uid 2000, file is owned by 1000.
     set_creds(2000, 2000);
     let r = chmod(b"/tmp/chmod-stranger", 0o600);
-    assert_eq!(
-        r, EPERM,
-        "non-owner chmod must be EPERM, got {}",
-        r
-    );
+    assert_eq!(r, EPERM, "non-owner chmod must be EPERM, got {}", r);
     set_root_creds();
 }
 
@@ -344,11 +337,7 @@ fn chown_by_non_root_eperm() {
     set_creds(1000, 1000);
     // Owner attempting to change uid is still EPERM per POSIX.
     let r = chown(b"/tmp/chown-nonroot", 2000, 1000);
-    assert_eq!(
-        r, EPERM,
-        "non-root chown(uid) must be EPERM, got {}",
-        r
-    );
+    assert_eq!(r, EPERM, "non-root chown(uid) must be EPERM, got {}", r);
     set_root_creds();
 }
 
@@ -472,7 +461,11 @@ fn fchownat_rejects_unknown_flag() {
     let r = unsafe { sys_lchown_impl(uva, 0, 0) };
     // Path doesn't exist: ENOENT, not EINVAL. We just want lchown to
     // reach the resolver rather than panic on an unsupported flag.
-    assert!(r < 0, "lchown on missing path must return a negative errno, got {}", r);
+    assert!(
+        r < 0,
+        "lchown on missing path must return a negative errno, got {}",
+        r
+    );
 }
 
 /// With `vfs_creds` off (the default), every new dispatch arm falls
@@ -528,18 +521,8 @@ fn chmod_dispatch_gate_enosys() {
 fn chown_dispatch_gate_enosys() {
     set_root_creds();
     let uva = stage(b"/tmp/anything");
-    let r = unsafe {
-        syscall_dispatch(
-            core::ptr::null_mut(),
-            syscall_nr::CHOWN,
-            uva,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let r =
+        unsafe { syscall_dispatch(core::ptr::null_mut(), syscall_nr::CHOWN, uva, 0, 0, 0, 0, 0) };
     assert_eq!(
         r, ENOSYS,
         "SYS_chown must dispatch to ENOSYS until vfs_creds flips on, got {}",
@@ -551,18 +534,8 @@ fn chown_dispatch_gate_enosys() {
 fn chown_dispatch_gate_enosys() {
     set_root_creds();
     let uva = stage(b"/tmp/anything-chown");
-    let r = unsafe {
-        syscall_dispatch(
-            core::ptr::null_mut(),
-            syscall_nr::CHOWN,
-            uva,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let r =
+        unsafe { syscall_dispatch(core::ptr::null_mut(), syscall_nr::CHOWN, uva, 0, 0, 0, 0, 0) };
     assert!(
         r != ENOSYS,
         "SYS_chown dispatcher must reach the impl with vfs_creds on, got ENOSYS"
