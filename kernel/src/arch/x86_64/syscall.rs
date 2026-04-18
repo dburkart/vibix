@@ -818,6 +818,19 @@ pub unsafe extern "C" fn syscall_dispatch(
         // InodeOps::rmdir on the parent after path-walking to the leaf.
         RMDIR => super::syscalls::vfs::sys_rmdir_impl(a0),
 
+        // unlink(path) — remove a non-directory from its parent. Same
+        // RFC 0004 A ↔ B gate as MKDIR/MKDIRAT: with `vfs_creds` off
+        // the arm is absent and the dispatcher's default returns
+        // `-ENOSYS`. Integration tests exercise the impl directly via
+        // `sys_unlink_impl` once the feature is on.
+        #[cfg(feature = "vfs_creds")]
+        UNLINK => super::syscalls::vfs::sys_unlink_impl(a0),
+
+        // unlinkat(dfd, path, flags) — unlink or rmdir (AT_REMOVEDIR)
+        // relative to `dfd`. Same gate as UNLINK.
+        #[cfg(feature = "vfs_creds")]
+        UNLINKAT => super::syscalls::vfs::sys_unlinkat_impl(a0 as i32, a1, a2 as u32),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1413,6 +1426,8 @@ pub mod syscall_nr {
     pub const MKDIR: u64 = 83;
     pub const MKDIRAT: u64 = 258;
     pub const RMDIR: u64 = 84;
+    pub const UNLINK: u64 = 87;
+    pub const UNLINKAT: u64 = 263;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1495,5 +1510,7 @@ mod tests {
 
         // Directory removal
         assert_eq!(syscall_nr::RMDIR, 84, "SYS_rmdir must be 84");
+        assert_eq!(syscall_nr::UNLINK, 87, "SYS_unlink must be 87");
+        assert_eq!(syscall_nr::UNLINKAT, 263, "SYS_unlinkat must be 263");
     }
 }

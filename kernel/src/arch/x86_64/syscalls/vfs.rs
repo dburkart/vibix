@@ -33,8 +33,8 @@ use crate::fs::vfs::{
 };
 use crate::fs::vfs::{Access, Credential};
 use crate::fs::{
-    flags as oflags, FileBackend, FileDescription, EBADF, EEXIST, EINVAL, EISDIR, ENAMETOOLONG,
-    ENOENT, ENOMEM, ENOTDIR,
+    flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EINVAL, EISDIR,
+    ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM,
 };
 
 /// Linux x86_64 value of the "use the current working directory"
@@ -49,6 +49,15 @@ pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 /// `AT_EMPTY_PATH` — treat an empty `path` as a reference to the file
 /// behind `dfd` (used by `fstatat(fd, "", &st, AT_EMPTY_PATH)`).
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+
+/// `AT_REMOVEDIR` — flag to `unlinkat(2)` that dispatches to `rmdir`
+/// semantics instead of `unlink`. Mirrors Linux's value.
+pub const AT_REMOVEDIR: u32 = 0x200;
+
+/// `S_ISVTX` — the POSIX "sticky bit" in `InodeMeta.mode`. When set on
+/// a directory, `unlink`/`rename` require the caller to own either the
+/// target file or the directory (or be root). Linux value 0o1000.
+const S_ISVTX: u16 = 0o1000;
 
 /// Copy a user path into a heap buffer sized at `PATH_MAX + 1`. The
 /// `+1` lets `copy_path_from_user_pub` observe the terminating NUL
@@ -931,4 +940,169 @@ pub unsafe fn sys_rmdir_impl(path_uva: u64) -> i64 {
         Ok(()) => 0,
         Err(e) => e,
     }
+}
+
+/// Shared body for `unlink(2)` / `unlinkat(2)`.
+///
+/// Resolves the parent directory, splits off the leaf name, then
+/// dispatches to `InodeOps::unlink` (default) or `InodeOps::rmdir`
+/// (when `AT_REMOVEDIR` is set in `flags`). Enforces the common POSIX
+/// pre-checks the trait impls must not each reinvent:
+///
+/// - Trailing-slash leaf forces directory semantics: non-`AT_REMOVEDIR`
+///   `unlink("foo/")` returns `EISDIR` since the caller named a
+///   directory explicitly.
+/// - A `.` / `..` / empty leaf is rejected upfront via `split_parent`.
+/// - The leaf may not itself be a mountpoint — `EBUSY` per POSIX
+///   (rmdir/unlink on a mount root is always refused).
+/// - Sticky-bit (`S_ISVTX`) on the parent directory forces the caller
+///   to own the parent or the target file; root bypasses.
+///
+/// The body is always compiled — only the syscall *dispatch arms*
+/// upstream are gated behind `#[cfg(feature = "vfs_creds")]`. Tests
+/// reach this impl directly through `sys_unlink_impl` /
+/// `sys_unlinkat_impl`, mirroring the convention `sys_mkdir_impl`
+/// established in #585. Until Workstream B flips `vfs_creds` on,
+/// ring-3 callers see `-ENOSYS` because the dispatcher's default
+/// arm catches the syscall numbers.
+fn unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
+    // Only AT_REMOVEDIR is recognised today. Everything else must be
+    // whitelisted explicitly so a silent-accept never masks a future
+    // flag bit.
+    if flags & !AT_REMOVEDIR != 0 {
+        return EINVAL;
+    }
+    let remove_dir = flags & AT_REMOVEDIR != 0;
+
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    // `*at` preconditions mirror `openat`: non-AT_FDCWD dfd with a
+    // relative path is out of scope until per-fd cwd lands (#239).
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    // Trailing-slash means the caller explicitly named a directory.
+    // POSIX unlink(2) on a trailing-slash path returns EISDIR (or
+    // ENOTDIR if the final component does not resolve to a directory);
+    // Linux picks EISDIR when the named leaf itself is a directory and
+    // we mirror that here. `rmdir`/`AT_REMOVEDIR` accepts a trailing
+    // slash since that's the POSIX-preferred spelling for directories.
+    let trailing_slash = path.len() > 1 && path.last() == Some(&b'/');
+
+    let (parent_path, leaf) = match split_parent(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Resolve the parent (follow symlinks on every intermediate
+    // component — standard POSIX behaviour).
+    let (parent_inode, pnd) = match resolve_inode(parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if parent_inode.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    // Resolve the leaf via lookup on the parent so we can run the
+    // mountpoint + sticky checks before calling into the FS driver.
+    // We intentionally do NOT go back through `path_walk` for the
+    // leaf — that would cross a symlink on a symlinked leaf and delete
+    // the wrong thing. `unlink`/`rmdir` always act on the name itself.
+    let leaf_inode = match parent_inode.ops.lookup(&parent_inode, leaf) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    // Mountpoint check: we need the leaf's dentry to inspect `.mount`.
+    // `pnd.path.dentry` is the parent-directory dentry after the walk.
+    // Look the leaf up in the parent's child cache — if a mount edge
+    // is attached to the leaf dentry, refuse with `EBUSY` per POSIX.
+    // A miss in the child cache (or a negative entry) means nothing
+    // is mounted on the leaf, so there is no mountpoint to refuse.
+    if let Ok(leaf_dstr) = crate::fs::vfs::DString::try_from_bytes(leaf) {
+        let parent_dentry = pnd.path.dentry.clone();
+        let children = parent_dentry.children.read();
+        if let Some(crate::fs::vfs::ChildState::Resolved(child)) = children.get(&leaf_dstr) {
+            if child.mount.read().is_some() {
+                return EBUSY;
+            }
+        }
+    }
+
+    // Kind-based dispatch. `unlink` on a directory is EISDIR; `rmdir`
+    // on a non-directory is ENOTDIR. Drivers can still reject on their
+    // own, but catching it up front gives a consistent errno across
+    // backends.
+    if remove_dir {
+        if leaf_inode.kind != InodeKind::Dir {
+            return ENOTDIR;
+        }
+    } else {
+        if leaf_inode.kind == InodeKind::Dir {
+            return EISDIR;
+        }
+        if trailing_slash {
+            // unlink("foo/") where foo is a symlink to a directory is
+            // still refused (ENOTDIR on Linux). Here the leaf isn't a
+            // directory but the caller named a directory explicitly,
+            // so ENOTDIR best describes the mismatch. Unreachable for
+            // regular files via split_parent today, but kept as a
+            // defensive guard for future resolver behaviour.
+            return ENOTDIR;
+        }
+    }
+
+    // Sticky-bit check. When S_ISVTX is set on the parent, POSIX
+    // requires the caller to own either the parent or the target
+    // file, or be the super-user. Uses `Credential::kernel()` as a
+    // placeholder — replaced by the per-task credential when
+    // Workstream B flips `vfs_creds` on (#546).
+    let cred = Credential::kernel();
+    let parent_meta = parent_inode.meta.read();
+    if parent_meta.mode & S_ISVTX != 0 && cred.uid != 0 {
+        let leaf_uid = leaf_inode.meta.read().uid;
+        if cred.uid != parent_meta.uid && cred.uid != leaf_uid {
+            return EPERM;
+        }
+    }
+    drop(parent_meta);
+
+    let r = if remove_dir {
+        parent_inode.ops.rmdir(&parent_inode, leaf)
+    } else {
+        parent_inode.ops.unlink(&parent_inode, leaf)
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `unlink(path)` — remove a non-directory from its parent. Thin
+/// wrapper over [`unlinkat_impl`] with `dfd = AT_FDCWD` and no flags.
+///
+/// Reachable from ring-3 only when the `vfs_creds` feature is on
+/// (the dispatch arm is gated). Tests call this entry point directly
+/// to exercise the impl regardless of feature state, mirroring the
+/// `sys_mkdir_impl` convention from #585.
+pub unsafe fn sys_unlink_impl(path_uva: u64) -> i64 {
+    unlinkat_impl(AT_FDCWD, path_uva, 0)
+}
+
+/// `unlinkat(dfd, path, flags)` — `unlink` or `rmdir` (when `flags`
+/// sets `AT_REMOVEDIR`) relative to `dfd`. `AT_FDCWD` and absolute
+/// paths only; a real fd with a relative path returns `EINVAL` until
+/// per-fd cwd semantics land (#239).
+///
+/// Reachable from ring-3 only when `vfs_creds` is on (gated dispatch
+/// arm). See [`sys_unlink_impl`] for the test-path convention.
+pub unsafe fn sys_unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
+    unlinkat_impl(dfd, path_uva, flags)
 }
