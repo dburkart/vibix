@@ -1,7 +1,7 @@
 ---
 rfc: 0004
 title: Ext2 Filesystem Driver
-status: In Review
+status: Accepted
 created: 2026-04-18
 ---
 
