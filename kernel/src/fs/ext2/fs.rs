@@ -180,11 +180,7 @@ impl FileSystem for Ext2Fs {
         "ext2"
     }
 
-    fn mount(
-        &self,
-        _source: MountSource<'_>,
-        flags: MountFlags,
-    ) -> Result<Arc<SuperBlock>, i64> {
+    fn mount(&self, _source: MountSource<'_>, flags: MountFlags) -> Result<Arc<SuperBlock>, i64> {
         // 1. Read and parse the primary superblock *before* claiming the
         //    mount latch. A malformed SB must not burn the factory —
         //    the caller should be able to drop in a good image and try
@@ -212,8 +208,7 @@ impl FileSystem for Ext2Fs {
             return Err(EINVAL);
         }
         let block_size = on_disk_sb.block_size().ok_or(EINVAL)?;
-        if on_disk_sb.s_rev_level != EXT2_GOOD_OLD_REV
-            && on_disk_sb.s_rev_level != EXT2_DYNAMIC_REV
+        if on_disk_sb.s_rev_level != EXT2_GOOD_OLD_REV && on_disk_sb.s_rev_level != EXT2_DYNAMIC_REV
         {
             return Err(EINVAL);
         }
@@ -225,10 +220,7 @@ impl FileSystem for Ext2Fs {
             EXT2_GOOD_OLD_INODE_SIZE as u32
         } else {
             let s = on_disk_sb.s_inode_size as u32;
-            if s < EXT2_GOOD_OLD_INODE_SIZE as u32
-                || s > block_size
-                || !s.is_power_of_two()
-            {
+            if s < EXT2_GOOD_OLD_INODE_SIZE as u32 || s > block_size || !s.is_power_of_two() {
                 return Err(EINVAL);
             }
             s

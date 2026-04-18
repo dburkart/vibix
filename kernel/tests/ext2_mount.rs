@@ -102,7 +102,10 @@ fn run_tests() {
             "bogus_ro_compat_forces_readonly",
             &(bogus_ro_compat_forces_readonly as fn()),
         ),
-        ("bad_magic_returns_einval", &(bad_magic_returns_einval as fn())),
+        (
+            "bad_magic_returns_einval",
+            &(bad_magic_returns_einval as fn()),
+        ),
         (
             "single_mount_latch_rejects_double_mount",
             &(single_mount_latch_rejects_double_mount as fn()),
