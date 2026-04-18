@@ -464,9 +464,7 @@ impl BlockCache {
         // device call never holds a spinlock that VFS callers contend
         // on (RFC 0004 §Buffer cache, OS-engineer B5 hazard).
         let fresh = Arc::new(BufferHead::new(self.block_size as usize));
-        fresh
-            .state
-            .store(STATE_LOCKED_IO, Ordering::Release);
+        fresh.state.store(STATE_LOCKED_IO, Ordering::Release);
         {
             let mut data = fresh.data.write();
             let offset = blk
@@ -619,8 +617,7 @@ impl BlockCache {
                     // Clear LOCKED_IO and surface OutOfRange; the
                     // DIRTY bit stays set so the caller can retry
                     // after adjusting the key.
-                    bh.state
-                        .fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
+                    bh.state.fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
                     return Err(BlockError::OutOfRange);
                 }
             };
@@ -630,8 +627,7 @@ impl BlockCache {
             // is a caller bug — `sync_dirty_buffer` on an orphaned
             // buffer has nowhere to flush. Clear LOCKED_IO and return
             // success; the bit fence is what mattered.
-            bh.state
-                .fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
+            bh.state.fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
             return Ok(());
         };
 
@@ -639,18 +635,15 @@ impl BlockCache {
         // device error, clear only LOCKED_IO so the caller can retry.
         match result {
             Ok(()) => {
-                bh.state.fetch_and(
-                    !(STATE_DIRTY | STATE_LOCKED_IO),
-                    Ordering::AcqRel,
-                );
+                bh.state
+                    .fetch_and(!(STATE_DIRTY | STATE_LOCKED_IO), Ordering::AcqRel);
                 if let Some(key) = key {
                     self.dirty.lock().remove(&key);
                 }
                 Ok(())
             }
             Err(e) => {
-                bh.state
-                    .fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
+                bh.state.fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
                 Err(e)
             }
         }
@@ -697,10 +690,7 @@ impl BlockCache {
     /// cold-and-unreferenced victim, returns [`BlockError::NoMemory`].
     /// The caller (`bread`) converts that into the user-visible
     /// ENOMEM (normative invariant 3).
-    fn clock_pro_evict(
-        inner: &mut CacheInner,
-        max_buffers: usize,
-    ) -> Result<(), BlockError> {
+    fn clock_pro_evict(inner: &mut CacheInner, max_buffers: usize) -> Result<(), BlockError> {
         // Worst case for convergence of this simplified CLOCK-Pro:
         //
         // - Revolution 1 clears every buffer's reference bit (and may
@@ -820,10 +810,10 @@ fn next_after(
 ) -> Option<(DeviceId, u64)> {
     // BTreeMap's range is sorted, so the first key > `key` is the
     // natural successor. If none exists, wrap to the smallest key.
-    if let Some((&k, _)) = map.range((
-        core::ops::Bound::Excluded(key),
-        core::ops::Bound::Unbounded,
-    )).next() {
+    if let Some((&k, _)) = map
+        .range((core::ops::Bound::Excluded(key), core::ops::Bound::Unbounded))
+        .next()
+    {
         Some(k)
     } else {
         map.keys().next().copied()
@@ -1325,7 +1315,10 @@ mod tests {
         // at max_buffers.
         // Drop the `Ok` side so we don't require `Debug` on
         // `Arc<BufferHead>`.
-        let err = cache.bread(dev, 1).map(|_| ()).expect_err("ENOMEM expected");
+        let err = cache
+            .bread(dev, 1)
+            .map(|_| ())
+            .expect_err("ENOMEM expected");
         assert_eq!(err, BlockError::NoMemory);
 
         // Drop the pin, retry — now it succeeds.
@@ -1346,9 +1339,10 @@ mod tests {
 
         let victim = cache.bread(dev, 5).expect("bread 5");
         // Pretend writeback is in flight: DIRTY + LOCKED_IO both set.
-        victim
-            .state
-            .store(STATE_VALID | STATE_DIRTY | STATE_LOCKED_IO, Ordering::Release);
+        victim.state.store(
+            STATE_VALID | STATE_DIRTY | STATE_LOCKED_IO,
+            Ordering::Release,
+        );
         // Drop the external pin so only DIRTY+LOCKED_IO is what
         // protects it.
         drop(victim);
