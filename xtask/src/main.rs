@@ -978,11 +978,17 @@ fn integration_test_names() -> R<Vec<String>> {
 
 fn test_unit() -> R<()> {
     // Host unit tests (--lib only; pure-logic modules).
+    //
+    // `--features ext2` is enabled so the ext2 driver's host unit
+    // tests (`fs::ext2::fs::tests` — mount-sequence arithmetic and
+    // feature-flag constants) are picked up. The on-disk type tests in
+    // `fs::ext2::disk::tests` compile unconditionally and are included
+    // either way.
     println!("→ host unit tests");
     check(
         Command::new("cargo")
             .current_dir(workspace_root())
-            .args(["test", "--package", "vibix", "--lib"])
+            .args(["test", "--package", "vibix", "--lib", "--features", "ext2"])
             .status()?,
     )?;
     Ok(())
@@ -997,11 +1003,19 @@ fn test_integration() -> R<()> {
     // The test list is derived from `kernel/Cargo.toml` `[[test]]`
     // entries so adding a new integration test in the manifest
     // automatically wires it into `cargo xtask test` (issue #292).
+    //
+    // `--features ext2` is passed unconditionally so any test gated on
+    // the Workstream D/E driver (`required-features = ["ext2"]`) is
+    // picked up. The feature is a compile-time gate around the
+    // ext2-driver trait impls; enabling it in the test binary has no
+    // effect on boot-path behaviour (those call sites stay gated even
+    // with the feature on until an explicit registration hook lands in
+    // a later wave).
     println!("→ integration tests under QEMU");
     let tests = integration_test_names()?;
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
-        .args(["test", "--package", "vibix"])
+        .args(["test", "--package", "vibix", "--features", "ext2"])
         .args(KERNEL_BUILD_STD_ARGS);
     for t in &tests {
         cmd.arg("--test").arg(t);

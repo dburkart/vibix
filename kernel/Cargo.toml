@@ -57,6 +57,16 @@ fork-trace = []
 # partially-landed Workstream A from exposing an unauthenticated
 # DAC-bypass window.
 vfs_creds = []
+# RFC 0004 Workstream D/E feature gate. When off, the ext2 on-disk
+# types (`fs::ext2::disk`) still compile (they're pure data, host unit
+# tests round-trip them against a golden `mkfs.ext2` fixture), but the
+# trait impls (`Ext2Fs`, `Ext2Super`) do not. This keeps a
+# partially-landed driver from accidentally being reachable through
+# the boot mount path while the inode / dir-entry / allocator surfaces
+# are still being built out. Integration tests that exercise the
+# driver (`ext2_mount`, future waves) flip this on with
+# `--features ext2`.
+ext2 = []
 
 [[test]]
 name = "basic_boot"
@@ -325,3 +335,8 @@ harness = false
 [[test]]
 name = "block_cache_sync_fs"
 harness = false
+
+[[test]]
+name = "ext2_mount"
+harness = false
+required-features = ["ext2"]
