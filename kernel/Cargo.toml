@@ -313,3 +313,7 @@ harness = false
 [[test]]
 name = "signal_sa_restart_preserves_args"
 harness = false
+
+[[test]]
+name = "block_cache_sync_fs"
+harness = false

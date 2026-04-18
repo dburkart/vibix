@@ -694,6 +694,95 @@ impl BlockCache {
         // decrements it.
     }
 
+    /// Flush every dirty buffer owned by `device_id` to the backing
+    /// device, in ascending `(DeviceId, u64)` key order.
+    ///
+    /// Implements RFC 0004 §Buffer cache `sync_fs` — the per-mount
+    /// writeback primitive. Wired by the VFS layer into
+    /// `SuperOps::sync_fs` and called from the `umount` path before the
+    /// superblock is detached so on-disk state is consistent across a
+    /// remount.
+    ///
+    /// # Filtering
+    ///
+    /// Only keys whose `DeviceId` equals `device_id` are flushed. The
+    /// cache may host multiple mounts backed by the same
+    /// `Arc<dyn BlockDevice>` (each with its own `DeviceId` allocated
+    /// via [`register_device`](Self::register_device)); `sync_fs` on
+    /// one mount must not flush another mount's dirty buffers.
+    ///
+    /// # Best-effort error propagation
+    ///
+    /// No batching: each matching dirty key is handed to
+    /// [`sync_dirty_buffer`](Self::sync_dirty_buffer) in turn. The
+    /// first `Err(BlockError)` is captured and returned; subsequent
+    /// flushes continue so a transient failure on one buffer doesn't
+    /// leave the rest of the mount's dirty state on the floor. Buffers
+    /// that fail keep `STATE_DIRTY` set (per `sync_dirty_buffer`'s
+    /// contract) and remain enlisted in the dirty set, so a retry
+    /// (e.g. from the writeback daemon) will pick them up.
+    ///
+    /// # Concurrent mutation
+    ///
+    /// The dirty-set snapshot is taken under the dirty-set mutex then
+    /// released before issuing any I/O, so concurrent `mark_dirty` /
+    /// `sync_dirty_buffer` callers don't contend on the set for the
+    /// duration of the sweep. A buffer enlisted after the snapshot
+    /// won't be observed by this call — that's acceptable: a
+    /// just-dirtied buffer is covered by the next `sync_fs` (or by the
+    /// writeback daemon). A buffer whose key is in the snapshot but
+    /// has since been evicted is silently skipped via the residency
+    /// lookup inside `sync_dirty_buffer`.
+    pub fn sync_fs(&self, device_id: DeviceId) -> Result<(), BlockError> {
+        // Snapshot the dirty keys for this device under the dirty-set
+        // mutex, then release it: issuing device I/O with a spinlock
+        // held violates the OS-engineer B5 hazard (RFC 0004 §Buffer
+        // cache) and would starve concurrent `mark_dirty` callers.
+        let keys: alloc::vec::Vec<(DeviceId, u64)> = {
+            let dirty = self.dirty.lock();
+            dirty
+                .iter()
+                .filter(|(dev, _)| *dev == device_id)
+                .copied()
+                .collect()
+        };
+
+        let mut first_err: Option<BlockError> = None;
+        for key in keys {
+            // Re-look-up the buffer out of `entries` under the inner
+            // lock. If it was evicted between snapshot and now, there's
+            // nothing for us to flush — `sync_dirty_buffer` itself has
+            // the same "not resident → success" fallback, but doing the
+            // lookup here lets us skip the state CAS entirely.
+            let bh = {
+                let inner = self.inner.lock();
+                inner.entries.get(&key).cloned()
+            };
+            let bh = match bh {
+                Some(bh) => bh,
+                None => {
+                    // Evicted since snapshot. Drop the stale dirty-set
+                    // entry so we don't keep re-observing it.
+                    self.dirty.lock().remove(&key);
+                    continue;
+                }
+            };
+            if let Err(e) = self.sync_dirty_buffer(&bh) {
+                // Best-effort: keep flushing the rest of the mount.
+                // Surface only the first error so the caller has a
+                // single actionable failure to log.
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// CLOCK-Pro eviction sweep.
     ///
     /// Rotates `clock_hand` through resident entries in BTreeMap key
@@ -1638,5 +1727,249 @@ mod tests {
         );
         // LOCKED_IO was never taken — fast-path bailed before CAS.
         assert!(!bh.state_has(STATE_LOCKED_IO));
+    }
+
+    // ---------- sync_fs (issue #554) ----------
+
+    /// `sync_fs` on a mount with no dirty buffers is a successful no-op
+    /// that issues no device writes.
+    #[test]
+    fn sync_fs_on_clean_cache_is_noop() {
+        let (cache, disk, dev) = ramdisk_cache(512, 8, 4);
+        disk.seed_block(0, 0x11);
+        let _bh = cache.bread(dev, 0).expect("bread");
+        let writes_before = disk.writes();
+        cache.sync_fs(dev).expect("clean sync_fs ok");
+        assert_eq!(
+            disk.writes(),
+            writes_before,
+            "no dirty buffers → no device writes",
+        );
+    }
+
+    /// `sync_fs` flushes every dirty buffer owned by the target
+    /// `DeviceId`, clears the dirty bit, and drops the dirty-set keys.
+    #[test]
+    fn sync_fs_flushes_all_dirty_for_device() {
+        let (cache, disk, dev) = ramdisk_cache(512, 16, 8);
+        for b in 0..4 {
+            disk.seed_block(b, 0);
+        }
+
+        // Dirty four buffers under `dev`.
+        let mut handles = alloc::vec::Vec::new();
+        for b in 0..4u64 {
+            let bh = cache.bread(dev, b).expect("bread");
+            {
+                let mut data = bh.data.write();
+                for slot in data.iter_mut() {
+                    *slot = b as u8;
+                }
+            }
+            cache.mark_dirty(&bh);
+            assert!(bh.state_has(STATE_DIRTY));
+            handles.push(bh);
+        }
+        assert_eq!(cache.dirty.lock().len(), 4);
+
+        let writes_before = disk.writes();
+        cache.sync_fs(dev).expect("sync_fs");
+        assert_eq!(
+            disk.writes(),
+            writes_before + 4,
+            "one device write per dirty buffer",
+        );
+
+        // DIRTY bits cleared, dirty set drained.
+        for bh in &handles {
+            assert!(!bh.state_has(STATE_DIRTY));
+            assert!(!bh.state_has(STATE_LOCKED_IO));
+        }
+        assert!(cache.dirty.lock().is_empty());
+
+        // On-disk bytes match what we wrote.
+        {
+            let storage = disk.storage.lock();
+            for b in 0..4usize {
+                let off = b * 512;
+                assert!(
+                    storage[off..off + 512].iter().all(|byte| *byte == b as u8),
+                    "block {} not flushed correctly",
+                    b,
+                );
+            }
+        }
+    }
+
+    /// `sync_fs(dev_a)` must not flush buffers owned by `dev_b`, even
+    /// when both devices share the same underlying `Arc<dyn BlockDevice>`.
+    /// This is the whole point of filtering by `DeviceId` — one mount's
+    /// sync is not allowed to affect another mount.
+    #[test]
+    fn sync_fs_is_scoped_to_device_id() {
+        let (cache, disk, dev_a) = ramdisk_cache(512, 16, 8);
+        // Second DeviceId on the same cache (models two concurrent mounts
+        // sharing the same ramdisk — RFC 0004 §Buffer cache).
+        let dev_b = cache.register_device();
+
+        let bh_a = cache.bread(dev_a, 0).expect("bread a");
+        {
+            let mut data = bh_a.data.write();
+            for slot in data.iter_mut() {
+                *slot = 0xaa;
+            }
+        }
+        cache.mark_dirty(&bh_a);
+
+        let bh_b = cache.bread(dev_b, 0).expect("bread b");
+        {
+            let mut data = bh_b.data.write();
+            for slot in data.iter_mut() {
+                *slot = 0x55;
+            }
+        }
+        cache.mark_dirty(&bh_b);
+
+        assert!(bh_a.state_has(STATE_DIRTY));
+        assert!(bh_b.state_has(STATE_DIRTY));
+        assert_eq!(cache.dirty.lock().len(), 2);
+
+        let writes_before = disk.writes();
+        cache.sync_fs(dev_a).expect("sync_fs dev_a");
+        assert_eq!(
+            disk.writes(),
+            writes_before + 1,
+            "sync_fs(dev_a) flushes exactly one buffer",
+        );
+
+        // dev_a buffer: clean. dev_b buffer: still dirty (untouched).
+        assert!(!bh_a.state_has(STATE_DIRTY), "dev_a buffer flushed");
+        assert!(bh_b.state_has(STATE_DIRTY), "dev_b buffer must be left dirty");
+        assert!(!cache.dirty.lock().contains(&(dev_a, 0)));
+        assert!(cache.dirty.lock().contains(&(dev_b, 0)));
+    }
+
+    /// `sync_fs` propagates the first `BlockError` from the underlying
+    /// device but continues flushing the rest of the mount's dirty
+    /// buffers (best-effort).
+    #[test]
+    fn sync_fs_best_effort_on_device_error() {
+        /// Device that fails the Nth write (1-indexed); all other
+        /// writes succeed and land in an in-memory backing store.
+        struct FailingDisk {
+            block_size: u32,
+            storage: Mutex<alloc::vec::Vec<u8>>,
+            writes: AtomicU32,
+            fail_on_nth: u32,
+        }
+        impl BlockDevice for FailingDisk {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+                let storage = self.storage.lock();
+                let off = offset as usize;
+                if off + buf.len() > storage.len() {
+                    return Err(BlockError::OutOfRange);
+                }
+                buf.copy_from_slice(&storage[off..off + buf.len()]);
+                Ok(())
+            }
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+                let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == self.fail_on_nth {
+                    return Err(BlockError::DeviceError);
+                }
+                let mut storage = self.storage.lock();
+                let off = offset as usize;
+                storage[off..off + buf.len()].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_size(&self) -> u32 {
+                self.block_size
+            }
+            fn capacity(&self) -> u64 {
+                self.storage.lock().len() as u64
+            }
+        }
+
+        let disk = Arc::new(FailingDisk {
+            block_size: 512,
+            storage: Mutex::new(vec![0u8; 512 * 16]),
+            writes: AtomicU32::new(0),
+            // Fail the *second* device write of the sweep.
+            fail_on_nth: 2,
+        });
+        let cache = BlockCache::new(disk.clone() as Arc<dyn BlockDevice>, 512, 8);
+        let dev = cache.register_device();
+
+        // Dirty three buffers. Flush order follows BTreeSet iteration —
+        // ascending `(dev, blk)` — so block 1 will be the 2nd (failing)
+        // write.
+        let mut handles = alloc::vec::Vec::new();
+        for b in 0..3u64 {
+            let bh = cache.bread(dev, b).expect("bread");
+            {
+                let mut data = bh.data.write();
+                for slot in data.iter_mut() {
+                    *slot = (b + 1) as u8;
+                }
+            }
+            cache.mark_dirty(&bh);
+            handles.push(bh);
+        }
+
+        let err = cache.sync_fs(dev).expect_err("first device error surfaces");
+        assert_eq!(err, BlockError::DeviceError);
+
+        // Device saw three writes — the sweep did not bail on the first
+        // error, it best-effort continued.
+        assert_eq!(disk.writes.load(Ordering::Relaxed), 3);
+
+        // Block 0 and block 2 are clean; block 1 is still dirty (kept
+        // enlisted for a retry).
+        assert!(!handles[0].state_has(STATE_DIRTY));
+        assert!(handles[1].state_has(STATE_DIRTY));
+        assert!(!handles[2].state_has(STATE_DIRTY));
+        assert!(cache.dirty.lock().contains(&(dev, 1)));
+        assert!(!cache.dirty.lock().contains(&(dev, 0)));
+        assert!(!cache.dirty.lock().contains(&(dev, 2)));
+    }
+
+    /// A dirty key whose buffer was evicted between snapshot and flush
+    /// is silently skipped (and dropped from the dirty set) — `sync_fs`
+    /// must not error on a stale dirty-set entry.
+    #[test]
+    fn sync_fs_skips_evicted_dirty_keys() {
+        let (cache, disk, dev) = ramdisk_cache(512, 16, 4);
+        disk.seed_block(7, 0x00);
+        let bh = cache.bread(dev, 7).expect("bread");
+        cache.mark_dirty(&bh);
+        assert!(cache.dirty.lock().contains(&(dev, 7)));
+
+        // Simulate eviction of the buffer while the dirty-set entry
+        // lingers. Clear the DIRTY bit so the pulled-out `Arc` doesn't
+        // fence the inner-lock eviction path; the dirty *set* key is
+        // what `sync_fs` iterates.
+        bh.state.fetch_and(!STATE_DIRTY, Ordering::AcqRel);
+        drop(bh);
+        // Forcibly remove the entry from the cache.
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.remove(&(dev, 7));
+            inner.classes.remove(&(dev, 7));
+        }
+        // Re-inject a stale dirty-set entry that no longer has a
+        // resident buffer.
+        cache.dirty.lock().insert((dev, 7));
+
+        let writes_before = disk.writes();
+        cache.sync_fs(dev).expect("stale dirty entry tolerated");
+        assert_eq!(
+            disk.writes(),
+            writes_before,
+            "evicted buffer must not drive a write",
+        );
+        assert!(
+            !cache.dirty.lock().contains(&(dev, 7)),
+            "stale dirty-set entry must be dropped",
+        );
     }
 }

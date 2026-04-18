@@ -167,6 +167,31 @@ pub trait SuperOps: Send + Sync {
         Ok(())
     }
     fn statfs(&self) -> Result<StatFs, i64>;
+    /// Flush every dirty buffer belonging to this mount to stable
+    /// storage. Called from the `umount` path (before
+    /// [`unmount`](Self::unmount) detaches the superblock) and,
+    /// eventually, by the `sync(2)` syscall (Workstream F).
+    ///
+    /// Contract (RFC 0004 §Buffer cache, issue #554):
+    ///
+    /// - In-memory filesystems (ramfs, tarfs, devfs) have no backing
+    ///   device; the default impl returns `Ok(())`.
+    /// - Filesystems backed by a [`BlockCache`](crate::block::cache::BlockCache)
+    ///   must delegate to
+    ///   [`BlockCache::sync_fs`](crate::block::cache::BlockCache::sync_fs)
+    ///   with the mount's [`DeviceId`](crate::block::cache::DeviceId)
+    ///   so only that mount's dirty buffers are flushed.
+    /// - Best-effort error propagation: if multiple buffers fail, the
+    ///   first error is returned and the rest are flushed anyway. A
+    ///   dirty buffer that fails to flush remains enlisted for a later
+    ///   retry (writeback daemon or a subsequent explicit sync).
+    ///
+    /// The `sb` argument is passed so a driver that owns more than one
+    /// `BlockCache` (future sharded layout) can route to the right
+    /// one; single-cache drivers can ignore it.
+    fn sync_fs(&self, _sb: &SuperBlock) -> Result<(), i64> {
+        Ok(())
+    }
     /// Called during Phase B of `unmount()`, after the mount edge has been
     /// removed from the table (Phase A).  At this point the mount is
     /// irrevocably gone regardless of what this method does.
