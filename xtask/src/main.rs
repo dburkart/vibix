@@ -1062,9 +1062,21 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     // Kernel panic marker printed by the panic_handler in kernel/src/main.rs.
     // Seeing this means the kernel has already lost — don't wait out HARD_CAP.
     const PANIC_MARKER: &str = "KERNEL PANIC:";
+    // Cancel-channel watchdog (same pattern as `repro_fork` — see #516).
+    // `thread::sleep(HARD_CAP)` would block the join at the end of this
+    // function for the full cap even when markers arrived in a few seconds,
+    // dominating wall-clock on the happy path (the #507 nightly soak was
+    // paying ~10 min per run for nothing). Replace with a `recv_timeout`
+    // that the main loop wakes up by dropping `cancel_tx` on its way out:
+    // the watchdog sees `Disconnected` and exits immediately. If the main
+    // loop hangs or HARD_CAP elapses first, `recv_timeout` returns
+    // `Timeout` and the watchdog kills QEMU — original fail-safe semantics
+    // preserved.
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(HARD_CAP);
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(HARD_CAP) {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
     });
 
     let deadline = Instant::now() + HARD_CAP;
@@ -1119,8 +1131,12 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     }
 
     // Ensure QEMU is dead (idempotent if watchdog already fired). Killing
-    // the child closes the pipe, which unblocks the reader thread.
+    // the child closes the pipe, which unblocks the reader thread. Drop
+    // the cancel sender so the watchdog's `recv_timeout` wakes with
+    // Disconnected and we don't block the join for the full HARD_CAP on
+    // the success path — see #516.
     let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(cancel_tx);
     let _ = watchdog.join();
     let _ = reader_handle.join();
     let _ = child.wait();
