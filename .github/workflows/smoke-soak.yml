@@ -221,16 +221,21 @@ jobs:
 
       # Pre-build the kernel + reproducer ISO once up front so each
       # per-run iteration only pays the QEMU-boot cost, not the
-      # build cost. `cargo xtask repro-fork` is a no-op rebuild when
-      # the artifacts are already current, but an explicit pre-build
-      # here also surfaces build failures in their own step rather
-      # than charged against run 1's pass/fail accounting.
+      # build cost. `cargo xtask repro-fork-build` is the build-only
+      # variant of `repro-fork` — it compiles the kernel, the
+      # reproducer init binary, and assembles the ISO, then exits
+      # without booting QEMU. Using the full `repro-fork` subcommand
+      # here would also run the harness in the Pre-build step, which
+      # defeats the whole point of having a dedicated 100× soak loop
+      # below — a first-boot flake in Pre-build would skip the loop
+      # entirely (see issue #526, run 24593451935).
       - name: Pre-build reproducer ISO
-        run: cargo xtask repro-fork
-        # One full run costs ~15-60 s on a clean kernel; even with the
-        # flake-hit 60 s heartbeat watchdog it stays under the outer
-        # SOAK_RUN_TIMEOUT_SECS. Done here so the first iteration of
-        # the loop below sees warm artifacts.
+        run: cargo xtask repro-fork-build
+        # The build step finishes well under 10 min on a cold cache
+        # and near-instantly when the cargo + limine caches are warm.
+        # The 20 min cap is belt-and-suspenders headroom for a fully
+        # cold runner; the step does not boot QEMU, so it cannot
+        # stall on a kernel-side flake.
         timeout-minutes: 20
 
       - name: Run smoke soak

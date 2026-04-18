@@ -9,6 +9,8 @@
 //!   test-runner   — (internal) boot a pre-built test kernel ELF in QEMU
 //!   smoke         — boot the kernel and assert on expected serial markers
 //!   repro-fork    — boot with the fork-loop reproducer harness as PID 1 (issue #506)
+//!   repro-fork-build — build-only variant of `repro-fork`: warm kernel + ISO
+//!                      without booting QEMU (issue #526, for CI pre-build)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   clean         — remove build artifacts
@@ -149,6 +151,9 @@ fn main() -> R<()> {
         }
         "smoke" => smoke(&opts)?,
         "repro-fork" => repro_fork(&opts)?,
+        "repro-fork-build" => {
+            repro_fork_build(&opts)?;
+        }
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "initrd" => {
@@ -159,7 +164,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|repro-fork|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -1170,6 +1175,39 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     }
 }
 
+/// Warm the reproducer ISO without booting QEMU.  Issue #526.
+///
+/// Builds the kernel, the `userspace_repro_fork` binary, and the ISO
+/// that ships the reproducer as `/boot/userspace_init.elf`.  Returns
+/// the path to the completed ISO.
+///
+/// This is the build-only half of `repro_fork`.  It exists so that CI
+/// can warm the artifacts (and catch build-step failures) in a distinct
+/// workflow step, without also paying for a full QEMU run.  The 100×
+/// smoke-soak workflow drives one `scripts/repro-fork.sh` boot per
+/// iteration; without this split, the "Pre-build" step ended up running
+/// the full harness and any first-boot flake prevented the soak loop
+/// from executing (run 24593451935).
+///
+/// After this returns successfully, a subsequent `cargo xtask
+/// repro-fork` (or `scripts/repro-fork.sh`) on the same workspace will
+/// find every upstream artifact warm — cargo no-ops, the ISO staging
+/// directory is re-assembled from already-built inputs, and the run
+/// cost collapses to QEMU boot time.
+fn repro_fork_build(opts: &BuildOpts) -> R<PathBuf> {
+    // Build the kernel and the reproducer init binary, then assemble
+    // an ISO with the reproducer substituted for userspace_init.elf.
+    let kernel = build(opts)?;
+    let repro_init = build_userspace_repro_fork()?;
+    let iso = workspace_root().join("target").join("vibix-repro-fork.iso");
+    make_iso_with_init(&kernel, &repro_init, &iso, "iso_repro_fork")?;
+    // Also ensure the test disk is present so the per-run boot path
+    // doesn't need to regenerate it.  `ensure_test_disk` is idempotent.
+    ensure_test_disk()?;
+    println!("→ repro-fork iso: {}", iso.display());
+    Ok(iso)
+}
+
 /// Build + boot the fork-loop reproducer ISO under QEMU with a
 /// heartbeat-aware watchdog.  Issue #506 / epic #501.
 ///
@@ -1214,13 +1252,11 @@ fn repro_fork(opts: &BuildOpts) -> R<()> {
         "repro: harness panic",
     ];
 
-    // Build the kernel and the reproducer init binary, then assemble
-    // an ISO with the reproducer substituted for userspace_init.elf.
-    let kernel = build(opts)?;
-    let repro_init = build_userspace_repro_fork()?;
-    let iso = workspace_root().join("target").join("vibix-repro-fork.iso");
-    make_iso_with_init(&kernel, &repro_init, &iso, "iso_repro_fork")?;
-    println!("→ repro-fork iso: {}", iso.display());
+    // Build the kernel, the reproducer init binary, and the ISO.
+    // Delegating to `repro_fork_build` keeps the build-only subcommand
+    // and the full-harness subcommand on the exact same build path —
+    // no drift risk between them.
+    let iso = repro_fork_build(opts)?;
 
     let disk = ensure_test_disk()?;
     let mut child = Command::new("qemu-system-x86_64")
@@ -1630,5 +1666,103 @@ harness = false
                 "skiplist entry {skipped} must not appear in runner list"
             );
         }
+    }
+
+    /// Issue #526: `repro-fork-build` must be a pure build subcommand.
+    /// If it ever grows a QEMU invocation, the smoke-soak Pre-build
+    /// step would regress to the full-harness behavior that prompted
+    /// this split in the first place.  We can't execute the subcommand
+    /// from a host unit test (it drives cargo against a custom
+    /// target), so we enforce the contract by inspecting its source.
+    #[test]
+    fn repro_fork_build_does_not_invoke_qemu() {
+        let source =
+            std::fs::read_to_string(workspace_root().join("xtask").join("src").join("main.rs"))
+                .expect("read xtask main.rs");
+
+        // Locate the `fn repro_fork_build` body.  The function opens
+        // with `fn repro_fork_build(` and its body runs until the
+        // next top-level `fn ` declaration.  This is brittle against
+        // drastic reformatting but catches the bug we care about —
+        // "someone added a qemu-system-x86_64 call" — with zero
+        // false positives on the current source.
+        let start = source
+            .find("fn repro_fork_build(")
+            .expect("repro_fork_build must exist");
+        let after_start = &source[start..];
+        let body_start = after_start
+            .find('{')
+            .expect("repro_fork_build must have a body");
+        let search_region = &after_start[body_start..];
+        // Find the matching close brace by brace-counting.
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, ch) in search_region.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &search_region[..end.expect("balanced braces")];
+
+        for forbidden in &["qemu-system-x86_64", "qemu_system_x86_64"] {
+            assert!(
+                !body.contains(forbidden),
+                "repro_fork_build body must not contain `{forbidden}` \
+                 (build-only contract, issue #526)"
+            );
+        }
+
+        // The repro-fork full-harness path is the one thing this
+        // helper must never reach into — that path is what boots
+        // QEMU.  Calling it would undo the whole split.  Check for
+        // a call to `repro_fork(` at an identifier boundary so we
+        // don't false-positive on `build_userspace_repro_fork()`.
+        let mut prev: Option<char> = None;
+        let mut hit = false;
+        for (i, ch) in body.char_indices() {
+            if body[i..].starts_with("repro_fork(") {
+                let is_boundary = match prev {
+                    None => true,
+                    Some(c) => !(c.is_alphanumeric() || c == '_'),
+                };
+                if is_boundary {
+                    hit = true;
+                    break;
+                }
+            }
+            prev = Some(ch);
+        }
+        assert!(
+            !hit,
+            "repro_fork_build body must not call `repro_fork(` \
+             (build-only contract, issue #526)"
+        );
+    }
+
+    /// Issue #526: the `repro-fork-build` subcommand must be wired
+    /// into both the dispatcher and the usage string, otherwise CI's
+    /// `cargo xtask repro-fork-build` call would hit the "unknown
+    /// subcommand" arm.
+    #[test]
+    fn repro_fork_build_subcommand_is_registered() {
+        let source =
+            std::fs::read_to_string(workspace_root().join("xtask").join("src").join("main.rs"))
+                .expect("read xtask main.rs");
+        assert!(
+            source.contains("\"repro-fork-build\" =>"),
+            "main() must dispatch \"repro-fork-build\""
+        );
+        assert!(
+            source.contains("repro-fork-build"),
+            "usage string must list repro-fork-build"
+        );
     }
 }
