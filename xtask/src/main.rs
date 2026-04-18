@@ -101,7 +101,24 @@ const SMOKE_MARKERS: &[&str] = &[
     // `ring3-first-fault:` diagnostic line emitted by the IDT fault
     // handlers in that case).
     "ring3-iretq: rip=",
+    // #478 diagnostic: emitted by userspace init on fd=2 as the very first
+    // userspace action, immediately after ring-3 entry and before the first
+    // `write(1, HELLO_MSG)`. Three-marker localization:
+    //   - `ring3-iretq:` present, `pre-write marker` absent:
+    //     first SYSCALL instruction or the kernel syscall-entry trampoline
+    //     silently faulted before the Rust handler ran.
+    //   - `pre-write marker` present, `init: hello from pid 1` absent:
+    //     fd=1 write path (or state between the two writes) is the culprit,
+    //     not ring-3 entry.
+    //   - `init: hello from pid 1` present, `post-write marker` absent:
+    //     SYSRET / user-context restore is the culprit, not the write itself.
+    "init: pre-write marker",
     "init: hello from pid 1",
+    // #478 diagnostic: emitted on fd=1 immediately after the first
+    // `write(1, HELLO_MSG)` returns, before any further work (fork etc.).
+    // Missing this while `init: hello from pid 1` fires is a signal that the
+    // SYSRET / user-context restore after the first write is broken.
+    "init: post-write marker",
 ];
 
 /// Markers for the fork+exec+wait flow. These are flakey under un-accelerated
