@@ -449,6 +449,20 @@ pub fn current_cwd() -> Option<alloc::sync::Arc<crate::fs::vfs::Dentry>> {
     SCHED.lock().current.as_ref().and_then(|t| t.cwd.clone())
 }
 
+/// Replace the currently-running task's `Credential` snapshot.
+///
+/// Used by the `setuid(2)` / `setgid(2)` family once they land in
+/// userspace, and by integration tests that want to exercise DAC
+/// checks with a non-root credential. Builds a fresh `Arc<Credential>`
+/// rather than mutating in place; existing read-side snapshots keep
+/// the prior `Arc` alive and see a consistent pre-swap view.
+pub fn set_current_credentials(cred: crate::fs::vfs::Credential) {
+    let sched = SCHED.lock();
+    if let Some(t) = sched.current.as_ref() {
+        *t.credentials.write() = alloc::sync::Arc::new(cred);
+    }
+}
+
 /// Set the per-process current working directory to `dentry`.
 ///
 /// Called by `sys_chdir` after successfully resolving and verifying
