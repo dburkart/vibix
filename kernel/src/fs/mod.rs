@@ -26,6 +26,15 @@ use crate::poll::{PollMask, PollTable, DEFAULT_POLLMASK};
 #[cfg(target_os = "none")]
 pub mod vfs;
 
+/// ext2 filesystem driver — on-disk types today; trait impls land in
+/// sibling Workstream D/E issues per RFC 0004.
+///
+/// Compiled for both `target_os = "none"` (kernel) and host unit tests
+/// so `cargo test --lib` can round-trip the on-disk types against the
+/// `mkfs.ext2` golden fixture.
+#[cfg(any(test, target_os = "none"))]
+pub mod ext2;
+
 /// I/O dispatch interface for a single open file description.
 ///
 /// Implementations must be `Send + Sync` so that `Arc<dyn FileBackend>` can
