@@ -136,3 +136,28 @@ pub fn set_tss_rsp0(stack_top: u64) {
         (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(stack_top);
     }
 }
+
+/// Read the current value of `TSS.rsp[0]` directly from the live TSS
+/// struct that the CPU's TSS descriptor points at.
+///
+/// Used by the post-switch sanity check in
+/// [`crate::task::set_active_syscall_stack`] to confirm the helper's
+/// write landed in the struct the hardware will actually consult on
+/// the next ring-3 → ring-0 transition.
+pub fn tss_rsp0() -> u64 {
+    // SAFETY: same invariants as `set_tss_rsp0`'s writer side. We only
+    // read, and the CPU writes `rsp[0]` only when fetching it on a
+    // privilege change — never mid-execution here.
+    let tss_ptr: *const TaskStateSegment = &*TSS;
+    unsafe { (*tss_ptr).privilege_stack_table[0].as_u64() }
+}
+
+/// Read the atomic shadow of `TSS.rsp[0]` — the last value passed to
+/// [`set_tss_rsp0`]. Cheap; does not dereference the live TSS struct.
+///
+/// Exposed so tests and the sanity check in
+/// [`crate::task::set_active_syscall_stack`] can compare the helper's
+/// last-written value against the live TSS without an unsafe read.
+pub fn tss_rsp0_shadow() -> u64 {
+    TSS_RSP0.load(Ordering::Relaxed)
+}
