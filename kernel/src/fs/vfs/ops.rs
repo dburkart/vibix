@@ -369,8 +369,8 @@ pub(crate) fn meta_into_stat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::vfs::FsId;
     use crate::fs::vfs::super_block::{SbFlags, SuperBlock};
+    use crate::fs::vfs::FsId;
     use alloc::sync::Arc;
     use alloc::vec;
 
@@ -506,10 +506,7 @@ mod tests {
             // Group has no write bit → write denied via group class
             // (owner class doesn't match euid != 1000), and "other" is
             // 0 so the fall-through also denies.
-            assert_eq!(
-                default_permission(inode, &cred, Access::WRITE),
-                Err(EACCES)
-            );
+            assert_eq!(default_permission(inode, &cred, Access::WRITE), Err(EACCES));
         });
     }
 
@@ -521,10 +518,7 @@ mod tests {
             let cred = Credential::from_task_ids(50, 50, 50, 60, 60, 60, vec![1500, 2000, 3000]);
             assert!(default_permission(inode, &cred, Access::READ).is_ok());
             assert!(default_permission(inode, &cred, Access::EXECUTE).is_ok());
-            assert_eq!(
-                default_permission(inode, &cred, Access::WRITE),
-                Err(EACCES)
-            );
+            assert_eq!(default_permission(inode, &cred, Access::WRITE), Err(EACCES));
         });
     }
 
@@ -535,10 +529,7 @@ mod tests {
         with_inode(0o604, 1000, 2000, |inode| {
             let cred = Credential::from_task_ids(50, 50, 50, 60, 60, 60, vec![70, 80]);
             assert!(default_permission(inode, &cred, Access::READ).is_ok());
-            assert_eq!(
-                default_permission(inode, &cred, Access::WRITE),
-                Err(EACCES)
-            );
+            assert_eq!(default_permission(inode, &cred, Access::WRITE), Err(EACCES));
         });
     }
 
