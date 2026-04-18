@@ -764,7 +764,19 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
     let sig_for_delivery = signal_to_deliver(decision, popped.map(|(s, d, _)| (s, d)));
 
     if let Some(sig) = sig_for_delivery {
-        deliver_signal(sig, &mut *ctx);
+        // Only mark the frame as restart-pending when we actually rewound
+        // RIP to the SYSCALL instruction for an SA_RESTART replay.
+        // Handler-only deliveries on non-restart paths (EINTR, NoChange)
+        // must leave the SigFrame's restart_flag cleared so `sigreturn`
+        // does not clobber the post-handler `user_rax` with the pre-
+        // handler syscall number (issue #522, PR #528 review).
+        let restart_pending = matches!(
+            decision,
+            RestartDecision::Restart {
+                deliver_handler: true
+            }
+        );
+        deliver_signal(sig, &mut *ctx, restart_pending);
     }
     rv_out
 }
@@ -772,9 +784,16 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
 /// Deliver signal `sig` by either redirecting return-to-user context to the
 /// handler or terminating the process for default-terminate signals.
 ///
+/// `restart_pending` is true iff the caller (`check_and_deliver_signals`)
+/// rewound `ctx.user_rip` to the SYSCALL instruction for an SA_RESTART-ed
+/// ERESTARTSYS replay. That bit is embedded in the pushed `SigFrame` and
+/// read back out by `sigreturn` — only a restart-marked frame causes the
+/// syscall-arg gregs to be written back into the kernel context and
+/// `SYSCALL_RESTART_PENDING` to be asserted (issue #522).
+///
 /// # Safety
 /// `ctx` must point to valid kernel-stack-saved user context.
-unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
+unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pending: bool) {
     let task_id = crate::task::current_id();
 
     // Capture the pre-delivery mask and block the signal in one lock window.
@@ -842,6 +861,7 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext) {
                 ctx.user_rflags,
                 pre_block_mask,
                 saved_regs,
+                restart_pending,
             ) {
                 Ok(sp) => sp,
                 Err(_) => {
@@ -895,6 +915,7 @@ pub unsafe fn sys_sigreturn(user_rsp: u64) -> SigReturnRegs {
                 rflags: restored.rflags,
                 rsp: restored.rsp,
                 syscall_regs: restored.syscall_regs,
+                restart_pending: restored.restart_pending,
             }
         }
         Err(_) => {
@@ -912,19 +933,21 @@ pub unsafe fn sys_sigreturn(user_rsp: u64) -> SigReturnRegs {
 /// The register values to restore after `sigreturn`.
 ///
 /// `syscall_regs` carries the Linux x86_64 syscall registers that were
-/// live at the time the signal was delivered. When the SYSCALL instruction
-/// that produced `-ERESTARTSYS` is about to re-execute (because the
-/// handler ran under SA_RESTART), the trampoline reloads these values
-/// from the `SyscallReturnContext` so userspace sees the original syscall
-/// number and arguments. On paths that did not interrupt a syscall the
-/// values are whatever the handler stored in the frame; the restart-
-/// trampoline branch is only taken when `SYSCALL_RESTART_PENDING` is set,
-/// so those paths never act on them.
+/// live at the time the signal was delivered. When `restart_pending` is
+/// true the caller MUST write `syscall_regs` back into the task's
+/// `SyscallReturnContext` and assert `SYSCALL_RESTART_PENDING` so the
+/// re-executed SYSCALL sees the original `(nr, a0..a5)`. When
+/// `restart_pending` is false the caller MUST leave both the kernel
+/// context and the global flag untouched — otherwise a handler that
+/// returns normally on a non-SA_RESTART path would have its
+/// post-syscall return value in `user_rax` clobbered back to the
+/// syscall number (issue #522).
 pub struct SigReturnRegs {
     pub rip: u64,
     pub rflags: u64,
     pub rsp: u64,
     pub syscall_regs: frame::SavedSyscallRegs,
+    pub restart_pending: bool,
 }
 
 // ── Host-side unit tests ──────────────────────────────────────────────────

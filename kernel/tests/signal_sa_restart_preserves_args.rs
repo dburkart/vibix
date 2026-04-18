@@ -14,14 +14,22 @@
 //!
 //! ## What we verify here
 //!
-//! The kernel-side contract has two halves:
+//! The kernel-side contract has three halves:
 //!
 //! 1. `push_signal_frame` captures the seven Linux syscall-ABI registers
 //!    (rax, rdi, rsi, rdx, r10, r8, r9) into the `SigFrame` `gregs` slots
 //!    that `restore_signal_frame` reads back from.
-//! 2. `sys_sigreturn` writes them into the caller's `SyscallReturnContext`
-//!    and asserts `SYSCALL_RESTART_PENDING` so the asm trampoline reloads
-//!    the kernel-stack-saved `rax/rdi/...` slots on its way to SYSRETQ.
+//! 2. When the frame was pushed on an SA_RESTART-ed ERESTARTSYS path
+//!    (`restart_pending = true`), the `SIGRETURN` dispatch arm writes the
+//!    recovered arg regs into the caller's `SyscallReturnContext` and
+//!    asserts `SYSCALL_RESTART_PENDING` so the asm trampoline reloads
+//!    those slots on its way to SYSRETQ.
+//! 3. When the frame was pushed on a non-restart path
+//!    (`restart_pending = false`), the `SIGRETURN` dispatch arm MUST NOT
+//!    clobber the ctx's `user_rax..user_r9` (they still hold the
+//!    post-syscall result the handler was interrupted over) and MUST
+//!    NOT assert `SYSCALL_RESTART_PENDING`. This is the regression
+//!    surface called out in the #528 review.
 //!
 //! End-to-end ring-3 SA_RESTART coverage (a user handler that actually
 //! clobbers arg regs and a syscall like `read`/`write` that restarts) is
@@ -80,6 +88,14 @@ fn run_tests() {
         (
             "sigreturn_dispatch_writes_ctx_and_asserts_restart",
             &(sigreturn_dispatch_writes_ctx_and_asserts_restart as fn()),
+        ),
+        (
+            "sigreturn_dispatch_leaves_ctx_alone_when_not_restart",
+            &(sigreturn_dispatch_leaves_ctx_alone_when_not_restart as fn()),
+        ),
+        (
+            "restart_flag_roundtrips_through_sigframe",
+            &(restart_flag_roundtrips_through_sigframe as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -160,6 +176,7 @@ fn syscall_regs_roundtrip_through_sigframe() {
                 saved_rflags,
                 saved_mask,
                 regs,
+                /* restart_pending = */ true,
             )
         })
     }
@@ -193,7 +210,7 @@ fn zero_syscall_regs_are_preserved_verbatim() {
     let regs = SavedSyscallRegs::default();
     let new_rsp = unsafe {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            push_signal_frame(user_stack, SIGUSR1, 0x4000_0000, 0x202, 0, regs)
+            push_signal_frame(user_stack, SIGUSR1, 0x4000_0000, 0x202, 0, regs, true)
         })
     }
     .expect("push_signal_frame failed");
@@ -257,7 +274,15 @@ fn sigreturn_dispatch_writes_ctx_and_asserts_restart() {
     let regs = distinct_regs();
     let new_rsp = unsafe {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            push_signal_frame(user_stack, SIGUSR1, 0x4000_0000, 0x202, 0, regs)
+            push_signal_frame(
+                user_stack,
+                SIGUSR1,
+                0x4000_0000,
+                0x202,
+                0,
+                regs,
+                /* restart_pending = */ true,
+            )
         })
     }
     .expect("push_signal_frame failed");
@@ -322,4 +347,138 @@ fn sigreturn_dispatch_writes_ctx_and_asserts_restart() {
 
     // Leave global state clean for neighbouring tests.
     SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
+}
+
+/// Regression for the #528 review finding: on a non-SA_RESTART
+/// sigreturn, the dispatch arm must leave `ctx.user_rax..user_r9`
+/// untouched and NOT assert `SYSCALL_RESTART_PENDING`. Otherwise the
+/// post-syscall return value the handler was interrupted over (still
+/// sitting in `user_rax`) gets silently clobbered back to the
+/// syscall-entry rax on its way to SYSRETQ, and the asm trampoline
+/// replays an unrelated syscall with the frame's rdi..r9.
+fn sigreturn_dispatch_leaves_ctx_alone_when_not_restart() {
+    let user_stack = anon_rw_page() + 4096;
+    prefault(user_stack - 4096);
+
+    // Same distinct sentinels as the restart-case test, but pushed with
+    // `restart_pending = false` — this mirrors the normal "handler ran,
+    // now returning" path where `check_and_deliver_signals` did not
+    // rewind RIP for a syscall replay.
+    let frame_regs = distinct_regs();
+    let new_rsp = unsafe {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            push_signal_frame(
+                user_stack,
+                SIGUSR1,
+                0x4000_0000,
+                0x202,
+                0,
+                frame_regs,
+                /* restart_pending = */ false,
+            )
+        })
+    }
+    .expect("push_signal_frame failed");
+
+    // Pre-fill ctx with a different, ctx-specific set of sentinels so
+    // any accidental write from the dispatch arm shows up as a
+    // frame-regs value aliasing over the sentinel.
+    const CTX_RAX: u64 = 0xBEEF_0000_0000_0042u64; // plausible syscall rv
+    const CTX_RDI: u64 = 0xBEEF_0000_0000_00D1u64;
+    const CTX_RSI: u64 = 0xBEEF_0000_0000_0051u64;
+    const CTX_RDX: u64 = 0xBEEF_0000_0000_00D2u64;
+    const CTX_R10: u64 = 0xBEEF_0000_0000_0010u64;
+    const CTX_R8: u64 = 0xBEEF_0000_0000_0008u64;
+    const CTX_R9: u64 = 0xBEEF_0000_0000_0009u64;
+    let mut ctx = SyscallReturnContext {
+        user_rax: CTX_RAX,
+        user_rdi: CTX_RDI,
+        user_rsi: CTX_RSI,
+        user_rdx: CTX_RDX,
+        user_r10: CTX_R10,
+        user_r8: CTX_R8,
+        user_r9: CTX_R9,
+        user_rip: 0,
+        user_rflags: 0,
+        user_rsp: new_rsp,
+    };
+
+    SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
+
+    let rv = unsafe {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            vibix::arch::x86_64::syscall::syscall_dispatch(
+                &mut ctx as *mut SyscallReturnContext,
+                15, // SIGRETURN
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        })
+    };
+    assert_eq!(rv, 0, "SIGRETURN returned non-zero: {rv}");
+
+    // Each arg slot must be the ctx sentinel, NOT the frame payload.
+    // If any of these drift to the frame value, the dispatch arm is
+    // writing back on a path where `restart_pending` is false — the
+    // exact bug called out in the #528 review.
+    assert_eq!(
+        ctx.user_rax, CTX_RAX,
+        "non-restart SIGRETURN clobbered ctx.user_rax: got {:#x}, frame had {:#x}",
+        ctx.user_rax, frame_regs.rax
+    );
+    assert_eq!(ctx.user_rdi, CTX_RDI, "non-restart SIGRETURN clobbered rdi");
+    assert_eq!(ctx.user_rsi, CTX_RSI, "non-restart SIGRETURN clobbered rsi");
+    assert_eq!(ctx.user_rdx, CTX_RDX, "non-restart SIGRETURN clobbered rdx");
+    assert_eq!(ctx.user_r10, CTX_R10, "non-restart SIGRETURN clobbered r10");
+    assert_eq!(ctx.user_r8, CTX_R8, "non-restart SIGRETURN clobbered r8");
+    assert_eq!(ctx.user_r9, CTX_R9, "non-restart SIGRETURN clobbered r9");
+
+    // And the global flag must stay cleared — if set, the asm trampoline
+    // would reload the (now-stale) user_rax..user_r9 from ctx and emit
+    // a spurious syscall replay at SYSRETQ.
+    assert_eq!(
+        SYSCALL_RESTART_PENDING.load(Ordering::Relaxed),
+        0,
+        "non-restart SIGRETURN spuriously asserted SYSCALL_RESTART_PENDING"
+    );
+}
+
+/// The `restart_pending` bit itself round-trips through the SigFrame —
+/// push-then-restore with `true` must observe `true`, with `false` must
+/// observe `false`. Belt-and-braces: the two behavioural tests above
+/// already depend on this, but an explicit round-trip check pins the
+/// failure to "restart bit wrong" if the underlying frame slot ever
+/// drifts to a wrong offset.
+fn restart_flag_roundtrips_through_sigframe() {
+    for want in [true, false] {
+        let user_stack = anon_rw_page() + 4096;
+        prefault(user_stack - 4096);
+        let new_rsp = unsafe {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                push_signal_frame(
+                    user_stack,
+                    SIGUSR1,
+                    0x4000_0000,
+                    0x202,
+                    0,
+                    SavedSyscallRegs::default(),
+                    want,
+                )
+            })
+        }
+        .expect("push_signal_frame failed");
+        let restored = unsafe {
+            x86_64::instructions::interrupts::without_interrupts(|| restore_signal_frame(new_rsp))
+        }
+        .expect("restore_signal_frame failed");
+        assert_eq!(
+            restored.restart_pending, want,
+            "restart_pending did not round-trip: pushed {want}, got {}",
+            restored.restart_pending
+        );
+    }
 }

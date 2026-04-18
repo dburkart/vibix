@@ -746,30 +746,35 @@ pub unsafe extern "C" fn syscall_dispatch(
         // of the sigreturn-trampoline. No cross-task hand-off via globals
         // (issue #504).
         //
-        // The syscall arg registers (rax=nr, rdi, rsi, rdx, r10, r8, r9)
-        // are also written back so that if the user PC we're returning to
-        // is a SYSCALL instruction about to re-run under SA_RESTART
-        // (issue #522), it sees the original syscall number and args
-        // instead of whatever the handler left in those registers.
-        // `SYSCALL_RESTART_PENDING` is asserted to steer the asm
-        // trampoline down the "reload saved user syscall regs" branch at
-        // SYSRETQ; on non-restart sigreturns the branch is a harmless
-        // reload of whatever is already there (the handler-managed frame
-        // contents for code that is not at a SYSCALL instruction).
+        // When the signal was delivered on an SA_RESTART-ed ERESTARTSYS
+        // path — i.e. `check_and_deliver_signals` rewound RIP to the
+        // SYSCALL instruction before handing to the handler — the
+        // SigFrame carries `restart_pending = true`. In that case we
+        // also write back the seven Linux syscall registers (rax=nr,
+        // rdi, rsi, rdx, r10, r8, r9) and raise `SYSCALL_RESTART_PENDING`
+        // so the asm trampoline reloads them before the replayed SYSCALL
+        // (issue #522).
+        //
+        // On every other `sigreturn` the SyscallReturnContext still holds
+        // the post-syscall return value in `user_rax`; clobbering it back
+        // to the syscall number would be a correctness bug. The gate on
+        // `restored.restart_pending` ensures we do nothing of the sort.
         SIGRETURN => {
             let user_rsp = (*ctx).user_rsp;
             let restored = crate::signal::sys_sigreturn(user_rsp);
             (*ctx).user_rip = restored.rip;
             (*ctx).user_rflags = restored.rflags;
             (*ctx).user_rsp = restored.rsp;
-            (*ctx).user_rax = restored.syscall_regs.rax;
-            (*ctx).user_rdi = restored.syscall_regs.rdi;
-            (*ctx).user_rsi = restored.syscall_regs.rsi;
-            (*ctx).user_rdx = restored.syscall_regs.rdx;
-            (*ctx).user_r10 = restored.syscall_regs.r10;
-            (*ctx).user_r8 = restored.syscall_regs.r8;
-            (*ctx).user_r9 = restored.syscall_regs.r9;
-            SYSCALL_RESTART_PENDING.store(1, core::sync::atomic::Ordering::Relaxed);
+            if restored.restart_pending {
+                (*ctx).user_rax = restored.syscall_regs.rax;
+                (*ctx).user_rdi = restored.syscall_regs.rdi;
+                (*ctx).user_rsi = restored.syscall_regs.rsi;
+                (*ctx).user_rdx = restored.syscall_regs.rdx;
+                (*ctx).user_r10 = restored.syscall_regs.r10;
+                (*ctx).user_r8 = restored.syscall_regs.r8;
+                (*ctx).user_r9 = restored.syscall_regs.r9;
+                SYSCALL_RESTART_PENDING.store(1, core::sync::atomic::Ordering::Relaxed);
+            }
             0i64
         }
 
