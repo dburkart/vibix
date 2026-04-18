@@ -49,12 +49,18 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("getuid_returns_kernel_uid", &(getuid_returns_kernel_uid as fn())),
+        (
+            "getuid_returns_kernel_uid",
+            &(getuid_returns_kernel_uid as fn()),
+        ),
         (
             "geteuid_returns_kernel_euid",
             &(geteuid_returns_kernel_euid as fn()),
         ),
-        ("getgid_returns_kernel_gid", &(getgid_returns_kernel_gid as fn())),
+        (
+            "getgid_returns_kernel_gid",
+            &(getgid_returns_kernel_gid as fn()),
+        ),
         (
             "getegid_returns_kernel_egid",
             &(getegid_returns_kernel_egid as fn()),
