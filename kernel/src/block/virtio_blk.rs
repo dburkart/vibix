@@ -29,6 +29,10 @@
 #[cfg(target_os = "none")]
 use super::BlkError;
 #[cfg(target_os = "none")]
+use super::BlockDevice;
+#[cfg(target_os = "none")]
+use super::BlockError;
+#[cfg(target_os = "none")]
 use super::SECTOR_SIZE;
 
 #[cfg(target_os = "none")]
@@ -671,6 +675,87 @@ unsafe fn write16(base: u16, reg: u16, v: u16) {
 unsafe fn write32(base: u16, reg: u16, v: u32) {
     let mut p: Port<u32> = Port::new(base + reg);
     p.write(v);
+}
+
+/// [`BlockDevice`] wrapper around the singleton virtio-blk driver.
+///
+/// The driver itself is a module-level `DEVICE: Mutex<Option<BlkDevice>>`
+/// singleton — there is at most one virtio-blk in the system today — but
+/// the buffer cache and filesystem drivers want an `Arc<dyn BlockDevice>`
+/// per mount so they can hold a stable handle without reaching into this
+/// module. `VirtioBlk` is a zero-sized adapter that forwards each trait
+/// method to the underlying module-level `read`/`write`.
+///
+/// It is only meaningful to construct a `VirtioBlk` after
+/// [`init`] has brought the device up and [`ready`] returns `true`;
+/// calls against a not-yet-initialized device surface
+/// [`BlockError::NotInitialized`].
+///
+/// `SECTOR_SIZE` is reported as the block size. Future backends with
+/// different geometries (4 KiB on NVMe, for example) will report their
+/// own value.
+///
+/// # Capacity
+///
+/// The legacy virtio-blk driver does not read the device configuration
+/// registers that carry `capacity`; we therefore report `u64::MAX` as a
+/// conservative upper bound. Callers that need a real capacity (mount
+/// path, file-backed boot check) must obtain it out of band — the
+/// buffer cache keys on `(DeviceId, block_no)` and doesn't bounds-check
+/// against `capacity()`, so this is not yet a correctness gap.
+#[cfg(target_os = "none")]
+pub struct VirtioBlk;
+
+#[cfg(target_os = "none")]
+impl VirtioBlk {
+    /// Construct a new adapter. Cheap — the real driver state lives in
+    /// the module-level singleton and is shared across all adapters.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "none")]
+impl Default for VirtioBlk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "none")]
+impl BlockDevice for VirtioBlk {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        let bs = SECTOR_SIZE as u64;
+        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
+            return Err(BlockError::BadAlign);
+        }
+        let lba = offset / bs;
+        read(lba, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let bs = SECTOR_SIZE as u64;
+        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
+            return Err(BlockError::BadAlign);
+        }
+        let lba = offset / bs;
+        // Legacy driver doesn't know device capacity — writes past the
+        // end will surface as device error from the virtio backend
+        // (which is already mapped to `Eio` via `BlkError::DeviceError`).
+        write(lba, buf)
+    }
+
+    fn block_size(&self) -> u32 {
+        SECTOR_SIZE as u32
+    }
+
+    fn capacity(&self) -> u64 {
+        // Capacity is not yet plumbed up from the config BAR; report the
+        // conservative upper bound documented on the struct. Unblocks
+        // the trait contract without constraining callers that don't
+        // consult `capacity()`.
+        u64::MAX
+    }
 }
 
 #[cfg(all(test, not(target_os = "none")))]
