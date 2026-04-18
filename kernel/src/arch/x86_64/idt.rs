@@ -14,16 +14,29 @@ use crate::arch::x86_64::interrupts::{
 };
 use crate::serial_println;
 
-/// #478 diagnostic latch: the first CPL=3 fault of the session logs a
-/// `ring3-first-fault:` line with full frame state before the handler
-/// runs its normal path. Subsequent ring-3 faults are common (SIGSEGV
-/// delivery etc.) and must not flood the log. One-shot by design.
+/// #478 / #527 diagnostic latch: the first *unexpected* CPL=3 fault of the
+/// session logs a `ring3-first-fault:` line with full frame state before
+/// the handler runs its normal path. Subsequent ring-3 faults are common
+/// (SIGSEGV delivery etc.) and must not flood the log. One-shot by design.
+///
+/// "Unexpected" here means a fault that the kernel could not resolve via
+/// its normal dispatch (CoW first-touch, demand-page fill, growsdown stack
+/// extension, etc.).  The `#PF` path only calls this helper on the
+/// fall-through / access-violation branch; the successfully-handled
+/// CoW / demand-page returns skip the log entirely.  That keeps the marker
+/// as a high-signal first-unexpected-fault breadcrumb instead of firing on
+/// every boot's legitimate first-fork CoW fault (issue #527).
 static FIRST_RING3_FAULT_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Emit one `ring3-first-fault:` line on the first CPL=3 fault ever
-/// observed. `extra` is vector-specific trailer (e.g. `code=0x0` for #GP,
-/// `cr2=0x400000 code=PROTECTION` for #PF) — no user memory is touched
-/// while formatting, only scalars copied out of the hardware frame.
+/// Emit one `ring3-first-fault:` line on the first *unresolved* CPL=3 fault
+/// ever observed. `extra` is vector-specific trailer (e.g. `code=0x0` for
+/// `#GP`, `cr2=0x400000 code=PROTECTION` for `#PF`) — no user memory is
+/// touched while formatting, only scalars copied out of the hardware frame.
+///
+/// Callers: `#UD` / `#GP` call unconditionally (no legitimate resolution
+/// path for those in ring 3). `#PF` calls only after the VMA-backed
+/// resolver and growsdown extension have both declined to handle the
+/// fault — so a routine CoW or demand-page fault is silent.
 fn log_first_ring3_fault(vector: &str, frame: &InterruptStackFrame, extra: core::fmt::Arguments) {
     if (frame.code_segment.0 & 0b11) == 0 {
         return;
@@ -136,11 +149,12 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     }
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
-    log_first_ring3_fault(
-        "#PF",
-        &frame,
-        format_args!("cr2={:#x} code={:?}", addr_u64, code),
-    );
+    // Note: log_first_ring3_fault is intentionally NOT called here.  The
+    // diagnostic latch fires only on CPL=3 faults that reach the
+    // access-violation fall-through below, so a routine CoW first-touch
+    // or demand-page fault on the parent's post-fork stack page (issue
+    // #527) stays silent.  SMAP, RSVD, and USER_VA_END panics log their
+    // own dedicated exception lines, so they don't need the marker.
 
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
         use crate::test_harness::{exit_qemu, QemuExitCode};
@@ -327,6 +341,14 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // with DefaultAction::Terminate. The helper calls `task::exit()`, so
     // IRETQ never runs; the scheduler context-switches to the next task.
     if cpl != 0 {
+        // Only fire the one-shot ring-3 first-fault latch for faults that
+        // could not be resolved above.  See #527 and the doc comment on
+        // `log_first_ring3_fault`.
+        log_first_ring3_fault(
+            "#PF",
+            &frame,
+            format_args!("cr2={:#x} code={:?}", addr_u64, code),
+        );
         serial_println!(
             "#PF ring-3 access violation addr={:#x} code={:?}",
             addr_u64,
