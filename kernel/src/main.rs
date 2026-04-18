@@ -66,7 +66,10 @@ pub extern "C" fn _start() -> ! {
     if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
         let bytes = cmdline_resp.cmdline().to_bytes();
         if !bytes.is_empty() {
-            serial_println!("cmdline: {:?}", core::str::from_utf8(bytes).unwrap_or("<non-utf8>"));
+            serial_println!(
+                "cmdline: {:?}",
+                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+            );
         }
         if vibix::block::writeback::parse_cmdline(bytes) {
             serial_println!(

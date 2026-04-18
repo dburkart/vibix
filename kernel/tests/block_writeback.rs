@@ -89,7 +89,10 @@ fn run_tests() {
             "writeback_secs_zero_disables_daemon",
             &(writeback_secs_zero_disables_daemon as fn()),
         ),
-        ("default_cadence_is_thirty_seconds", &(default_cadence as fn())),
+        (
+            "default_cadence_is_thirty_seconds",
+            &(default_cadence as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -282,8 +285,8 @@ fn join_waits_for_daemon() {
     cache.mark_dirty(&bh);
     drop(bh);
 
-    let handle = writeback::start(sb.clone(), cache.clone(), dev)
-        .expect("writeback daemon must start");
+    let handle =
+        writeback::start(sb.clone(), cache.clone(), dev).expect("writeback daemon must start");
 
     // Pre-emptive flush would leave nothing for the daemon to do; skip
     // it so the "join drains pending dirty state" assertion is

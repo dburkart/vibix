@@ -373,9 +373,7 @@ mod daemon {
             )
         };
 
-        state
-            .task_id
-            .store(task::current_id(), Ordering::Relaxed);
+        state.task_id.store(task::current_id(), Ordering::Relaxed);
 
         writeback_loop(&state);
 
@@ -451,7 +449,6 @@ mod daemon {
             time::ticks() < deadline
         });
     }
-
 }
 
 #[cfg(target_os = "none")]
