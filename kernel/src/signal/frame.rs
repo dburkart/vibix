@@ -17,7 +17,9 @@
 //!   uc_stack:  [u64; 3]     — ss_sp, ss_flags, ss_size
 //!   gregs:     [u64; 23]    — mcontext_t gregs (see GREGS_* constants)
 //!   uc_sigmask: u64         — saved signal mask
-//!   _reserved: [u8; 8]     — alignment / future use
+//!   restart_flag: u64       — kernel-private: non-zero iff this frame
+//!                             interrupted an ERESTARTSYS-ed syscall that
+//!                             must be replayed at sigreturn (#522)
 //!   fpstate:   u64          — NULL (FPU state not saved; known limitation)
 //! ```
 //!
@@ -36,12 +38,27 @@
 //! 16:RIP 17:EFLAGS 18:CS 19:GS 20:FS 21:ERR 22:TRAPNO
 //! ```
 //!
-//! We save RIP, RFLAGS, and RSP (indices 16, 17, 15) which are sufficient for
-//! `sigreturn` to resume the interrupted code.  The others are zero-filled.
+//! We save RIP, RFLAGS, and RSP (indices 16, 17, 15) and — for SA_RESTART
+//! correctness after a user handler runs — the six Linux syscall arg
+//! registers plus the syscall number (RAX, RDI, RSI, RDX, R10, R8, R9).
+//! Without those, a signal delivered to a user handler on an ERESTARTSYS
+//! path would restart the syscall with whatever the handler left in those
+//! registers. See issue #522.  The remaining gregs slots are zero-filled.
+//!
+//! Mapping of the Linux syscall ABI onto gregs indices:
+//!   RAX (syscall nr) → 13, RDI (a0) → 8, RSI (a1) → 9, RDX (a2) → 12,
+//!   R10 (a3) → 2,   R8  (a4) → 0, R9  (a5) → 1.
 
 use core::mem;
 
 /// Index of key registers in `SigFrame::gregs`.
+const REG_R8: usize = 0;
+const REG_R9: usize = 1;
+const REG_R10: usize = 2;
+const REG_RDI: usize = 8;
+const REG_RSI: usize = 9;
+const REG_RDX: usize = 12;
+const REG_RAX: usize = 13;
 const REG_RSP: usize = 15;
 const REG_RIP: usize = 16;
 const REG_EFLAGS: usize = 17;
@@ -80,7 +97,14 @@ pub struct SigFrame {
     pub gregs: [u64; 23],
     /// Saved signal mask (restored by sigreturn).
     pub uc_sigmask: u64,
-    pub _reserved: [u8; 8],
+    /// Kernel-private: non-zero iff the signal was delivered on an
+    /// SA_RESTART-ed ERESTARTSYS path where `check_and_deliver_signals`
+    /// rewound RIP to the SYSCALL instruction. `sigreturn(2)` uses this
+    /// to decide whether to restore the saved syscall-arg gregs into the
+    /// `SyscallReturnContext` and raise `SYSCALL_RESTART_PENDING`. The
+    /// field lives where Linux keeps `__reserved[8]`; userspace is not
+    /// expected to read or modify it (issue #522).
+    pub restart_flag: u64,
     /// Pointer to saved FPU state.  Always NULL in this implementation.
     pub fpstate: u64,
     /// Inline sigreturn trampoline code.
@@ -92,11 +116,49 @@ pub struct SigFrame {
 const _: () = assert!(mem::size_of::<SigFrame>() % 16 == 0);
 
 /// Recovered register state from a `SigFrame`.
+///
+/// `syscall_regs` carries the seven Linux x86_64 syscall registers
+/// (RAX, RDI, RSI, RDX, R10, R8, R9) that were live on the interrupted
+/// SYSCALL instruction, so `sigreturn(2)` can replay an SA_RESTART-ed
+/// syscall with its original number and arguments (issue #522).
+///
+/// `restart_pending` is true iff this frame was pushed on an
+/// SA_RESTART-ed ERESTARTSYS path. When false, the caller MUST NOT
+/// write `syscall_regs` back into the `SyscallReturnContext` and MUST
+/// NOT assert `SYSCALL_RESTART_PENDING`: on normal handler returns the
+/// ctx still holds the syscall return value in `user_rax`, and
+/// clobbering it would corrupt the post-syscall result the handler was
+/// interrupted on. When true, the caller writes the regs back and
+/// asserts the flag so the asm trampoline reloads them before the
+/// replayed SYSCALL.
 pub struct RestoredRegs {
     pub rip: u64,
     pub rflags: u64,
     pub rsp: u64,
     pub saved_mask: u64,
+    pub syscall_regs: SavedSyscallRegs,
+    pub restart_pending: bool,
+}
+
+/// The seven Linux x86_64 syscall registers preserved across a
+/// signal-handler round-trip so `sigreturn(2)` can restart an
+/// SA_RESTART-ed syscall with its original number and args (issue #522).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SavedSyscallRegs {
+    /// RAX — syscall number at SYSCALL entry.
+    pub rax: u64,
+    /// RDI — a0.
+    pub rdi: u64,
+    /// RSI — a1.
+    pub rsi: u64,
+    /// RDX — a2.
+    pub rdx: u64,
+    /// R10 — a3.
+    pub r10: u64,
+    /// R8 — a4.
+    pub r8: u64,
+    /// R9 — a5.
+    pub r9: u64,
 }
 
 /// Push a `SigFrame` onto the user stack at `user_rsp` and return the new
@@ -118,6 +180,8 @@ pub unsafe fn push_signal_frame(
     saved_rip: u64,
     saved_rflags: u64,
     saved_mask: u64,
+    syscall_regs: SavedSyscallRegs,
+    restart_pending: bool,
 ) -> Result<u64, ()> {
     use crate::arch::x86_64::uaccess;
 
@@ -143,7 +207,7 @@ pub unsafe fn push_signal_frame(
         uc_stack: [0u64; 3],
         gregs: [0u64; 23],
         uc_sigmask: saved_mask,
-        _reserved: [0u8; 8],
+        restart_flag: if restart_pending { 1 } else { 0 },
         fpstate: 0,
         trampoline_code: SIGRETURN_TRAMPOLINE,
         _trampoline_pad: [0u8; 7],
@@ -156,6 +220,22 @@ pub unsafe fn push_signal_frame(
     frame.gregs[REG_RIP] = saved_rip;
     frame.gregs[REG_EFLAGS] = saved_rflags;
     frame.gregs[REG_RSP] = user_rsp;
+
+    // Save the Linux syscall-ABI registers so `sigreturn(2)` can replay
+    // an SA_RESTART-ed syscall with the original (nr, a0..a5). Without
+    // these, a user handler that clobbers any of rax/rdi/rsi/rdx/r10/r8/r9
+    // would corrupt the restarted syscall (issue #522). The gregs slots
+    // are populated unconditionally so gdb / a friendly userspace can
+    // still observe the pre-handler syscall arguments, but `sigreturn`
+    // only writes them back into the kernel context when
+    // `restart_flag` is non-zero.
+    frame.gregs[REG_RAX] = syscall_regs.rax;
+    frame.gregs[REG_RDI] = syscall_regs.rdi;
+    frame.gregs[REG_RSI] = syscall_regs.rsi;
+    frame.gregs[REG_RDX] = syscall_regs.rdx;
+    frame.gregs[REG_R10] = syscall_regs.r10;
+    frame.gregs[REG_R8] = syscall_regs.r8;
+    frame.gregs[REG_R9] = syscall_regs.r9;
 
     // Copy frame to user stack.
     let frame_bytes =
@@ -204,7 +284,7 @@ pub unsafe fn push_fault_signal_frame(
         uc_stack: [0u64; 3],
         gregs: [0u64; 23],
         uc_sigmask: saved_mask,
-        _reserved: [0u8; 8],
+        restart_flag: 0,
         fpstate: 0,
         trampoline_code: SIGRETURN_TRAMPOLINE,
         _trampoline_pad: [0u8; 7],
@@ -220,6 +300,11 @@ pub unsafe fn push_fault_signal_frame(
     frame.gregs[REG_RIP] = saved_rip;
     frame.gregs[REG_EFLAGS] = saved_rflags;
     frame.gregs[REG_RSP] = user_rsp;
+    // Fault path does not resume an interrupted SYSCALL — the interrupted
+    // code is user code at `saved_rip`, not a syscall. Leave the syscall
+    // arg gregs as zero AND `restart_flag` as zero, so a (malicious or
+    // defensive) sigreturn cannot synthesize a SYSCALL-arg reload on the
+    // fault-recovery path.
 
     let frame_bytes =
         core::slice::from_raw_parts(&frame as *const SigFrame as *const u8, frame_size as usize);
@@ -267,6 +352,16 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
         rflags: frame.gregs[REG_EFLAGS],
         rsp,
         saved_mask: frame.uc_sigmask,
+        syscall_regs: SavedSyscallRegs {
+            rax: frame.gregs[REG_RAX],
+            rdi: frame.gregs[REG_RDI],
+            rsi: frame.gregs[REG_RSI],
+            rdx: frame.gregs[REG_RDX],
+            r10: frame.gregs[REG_R10],
+            r8: frame.gregs[REG_R8],
+            r9: frame.gregs[REG_R9],
+        },
+        restart_pending: frame.restart_flag != 0,
     })
 }
 
@@ -299,7 +394,7 @@ mod tests {
             uc_stack: [0u64; 3],
             gregs: [0u64; 23],
             uc_sigmask: 0,
-            _reserved: [0u8; 8],
+            restart_flag: 0,
             fpstate: 0,
             trampoline_code: SIGRETURN_TRAMPOLINE,
             _trampoline_pad: [0u8; 7],
@@ -317,5 +412,44 @@ mod tests {
         assert!(REG_RSP < 23);
         assert!(REG_RIP < 23);
         assert!(REG_EFLAGS < 23);
+        // #522: syscall-arg register indices must all stay in range.
+        assert!(REG_RAX < 23);
+        assert!(REG_RDI < 23);
+        assert!(REG_RSI < 23);
+        assert!(REG_RDX < 23);
+        assert!(REG_R10 < 23);
+        assert!(REG_R8 < 23);
+        assert!(REG_R9 < 23);
+    }
+
+    #[test]
+    fn syscall_greg_indices_match_linux_abi() {
+        // Linux x86_64 <sys/ucontext.h> REG_* ordering. Any drift here
+        // would silently miswire which gregs slot holds which syscall
+        // arg across the sigreturn boundary (issue #522).
+        assert_eq!(REG_R8, 0);
+        assert_eq!(REG_R9, 1);
+        assert_eq!(REG_R10, 2);
+        assert_eq!(REG_RDI, 8);
+        assert_eq!(REG_RSI, 9);
+        assert_eq!(REG_RDX, 12);
+        assert_eq!(REG_RAX, 13);
+    }
+
+    #[test]
+    fn syscall_greg_indices_are_pairwise_distinct() {
+        // Guard against a typo that would collapse two fields onto the
+        // same gregs slot — the unit test above pins each value, but an
+        // explicit uniqueness check keeps the intent clear and the
+        // failure mode obvious if someone ever edits the constants.
+        let idxs = [
+            REG_R8, REG_R9, REG_R10, REG_RDI, REG_RSI, REG_RDX, REG_RAX, REG_RSP, REG_RIP,
+            REG_EFLAGS,
+        ];
+        for (i, a) in idxs.iter().enumerate() {
+            for b in idxs.iter().skip(i + 1) {
+                assert_ne!(a, b, "duplicate gregs index {a}");
+            }
+        }
     }
 }

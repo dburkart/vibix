@@ -289,3 +289,7 @@ harness = false
 [[test]]
 name = "wait4_condvar_race"
 harness = false
+
+[[test]]
+name = "signal_sa_restart_preserves_args"
+harness = false
