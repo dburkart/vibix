@@ -567,8 +567,8 @@ const INODE_OFF_BLOCKS: usize = 28;
 const INODE_OFF_FLAGS: usize = 32;
 // i_osd1: offset 36..40 — preserved verbatim by RMW
 const INODE_OFF_I_BLOCK: usize = 40; // 15 u32s, through offset 100.
-// i_generation: offset 100..104 — preserved verbatim by RMW
-// i_file_acl:   offset 104..108 — preserved verbatim by RMW
+                                     // i_generation: offset 100..104 — preserved verbatim by RMW
+                                     // i_file_acl:   offset 104..108 — preserved verbatim by RMW
 const INODE_OFF_DIR_ACL_OR_SIZE_HIGH: usize = 108;
 // i_faddr:      offset 112..116 — preserved verbatim by RMW
 // i_osd2[12]:   offset 116..128; within it:
@@ -826,8 +826,7 @@ mod tests {
     /// 128 bytes of the root inode (ino 2), byte-for-byte. Offset 0
     /// corresponds to on-disk byte offset 5248 (block 5 × 1024 + 1 ×
     /// 128).
-    const GOLDEN_ROOT_INODE: &[u8; 128] =
-        include_bytes!("fixtures/golden_root_inode.bin");
+    const GOLDEN_ROOT_INODE: &[u8; 128] = include_bytes!("fixtures/golden_root_inode.bin");
 
     /// 64 bytes of the root directory's first block, covering the
     /// `.`, `..`, and `lost+found` records.
@@ -1033,8 +1032,10 @@ mod tests {
         // silently loses the upper 16 bits of every owner.
         let mut slot = *GOLDEN_ROOT_INODE;
         // Stamp high uid = 0xaabb, high gid = 0xccdd.
-        slot[INODE_OFF_L_I_UID_HIGH..INODE_OFF_L_I_UID_HIGH + 2].copy_from_slice(&0xaabbu16.to_le_bytes());
-        slot[INODE_OFF_L_I_GID_HIGH..INODE_OFF_L_I_GID_HIGH + 2].copy_from_slice(&0xccddu16.to_le_bytes());
+        slot[INODE_OFF_L_I_UID_HIGH..INODE_OFF_L_I_UID_HIGH + 2]
+            .copy_from_slice(&0xaabbu16.to_le_bytes());
+        slot[INODE_OFF_L_I_GID_HIGH..INODE_OFF_L_I_GID_HIGH + 2]
+            .copy_from_slice(&0xccddu16.to_le_bytes());
         let inode = Ext2Inode::decode(&slot);
         assert_eq!(inode.l_i_uid_high, 0xaabb);
         assert_eq!(inode.l_i_gid_high, 0xccdd);
