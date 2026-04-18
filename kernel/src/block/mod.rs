@@ -46,6 +46,7 @@ pub const SECTOR_SIZE: usize = 512;
 /// | `NotInitialized`| `ENODEV` |
 /// | `Timeout`       | `EIO`    |
 /// | `OutOfRange`    | `EINVAL` |
+/// | `NoMemory`      | `ENOMEM` |
 ///
 /// Kept deliberately small — the cache and ext2 driver only need to
 /// distinguish "retry is useless" from "range was invalid" from
@@ -72,6 +73,13 @@ pub enum BlockError {
     Enospc,
     /// The requested byte range lies outside `[0, capacity())`.
     OutOfRange,
+    /// Cache is full and eviction could find no victim buffer to reclaim.
+    /// Every resident entry was either pinned (external `Arc` handle held
+    /// by a caller) or mid-I/O (`DIRTY | LOCKED_IO`). Returned by
+    /// [`cache::BlockCache::bread`] in lieu of synchronously flushing dirty
+    /// buffers from the read path (RFC 0004 §Buffer cache, normative
+    /// invariant #3). Maps to userspace `ENOMEM`.
+    NoMemory,
 }
 
 /// Legacy error alias. See [`BlockError`] for the full taxonomy.
