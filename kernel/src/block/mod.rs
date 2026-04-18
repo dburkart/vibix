@@ -20,6 +20,8 @@
 //! pre-cache callers.
 
 #[cfg(any(test, target_os = "none"))]
+pub mod cache;
+#[cfg(any(test, target_os = "none"))]
 pub mod virtio_blk;
 
 #[cfg(any(test, target_os = "none"))]
