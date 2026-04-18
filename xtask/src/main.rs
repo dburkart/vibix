@@ -1416,6 +1416,97 @@ fn repro_fork(opts: &BuildOpts) -> R<()> {
     }
 }
 
+/// Parsed view of the repro-fork harness start banner.
+///
+/// The harness emits a dedicated `repro: CYCLES=N\n` line before the
+/// legacy `repro: starting fork loop cycles=N hb=K\n` banner so the
+/// compiled cycle count is legible even when early kernel logs
+/// interleave mid-banner on the shared serial (see issue #531).  This
+/// struct captures both signals so the parser can cross-check them.
+///
+/// Only referenced from host unit tests today (`parse_repro_banner_*`);
+/// the parser exists so a soak-step addition that wants to verify the
+/// banner at runtime has a single tested entry point to call into.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReproBanner {
+    /// Cycle count from the dedicated `repro: CYCLES=N` line.
+    cycles_dedicated: u64,
+    /// Cycle count from the combined `repro: starting fork loop
+    /// cycles=N hb=K` line (legacy banner).  `None` if the line is
+    /// absent or mangled (e.g. interleaved with kernel log output).
+    cycles_combined: Option<u64>,
+    /// Heartbeat interval from the legacy banner.  `None` if the line
+    /// is mangled or missing.
+    heartbeat: Option<u64>,
+}
+
+/// Parse the repro-fork start banner out of a captured serial log.
+///
+/// Returns `None` if the dedicated `repro: CYCLES=<N>` line is missing
+/// or malformed; that line is the single source of truth for the
+/// compiled cycle count, and its absence is the regression this
+/// parser guards against (issue #531: if `REPRO_FORK_CYCLES` or
+/// `option_env!` ever silently compiles to the wrong value again, the
+/// xtask test will flag it in CI rather than silently running the
+/// wrong number of iterations).
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_repro_banner(log: &str) -> Option<ReproBanner> {
+    let cycles_dedicated = parse_dedicated_cycles(log)?;
+    let (cycles_combined, heartbeat) = parse_combined_banner(log);
+    Some(ReproBanner {
+        cycles_dedicated,
+        cycles_combined,
+        heartbeat,
+    })
+}
+
+/// Extract `N` from the first occurrence of `repro: CYCLES=<N>`.
+///
+/// Only accepts base-10 digits up to the next non-digit or end-of-line
+/// so a mid-banner interleave (e.g. `repro: CYCLES=500ring3-iretq: ...`)
+/// still yields the intended value.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_dedicated_cycles(log: &str) -> Option<u64> {
+    const MARKER: &str = "repro: CYCLES=";
+    let start = log.find(MARKER)? + MARKER.len();
+    let rest = &log[start..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Extract `(cycles, heartbeat)` from the legacy
+/// `repro: starting fork loop cycles=<N> hb=<K>` banner.
+///
+/// Either element can be `None` if the banner was interleaved with
+/// other serial output.  The dedicated `repro: CYCLES=` line is the
+/// authoritative source; this helper exists for cross-checking and for
+/// future banner-shape regressions.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_combined_banner(log: &str) -> (Option<u64>, Option<u64>) {
+    const MARKER: &str = "repro: starting fork loop cycles=";
+    let Some(start) = log.find(MARKER) else {
+        return (None, None);
+    };
+    let rest = &log[start + MARKER.len()..];
+    let cycles: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let cycles = cycles.parse::<u64>().ok();
+
+    // Look for " hb=<K>" on the same line (no newline in between).
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let line = &rest[..line_end];
+    let hb_marker = " hb=";
+    let heartbeat = line.find(hb_marker).and_then(|idx| {
+        let tail = &line[idx + hb_marker.len()..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    });
+    (cycles, heartbeat)
+}
+
 fn lint() -> R<()> {
     println!("→ clippy: xtask (host)");
     check(
@@ -1773,5 +1864,141 @@ harness = false
             ),
             "usage string must list repro-fork-build"
         );
+    }
+
+    /// Issue #531: the repro-fork harness compiled CYCLES to a value
+    /// far above 500 (the CI soak ran ~14,988 cycles per boot), which
+    /// silently burned every soak iteration against the 900 s hard
+    /// cap.  The fix makes CYCLES self-report on a dedicated
+    /// `repro: CYCLES=<N>` line; this parser + test pin that contract
+    /// so a regression (e.g. someone dropping the dedicated line, or
+    /// `option_env!("REPRO_FORK_CYCLES")` silently parsing a typo'd
+    /// build override as a huge number) fails a host unit test in CI
+    /// before it ever reaches a soak run.
+    #[test]
+    fn parse_repro_banner_clean_log() {
+        let log = "\
+boot: ok
+repro: CYCLES=500
+repro: starting fork loop cycles=500 hb=50
+repro: fork loop complete cycles=500
+";
+        let banner = parse_repro_banner(log).expect("parse must succeed");
+        assert_eq!(banner.cycles_dedicated, 500);
+        assert_eq!(banner.cycles_combined, Some(500));
+        assert_eq!(banner.heartbeat, Some(50));
+    }
+
+    #[test]
+    fn parse_repro_banner_tolerates_interleaved_combined_line() {
+        // The #531 evidence log showed the combined banner mangled by
+        // a child exec's `ring3-iretq` log interleaving on the shared
+        // serial mid-line.  The dedicated `repro: CYCLES=` line is
+        // emitted first and newline-terminated precisely so its value
+        // is still recoverable even when the combined banner is
+        // unreadable.
+        let log = "\
+repro: CYCLES=500
+repro: starting fork loop cycles=ring3-iretq: rip=0x400000 rsp=0x7fffff58
+hello: hello from execed child
+";
+        let banner = parse_repro_banner(log).expect("dedicated line must still parse");
+        assert_eq!(banner.cycles_dedicated, 500);
+        // Combined banner's `cycles=` was immediately followed by
+        // non-digit text — parser yields None for that field.
+        assert_eq!(banner.cycles_combined, None);
+        assert_eq!(banner.heartbeat, None);
+    }
+
+    #[test]
+    fn parse_repro_banner_missing_dedicated_line_returns_none() {
+        // Only the legacy combined banner is present.  Parser must
+        // fail closed — a missing dedicated line is the regression
+        // we're guarding against.
+        let log = "\
+repro: starting fork loop cycles=500 hb=50
+";
+        assert!(parse_repro_banner(log).is_none());
+    }
+
+    #[test]
+    fn parse_repro_banner_rejects_nondigit_value() {
+        // Defensive: a malformed `repro: CYCLES=` line (no digits)
+        // must not trip a false positive.
+        let log = "repro: CYCLES=abc\n";
+        assert!(parse_repro_banner(log).is_none());
+    }
+
+    /// Issue #531: the xtask source-level contract for the repro-fork
+    /// userspace binary is "CYCLES compiles to 500 by default."  The
+    /// harness is cross-compiled for `x86_64-unknown-none` so we can't
+    /// exercise it from a host unit test directly, but we can inspect
+    /// the source to pin the default literal; if someone bumps it to
+    /// a huge number without updating the soak workflow, this test
+    /// fails in CI before the soak burns 6 hours discovering it.
+    #[test]
+    fn repro_fork_default_cycles_is_500() {
+        let source = std::fs::read_to_string(
+            workspace_root()
+                .join("userspace")
+                .join("repro_fork")
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("read repro_fork main.rs");
+        // The default is expressed as the `None => <literal>` arm of
+        // the `match option_env!("REPRO_FORK_CYCLES")` block.  A
+        // substring match is brittle across reformatting, but it
+        // catches exactly the regression we care about: "someone
+        // changed the default from 500 and forgot to update the soak
+        // timing budget / this test."
+        assert!(
+            source.contains("None => 500,"),
+            "userspace/repro_fork/src/main.rs must keep the default CYCLES=500; \
+             if you genuinely need to change this, also update \
+             .github/workflows/smoke-soak.yml timing budgets and issue #531's context"
+        );
+    }
+
+    /// Issue #531 root cause: the userspace syscall inline-asm blocks
+    /// declared only rcx/r11 as clobbered, but the vibix kernel's
+    /// SYSCALL trampoline + Rust SysV dispatcher also trash rdi, rsi,
+    /// rdx, r8, r9, r10 (and, via the C ABI, rax).  Loop counters held
+    /// in r8 across the fork syscall never incremented, so the
+    /// repro-fork harness ran until HARD_CAP every time.  Pin the
+    /// fixed clobber pattern in source so a future edit that drops a
+    /// clobber declaration fails a host unit test before it silently
+    /// regresses the soak.
+    #[test]
+    fn repro_fork_syscall_blocks_clobber_all_sysv_caller_saved() {
+        let source = std::fs::read_to_string(
+            workspace_root()
+                .join("userspace")
+                .join("repro_fork")
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("read repro_fork main.rs");
+
+        // Every `asm!(\"syscall\", ...)` block in this file that is
+        // not a `noreturn` exit must declare lateout for each SysV
+        // caller-saved register the kernel may trash on SYSRETQ:
+        // r8, r9, r10, r11 (rax, rcx, rdx, rdi, rsi are handled via
+        // the `inlateout`/`lateout` pattern documented in the ABI
+        // header, so we grep for the r-class registers here as the
+        // load-bearing signal).
+        for reg in ["r8", "r9", "r10", "r11"] {
+            let needle = format!("lateout(\"{reg}\")");
+            let count = source.matches(&needle).count();
+            // The module has 4 non-noreturn syscall sites in the
+            // reproducer (fork, execve-in-child, wait4, write_line).
+            // Every one of them must carry every r-class clobber.
+            assert!(
+                count >= 4,
+                "expected at least 4 `{needle}` declarations in repro_fork/main.rs, \
+                 found {count}.  If you added or removed a syscall site, update this \
+                 lower bound; if you dropped a clobber, restore it (issue #531)."
+            );
+        }
     }
 }

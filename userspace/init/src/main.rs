@@ -13,6 +13,19 @@
 //! - rcx and r11 are clobbered by SYSCALL/SYSRET
 //! - Return value in rax
 //!
+//! ### Kernel-side register clobbers — see issue #531
+//!
+//! The vibix kernel's SYSCALL trampoline does **not** preserve the user
+//! values of `rdi`, `rsi`, `rdx`, `r8`, `r9`, or `r10` across a
+//! syscall.  After `syscall_entry` pushes them for restart handling and
+//! calls the Rust `syscall_dispatch` (SysV C ABI), the dispatcher is
+//! free to use them as scratch; the SYSRETQ path only restores `rcx`
+//! and `r11`.  Every syscall block below therefore declares **all**
+//! SysV caller-saved GPRs as `inlateout`/`lateout` — missing any of
+//! them silently lets the compiler cache dead values across the
+//! syscall and produces incorrect behavior (caught in #531 after a
+//! loop counter in `r8` never incremented in the repro-fork harness).
+//!
 //! ## Syscall numbers and argument layout (pinned — do not renumber)
 //!
 //! These must stay in sync with the `match nr` arms in
@@ -72,6 +85,12 @@ pub extern "C" fn _start() -> ! {
             "syscall",
             inlateout("rax") 57u64 => fork_ret,
             lateout("rcx") _,
+            lateout("rdx") _,
+            lateout("rdi") _,
+            lateout("rsi") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
             lateout("r11") _,
             options(nostack, preserves_flags),
         );
@@ -83,11 +102,14 @@ pub extern "C" fn _start() -> ! {
         unsafe {
             core::arch::asm!(
                 "syscall",
-                in("rax") 59u64,  // execve
-                in("rdi") 0u64,   // path (ignored)
-                in("rsi") 0u64,   // argv (ignored)
-                in("rdx") 0u64,   // envp (ignored)
+                inlateout("rax") 59u64 => _,   // execve
+                inlateout("rdi") 0u64 => _,    // path (ignored)
+                inlateout("rsi") 0u64 => _,    // argv (ignored)
+                inlateout("rdx") 0u64 => _,    // envp (ignored)
                 lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
@@ -96,9 +118,14 @@ pub extern "C" fn _start() -> ! {
         unsafe {
             core::arch::asm!(
                 "syscall",
-                in("rax") 60u64, // exit
-                in("rdi") 1u64,  // status 1 (exec failed)
+                inlateout("rax") 60u64 => _,   // exit
+                inlateout("rdi") 1u64 => _,    // status 1 (exec failed)
                 lateout("rcx") _,
+                lateout("rdx") _,
+                lateout("rsi") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
@@ -116,12 +143,14 @@ pub extern "C" fn _start() -> ! {
         unsafe {
             core::arch::asm!(
                 "syscall",
-                inlateout("rax") 61u64 => _waited,  // wait4
-                in("rdi") child_pid,                  // pid
-                in("rsi") &mut wstatus as *mut i32 as u64,
-                in("rdx") 0u64,                       // options
-                in("r10") 0u64,                       // rusage
+                inlateout("rax") 61u64 => _waited,                         // wait4
+                inlateout("rdi") child_pid => _,                            // pid
+                inlateout("rsi") &mut wstatus as *mut i32 as u64 => _,      // *wstatus
+                inlateout("rdx") 0u64 => _,                                 // options
+                inlateout("r10") 0u64 => _,                                 // rusage
                 lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 lateout("r11") _,
                 options(nostack),
             );
@@ -139,11 +168,14 @@ fn write(fd: u64, buf: &[u8]) {
     unsafe {
         core::arch::asm!(
             "syscall",
-            in("rax") 1u64,
-            in("rdi") fd,
-            in("rsi") buf.as_ptr() as u64,
-            in("rdx") buf.len() as u64,
+            inlateout("rax") 1u64 => _,
+            inlateout("rdi") fd => _,
+            inlateout("rsi") buf.as_ptr() as u64 => _,
+            inlateout("rdx") buf.len() as u64 => _,
             lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
             lateout("r11") _,
             options(nostack, preserves_flags),
         );

@@ -31,6 +31,20 @@
 //!
 //! Mirrors `userspace/init/src/main.rs` exactly.  See that file for the
 //! full table of syscall numbers and argument conventions.
+//!
+//! ### Register clobbers — see issue #531
+//!
+//! The vibix kernel's SYSCALL entry trampoline does **not** preserve the
+//! user-mode values of `rdi`, `rsi`, `rdx`, `r8`, `r9`, or `r10` across
+//! a syscall.  After `syscall_entry` pushes them to the kernel stack and
+//! calls the Rust `syscall_dispatch` (SysV C ABI), those registers are
+//! free real-estate for the dispatcher, and the SYSRETQ path only
+//! restores `rcx` (user RIP) and `r11` (user RFLAGS).  Every syscall
+//! block below therefore declares **all** SysV caller-saved GPRs as
+//! `lateout`/`inlateout` — missing any of them silently lets the
+//! compiler cache dead values across the syscall and produces wildly
+//! wrong behavior (issue #531: the fork-loop counter was held in `r8`
+//! and never incremented, so the soak ran until HARD_CAP every time).
 
 #![no_std]
 #![no_main]
@@ -89,6 +103,18 @@ const STDOUT: u64 = 1;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Emit CYCLES on its own dedicated, newline-terminated line so a
+    // future #531-shaped regression (CYCLES compiled to the wrong value
+    // or the start banner getting serial-interleaved with early kernel
+    // output) shows up as a clean `repro: CYCLES=N` marker the xtask
+    // parser can pick up (see `xtask::tests::parse_cycles_banner`).
+    // Kept before the combined banner below so it lands on its own
+    // line even when the child's execve-ring3-iretq log interleaves
+    // mid-banner under contention.
+    write_line(b"repro: CYCLES=");
+    write_u64(CYCLES);
+    write_line(b"\n");
+
     write_line(b"repro: starting fork loop cycles=");
     write_u64(CYCLES);
     write_line(b" hb=");
@@ -106,6 +132,12 @@ pub extern "C" fn _start() -> ! {
                 "syscall",
                 inlateout("rax") SYS_FORK => fork_ret,
                 lateout("rcx") _,
+                lateout("rdx") _,
+                lateout("rdi") _,
+                lateout("rsi") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
@@ -119,11 +151,14 @@ pub extern "C" fn _start() -> ! {
             unsafe {
                 core::arch::asm!(
                     "syscall",
-                    in("rax") SYS_EXECVE,
-                    in("rdi") 0u64,
-                    in("rsi") 0u64,
-                    in("rdx") 0u64,
+                    inlateout("rax") SYS_EXECVE => _,
+                    inlateout("rdi") 0u64 => _,
+                    inlateout("rsi") 0u64 => _,
+                    inlateout("rdx") 0u64 => _,
                     lateout("rcx") _,
+                    lateout("r8") _,
+                    lateout("r9") _,
+                    lateout("r10") _,
                     lateout("r11") _,
                     options(nostack, preserves_flags),
                 );
@@ -148,11 +183,13 @@ pub extern "C" fn _start() -> ! {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") SYS_WAIT4 => waited,
-                in("rdi") child_pid,
-                in("rsi") &mut wstatus as *mut i32 as u64,
-                in("rdx") 0u64,
-                in("r10") 0u64,
+                inlateout("rdi") child_pid => _,
+                inlateout("rsi") &mut wstatus as *mut i32 as u64 => _,
+                inlateout("rdx") 0u64 => _,
+                inlateout("r10") 0u64 => _,
                 lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
                 lateout("r11") _,
                 options(nostack),
             );
@@ -205,11 +242,14 @@ fn write_line(buf: &[u8]) {
     unsafe {
         core::arch::asm!(
             "syscall",
-            in("rax") SYS_WRITE,
-            in("rdi") STDOUT,
-            in("rsi") buf.as_ptr() as u64,
-            in("rdx") buf.len() as u64,
+            inlateout("rax") SYS_WRITE => _,
+            inlateout("rdi") STDOUT => _,
+            inlateout("rsi") buf.as_ptr() as u64 => _,
+            inlateout("rdx") buf.len() as u64 => _,
             lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
             lateout("r11") _,
             options(nostack, preserves_flags),
         );
