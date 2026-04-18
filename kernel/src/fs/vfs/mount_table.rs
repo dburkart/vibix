@@ -180,8 +180,24 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
     };
 
     gc_drain_for(&sb);
-    // Phase B: sb.ops.unmount() is infallible per the SuperOps contract —
-    // the mount is already detached; we always return Ok(()).
+    // Phase B: flush any dirty buffers this mount owns *before*
+    // `sb.ops.unmount()` tears the driver's device plumbing down. Errors
+    // are logged and absorbed — the detach is unconditional, matching
+    // `SuperOps::unmount`'s infallibility contract. A later retry can
+    // pick up buffers that `sync_fs` failed to flush via the writeback
+    // daemon or an explicit `sync(2)`.
+    //
+    // See RFC 0004 §Buffer cache and issue #554 for the normative
+    // contract on flush-before-detach ordering.
+    if let Err(errno) = sb.ops.sync_fs(&sb) {
+        crate::serial_println!(
+            "vfs: sync_fs failed during unmount ({}): errno={}",
+            sb.fs_type,
+            errno,
+        );
+    }
+    // Phase B cont.: sb.ops.unmount() is infallible per the SuperOps
+    // contract — the mount is already detached; we always return Ok(()).
     sb.ops.unmount();
     Ok(())
 }
