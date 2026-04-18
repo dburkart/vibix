@@ -281,3 +281,7 @@ harness = false
 [[test]]
 name = "gdbstub_loop"
 harness = false
+
+[[test]]
+name = "syscall_stack_switch"
+harness = false
