@@ -905,6 +905,41 @@ pub unsafe extern "C" fn syscall_dispatch(
         // getegid() — return the caller's effective group ID.
         GETEGID => super::syscalls::creds::sys_getegid(),
 
+        // setuid(uid) — POSIX.1-2017 §setuid. Privileged (euid==0)
+        // transition sets ruid=euid=suid=uid; unprivileged sets euid
+        // only, and only to ruid or suid. `uid == (uid_t)-1` is
+        // EINVAL (no unchanged sentinel in the single-arg form).
+        // Issue #548.
+        SETUID => super::syscalls::creds::sys_setuid(a0 as u32),
+
+        // setgid(gid) — POSIX.1-2017 §setgid. Group-side mirror of
+        // setuid. Still gated on effective *user* ID (euid == 0) for
+        // the privileged bypass per POSIX.1.
+        SETGID => super::syscalls::creds::sys_setgid(a0 as u32),
+
+        // setreuid(ruid, euid) — POSIX.1-2017 §setreuid. Each argument
+        // may be (uid_t)-1 to leave the field unchanged. Non-root
+        // requires each non-(-1) target ∈ {ruid, euid, suid}.
+        // Bumps suid := new euid when ruid was set or euid changed to
+        // a value != old ruid.
+        SETREUID => super::syscalls::creds::sys_setreuid(a0 as u32, a1 as u32),
+
+        // setregid(rgid, egid) — group-side mirror of setreuid with
+        // the same sgid-bump rule.
+        SETREGID => super::syscalls::creds::sys_setregid(a0 as u32, a1 as u32),
+
+        // setresuid(ruid, euid, suid) — all three fields exposed to
+        // the caller; no implicit suid update. (uid_t)-1 preserves.
+        SETRESUID => {
+            super::syscalls::creds::sys_setresuid(a0 as u32, a1 as u32, a2 as u32)
+        }
+
+        // setresgid(rgid, egid, sgid) — group-side mirror of
+        // setresuid.
+        SETRESGID => {
+            super::syscalls::creds::sys_setresgid(a0 as u32, a1 as u32, a2 as u32)
+        }
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -1495,6 +1530,12 @@ pub mod syscall_nr {
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
+    pub const SETUID: u64 = 105;
+    pub const SETGID: u64 = 106;
+    pub const SETREUID: u64 = 113;
+    pub const SETREGID: u64 = 114;
+    pub const SETRESUID: u64 = 117;
+    pub const SETRESGID: u64 = 119;
 }
 
 #[cfg(test)]
@@ -1564,6 +1605,14 @@ mod tests {
         assert_eq!(syscall_nr::GETGID, 104, "SYS_getgid must be 104");
         assert_eq!(syscall_nr::GETEUID, 107, "SYS_geteuid must be 107");
         assert_eq!(syscall_nr::GETEGID, 108, "SYS_getegid must be 108");
+
+        // Credential writes (issue #548, RFC 0004 Workstream B)
+        assert_eq!(syscall_nr::SETUID, 105, "SYS_setuid must be 105");
+        assert_eq!(syscall_nr::SETGID, 106, "SYS_setgid must be 106");
+        assert_eq!(syscall_nr::SETREUID, 113, "SYS_setreuid must be 113");
+        assert_eq!(syscall_nr::SETREGID, 114, "SYS_setregid must be 114");
+        assert_eq!(syscall_nr::SETRESUID, 117, "SYS_setresuid must be 117");
+        assert_eq!(syscall_nr::SETRESGID, 119, "SYS_setresgid must be 119");
 
         // IPC / FIFO
         assert_eq!(syscall_nr::PIPE, 22, "SYS_pipe must be 22");

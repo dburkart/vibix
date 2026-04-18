@@ -440,6 +440,42 @@ pub fn current_credentials() -> alloc::sync::Arc<crate::fs::vfs::Credential> {
     snapshot
 }
 
+/// Atomically replace the currently-running task's credentials with
+/// `new_cred`. The write-side partner of [`current_credentials`]: the
+/// caller constructs a fresh [`Credential`](crate::fs::vfs::Credential)
+/// (typically by cloning the existing snapshot and overriding the
+/// relevant `uid`/`gid` fields) and this helper swaps the inner `Arc`
+/// under the per-task `BlockingRwLock`.
+///
+/// Readers that took an earlier `Arc` snapshot via
+/// `current_credentials()` continue to see the pre-swap `Credential` —
+/// the swap only becomes visible on the next read. Combined with
+/// `Credential`'s immutability, this is the atomic `Arc`-swap model
+/// documented in RFC 0004 §Credential model: a `setuid(2)` family write
+/// cannot tear an in-flight VFS DAC check on a sibling thread.
+///
+/// Mirrors the SCHED-lock pattern used by [`current_credentials`] — we
+/// take `SCHED` once, acquire the per-task credentials lock through it,
+/// and drop both under a single inner scope so the lock guards release
+/// in the correct order.
+///
+/// # Panics
+/// Panics if called before [`init`] (no running task yet).
+pub fn replace_current_credentials(new_cred: crate::fs::vfs::Credential) {
+    let sched = SCHED.lock();
+    let cur = sched
+        .current
+        .as_ref()
+        .expect("replace_current_credentials: no running task");
+    // Inner scope forces the `RwLockWriteGuard` to drop before the
+    // outer `sched` (`IrqLockGuard`), same as `current_credentials`.
+    {
+        let mut guard = cur.credentials.write();
+        *guard = alloc::sync::Arc::new(new_cred);
+    }
+    drop(sched);
+}
+
 /// Return the per-process current working directory dentry, or `None`
 /// if no cwd has been set (bootstrap / kernel-only tasks). Callers
 /// should fall back to [`crate::fs::vfs::root`] on `None`.
