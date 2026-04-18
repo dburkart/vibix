@@ -285,3 +285,7 @@ harness = false
 [[test]]
 name = "syscall_stack_switch"
 harness = false
+
+[[test]]
+name = "wait4_condvar_race"
+harness = false

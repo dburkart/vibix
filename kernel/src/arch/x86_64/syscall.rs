@@ -663,11 +663,44 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
 
             // Wait until a zombie child exists or no children remain.
-            // Snapshot EXIT_EVENT BEFORE the reap attempt so a child that
-            // exits in the gap between reap_child returning None and the
-            // wait_while park is not missed: if the event fires before snap
-            // is read, the condition (count == snap) is immediately false and
-            // wait_while returns at once, letting us loop back to reap.
+            //
+            // Correctness (issue #508): the snapshot-and-predicate pattern
+            // below is race-free against a child that transitions to Zombie
+            // between our `reap_child` returning `None` and the `wait_while`
+            // park. The argument has two legs:
+            //
+            // 1. EXIT_EVENT uses Release on bump (`mark_zombie`) and Acquire
+            //    on load (`exit_event_count`). A child that calls
+            //    `mark_zombie` after our `snap` read but before our
+            //    `wait_while` call has already performed the Release-bump
+            //    when the waiter's `cond()` runs, so the Acquire-load inside
+            //    `cond()` observes `snap + k` (k ≥ 1). `cond()` returns
+            //    false and `wait_while` returns immediately without parking.
+            //
+            // 2. `WaitQueue::wait_while` evaluates `cond()` under the queue's
+            //    internal Mutex and only enqueues the waiter if `cond()` is
+            //    still true. `mark_zombie`'s `notify_all` also takes that
+            //    same Mutex. So there is a total order between "waiter
+            //    enqueues" and "waker pops the queue":
+            //      - If the waker pops before the waiter enqueues, the
+            //        queue was empty at pop time, so `notify_all` is a
+            //        no-op — but by then EXIT_EVENT is already bumped, and
+            //        the waiter's under-lock `cond()` will see it and not
+            //        enqueue (case 1).
+            //      - If the waiter enqueues before the waker pops, the
+            //        waker pops the waiter's task id and calls `task::wake`,
+            //        which either unparks the parked task or sets
+            //        `wake_pending` so the next `block_current` returns
+            //        immediately (see `sync::waitqueue` module docs).
+            //
+            // Snapshotting EXIT_EVENT *before* the reap attempt (rather than
+            // after the `None`) is the key that makes leg 1 hold: any exit
+            // that happens during the reap window still bumps past `snap`,
+            // so the predicate catches it on the re-check. Moving the
+            // snapshot after `reap_child` would leave a window where an
+            // exit between the snapshot and the park goes undetected.
+            //
+            // Stress-tested by the `wait4_condvar_race` integration test.
             loop {
                 let snap = crate::process::exit_event_count();
                 if let Some((child_pid, exit_status)) =

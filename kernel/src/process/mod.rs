@@ -75,6 +75,19 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(2);
 
 /// Incremented each time any process transitions to Zombie. Used by
 /// `waitpid` to wait without holding TABLE lock inside WaitQueue.
+///
+/// Memory-ordering contract (relied on by `wait4`'s snapshot-predicate
+/// loop — see `kernel/src/arch/x86_64/syscall.rs` WAIT4, and the full
+/// proof for issue #508):
+/// - Writer (`mark_zombie`): `fetch_add(1, Release)` *before*
+///   `CHILD_WAIT.notify_all()`.
+/// - Reader (`exit_event_count`): `load(Acquire)`.
+///
+/// A `wait4` caller that snapshots the counter, calls `reap_child` and
+/// sees `None`, then re-checks under `wait_while` is guaranteed to
+/// observe any concurrent exit that sequenced its Release-bump before
+/// the reader's Acquire-load — either as a non-matching snapshot
+/// (wait_while returns immediately) or as a queued wake.
 static EXIT_EVENT: ExitEvent = AtomicU32::new(0);
 
 /// All wait()-ing parents sleep on this queue until a child exits.
