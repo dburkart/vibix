@@ -136,16 +136,26 @@ pub static SYSCALL_SCRATCH_RSP: AtomicU64 = AtomicU64::new(0);
 // the SIGRETURN_PENDING hand-off flag, are no longer necessary and have
 // been deleted.
 
-/// Set to 1 by `check_and_deliver_signals` when a bare syscall restart
-/// (no user handler) is about to occur. The syscall trampoline checks
-/// this flag after the signal hook returns: when set, the saved user
-/// syscall registers (rax, rdi, rsi, rdx, r10, r8, r9) are restored
-/// before SYSRETQ so the re-executed SYSCALL instruction sees the
-/// original syscall number and arguments. Cleared after consumption.
+/// Set to 1 when the SYSRETQ about to execute should reload the saved
+/// user syscall registers (rax, rdi, rsi, rdx, r10, r8, r9) from the
+/// `SyscallReturnContext` on the kernel stack before returning to user.
+/// Two call sites raise it:
 ///
-/// Not set on the SA_RESTART+handler path — that path delivers the
-/// handler first, and the restart occurs from sigreturn afterwards.
-/// Restoring arg regs through the sigreturn path is a follow-up.
+///   1. `check_and_deliver_signals` on a bare syscall-restart path
+///      (ERESTARTSYS with no user handler). The hook rewinds `user_rip`
+///      to the SYSCALL instruction and flags the trampoline to replay
+///      with the original `(nr, a0..a5)`.
+///   2. `sys_sigreturn` (via `syscall_dispatch` SIGRETURN arm) for the
+///      SA_RESTART+handler path. The signal frame captured the syscall
+///      arg registers at signal-delivery time; sigreturn restores them
+///      into the ctx and flags the trampoline so the SYSCALL that the
+///      handler returned to re-executes with its original args. Without
+///      this flag the trampoline would fall through to the common path
+///      that discards the saved regs and SYSRETQ would land on the
+///      rewound SYSCALL with whatever regs the handler clobbered
+///      (issue #522).
+///
+/// Cleared after consumption by the asm trampoline.
 #[no_mangle]
 pub static SYSCALL_RESTART_PENDING: AtomicU64 = AtomicU64::new(0);
 
@@ -735,12 +745,31 @@ pub unsafe extern "C" fn syscall_dispatch(
         // same frame, so SYSRETQ lands on the pre-signal user PC instead
         // of the sigreturn-trampoline. No cross-task hand-off via globals
         // (issue #504).
+        //
+        // The syscall arg registers (rax=nr, rdi, rsi, rdx, r10, r8, r9)
+        // are also written back so that if the user PC we're returning to
+        // is a SYSCALL instruction about to re-run under SA_RESTART
+        // (issue #522), it sees the original syscall number and args
+        // instead of whatever the handler left in those registers.
+        // `SYSCALL_RESTART_PENDING` is asserted to steer the asm
+        // trampoline down the "reload saved user syscall regs" branch at
+        // SYSRETQ; on non-restart sigreturns the branch is a harmless
+        // reload of whatever is already there (the handler-managed frame
+        // contents for code that is not at a SYSCALL instruction).
         SIGRETURN => {
             let user_rsp = (*ctx).user_rsp;
             let restored = crate::signal::sys_sigreturn(user_rsp);
             (*ctx).user_rip = restored.rip;
             (*ctx).user_rflags = restored.rflags;
             (*ctx).user_rsp = restored.rsp;
+            (*ctx).user_rax = restored.syscall_regs.rax;
+            (*ctx).user_rdi = restored.syscall_regs.rdi;
+            (*ctx).user_rsi = restored.syscall_regs.rsi;
+            (*ctx).user_rdx = restored.syscall_regs.rdx;
+            (*ctx).user_r10 = restored.syscall_regs.r10;
+            (*ctx).user_r8 = restored.syscall_regs.r8;
+            (*ctx).user_r9 = restored.syscall_regs.r9;
+            SYSCALL_RESTART_PENDING.store(1, core::sync::atomic::Ordering::Relaxed);
             0i64
         }
 
