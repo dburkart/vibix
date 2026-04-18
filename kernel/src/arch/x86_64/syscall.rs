@@ -866,6 +866,18 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         FCHOWNAT => super::syscalls::vfs::sys_fchownat_impl(a0 as i32, a1, a2, a3, a4 as u32),
 
+        // truncate(path, length) — set the length of the file at `path`.
+        // Gated behind `vfs_creds` because permission is checked against
+        // the caller's per-task credentials. Integration tests call
+        // `sys_truncate_impl` directly.
+        #[cfg(feature = "vfs_creds")]
+        TRUNCATE => super::syscalls::vfs::sys_truncate_impl(a0, a1 as i64),
+
+        // ftruncate(fd, length) — set the length of the open fd's file.
+        // Same gate as TRUNCATE.
+        #[cfg(feature = "vfs_creds")]
+        FTRUNCATE => super::syscalls::vfs::sys_ftruncate_impl(a0, a1 as i64),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1487,6 +1499,8 @@ pub mod syscall_nr {
     pub const OPEN: u64 = 2;
     pub const OPENAT: u64 = 257;
     pub const LSEEK: u64 = 8;
+    pub const TRUNCATE: u64 = 76;
+    pub const FTRUNCATE: u64 = 77;
     pub const CLOSE: u64 = 3;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
@@ -1631,5 +1645,9 @@ mod tests {
         assert_eq!(syscall_nr::LCHOWN, 94, "SYS_lchown must be 94");
         assert_eq!(syscall_nr::FCHOWNAT, 260, "SYS_fchownat must be 260");
         assert_eq!(syscall_nr::FCHMODAT, 268, "SYS_fchmodat must be 268");
+
+        // File truncation (issue #543)
+        assert_eq!(syscall_nr::TRUNCATE, 76, "SYS_truncate must be 76");
+        assert_eq!(syscall_nr::FTRUNCATE, 77, "SYS_ftruncate must be 77");
     }
 }

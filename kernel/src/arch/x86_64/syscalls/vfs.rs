@@ -27,14 +27,14 @@ use crate::fs::vfs::dentry::{DFlags, Dentry};
 use crate::fs::vfs::ops::{meta_into_stat, Stat};
 use crate::fs::vfs::ops::{SetAttr, SetAttrMask};
 use crate::fs::vfs::path_walk::{path_walk, LookupFlags, MountResolver, NameIdata, PATH_MAX};
-use crate::fs::vfs::super_block::SbActiveGuard;
+use crate::fs::vfs::super_block::{SbActiveGuard, SuperBlock};
 use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
 use crate::fs::vfs::{Access, Credential};
 use crate::fs::{
-    flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EINVAL, EISDIR,
-    ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM,
+    flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR,
+    ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS,
 };
 
 /// Linux x86_64 value of the "use the current working directory"
@@ -1412,4 +1412,185 @@ pub unsafe fn sys_lchown_impl(path_uva: u64, uid: u64, gid: u64) -> i64 {
 /// `fchownat(dfd, path, uid, gid, flags)` — `*at` form of chown.
 pub unsafe fn sys_fchownat_impl(dfd: i32, path_uva: u64, uid: u64, gid: u64, flags: u32) -> i64 {
     chownat_impl(dfd, path_uva, uid as u32, gid as u32, flags)
+}
+
+// ---------------------------------------------------------------------------
+// truncate / ftruncate (issue #543)
+//
+// Wires the POSIX file-length-mutation syscalls to `InodeOps::setattr`
+// with `SetAttrMask::SIZE`. Both forms share the same body after path
+// vs fd resolution — the shared `do_truncate` enforces common POSIX
+// rules (directory → EISDIR, RO mount → EROFS, size > max → EFBIG,
+// caller needs `W_OK` on the inode) and then hands off to the driver.
+//
+// Rules (POSIX.1-2017 §truncate, §ftruncate):
+//   - Negative `length` → EINVAL (caller passes a signed off_t).
+//   - Target is a directory → EISDIR.
+//   - Filesystem is read-only → EROFS.
+//   - Caller lacks W_OK on the inode → EACCES (via `InodeOps::permission`).
+//     For `truncate`, path-walk intermediates also need search (X_OK);
+//     that is enforced by `resolve_inode_as` under the caller's creds.
+//   - `length` exceeds the filesystem's maximum → EFBIG.
+//   - POSIX: growing a file creates a sparse hole that reads as zero.
+//     RamFs fulfils this by zero-filling in `setattr`; ext2 will do the
+//     same when it implements `setattr(size)` in Workstream E.
+//
+// ETXTBSY is not enforced here: the target-is-a-busy-exec-image check
+// belongs alongside execve's image pinning, which is #578 territory.
+// Leaving a TODO here documents the omission for future work.
+// ---------------------------------------------------------------------------
+
+/// Upper bound we accept for a `length` argument, derived from the
+/// target inode's superblock.
+///
+/// The ext2 block-map formula for a 4 KiB-block filesystem tops out at
+/// ~2 TiB (direct + single + double + triple indirect). Rather than
+/// hard-coding that, we compute it from `sb.block_size`:
+///
+/// ```text
+///   ptrs_per_block = block_size / 4
+///   max = (12 + n + n*n + n*n*n) * block_size
+/// ```
+///
+/// where 12 is the ext2 direct-block count. Filesystems whose block
+/// size is zero (or otherwise unusable as a divisor) fall back to
+/// `i64::MAX as u64`, matching POSIX's "no explicit limit". RamFs sets
+/// its block_size to 4096, so the formula still produces a sane cap.
+fn max_file_size_for(sb: &SuperBlock) -> u64 {
+    let bs = sb.block_size as u64;
+    if bs == 0 {
+        return i64::MAX as u64;
+    }
+    let n = bs / 4;
+    // Use checked arithmetic end-to-end so an overflow simply saturates
+    // to i64::MAX, which is the POSIX `off_t` ceiling we'd clamp against
+    // anyway. The branches below keep the formula readable.
+    let direct = 12u64.saturating_mul(bs);
+    let single = n.saturating_mul(bs);
+    let double = n.saturating_mul(n).saturating_mul(bs);
+    let triple = n.saturating_mul(n).saturating_mul(n).saturating_mul(bs);
+    let total = direct
+        .saturating_add(single)
+        .saturating_add(double)
+        .saturating_add(triple);
+    // Cap at i64::MAX so callers who pass the result back through a
+    // signed off_t never see it flip negative.
+    total.min(i64::MAX as u64)
+}
+
+/// Shared truncate body. Takes a resolved inode, a signed `length` (so
+/// the caller's EINVAL gate can fire before we get here), and the
+/// caller's credential snapshot.
+///
+/// Callers are responsible for resolving the target — `truncate` walks
+/// a path under the caller's creds; `ftruncate` looks up an fd. Once
+/// we have the inode, the rules are identical.
+fn do_truncate(inode: &Arc<Inode>, length: i64, cred: &Credential) -> i64 {
+    // POSIX: negative length is EINVAL. The caller passes `length` as a
+    // signed `i64` (x86_64 off_t) so the check lives here, not at the
+    // syscall boundary where the raw u64 would hide the sign bit.
+    if length < 0 {
+        return EINVAL;
+    }
+    let length = length as u64;
+
+    // Directory target is always EISDIR — POSIX says `truncate` on a
+    // directory is undefined, Linux returns EISDIR, and we do too.
+    if inode.kind == InodeKind::Dir {
+        return EISDIR;
+    }
+
+    // Read-only mount: fail early. Drivers on a RO SB also reject via
+    // their own setattr (tarfs::setattr returns EROFS unconditionally),
+    // but catching it here gives every backend consistent behaviour
+    // without the driver round-trip.
+    let sb = match inode.sb.upgrade() {
+        Some(s) => s,
+        None => return ENOENT,
+    };
+    if sb.flags.contains(crate::fs::vfs::SbFlags::RDONLY) {
+        return EROFS;
+    }
+
+    // Clamp against the filesystem's maximum file size. Using checked
+    // arithmetic: any overflow during the computation saturates to
+    // i64::MAX inside `max_file_size_for`, so this comparison never
+    // produces a false pass on a pathological block_size.
+    let max = max_file_size_for(&sb);
+    if length > max {
+        return EFBIG;
+    }
+
+    // DAC: caller needs W_OK on the inode itself. Goes through
+    // `InodeOps::permission` so a driver-level ACL override (when one
+    // ever exists) applies uniformly. Path-walk has already verified
+    // X_OK on each ancestor under the caller's creds.
+    if let Err(e) = inode.ops.permission(inode, cred, Access::WRITE) {
+        return e;
+    }
+
+    // TODO(#578): ETXTBSY when the target is a currently-executing
+    // image. This check lives alongside execve's image pinning, which
+    // RamFs cannot detect today. Wire it here once execve exposes a
+    // per-inode busy flag.
+
+    let attr = SetAttr {
+        mask: SetAttrMask::SIZE,
+        size: length,
+        ..SetAttr::default()
+    };
+    match inode.ops.setattr(inode, &attr) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `truncate(path, length)` — set the file at `path` to `length` bytes.
+///
+/// Follows a trailing symlink (POSIX defines no `AT_SYMLINK_NOFOLLOW`
+/// variant for `truncate`). Every path component is walked under the
+/// caller's credentials so an unsearchable ancestor surfaces as EACCES
+/// from `path_walk` rather than leaking through as a DAC failure on
+/// the final inode.
+///
+/// Reachable from ring-3 only when `vfs_creds` is on (gated dispatch
+/// arm). Integration tests exercise the impl directly via
+/// `sys_truncate_impl`, mirroring the mkdir/chmod convention.
+pub unsafe fn sys_truncate_impl(path_uva: u64, length: i64) -> i64 {
+    // Reject the obvious bad args before any path-walk work.
+    if length < 0 {
+        return EINVAL;
+    }
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    let cred = crate::task::current_credentials();
+    // truncate(2) always follows a trailing symlink.
+    let (inode, _nd) = match resolve_inode_as(path, /* follow */ true, (*cred).clone()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_truncate(&inode, length, &cred)
+}
+
+/// `ftruncate(fd, length)` — set the file behind an open fd to
+/// `length` bytes. The fd form skips path-walk entirely; the DAC gate
+/// still runs so a read-only fd whose backing inode denies `W_OK` to
+/// the caller fails closed.
+///
+/// Reachable from ring-3 only when `vfs_creds` is on (gated dispatch
+/// arm). Integration tests exercise the impl directly.
+pub unsafe fn sys_ftruncate_impl(fd_raw: u64, length: i64) -> i64 {
+    if length < 0 {
+        return EINVAL;
+    }
+    let inode = match fd_to_inode(fd_raw) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let cred = crate::task::current_credentials();
+    do_truncate(&inode, length, &cred)
 }
