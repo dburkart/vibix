@@ -930,15 +930,11 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // setresuid(ruid, euid, suid) — all three fields exposed to
         // the caller; no implicit suid update. (uid_t)-1 preserves.
-        SETRESUID => {
-            super::syscalls::creds::sys_setresuid(a0 as u32, a1 as u32, a2 as u32)
-        }
+        SETRESUID => super::syscalls::creds::sys_setresuid(a0 as u32, a1 as u32, a2 as u32),
 
         // setresgid(rgid, egid, sgid) — group-side mirror of
         // setresuid.
-        SETRESGID => {
-            super::syscalls::creds::sys_setresgid(a0 as u32, a1 as u32, a2 as u32)
-        }
+        SETRESGID => super::syscalls::creds::sys_setresgid(a0 as u32, a1 as u32, a2 as u32),
 
         _ => -38i64, // ENOSYS
     }

@@ -183,7 +183,11 @@ pub fn sys_setuid(uid: u32) -> i64 {
 pub fn sys_setreuid(ruid: u32, euid: u32) -> i64 {
     let cur = crate::task::current_credentials();
     let new_ruid = if ruid == UID_UNCHANGED { cur.uid } else { ruid };
-    let new_euid = if euid == UID_UNCHANGED { cur.euid } else { euid };
+    let new_euid = if euid == UID_UNCHANGED {
+        cur.euid
+    } else {
+        euid
+    };
     // Membership check (non-root only). Each *set* (i.e., non-(-1))
     // target must be a current member. Root bypasses.
     if cur.euid != 0 {
@@ -231,8 +235,16 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> i64 {
         }
     }
     let new_ruid = if ruid == UID_UNCHANGED { cur.uid } else { ruid };
-    let new_euid = if euid == UID_UNCHANGED { cur.euid } else { euid };
-    let new_suid = if suid == UID_UNCHANGED { cur.suid } else { suid };
+    let new_euid = if euid == UID_UNCHANGED {
+        cur.euid
+    } else {
+        euid
+    };
+    let new_suid = if suid == UID_UNCHANGED {
+        cur.suid
+    } else {
+        suid
+    };
     let new_cred = with_uids(&cur, new_ruid, new_euid, new_suid);
     crate::task::replace_current_credentials(new_cred);
     0
@@ -269,7 +281,11 @@ pub fn sys_setgid(gid: u32) -> i64 {
 pub fn sys_setregid(rgid: u32, egid: u32) -> i64 {
     let cur = crate::task::current_credentials();
     let new_rgid = if rgid == UID_UNCHANGED { cur.gid } else { rgid };
-    let new_egid = if egid == UID_UNCHANGED { cur.egid } else { egid };
+    let new_egid = if egid == UID_UNCHANGED {
+        cur.egid
+    } else {
+        egid
+    };
     if cur.euid != 0 {
         if rgid != UID_UNCHANGED && !is_member_gid(&cur, rgid) {
             return EPERM;
@@ -302,8 +318,16 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> i64 {
         }
     }
     let new_rgid = if rgid == UID_UNCHANGED { cur.gid } else { rgid };
-    let new_egid = if egid == UID_UNCHANGED { cur.egid } else { egid };
-    let new_sgid = if sgid == UID_UNCHANGED { cur.sgid } else { sgid };
+    let new_egid = if egid == UID_UNCHANGED {
+        cur.egid
+    } else {
+        egid
+    };
+    let new_sgid = if sgid == UID_UNCHANGED {
+        cur.sgid
+    } else {
+        sgid
+    };
     let new_cred = with_gids(&cur, new_rgid, new_egid, new_sgid);
     crate::task::replace_current_credentials(new_cred);
     0

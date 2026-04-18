@@ -74,8 +74,14 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        ("setuid_minus_one_einval", &(setuid_minus_one_einval as fn())),
-        ("setgid_minus_one_einval", &(setgid_minus_one_einval as fn())),
+        (
+            "setuid_minus_one_einval",
+            &(setuid_minus_one_einval as fn()),
+        ),
+        (
+            "setgid_minus_one_einval",
+            &(setgid_minus_one_einval as fn()),
+        ),
         (
             "root_setuid_drops_all_three",
             &(root_setuid_drops_all_three as fn()),
@@ -264,7 +270,10 @@ fn setuid_binary_drop_and_restore() {
     // != old ruid (1000), so suid is updated to the new euid. suid
     // stays at 0, which is what we want.
     let rc = dispatch(SYS_SETREUID, MINUS_ONE, 0, 0);
-    assert_eq!(rc, 0, "restore phase: setreuid(-1, 0) must succeed when suid=0; got {rc}");
+    assert_eq!(
+        rc, 0,
+        "restore phase: setreuid(-1, 0) must succeed when suid=0; got {rc}"
+    );
     let c = cur();
     assert_eq!(
         (c.uid, c.euid, c.suid),
@@ -327,7 +336,10 @@ fn setresuid_nonroot_outside_set_eperm() {
 fn setresuid_root_sets_all_three() {
     install_cred(0, 0, 0, 0, 0, 0);
     let rc = dispatch(SYS_SETRESUID, 111, 222, 333);
-    assert_eq!(rc, 0, "root setresuid(111, 222, 333) must succeed; got {rc}");
+    assert_eq!(
+        rc, 0,
+        "root setresuid(111, 222, 333) must succeed; got {rc}"
+    );
     let c = cur();
     assert_eq!(
         (c.uid, c.euid, c.suid),
@@ -345,10 +357,7 @@ fn setregid_minus_one_new_egid_transitions_egid_only() {
     // changes to a value != old rgid, so sgid := new egid.
     install_cred(0, 0, 0, 10, 20, 30);
     let rc = dispatch(SYS_SETREGID, MINUS_ONE, 999, 0);
-    assert_eq!(
-        rc, 0,
-        "root setregid(-1, 999) must succeed; got {rc}"
-    );
+    assert_eq!(rc, 0, "root setregid(-1, 999) must succeed; got {rc}");
     let c = cur();
     assert_eq!(
         (c.gid, c.egid, c.sgid),
@@ -454,7 +463,10 @@ fn uid_transition_preserves_supplementary_groups() {
     // so pass a same-value target (0 == current rgid) to land on the
     // unprivileged success path.
     let rc = dispatch(SYS_SETGID, 0, 0, 0);
-    assert_eq!(rc, 0, "non-root setgid(current rgid) must succeed; got {rc}");
+    assert_eq!(
+        rc, 0,
+        "non-root setgid(current rgid) must succeed; got {rc}"
+    );
     let c = cur();
     assert_eq!(
         c.groups.as_slice(),
