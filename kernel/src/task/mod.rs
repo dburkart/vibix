@@ -153,6 +153,7 @@ pub fn fork_current_task(
         parent_address_space,
         parent_fd_table,
         parent_cwd,
+        parent_credentials,
         parent_priority,
         parent_affinity,
         parent_fpu_ptr,
@@ -178,10 +179,19 @@ pub fn fork_current_task(
             crate::arch::x86_64::fpu::save(&mut cur.fpu);
         }
         crate::fork_trace!("fork-trace: [fork_current_task] ← fpu::save(parent)");
+        // Snapshot the parent's credentials Arc under the rwlock. POSIX
+        // fork(2) gives the child the parent's credentials at fork time;
+        // a concurrent setuid on the parent thread (impossible today —
+        // we are single-threaded per process — but the contract holds)
+        // would race the snapshot, and the Arc-snapshot pattern is what
+        // makes that race benign: the child gets whichever Credential
+        // was current at the instant of `read()`.
+        let parent_credentials = Arc::clone(&*cur.credentials.read());
         (
             Arc::clone(&cur.address_space),
             Arc::clone(&cur.fd_table),
             cur.cwd.clone(),
+            parent_credentials,
             cur.priority,
             cur.affinity,
             // SAFETY: the parent Task is the currently-running task and stays
@@ -228,6 +238,7 @@ pub fn fork_current_task(
             child_cr3,
             child_fd,
             parent_cwd,
+            parent_credentials,
         )
     }?;
     let child_id = child.id;

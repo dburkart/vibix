@@ -98,26 +98,111 @@ pub struct Timespec {
 
 /// Caller credentials consulted by [`InodeOps::permission`].
 ///
+/// Carries the full POSIX.1-2017 §2.4 saved-set-user-ID model: a real,
+/// effective, and saved ID for both user and group, plus the
+/// supplementary-group list. [`default_permission`] (and conforming
+/// overrides of `InodeOps::permission`) consult the **effective** IDs
+/// — `euid`, `egid`, `groups` — for access decisions; the real and
+/// saved IDs exist so `setuid`/`setresuid` and friends can implement
+/// the "drop privilege, reclaim later" pattern POSIX requires.
+///
+/// `Credential` values are immutable once constructed. A mid-syscall
+/// credential change (another thread running `setuid`) builds a fresh
+/// `Credential` and swaps the `Arc` inside
+/// [`Task::credentials`](crate::task::Task) — syscall entries clone the
+/// `Arc` once and carry that snapshot through the rest of the operation
+/// so a concurrent change cannot tear the read.
+///
 /// `Default` is deliberately not implemented: a default-constructed
 /// `Credential` would be uid 0, which `default_permission` treats as
 /// the root bypass — that would let any caller who reaches for
-/// `Credential::default()` accidentally elevate. Construct via
-/// [`Credential::kernel`] (root) or by setting fields explicitly.
+/// `Credential::default()` accidentally elevate. Prefer
+/// [`Credential::from_task_ids`] for a full six-ID construction from a
+/// task snapshot; direct field-literal construction elsewhere in the
+/// kernel is discouraged and should be limited to tests and the
+/// privileged [`Credential::kernel`] helper.
 #[derive(Clone, Debug)]
 pub struct Credential {
+    /// Real user ID (`getuid(2)`). The login identity; does not change
+    /// on `setuid(2)` by an unprivileged process.
     pub uid: u32,
+    /// Effective user ID (`geteuid(2)`). The identity consulted for
+    /// DAC checks. Equal to `uid` for most processes; differs after
+    /// `setuid(2)` or exec of a setuid binary.
+    pub euid: u32,
+    /// Saved set-user-ID (POSIX §2.4). Remembers a prior effective ID
+    /// so an unprivileged process that temporarily dropped `euid` can
+    /// reclaim it via `seteuid(suid)`.
+    pub suid: u32,
+    /// Real group ID (`getgid(2)`).
     pub gid: u32,
+    /// Effective group ID (`getegid(2)`). Consulted for DAC group-bit
+    /// checks alongside [`Self::groups`].
+    pub egid: u32,
+    /// Saved set-group-ID (POSIX §2.4). Group-side counterpart of
+    /// [`Self::suid`].
+    pub sgid: u32,
+    /// Supplementary group list (`getgroups(2)`). A caller matches the
+    /// group access bits of a file if `egid` OR any entry here equals
+    /// the file's group.
     pub groups: Vec<u32>,
 }
 
 impl Credential {
-    /// Kernel-internal credential: root. Use only from kernel code
-    /// paths that are not acting on behalf of a userspace task.
+    /// Kernel-internal credential: root on every ID. Use only from
+    /// kernel code paths that are not acting on behalf of a userspace
+    /// task (initial mount, kernel-thread I/O, test fixtures).
+    ///
+    /// Production userspace-driven VFS syscalls must **not** reach for
+    /// this helper: they read the caller's per-task snapshot via
+    /// `task.credentials.read().clone()` instead. Using
+    /// `Credential::kernel()` on a userspace-initiated path is an
+    /// unauthenticated full-DAC bypass (RFC 0004 §Security
+    /// Considerations); the RFC 0004 Workstream A ↔ B CI gate and the
+    /// `#[cfg(feature = "vfs_creds")]` guard on syscall dispatch arms
+    /// exist specifically to prevent that regression while the
+    /// Workstream B syscall wiring is still in progress.
     pub fn kernel() -> Self {
         Self {
             uid: 0,
+            euid: 0,
+            suid: 0,
             gid: 0,
+            egid: 0,
+            sgid: 0,
             groups: Vec::new(),
+        }
+    }
+
+    /// Build a `Credential` from the full six-ID saved-set-user-ID
+    /// tuple plus a supplementary group list. This is the preferred
+    /// constructor for non-root credentials: it takes every field at
+    /// once so forgetting one is a compile error rather than a silent
+    /// `0` that reads as root.
+    ///
+    /// Field-literal construction (`Credential { uid, euid, ... }`) is
+    /// discouraged outside of this module and tests; future additions
+    /// to the struct (filesystem-UID, login-UID, audit-UID) would
+    /// silently acquire arbitrary defaults at every call site that
+    /// skipped them. Use `from_task_ids` so the compiler surfaces the
+    /// new field.
+    pub fn from_task_ids(
+        uid: u32,
+        euid: u32,
+        suid: u32,
+        gid: u32,
+        egid: u32,
+        sgid: u32,
+        groups: Vec<u32>,
+    ) -> Self {
+        Self {
+            uid,
+            euid,
+            suid,
+            gid,
+            egid,
+            sgid,
+            groups,
         }
     }
 }
