@@ -486,6 +486,16 @@ impl BlockCache {
             bh.clock_ref.store(true, Ordering::Relaxed);
             return Ok(bh);
         }
+        // Re-check capacity under the install lock. Another thread
+        // may have won a *different*-key miss race while we were
+        // reading; if it pushed the cache up to `max_buffers` in the
+        // window between our pre-read sweep and now, we need a second
+        // sweep before installing or we'd silently exceed the cap.
+        // On `NoMemory` here the read is wasted but the invariant
+        // holds: `entries.len() <= max_buffers` after every `bread`.
+        if guard.entries.len() >= self.max_buffers {
+            Self::clock_pro_evict(&mut guard, self.max_buffers)?;
+        }
         guard.entries.insert((dev, blk), fresh.clone());
         let was_ghost = guard
             .non_resident
@@ -556,6 +566,16 @@ impl BlockCache {
     /// Returns `Ok(())` if the device accepted the write (or if `bh`
     /// was not dirty to begin with — harmless no-op).
     pub fn sync_dirty_buffer(&self, bh: &Arc<BufferHead>) -> Result<(), BlockError> {
+        // Fast clean-buffer bail-out. A buffer that isn't DIRTY has no
+        // bytes to flush; taking LOCKED_IO + snapshotting + issuing a
+        // redundant device write would be pure overhead and would
+        // spuriously fence eviction for no reason. Load DIRTY once,
+        // acquire-ordered so any preceding `mark_dirty` is visible;
+        // if it's clear we're done.
+        if bh.state.load(Ordering::Acquire) & STATE_DIRTY == 0 {
+            return Ok(());
+        }
+
         // Step 1: take the LOCKED_IO bit. If another flusher already
         // has it, spin briefly — in the single-threaded kernel today
         // this path is never concurrent-contended, but the bit also
@@ -568,6 +588,13 @@ impl BlockCache {
                 // the other flusher will carry the write through. A
                 // real concurrent flusher is a correctness hazard to
                 // investigate, not a behaviour this layer can repair.
+                return Ok(());
+            }
+            // Another window: `mark_dirty` → `sync_dirty_buffer` races
+            // can see DIRTY cleared by a concurrent flusher in the
+            // gap between the fast-path load above and this CAS. If
+            // DIRTY was cleared, bail out — there's nothing to flush.
+            if old & STATE_DIRTY == 0 {
                 return Ok(());
             }
             if bh
@@ -611,7 +638,7 @@ impl BlockCache {
         // Step 3: issue the device write with *no cache or data lock
         // held* — RFC 0004 §Buffer cache, OS-engineer B5 hazard.
         let result = if let Some((_, blk)) = key {
-            let offset = match (blk as u64).checked_mul(self.block_size as u64) {
+            let offset = match blk.checked_mul(self.block_size as u64) {
                 Some(o) => o,
                 None => {
                     // Clear LOCKED_IO and surface OutOfRange; the
@@ -1590,5 +1617,26 @@ mod tests {
     #[test]
     fn unused_atomic_import_stays_live() {
         let _ = AtomicUsize::new(0);
+    }
+
+    /// `sync_dirty_buffer` on a buffer that is **not** DIRTY issues
+    /// no device write. Prevents a redundant `write_at` from a caller
+    /// that opportunistically flushes without checking the bit.
+    #[test]
+    fn sync_dirty_buffer_skips_clean_buffer() {
+        let (cache, disk, dev) = ramdisk_cache(512, 4, 4);
+        disk.seed_block(0, 0x00);
+        let bh = cache.bread(dev, 0).expect("bread");
+        assert!(!bh.state_has(STATE_DIRTY));
+
+        let writes_before = disk.writes();
+        cache.sync_dirty_buffer(&bh).expect("clean flush is noop");
+        assert_eq!(
+            disk.writes(),
+            writes_before,
+            "clean buffer must not drive a device write",
+        );
+        // LOCKED_IO was never taken — fast-path bailed before CAS.
+        assert!(!bh.state_has(STATE_LOCKED_IO));
     }
 }
