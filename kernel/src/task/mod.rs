@@ -427,6 +427,20 @@ pub fn current_priority() -> u8 {
         .unwrap_or(DEFAULT_PRIORITY)
 }
 
+/// Top of the currently-running task's dedicated SYSCALL kernel stack,
+/// or `0` for kernel-only tasks. Exposed primarily so the integration
+/// test for [`set_active_syscall_stack`] can compare against
+/// [`crate::arch::x86_64::gdt::tss_rsp0`] and confirm the two agree
+/// after a context switch.
+pub fn current_syscall_stack_top() -> u64 {
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .map(|t| t.syscall_stack_top)
+        .unwrap_or(0)
+}
+
 fn find_priority(sched: &Scheduler, id: usize) -> Option<u8> {
     if let Some(cur) = sched.current.as_ref() {
         if cur.id == id {
@@ -646,6 +660,101 @@ pub fn replace_current_address_space(
     old // caller must drop this AFTER switching CR3
 }
 
+/// Single choke point for updating the SYSCALL/IRQ kernel-entry stack
+/// pointers on a context switch: writes both
+/// [`crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP`] (read by the
+/// `syscall_entry` trampoline on SYSCALL) and `TSS.rsp[0]` (read by the
+/// CPU on ring-3 → ring-0 interrupt or exception) from
+/// `task.syscall_stack_top`.
+///
+/// A `syscall_stack_top` of `0` means the task is kernel-only — it
+/// will never execute SYSCALL from ring-3, and leaving the previous
+/// task's stack pointers in place is harmless because nothing will
+/// consult them until the next ring-3 task is switched in.
+///
+/// # Why a helper
+///
+/// The preempt / block / exit paths each need to perform exactly this
+/// pair of writes after selecting the incoming task. Before this
+/// consolidation (issue #505) the sequence was inlined at three call
+/// sites — drift between them (e.g. a fourth switch path forgetting
+/// the update) would silently route the incoming ring-3 task's
+/// syscalls onto a previous task's kernel stack and corrupt it. Having
+/// a single named helper makes "this is how a switch updates the
+/// syscall stack" searchable and reviewable.
+///
+/// # Debug-only invariants
+///
+/// - When the task carries a non-zero `syscall_stack_top`, it must
+///   point somewhere above the task's own kernel-stack guard page —
+///   a SYSCALL entry would otherwise land on or below the guard and
+///   take a #PF (or, worse, into some other task's allocation if the
+///   value is entirely stale). Ring-3 arming is done once per task by
+///   [`arm_ring3_syscall_stack`] while the task is `current`; every
+///   subsequent switch-in passes the value through unchanged.
+/// - After the pair of writes, confirm the live TSS struct and the
+///   `SYSCALL_KERNEL_RSP` atomic both hold the value we just wrote.
+///   This catches a lost write (e.g. a mis-aimed pointer, or a future
+///   refactor that accidentally breaks the symmetry between the two
+///   writes).
+///
+/// `IA32_KERNEL_GS_BASE` is not used by the current kernel — there is
+/// no `swapgs` on the SYSCALL entry path — so the readback checks the
+/// TSS struct directly against the atomic shadow and
+/// `SYSCALL_KERNEL_RSP`. If a future ring-0 stack-swap mechanism
+/// starts using `IA32_KERNEL_GS_BASE`, add an `rdmsr` check here.
+pub(in crate::task) fn set_active_syscall_stack(task: &Task) {
+    use crate::arch::x86_64::gdt::{set_tss_rsp0, tss_rsp0, tss_rsp0_shadow};
+    use crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP;
+    use core::sync::atomic::Ordering;
+
+    let top = task.syscall_stack_top;
+
+    if top == 0 {
+        // Kernel-only task (or the bootstrap task before
+        // `arm_ring3_syscall_stack` runs). No SYSCALL stack to arm —
+        // leave the previous ring-3 task's stack pointers in place,
+        // which is harmless because a kernel-only task cannot execute
+        // SYSCALL. The scheduler will call this helper again when a
+        // ring-3 task switches back in.
+        return;
+    }
+
+    // Debug-only sanity on the source of truth: an armed ring-3 task
+    // must have been set up with a top above its own guard page. A
+    // ring-3 task whose `syscall_stack_top` sits inside (or below) its
+    // guard would SYSCALL onto the guard and take a #PF; catch that
+    // in debug rather than letting the first syscall explode.
+    debug_assert!(
+        task.guard_base == 0 || top as usize > task.guard_base,
+        "set_active_syscall_stack: task id={} syscall_stack_top ({:#x}) not above guard_base ({:#x})",
+        task.id,
+        top,
+        task.guard_base,
+    );
+
+    SYSCALL_KERNEL_RSP.store(top, Ordering::Relaxed);
+    set_tss_rsp0(top);
+
+    if cfg!(debug_assertions) {
+        let shadow = tss_rsp0_shadow();
+        let live = tss_rsp0();
+        let syscall_rsp = SYSCALL_KERNEL_RSP.load(Ordering::Relaxed);
+        debug_assert_eq!(
+            shadow, top,
+            "set_active_syscall_stack: TSS_RSP0 atomic shadow ({shadow:#x}) != helper write ({top:#x})",
+        );
+        debug_assert_eq!(
+            live, top,
+            "set_active_syscall_stack: live TSS.rsp[0] ({live:#x}) != helper write ({top:#x})",
+        );
+        debug_assert_eq!(
+            syscall_rsp, top,
+            "set_active_syscall_stack: SYSCALL_KERNEL_RSP ({syscall_rsp:#x}) != helper write ({top:#x})",
+        );
+    }
+}
+
 /// Prepare the current task to run in ring-3: configure TSS.rsp[0] and
 /// `SYSCALL_KERNEL_RSP` to point at the TOP of this task's own kernel stack
 /// so ring-3 syscalls and exceptions land on a per-task stack (not the shared
@@ -655,27 +764,21 @@ pub fn replace_current_address_space(
 /// Must be called from the task's kernel entry function (e.g.
 /// `init_ring3_entry`) *before* jumping to ring-3 with `jump_to_ring3`.
 pub fn arm_ring3_syscall_stack() {
-    use crate::arch::x86_64::gdt::set_tss_rsp0;
-    use crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP;
-    use core::sync::atomic::Ordering;
     // GUARD_SIZE=4096 and STACK_SIZE=16*1024 from task.rs (private constants;
     // replicated here to avoid visibility issues — must stay in sync with task.rs).
     const GUARD_SIZE: usize = 4096;
     const STACK_SIZE: usize = 16 * 1024;
 
-    let stack_top = {
-        let mut sched = SCHED.lock();
-        let current = sched
-            .current
-            .as_mut()
-            .expect("arm_ring3_syscall_stack: no running task");
-        let top = (current.guard_base + GUARD_SIZE + STACK_SIZE) as u64;
-        current.syscall_stack_top = top;
-        top
-    };
-    // Point the SYSCALL entry and IRQ entry stacks at the task's own stack.
-    SYSCALL_KERNEL_RSP.store(stack_top, Ordering::Relaxed);
-    set_tss_rsp0(stack_top);
+    let mut sched = SCHED.lock();
+    let current = sched
+        .current
+        .as_mut()
+        .expect("arm_ring3_syscall_stack: no running task");
+    let top = (current.guard_base + GUARD_SIZE + STACK_SIZE) as u64;
+    current.syscall_stack_top = top;
+    // Delegate to the single choke point so the switch-path helpers
+    // and the initial-arming path use exactly the same update sequence.
+    set_active_syscall_stack(current);
 }
 
 /// Install a VMA on the currently-running task. The VMA is resolved
@@ -784,7 +887,7 @@ pub fn exit() -> ! {
     // released. IrqLock cannot be used end-to-end here because the
     // guard drop would re-enable IRQs before context_switch.
     interrupts::disable();
-    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_syscall_top) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr) = {
         let mut sched = SCHED.lock();
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
@@ -808,8 +911,11 @@ pub fn exit() -> ! {
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        // Arm SYSCALL/TSS for the incoming task's own per-task kernel
+        // stack. Done while still holding SCHED so the Task reference
+        // outlives the write.
+        set_active_syscall_stack(sched.current.as_ref().unwrap());
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
-        let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
         // Enqueue the doomed task for the reaper task to drain in its
         // own context. We drop SCHED before touching REAPER_VICTIMS /
         // REAPER_WQ to keep the lock order SCHED -> REAPER_VICTIMS and
@@ -824,13 +930,7 @@ pub fn exit() -> ! {
         // `context_switch`'s single write to `prev.rsp`.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         drop(victims);
-        (
-            prev_rsp_ptr,
-            next_rsp,
-            next_cr3,
-            next_fpu_ptr,
-            next_syscall_top,
-        )
+        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr)
     };
     // Poke the reaper before we switch away. `notify_all` takes
     // `WaitQueue.inner` then `SCHED` (via `task::wake`); SCHED was
@@ -842,12 +942,6 @@ pub fn exit() -> ! {
     // We intentionally skip `fpu::save` — the exiting task is doomed.
     unsafe {
         fpu::restore(&*next_fpu_ptr);
-        if next_syscall_top != 0 {
-            use core::sync::atomic::Ordering;
-            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
-                .store(next_syscall_top, Ordering::Relaxed);
-            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
-        }
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
     unreachable!("task::exit returned from context_switch");
@@ -1000,11 +1094,15 @@ pub fn preempt_tick() {
     let prev_prio = prev.priority;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+    // Arm SYSCALL/TSS for the incoming task's own per-task kernel
+    // stack. Done while still holding SCHED so the Task reference is
+    // valid; the helper only performs atomic / live-TSS writes and
+    // does not take any other lock.
+    set_active_syscall_stack(sched.current.as_ref().unwrap());
     // Grab a raw pointer to the incoming task's FPU area while we
     // still hold the mutable borrow; we'll dereference it after the
     // lock is dropped.
     let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
-    let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
     sched.push_ready(prev);
     // The push above put `prev` at the back of its priority's queue;
     // retrieve the pointer through the bank to keep the Box-stability
@@ -1031,16 +1129,9 @@ pub fn preempt_tick() {
     unsafe {
         fpu::save(&mut *prev_fpu_ptr);
         fpu::restore(&*next_fpu_ptr);
-        // Update the SYSCALL/TSS stack pointer to the incoming task's
-        // own per-task kernel stack, if it has one. This prevents ring-3
-        // syscalls from the incoming task clobbering the shared INIT_KERNEL_STACK
-        // state of other tasks that are blocked mid-syscall.
-        if next_syscall_top != 0 {
-            use core::sync::atomic::Ordering;
-            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
-                .store(next_syscall_top, Ordering::Relaxed);
-            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
-        }
+        // Note: SYSCALL/TSS stack pointers were armed above under the
+        // SCHED lock via `set_active_syscall_stack`; see the helper for
+        // why this consolidation exists (#505).
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 }
@@ -1087,7 +1178,7 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3, next_syscall_top) = {
+    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -1124,8 +1215,11 @@ pub fn block_current() {
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        // Arm SYSCALL/TSS for the incoming task's own per-task kernel
+        // stack under the SCHED lock; see `set_active_syscall_stack`
+        // for why this consolidation exists (#505).
+        set_active_syscall_stack(sched.current.as_ref().unwrap());
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
-        let next_syscall_top = sched.current.as_ref().unwrap().syscall_stack_top;
         sched.parked.insert(prev_id, prev);
 
         let prev_ref = sched
@@ -1140,14 +1234,7 @@ pub fn block_current() {
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
 
-        (
-            prev_rsp_ptr,
-            prev_fpu_ptr,
-            next_fpu_ptr,
-            next_rsp,
-            next_cr3,
-            next_syscall_top,
-        )
+        (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3)
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
@@ -1158,12 +1245,6 @@ pub fn block_current() {
     unsafe {
         fpu::save(&mut *prev_fpu_ptr);
         fpu::restore(&*next_fpu_ptr);
-        if next_syscall_top != 0 {
-            use core::sync::atomic::Ordering;
-            crate::arch::x86_64::syscall::SYSCALL_KERNEL_RSP
-                .store(next_syscall_top, Ordering::Relaxed);
-            crate::arch::x86_64::gdt::set_tss_rsp0(next_syscall_top);
-        }
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 
