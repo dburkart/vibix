@@ -13,6 +13,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # RFC 0004 Workstream A ↔ B gate: the `vfs_creds` feature must not be
+  # the default until Workstream B lands `Task::credentials`. Without
+  # per-task credentials, every VFS write syscall runs as root
+  # (`Credential::kernel()`) — enabling the feature before B merges
+  # would expose an unauthenticated full-DAC bypass. This is a
+  # belt-and-suspenders second line of defense behind the compile-time
+  # feature gate in `kernel/src/arch/x86_64/syscall.rs`.
+  #
+  # Rule:
+  #   - If `Task::credentials` is absent from the tree, `default` in
+  #     `kernel/Cargo.toml` must not contain `vfs_creds`.
+  #   - If `Task::credentials` is present, the gate is satisfied;
+  #     enabling `vfs_creds` by default is allowed.
+  vfs-creds-gate:
+    name: RFC 0004 vfs_creds gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check vfs_creds is not default-on without Task::credentials
+        run: |
+          set -euo pipefail
+          # Workstream B sentinel: presence of `Task::credentials` on the
+          # Task type specifically. We scope to files that define or
+          # impl `Task` so an unrelated `credentials` field on some other
+          # type (e.g. a session or config struct) can't satisfy the gate.
+          task_files=$(grep -rlE '(^|[[:space:]])(struct|impl([[:space:]]|<))[[:space:]]*Task([[:space:]]|<|\{|$)' kernel/src 2>/dev/null || true)
+          if [ -n "$task_files" ]; then
+            if echo "$task_files" | xargs grep -E '(pub[[:space:]]+)?credentials[[:space:]]*:[[:space:]]*.*Credential' >/dev/null 2>&1 \
+               || echo "$task_files" | xargs grep -E 'fn[[:space:]]+credentials[[:space:]]*\(' >/dev/null 2>&1; then
+              echo "Task::credentials present — gate satisfied."
+              exit 0
+            fi
+          fi
+          # Sentinel absent: verify `vfs_creds` is not on by default.
+          # We parse Cargo.toml with Python/tomllib instead of awk ranges —
+          # `awk '/^\[features\]/,/^\[/'` fails open because the end
+          # pattern also matches the opening `[features]` header, making
+          # the awk block a single-line no-op and turning the DAC-bypass
+          # gate into a rubber stamp.
+          if python3 -c "import sys; tomllib=__import__('tomllib') if sys.version_info>=(3,11) else __import__('tomli'); cargo=tomllib.load(open('kernel/Cargo.toml','rb')); sys.exit(1 if 'vfs_creds' in cargo.get('features',{}).get('default',[]) else 0)"; then
+            echo "vfs_creds is gated off and Task::credentials is absent — consistent."
+          else
+            echo "ERROR: vfs_creds is default-on but Task::credentials is absent." >&2
+            echo "This would expose an unauthenticated DAC-bypass window (RFC 0004 §Security)." >&2
+            exit 1
+          fi
+
   # Fast lane: formatting, clippy (host-only), and release build sanity.
   # Does not need QEMU, so it finishes well ahead of the kernel test jobs.
   fmt-build:

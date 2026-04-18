@@ -798,6 +798,22 @@ pub unsafe extern "C" fn syscall_dispatch(
         // mknodat(dfd, path, mode, dev) — like mknod relative to dfd.
         MKNODAT => super::syscalls::vfs::sys_mknodat_impl(a0 as i32, a1, a2, a3),
 
+        // mkdir(path, mode) — create a directory at `path`.
+        //
+        // RFC 0004 Workstream A ↔ B gate: the dispatch arm is compiled
+        // behind `vfs_creds` so a partially-landed Workstream A (write
+        // syscalls without per-task credentials) cannot be reached from
+        // ring-3. With the feature off the arm is absent and `nr == 83`
+        // falls through to the `_ => -ENOSYS` default. Integration tests
+        // reach the impl directly through `sys_mkdir_impl`.
+        #[cfg(feature = "vfs_creds")]
+        MKDIR => super::syscalls::vfs::sys_mkdir_impl(a0, a1),
+
+        // mkdirat(dfd, path, mode) — like mkdir relative to dfd. Same
+        // gate as MKDIR.
+        #[cfg(feature = "vfs_creds")]
+        MKDIRAT => super::syscalls::vfs::sys_mkdirat_impl(a0 as i32, a1, a2),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1390,6 +1406,8 @@ pub mod syscall_nr {
     pub const PIPE2: u64 = 293;
     pub const MKNOD: u64 = 133;
     pub const MKNODAT: u64 = 259;
+    pub const MKDIR: u64 = 83;
+    pub const MKDIRAT: u64 = 258;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1467,5 +1485,7 @@ mod tests {
         assert_eq!(syscall_nr::PIPE2, 293, "SYS_pipe2 must be 293");
         assert_eq!(syscall_nr::MKNOD, 133, "SYS_mknod must be 133");
         assert_eq!(syscall_nr::MKNODAT, 259, "SYS_mknodat must be 259");
+        assert_eq!(syscall_nr::MKDIR, 83, "SYS_mkdir must be 83");
+        assert_eq!(syscall_nr::MKDIRAT, 258, "SYS_mkdirat must be 258");
     }
 }
