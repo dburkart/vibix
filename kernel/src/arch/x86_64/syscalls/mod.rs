@@ -4,5 +4,6 @@
 //! lives in its own file and syscall.rs can stay focused on the trampoline
 //! and register plumbing.
 
+pub mod creds;
 pub mod ioctl;
 pub mod vfs;

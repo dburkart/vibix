@@ -295,6 +295,10 @@ name = "syscall_unlink"
 harness = false
 
 [[test]]
+name = "syscall_getuid_family"
+harness = false
+
+[[test]]
 name = "ntty_sigint_flush"
 harness = false
 
