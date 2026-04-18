@@ -783,6 +783,16 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
     // POSIX — so no equivalent of `mknod_impl`'s trailing-slash rejection
     // is needed here.
 
+    // Normalize the leaf first so that invalid leaves (".", "..", "") are
+    // rejected with ENOENT (per the PR contract) before any EEXIST fast
+    // path gets a chance to classify them. Running `resolve_inode` first
+    // would let `/tmp/.` map to the existing `/tmp` inode and return
+    // EEXIST, which is the wrong errno.
+    let (parent_path, leaf) = match split_parent(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
     // Refuse if the target already exists. The pre-check races with a
     // concurrent creator, but the authoritative check is the FS driver's
     // own duplicate-insert path — RamFs returns EEXIST under the dir
@@ -792,11 +802,6 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
     if resolve_inode(path, /* follow */ false).is_ok() {
         return EEXIST;
     }
-
-    let (parent_path, leaf) = match split_parent(path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
     let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
         Ok(v) => v,
         Err(e) => return e,

@@ -255,20 +255,14 @@ fn mkdir_missing_parent_is_enoent() {
 
 fn mkdir_dot_is_enoent() {
     // The leaf-normalizer in split_parent rejects ".", "..", and the
-    // empty string — they can't be nameable leaves. "/" is rejected
-    // too (maps to EEXIST since the root already exists).
+    // empty string — they can't be nameable leaves. The normalizer runs
+    // *before* the EEXIST fast path, so these must always return ENOENT
+    // (never EEXIST, even though `/tmp/.` resolves to the existing
+    // `/tmp` inode).
     let r = mkdir(b"/tmp/.", 0o755);
-    assert!(
-        r == ENOENT || r == EEXIST,
-        "mkdir('/tmp/.') must fail with ENOENT or EEXIST, got {}",
-        r
-    );
+    assert_eq!(r, ENOENT, "mkdir('/tmp/.') must ENOENT, got {}", r);
     let r = mkdir(b"/tmp/..", 0o755);
-    assert!(
-        r == ENOENT || r == EEXIST,
-        "mkdir('/tmp/..') must fail with ENOENT or EEXIST, got {}",
-        r
-    );
+    assert_eq!(r, ENOENT, "mkdir('/tmp/..') must ENOENT, got {}", r);
     let r = mkdir(b"", 0o755);
     assert_eq!(r, ENOENT, "mkdir('') must ENOENT, got {}", r);
 }
