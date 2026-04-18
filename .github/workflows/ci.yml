@@ -36,22 +36,31 @@ jobs:
       - name: Check vfs_creds is not default-on without Task::credentials
         run: |
           set -euo pipefail
-          # Workstream B sentinel: presence of `Task::credentials` as a
-          # field or method declaration in kernel sources.
-          if grep -rE '(pub[[:space:]]+)?credentials[[:space:]]*:[[:space:]]*.*Credential' kernel/src >/dev/null 2>&1 \
-             || grep -rE 'fn[[:space:]]+credentials[[:space:]]*\(' kernel/src >/dev/null 2>&1; then
-            echo "Task::credentials present — gate satisfied."
-            exit 0
+          # Workstream B sentinel: presence of `Task::credentials` on the
+          # Task type specifically. We scope to files that define or
+          # impl `Task` so an unrelated `credentials` field on some other
+          # type (e.g. a session or config struct) can't satisfy the gate.
+          task_files=$(grep -rlE '(^|[[:space:]])(struct|impl([[:space:]]|<))[[:space:]]*Task([[:space:]]|<|\{|$)' kernel/src 2>/dev/null || true)
+          if [ -n "$task_files" ]; then
+            if echo "$task_files" | xargs grep -E '(pub[[:space:]]+)?credentials[[:space:]]*:[[:space:]]*.*Credential' >/dev/null 2>&1 \
+               || echo "$task_files" | xargs grep -E 'fn[[:space:]]+credentials[[:space:]]*\(' >/dev/null 2>&1; then
+              echo "Task::credentials present — gate satisfied."
+              exit 0
+            fi
           fi
           # Sentinel absent: verify `vfs_creds` is not on by default.
-          default_line=$(awk '/^\[features\]/,/^\[/' kernel/Cargo.toml \
-                        | grep -E '^default[[:space:]]*=' || true)
-          if echo "$default_line" | grep -q 'vfs_creds'; then
+          # We parse Cargo.toml with Python/tomllib instead of awk ranges —
+          # `awk '/^\[features\]/,/^\[/'` fails open because the end
+          # pattern also matches the opening `[features]` header, making
+          # the awk block a single-line no-op and turning the DAC-bypass
+          # gate into a rubber stamp.
+          if python3 -c "import sys; tomllib=__import__('tomllib') if sys.version_info>=(3,11) else __import__('tomli'); cargo=tomllib.load(open('kernel/Cargo.toml','rb')); sys.exit(1 if 'vfs_creds' in cargo.get('features',{}).get('default',[]) else 0)"; then
+            echo "vfs_creds is gated off and Task::credentials is absent — consistent."
+          else
             echo "ERROR: vfs_creds is default-on but Task::credentials is absent." >&2
             echo "This would expose an unauthenticated DAC-bypass window (RFC 0004 §Security)." >&2
             exit 1
           fi
-          echo "vfs_creds is gated off and Task::credentials is absent — consistent."
 
   # Fast lane: formatting, clippy (host-only), and release build sanity.
   # Does not need QEMU, so it finishes well ahead of the kernel test jobs.
