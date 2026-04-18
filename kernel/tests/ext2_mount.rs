@@ -47,19 +47,12 @@ use vibix::fs::ext2::Ext2Fs;
 use vibix::fs::vfs::ops::{FileSystem as _, MountSource};
 use vibix::fs::vfs::super_block::{SbFlags, SuperBlock};
 use vibix::fs::vfs::MountFlags;
+use vibix::fs::{EBUSY, EINVAL, ENODEV};
 use vibix::{
     exit_qemu, serial_println,
     test_harness::{test_panic_handler, Testable},
     QemuExitCode,
 };
-
-/// Errno constants. Duplicated from `kernel/src/fs/mod.rs` because
-/// that module isn't re-exported at the crate root and integration
-/// tests can't reach into `crate::fs::*` without a `pub use` that
-/// wave 2 doesn't need outside the tests.
-const EINVAL: i64 = -22;
-const EBUSY: i64 = -16;
-const ENODEV: i64 = -19;
 
 /// 64 KiB `mkfs.ext2` image used as the backing bytes for the RamDisk.
 /// Checked in; see `kernel/src/fs/ext2/fixtures/README.md`.
@@ -179,7 +172,11 @@ impl BlockDevice for RamDisk {
         Ok(())
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        self.writes.fetch_add(1, Ordering::Relaxed);
+        // Note: the counter is bumped only on a *successful* write. A
+        // malformed/out-of-range write returns an error without
+        // touching it, so assertions like "failed mount must not write
+        // to device" can't false-positive on a bad call that the
+        // driver should never issue anyway.
         let bs = self.block_size as u64;
         if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
             return Err(BlockError::BadAlign);
@@ -193,6 +190,7 @@ impl BlockDevice for RamDisk {
         }
         let off = offset as usize;
         storage[off..off + buf.len()].copy_from_slice(buf);
+        self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     fn block_size(&self) -> u32 {
