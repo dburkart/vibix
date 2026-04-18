@@ -878,19 +878,20 @@ pub unsafe fn sys_rmdir_impl(path_uva: u64) -> i64 {
     if path.is_empty() {
         return ENOENT;
     }
-    // `rmdir("/")` never succeeds — the FS root is a mountpoint that
-    // cannot be removed. Return EBUSY per Linux's root-removal errno.
-    if path == b"/" {
-        return crate::fs::EBUSY;
+
+    // Collapse *all* trailing slashes so "/foo", "/foo/", and "/foo//"
+    // share the leaf check and the parent split. Bare "/" survives as
+    // "/" because the loop only strips while `len > 1`.
+    let mut trimmed: &[u8] = path;
+    while trimmed.len() > 1 && *trimmed.last().unwrap() == b'/' {
+        trimmed = &trimmed[..trimmed.len() - 1];
     }
 
-    // Strip trailing slash so ".../foo/" and ".../foo" share the leaf
-    // check. Keep bare "/" handled above since `split_parent` rejects it.
-    let trimmed: &[u8] = if path.len() > 1 && *path.last().unwrap() == b'/' {
-        &path[..path.len() - 1]
-    } else {
-        path
-    };
+    // `rmdir("/")` never succeeds — the FS root is a mountpoint that
+    // cannot be removed. Return EBUSY per Linux's root-removal errno.
+    if trimmed == b"/" {
+        return crate::fs::EBUSY;
+    }
 
     // Locate the leaf to enforce POSIX's `.` / `..` rejection before
     // committing to a full path walk. The resolver below would
@@ -910,7 +911,11 @@ pub unsafe fn sys_rmdir_impl(path_uva: u64) -> i64 {
         return crate::fs::ENOTEMPTY;
     }
 
-    let (parent_path, leaf) = match split_parent(path) {
+    // Pass the trailing-slash-collapsed path to `split_parent` so the
+    // inner strip logic sees a clean leaf (it only peels one slash
+    // itself, so multi-slash inputs would otherwise come back with an
+    // empty leaf → ENOENT).
+    let (parent_path, leaf) = match split_parent(trimmed) {
         Ok(v) => v,
         Err(e) => return e,
     };
