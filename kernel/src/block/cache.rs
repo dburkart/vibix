@@ -1844,7 +1844,10 @@ mod tests {
 
         // dev_a buffer: clean. dev_b buffer: still dirty (untouched).
         assert!(!bh_a.state_has(STATE_DIRTY), "dev_a buffer flushed");
-        assert!(bh_b.state_has(STATE_DIRTY), "dev_b buffer must be left dirty");
+        assert!(
+            bh_b.state_has(STATE_DIRTY),
+            "dev_b buffer must be left dirty"
+        );
         assert!(!cache.dirty.lock().contains(&(dev_a, 0)));
         assert!(cache.dirty.lock().contains(&(dev_b, 0)));
     }
