@@ -344,3 +344,7 @@ harness = false
 name = "ext2_mount"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "block_writeback"
+harness = false

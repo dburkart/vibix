@@ -54,6 +54,40 @@ pub extern "C" fn _start() -> ! {
     serial_println!("GDT + IDT loaded");
 
     vibix::mem::init();
+
+    // Parse the kernel command line (before any subsystem that reads
+    // configured knobs brings itself up). Today only
+    // `writeback_secs=<N>` is consumed; the parser ignores anything
+    // else so future knobs can be added without changing this call
+    // site. The cmdline string is owned by Limine and lives as
+    // BOOTLOADER_RECLAIMABLE memory through the first VFS mount, so
+    // reading it here before `mem::reclaim_bootloader_memory` runs
+    // is safe.
+    if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
+        let bytes = cmdline_resp.cmdline().to_bytes();
+        if !bytes.is_empty() {
+            serial_println!("cmdline: {:?}", core::str::from_utf8(bytes).unwrap_or("<non-utf8>"));
+        }
+        if vibix::block::writeback::parse_cmdline(bytes) {
+            serial_println!(
+                "writeback: cadence configured to {} s ({})",
+                vibix::block::writeback::configured_secs(),
+                if vibix::block::writeback::is_disabled() {
+                    "disabled"
+                } else {
+                    "enabled"
+                },
+            );
+        } else {
+            serial_println!(
+                "writeback: using default cadence ({} s)",
+                vibix::block::writeback::DEFAULT_INTERVAL_SECS,
+            );
+        }
+    } else {
+        serial_println!("cmdline: not provided by bootloader");
+    }
+
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     match vibix::hpet::init() {
         Ok(()) => {}

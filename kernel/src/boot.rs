@@ -4,9 +4,9 @@
 
 use limine::modules::InternalModule;
 use limine::request::{
-    ExecutableAddressRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest,
-    StackSizeRequest,
+    ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest, FramebufferRequest,
+    HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker,
+    RsdpRequest, StackSizeRequest,
 };
 use limine::BaseRevision;
 
@@ -43,6 +43,13 @@ pub static KERNEL_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressR
 #[used]
 #[link_section = ".limine_requests"]
 pub static KERNEL_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
+
+/// Kernel command-line string, passed by Limine from the bootloader
+/// config. Parsed at boot for knobs like `writeback_secs=N`
+/// (issue #555).
+#[used]
+#[link_section = ".limine_requests"]
+pub static KERNEL_CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]
