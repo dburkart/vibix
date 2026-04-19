@@ -370,3 +370,8 @@ required-features = ["ext2"]
 name = "ext2_file_read"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_dir_ops"
+harness = false
+required-features = ["ext2"]
