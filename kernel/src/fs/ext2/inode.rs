@@ -73,6 +73,7 @@ use super::disk::{
 use super::fs::Ext2Super;
 
 use crate::fs::vfs::inode::{Inode, InodeKind, InodeMeta};
+use crate::fs::vfs::open_file::OpenFile;
 use crate::fs::vfs::ops::{FileOps, InodeOps, Stat};
 use crate::fs::vfs::{SbFlags, SuperBlock, Timespec};
 use crate::fs::{EINVAL, EIO, ENOENT};
@@ -240,13 +241,23 @@ impl InodeOps for Ext2Inode {
     }
 }
 
-/// Placeholder `FileOps` for an ext2 inode. Wave 2 carries only the
-/// defaults (read/write return `EINVAL`/`EPERM`, getdents returns
-/// `ENOTDIR`). #561 replaces it with a read implementation once the
-/// indirect-block walker (#560) lands.
+/// Zero-sized marker type re-exported from wave 2 as the `FileOps`
+/// slot on `Inode`. Wave 3 (#561) moves the actual `FileOps` impl onto
+/// [`Ext2Inode`] itself (so the read path can reach the metadata lock
+/// and `super_ref` without a second lookup) and routes `iget` to share
+/// the inode Arc as `Arc<dyn FileOps>`; this type is kept only for
+/// downstream re-exports.
 pub struct Ext2FileOps;
 
 impl FileOps for Ext2FileOps {}
+
+impl FileOps for Ext2Inode {
+    /// Regular-file read through the buffer cache. See
+    /// [`super::file::read_file_at`] for the normative pipeline.
+    fn read(&self, f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
+        super::file::read_file_at(&f.inode, self, buf, off)
+    }
+}
 
 /// Infer an [`InodeKind`] from the on-disk `i_mode` S_IFMT bits.
 ///
@@ -415,7 +426,7 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
         ino as u64,
         Arc::downgrade(sb),
         ext2_inode.clone() as Arc<dyn InodeOps>,
-        Arc::new(Ext2FileOps) as Arc<dyn FileOps>,
+        ext2_inode.clone() as Arc<dyn FileOps>,
         kind,
         vfs_meta,
     ));
