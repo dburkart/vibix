@@ -23,6 +23,8 @@
 pub mod cache;
 #[cfg(any(test, target_os = "none"))]
 pub mod virtio_blk;
+#[cfg(any(test, target_os = "none"))]
+pub mod writeback;
 
 #[cfg(any(test, target_os = "none"))]
 use alloc::sync::Arc;
