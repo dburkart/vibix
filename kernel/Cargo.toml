@@ -305,6 +305,10 @@ name = "syscall_unlink"
 harness = false
 
 [[test]]
+name = "syscall_link_symlink"
+harness = false
+
+[[test]]
 name = "syscall_getuid_family"
 harness = false
 

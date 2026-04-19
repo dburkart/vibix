@@ -853,6 +853,41 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         UNLINKAT => super::syscalls::vfs::sys_unlinkat_impl(a0 as i32, a1, a2 as u32),
 
+        // link/linkat/symlink/symlinkat/readlink/readlinkat (issue #540,
+        // RFC 0004 Workstream A wave 1). Same A-before-B gate as the
+        // other write syscalls — with `vfs_creds` off the arms are
+        // absent and the dispatcher's default returns `-ENOSYS`.
+        // Integration tests call `sys_*_impl` directly regardless of
+        // feature state, mirroring the mkdir/unlink convention.
+
+        // link(oldpath, newpath) — create a hard link at `newpath`.
+        #[cfg(feature = "vfs_creds")]
+        LINK => super::syscalls::vfs::sys_link_impl(a0, a1),
+
+        // linkat(olddfd, oldpath, newdfd, newpath, flags) — *at form
+        // of link; honors AT_SYMLINK_FOLLOW.
+        #[cfg(feature = "vfs_creds")]
+        LINKAT => super::syscalls::vfs::sys_linkat_impl(a0 as i32, a1, a2 as i32, a3, a4 as u32),
+
+        // symlink(target, linkpath) — create a symbolic link at
+        // `linkpath` whose contents are `target`.
+        #[cfg(feature = "vfs_creds")]
+        SYMLINK => super::syscalls::vfs::sys_symlink_impl(a0, a1),
+
+        // symlinkat(target, newdfd, linkpath) — *at form of symlink.
+        #[cfg(feature = "vfs_creds")]
+        SYMLINKAT => super::syscalls::vfs::sys_symlinkat_impl(a0, a1 as i32, a2),
+
+        // readlink(path, buf, bufsize) — read the target of a symlink.
+        // Output is NOT NUL-terminated; the return value is the byte
+        // count written (POSIX).
+        #[cfg(feature = "vfs_creds")]
+        READLINK => super::syscalls::vfs::sys_readlink_impl(a0, a1, a2),
+
+        // readlinkat(dfd, path, buf, bufsize) — *at form of readlink.
+        #[cfg(feature = "vfs_creds")]
+        READLINKAT => super::syscalls::vfs::sys_readlinkat_impl(a0 as i32, a1, a2, a3),
+
         // chmod / chown family (issue #541, RFC 0004 §Permission model).
         // Every arm is gated behind `vfs_creds` — these syscalls make DAC
         // decisions against the caller's credentials, so until Workstream
@@ -1552,6 +1587,12 @@ pub mod syscall_nr {
     pub const RMDIR: u64 = 84;
     pub const UNLINK: u64 = 87;
     pub const UNLINKAT: u64 = 263;
+    pub const LINK: u64 = 86;
+    pub const LINKAT: u64 = 265;
+    pub const SYMLINK: u64 = 88;
+    pub const SYMLINKAT: u64 = 266;
+    pub const READLINK: u64 = 89;
+    pub const READLINKAT: u64 = 267;
     pub const CHMOD: u64 = 90;
     pub const FCHMOD: u64 = 91;
     pub const CHOWN: u64 = 92;
@@ -1668,6 +1709,14 @@ mod tests {
         assert_eq!(syscall_nr::RMDIR, 84, "SYS_rmdir must be 84");
         assert_eq!(syscall_nr::UNLINK, 87, "SYS_unlink must be 87");
         assert_eq!(syscall_nr::UNLINKAT, 263, "SYS_unlinkat must be 263");
+
+        // Hard/symbolic links (issue #540)
+        assert_eq!(syscall_nr::LINK, 86, "SYS_link must be 86");
+        assert_eq!(syscall_nr::LINKAT, 265, "SYS_linkat must be 265");
+        assert_eq!(syscall_nr::SYMLINK, 88, "SYS_symlink must be 88");
+        assert_eq!(syscall_nr::SYMLINKAT, 266, "SYS_symlinkat must be 266");
+        assert_eq!(syscall_nr::READLINK, 89, "SYS_readlink must be 89");
+        assert_eq!(syscall_nr::READLINKAT, 267, "SYS_readlinkat must be 267");
 
         // Metadata mutation (issue #541)
         assert_eq!(syscall_nr::CHMOD, 90, "SYS_chmod must be 90");

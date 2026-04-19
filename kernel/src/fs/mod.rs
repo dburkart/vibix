@@ -242,6 +242,7 @@ pub const EFBIG: i64 = -27;
 pub const ENOSPC: i64 = -28;
 pub const ESPIPE: i64 = -29;
 pub const EROFS: i64 = -30;
+pub const EMLINK: i64 = -31;
 pub const EPIPE: i64 = -32;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOTEMPTY: i64 = -39;
@@ -1063,6 +1064,7 @@ mod tests {
         assert_eq!(ENOSPC, -28);
         assert_eq!(ESPIPE, -29);
         assert_eq!(EROFS, -30);
+        assert_eq!(EMLINK, -31);
         assert_eq!(EPIPE, -32);
         assert_eq!(ENAMETOOLONG, -36);
         assert_eq!(ENOTEMPTY, -39);
