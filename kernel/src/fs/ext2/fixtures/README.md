@@ -21,16 +21,37 @@ E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
 output deterministic; the `-O ^...` set disables the post-rev-0
 features vibix does not read.
 
+The four `golden_*.bin` slices above are cut from the 1 MiB image.
+
+A **second** smaller fixture, `golden.img` (64 KiB, 64 × 1 KiB blocks,
+16 inodes), is committed whole and used by
+`kernel/tests/ext2_mount.rs` (issue #558) as a full backing-device
+image for the mount path. Its generator is the same `mkfs.ext2`
+invocation with `count=64` and `-N 16` instead of `count=1024` and
+`-N 64`:
+
+```sh
+dd if=/dev/zero of=golden.img bs=1024 count=64
+E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
+    -b 1024 -N 16 -I 128 -F \
+    -U 00000000-0000-0000-0000-000000000001 \
+    -E hash_seed=11111111-2222-3333-4444-555555555555 \
+    -M / -t ext2 \
+    -O '^dir_index,^has_journal,^ext_attr,^resize_inode' \
+    golden.img
+```
+
 ## Files
 
 | File | Source byte range | Size | Content |
 |---|---|---|---|
-| `golden_superblock.bin` | `[1024, 2048)` | 1024 | rev-1 superblock |
-| `golden_bgd0.bin` | `[2048, 2080)` | 32 | first group descriptor |
-| `golden_root_inode.bin` | `[5248, 5376)` | 128 | root inode (ino 2) |
-| `golden_root_dir.bin` | `[13312, 13376)` | 64 | root dir first block prefix (`.`, `..`, `lost+found`) |
+| `golden_superblock.bin` | `[1024, 2048)` | 1024 | rev-1 superblock (1 MiB image) |
+| `golden_bgd0.bin` | `[2048, 2080)` | 32 | first group descriptor (1 MiB image) |
+| `golden_root_inode.bin` | `[5248, 5376)` | 128 | root inode (ino 2) (1 MiB image) |
+| `golden_root_dir.bin` | `[13312, 13376)` | 64 | root dir first block prefix (1 MiB image) |
+| `golden.img` | `[0, 65536)` | 65536 | full 64 KiB mkfs.ext2 image (mount tests) |
 
-Byte offsets are computed from:
+Byte offsets for the 1 MiB slices are computed from:
 - Superblock at byte 1024 regardless of block size.
 - Group descriptor table at block 2 (byte 2048) on 1 KiB-block volumes.
 - Inode table at block 5 per `dumpe2fs`; root inode (ino 2) is at slot
