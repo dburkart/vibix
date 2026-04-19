@@ -231,7 +231,7 @@ pub fn read_file_at(
 /// block fs has ~128 groups). A follow-up that caches the map on
 /// [`Ext2Super`] is tracked as an optimisation (RFC 0004 §Indirect-
 /// block walker — "memoise the metadata map at mount").
-fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
+pub(super) fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
     use super::disk::EXT2_GROUP_DESC_SIZE;
 
     let block_size = super_.block_size;
