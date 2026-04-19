@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 pub mod disk;
+pub mod symlink;
 
 // The driver proper needs the VFS layer (`FileSystem`/`SuperOps`
 // traits) and the block-cache surface, both of which are gated on
