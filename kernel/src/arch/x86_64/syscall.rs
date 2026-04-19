@@ -226,12 +226,34 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
         USER_DATA_SELECTOR,
         0x202u64,
     );
+    // #478 diagnostic step 1: emit a single-byte marker on the QEMU debug
+    // console (port 0xe9) *immediately* before the iretq, and a second
+    // byte in the same asm block *after* the iretq frame is pushed but
+    // before the iretq retires. Because debugcon is captured to a separate
+    // file by xtask (`-debugcon file:...`), this signal is independent of
+    // the serial path and tells us whether iretq retired at all when the
+    // serial "init: hello from pid 1" marker goes missing.
+    //
+    // Byte assignments (step 1 of the 3-step plan):
+    //   0xE0 — kernel: about to push iretq frame
+    //   0xE1 — kernel: iretq frame pushed, iretq next instruction
+    // (Userspace markers 0xE2/0xE3 require IOPL=3 or an ioperm bitmap;
+    //  the kernel-side fallback — per the investigation plan — still
+    //  produces a useful signal on a silent #GP/#PF in the iretq path.)
+    core::arch::asm!(
+        "mov al, 0xE0",
+        "out 0xE9, al",
+        out("al") _,
+        options(nostack, preserves_flags),
+    );
     core::arch::asm!(
         "push {ss}",      // SS  = user data selector (stack segment)
         "push {sp}",      // RSP = user stack top
         "push 0x202",     // RFLAGS: IF=1, bit-1 reserved=1
         "push {cs}",      // CS  = user code selector
         "push {rip}",     // RIP = user entry point
+        "mov al, 0xE1",   // debugcon marker: iretq frame pushed
+        "out 0xE9, al",   // observable even if iretq faults silently
         "iretq",
         ss  = in(reg) USER_DATA_SELECTOR as u64,
         sp  = in(reg) stack_top,
