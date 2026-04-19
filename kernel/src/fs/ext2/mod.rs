@@ -22,6 +22,16 @@
 pub mod disk;
 pub mod symlink;
 
+// The indirect-block walker is gated on the same `any(test, target_os =
+// "none")` envelope the rest of the block-backed code uses: it depends on
+// [`crate::block::cache::BlockCache`], which in turn is only compiled for
+// `target_os = "none"` or host unit tests. The walker itself is pure
+// logic over the `BlockCache` surface — no VFS-layer dependencies — so
+// it can live outside the `ext2` feature gate; the driver proper (below)
+// is still the one that exercises it in production.
+#[cfg(any(test, target_os = "none"))]
+pub mod indirect;
+
 // The driver proper needs the VFS layer (`FileSystem`/`SuperOps`
 // traits) and the block-cache surface, both of which are gated on
 // `target_os = "none"`. Host unit tests for pure logic in this module
