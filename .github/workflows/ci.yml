@@ -215,3 +215,14 @@ jobs:
 
       - name: cargo xtask smoke
         run: cargo xtask smoke
+
+      # #478 diagnostic step 1: port-0xE9 debugcon capture around the
+      # ring-0→ring-3 iretq. Upload on failure so investigators can see
+      # whether iretq retired at all, independent of the serial path.
+      - name: Upload debugcon log (#478 diagnostic)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-debugcon-log
+          path: target/debugcon.log
+          if-no-files-found: ignore

@@ -1037,6 +1037,24 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let iso = iso(opts)?;
     let disk = ensure_test_disk()?;
 
+    // #478 diagnostic step 1: capture QEMU's port-0xE9 debug console to a
+    // file alongside serial. The kernel emits single-byte markers on 0xE9
+    // immediately around the ring-0→ring-3 iretq (see
+    // `kernel::arch::x86_64::syscall::jump_to_ring3`). Because the
+    // debugcon path is independent of the serial mux, seeing e.g. `0xE1`
+    // here when the "init: hello from pid 1" serial marker is missing
+    // proves iretq was attempted; missing `0xE1` points at a pre-iretq
+    // fault. Unconditional — the capture is cheap and always-on.
+    let debugcon_log: PathBuf = {
+        let mut p =
+            PathBuf::from(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
+        p.push("debugcon.log");
+        // Truncate any stale log from a previous run.
+        let _ = fs::remove_file(&p);
+        p
+    };
+    let debugcon_arg = format!("file:{}", debugcon_log.display());
+
     // Boot QEMU with serial to stdio; stdout is piped so we can read it
     // incrementally.  -no-shutdown keeps the kernel in hlt_loop forever
     // (the kernel never calls isa-debug-exit), so we are responsible for
@@ -1058,6 +1076,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(["-debugcon", &debugcon_arg])
         .args(virtio_blk_args(&disk))
         .arg("-cdrom")
         .arg(&iso)
@@ -1160,8 +1179,24 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let _ = reader_handle.join();
     let _ = child.wait();
 
+    // Helper to dump the debugcon log (#478 diagnostic step 1) on any
+    // failure path so CI log lines and uploaded artifacts both show it.
+    let dump_debugcon = |log_path: &Path| match fs::read(log_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x} ")).collect();
+            eprintln!(
+                    "--- captured debugcon (port 0xE9, {} bytes) ---\n{}\n-----------------------------------",
+                    bytes.len(),
+                    hex.trim_end()
+                );
+        }
+        Ok(_) => eprintln!("--- captured debugcon: <empty> ---"),
+        Err(e) => eprintln!("--- captured debugcon: <unreadable: {e}> ---"),
+    };
+
     if panicked {
         eprintln!("--- captured serial ---\n{accumulated}\n-----------------------");
+        dump_debugcon(&debugcon_log);
         return Err("smoke: kernel panic detected".into());
     }
 
@@ -1185,6 +1220,7 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         let mut missing: Vec<&str> = remaining.into_iter().collect();
         missing.sort_unstable();
         eprintln!("--- captured serial ---\n{accumulated}\n-----------------------");
+        dump_debugcon(&debugcon_log);
         Err(format!("smoke: missing markers {:?}", missing).into())
     }
 }
