@@ -317,6 +317,10 @@ name = "syscall_setuid_family"
 harness = false
 
 [[test]]
+name = "syscall_truncate"
+harness = false
+
+[[test]]
 name = "ntty_sigint_flush"
 harness = false
 
