@@ -101,7 +101,7 @@ fn inline_bytes(inode: &Ext2Inode) -> [u8; 60] {
 /// The copy length is `min(i_size, 60, buf.len())` — the three-way
 /// clamp from RFC 0004 §Security. Does **not** NUL-terminate. Returns
 /// `Err(EINVAL)` if `inode` is not a fast symlink (the caller should
-/// dispatch through [`read_symlink_fast_path`] which checks for them).
+/// dispatch through [`read_symlink`] which checks for that).
 pub fn read_fast_symlink(inode: &Ext2Inode, buf: &mut [u8]) -> Result<usize, i64> {
     if !is_fast_symlink(inode) {
         return Err(crate::fs::EINVAL);
@@ -276,13 +276,17 @@ mod tests {
         let target = b"/usr/bin/env";
         let link = make_inode(EXT2_S_IFLNK | 0o777, target.len() as u32, 0, target);
 
-        let mut buf = [0u8; 128];
+        // Prefill with a sentinel so the "no NUL terminator" check
+        // actually catches an accidental terminator write — a
+        // zero-initialised buffer would pass even if the reader did
+        // append a NUL.
+        let mut buf = [0xffu8; 128];
         let n = read_fast_symlink(&link, &mut buf).expect("fast-symlink read");
         assert_eq!(n, target.len());
         assert_eq!(&buf[..n], target);
-        // No trailing NUL — POSIX `readlink` contract.
-        assert_ne!(buf[n], 0u8.wrapping_sub(1));
-        assert_eq!(buf[n], 0);
+        // No trailing NUL — POSIX `readlink` contract. Byte after
+        // the copied range must still be the sentinel.
+        assert_eq!(buf[n], 0xff);
     }
 
     #[test]
