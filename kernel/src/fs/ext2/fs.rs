@@ -152,6 +152,12 @@ pub struct Ext2Fs {
     /// Self-reference so `Ext2Super::unmount` can upgrade it and clear
     /// the latch. `Arc::new_cyclic` fills this in at construction.
     self_ref: Weak<Ext2Fs>,
+    /// Weak pointer to the currently-mounted `Ext2Super`, set on a
+    /// successful `mount` and cleared on `unmount`. Exposed via
+    /// [`Ext2Fs::current_super`] so integration tests (and the future
+    /// `/proc/mounts` consumer) can reach the concrete per-mount type
+    /// without a dyn-Any downcast on `Arc<dyn SuperOps>`.
+    current_super: spin::Mutex<Weak<Ext2Super>>,
 }
 
 impl Ext2Fs {
@@ -164,6 +170,7 @@ impl Ext2Fs {
             device,
             mounted: AtomicBool::new(false),
             self_ref: weak.clone(),
+            current_super: spin::Mutex::new(Weak::new()),
         })
     }
 
@@ -172,6 +179,20 @@ impl Ext2Fs {
     /// ramdisk.
     pub fn device_capacity(&self) -> u64 {
         self.device.capacity()
+    }
+
+    /// Upgrade the weak reference to the currently-mounted
+    /// [`Ext2Super`]. Returns `None` if the factory hasn't been
+    /// mounted, if an `unmount` has run, or if the `Arc<Ext2Super>` has
+    /// been fully dropped (which shouldn't happen while the VFS
+    /// [`SuperBlock`] holds a strong ref through `sb.ops`).
+    ///
+    /// Test-oriented: production callers route through
+    /// `SuperBlock::ops`. This is the escape hatch tests need to reach
+    /// `iget` / `inode_cache` / `orphan_list` without a dyn-Any
+    /// downcast.
+    pub fn current_super(&self) -> Option<Arc<Ext2Super>> {
+        self.current_super.lock().upgrade()
     }
 }
 
@@ -391,7 +412,7 @@ impl FileSystem for Ext2Fs {
             sb_flags = sb_flags | SbFlags::NOEXEC;
         }
 
-        let super_ops: Arc<Ext2Super> = Arc::new(Ext2Super {
+        let super_ops: Arc<Ext2Super> = Arc::new_cyclic(|weak| Ext2Super {
             fs_id: fs_id.0,
             cache,
             device_id,
@@ -402,6 +423,9 @@ impl FileSystem for Ext2Fs {
             bgdt,
             ext2_flags,
             owner: self.self_ref.clone(),
+            inode_cache: super::inode::new_inode_cache(),
+            orphan_list: super::inode::new_orphan_list(),
+            self_ref: weak.clone(),
         });
 
         let sb = Arc::new(SuperBlock::new(
@@ -411,6 +435,32 @@ impl FileSystem for Ext2Fs {
             block_size,
             sb_flags,
         ));
+
+        // Record a `Weak<Ext2Super>` in the factory so `current_super()`
+        // can hand the concrete type back to callers (tests, the future
+        // `/proc/mounts`). Must happen before `iget_root` below: the
+        // caller holds an `Arc<Ext2Super>` already (`super_ops`), but
+        // stashing the weak here centralises the bookkeeping.
+        *self.current_super.lock() = Arc::downgrade(&super_ops);
+
+        // Populate `sb.root` before returning so path-walk callers that
+        // start at the mount's root observe a ready-to-use inode. A
+        // failure here (corrupt root inode, I/O error reading the
+        // root-inode block) must roll back the mount — including the
+        // single-mount latch — so the factory can be retried against a
+        // repaired image.
+        match super::inode::iget_root(&super_ops, &sb) {
+            Ok(root) => {
+                sb.root.call_once(|| root);
+            }
+            Err(e) => {
+                // Releasing the latch here mirrors the `unlatch` helper
+                // above. The BlockCache / SuperBlock Arcs are dropped
+                // on function return.
+                unlatch();
+                return Err(e);
+            }
+        }
 
         Ok(sb)
     }
@@ -456,14 +506,49 @@ pub struct Ext2Super {
     /// single-mount latch. `Weak` breaks the `Ext2Fs → SuperBlock →
     /// Ext2Super → Ext2Fs` cycle.
     owner: Weak<Ext2Fs>,
+    /// Weak-ref inode cache. Populated by
+    /// [`iget`](super::inode::iget); a hit returns the same
+    /// `Arc<Inode>` so repeat lookups dedup. Wave 3 (#559) introduces
+    /// this; Workstream E populates it on every inode read.
+    pub inode_cache: super::inode::InodeCache,
+    /// Strong-ref orphan list. Holds `Arc<Inode>` for every
+    /// unlinked-but-open inode on this mount so its blocks aren't
+    /// freed before the last close (RFC 0004 §Orphan-list residency
+    /// invariant). Wave 3 constructs it empty; the unlink path (E)
+    /// and mount-time orphan replay (#564) populate it.
+    pub orphan_list: super::inode::OrphanList,
+    /// Self-reference so [`SuperOps::root_inode`] can hand `iget_root`
+    /// a strong `Arc<Ext2Super>` without the caller threading one in.
+    /// Filled in by [`Arc::new_cyclic`] at mount time.
+    self_ref: Weak<Ext2Super>,
 }
 
 impl SuperOps for Ext2Super {
     fn root_inode(&self) -> Arc<Inode> {
-        // Wave 2 does not build the root inode — that's #559. VFS
-        // callers should use `sb.root` (a `Once`) once #559 wires it
-        // in; reaching here in wave 2 is a driver bug.
-        unreachable!("ext2 wave 2 does not populate root_inode; see issue #559")
+        // Wave 3 (#559) wires the root inode into `SuperBlock::root` at
+        // mount time via `iget_root`. Callers are expected to read
+        // `sb.root.get()` directly; `root_inode` is a legacy hook and
+        // reaching it means the caller bypassed the once-cell. Upgrade
+        // the self-reference, resolve the matching SuperBlock through
+        // the mount table's `fs_id`, and return the cached root inode.
+        // If the self-weak or the cache entry is gone, we're mid-drop
+        // and the caller's `Arc<Inode>` clone is ill-defined — panic
+        // loudly rather than hand back a stub.
+        let super_arc = self
+            .self_ref
+            .upgrade()
+            .expect("Ext2Super dropped before root_inode was invoked");
+        // We can't construct a fresh Arc<Inode> without an Arc<SuperBlock>
+        // here — one isn't reachable from SuperOps. Consult the
+        // inode_cache (populated at mount by `iget_root`); the VFS
+        // holds a strong ref via `sb.root`, so the Weak upgrade
+        // succeeds for as long as the mount is live.
+        let cache = super_arc.inode_cache.lock();
+        let weak = cache
+            .get(&super::disk::EXT2_ROOT_INO)
+            .expect("root inode must be cached at mount time");
+        weak.upgrade()
+            .expect("SuperBlock::root holds a strong ref to the root inode")
     }
 
     fn statfs(&self) -> Result<StatFs, i64> {
@@ -513,8 +598,12 @@ impl SuperOps for Ext2Super {
         // run anyway).
 
         // Release the single-mount latch so a subsequent mount of the
-        // same factory can succeed.
+        // same factory can succeed. Also clear the weak back-reference
+        // exposed via `Ext2Fs::current_super` so a stale `Weak` can't
+        // upgrade after unmount-then-remount into a different
+        // `Ext2Super`.
         if let Some(fs) = self.owner.upgrade() {
+            *fs.current_super.lock() = Weak::new();
             fs.mounted.store(false, Ordering::SeqCst);
         }
     }
