@@ -363,6 +363,26 @@ impl FileSystem for Ext2Fs {
         }
         debug_assert_eq!(bgdt.len() as u32, groups);
 
+        // 7b. Mount-time orphan-chain validation (issue #564, RFC 0004
+        //     §Orphan list + §Mount-time recovery). Runs as a raw walk
+        //     *before* the `s_state := ERROR_FS` stamp so that a
+        //     corrupt chain demotes us to RO before any write hits
+        //     disk. The walk phase is pure-read; the pin phase (which
+        //     needs the `Arc<SuperBlock>`) runs after construction
+        //     below. We stash the surviving inos here for phase 2.
+        let (orphan_verdict, orphan_inos) = super::orphan::walk_orphan_chain_raw(
+            &cache,
+            device_id,
+            &on_disk_sb,
+            &bgdt,
+            inode_size,
+            block_size,
+        );
+        if orphan_verdict == super::orphan::ForceRo::Yes {
+            effective_rdonly = true;
+            ext2_flags |= Ext2MountFlags::FORCED_RDONLY;
+        }
+
         // 8. RW bring-up: stamp `s_state := ERROR_FS` so an unclean
         //    crash is detectable on the next mount. The canonical
         //    `VALID_FS` is rewritten only by a clean unmount. RO
@@ -461,6 +481,16 @@ impl FileSystem for Ext2Fs {
                 return Err(e);
             }
         }
+
+        // Phase 2 of mount-time orphan-chain validation (#564): now
+        // that the SuperBlock is built and the root inode is live,
+        // pin each surviving orphan ino into
+        // `super_ops.orphan_list` so its blocks remain reserved for
+        // the life of the mount. A failure here is logged and
+        // skipped — a successful raw walk proved the slot looked
+        // orphan-ish, and a late pin failure shouldn't retroactively
+        // tear down a mount the caller has committed to.
+        super::orphan::pin_orphans(&super_ops, &sb, &orphan_inos);
 
         Ok(sb)
     }

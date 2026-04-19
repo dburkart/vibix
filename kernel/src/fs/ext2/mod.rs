@@ -58,6 +58,13 @@ pub mod inode;
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod file;
 
+// Mount-time orphan-chain validation (#564). Same feature gate as
+// `fs` / `inode`: it consumes `Ext2Super` and uses the BlockCache to
+// read inode-table blocks. Host unit tests for pure helpers inside
+// live behind `#[cfg(test)]`.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod orphan;
+
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use fs::{Ext2Fs, Ext2MountFlags, Ext2Super, SUPERBLOCK_BYTE_OFFSET};
 
@@ -66,3 +73,6 @@ pub use inode::{iget, iget_root, Ext2FileOps, Ext2Inode, Ext2InodeMeta};
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use file::read_file_at;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use orphan::{validate_orphan_chain, ForceRo};
