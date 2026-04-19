@@ -283,7 +283,9 @@ fn read_pointer_slot(
     let off = (index as usize) * 4;
     // `data.len() == cache.block_size() == geom.block_size`; the
     // `index < ptrs_per_block` assert above already bounded `off`.
-    let slot: [u8; 4] = data[off..off + 4].try_into().unwrap_or([0; 4]);
+    let slot: [u8; 4] = data[off..off + 4]
+        .try_into()
+        .expect("indirect pointer slot is exactly 4 bytes");
     Ok(u32::from_le_bytes(slot))
 }
 
