@@ -50,6 +50,54 @@ E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
 | `golden_root_inode.bin` | `[5248, 5376)` | 128 | root inode (ino 2) (1 MiB image) |
 | `golden_root_dir.bin` | `[13312, 13376)` | 64 | root dir first block prefix (1 MiB image) |
 | `golden.img` | `[0, 65536)` | 65536 | full 64 KiB mkfs.ext2 image (mount tests) |
+| `read_test.img` | — | 1048576 | 1 MiB mkfs.ext2 image pre-populated with `small.bin` (26 B), `large.bin` (300 KiB crossing single-indirect), `hole.bin` (3 KiB dense), and `sparse.bin` (11 KiB with logical blocks 1..9 hole-punched via `debugfs set_inode_field block[n] 0`). Used by `kernel/tests/ext2_file_read.rs` (issue #561). |
+
+## `read_test.img` generator
+
+```sh
+dd if=/dev/zero of=read_test.img bs=1024 count=1024
+E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
+    -b 1024 -N 64 -I 128 -F \
+    -U 00000000-0000-0000-0000-000000000002 \
+    -E hash_seed=11111111-2222-3333-4444-555555555555 \
+    -M / -t ext2 \
+    -O '^dir_index,^has_journal,^ext_attr,^resize_inode,^sparse_super' \
+    read_test.img
+
+# small.bin: 26-byte greeting, single direct block.
+printf 'hello ext2 read path #561\n' > small.bin
+
+# large.bin: 300 × 1 KiB blocks with per-block markers, crosses the
+# 12-direct → single-indirect boundary at logical block 12.
+python3 -c '
+data = bytearray()
+for b in range(300):
+    head = f"BLK{b:05d}".encode("ascii")
+    body = bytes([(b * 131 + i) & 0xff for i in range(1024 - len(head))])
+    data.extend(head + body)
+open("large.bin", "wb").write(bytes(data))
+'
+
+# hole.bin: dense pattern (no sparse) — the name is historical; kept
+# for completeness even though sparse.bin carries the hole test.
+python3 -c "open('hole_raw.bin','wb').write(b'A'*512 + b'\x00'*2048 + b'B'*512)"
+
+# sparse.bin: logical block 0 and 10 live, 1..9 hole-punched. Written
+# as 11 KiB of non-zero content first, then `set_inode_field block[i]
+# 0` zeroes the direct slots in-place.
+python3 -c "open('prehole.bin','wb').write(b'X'*1024 + b'H'*9*1024 + b'Z'*1024)"
+
+debugfs -w -R 'write small.bin small.bin'       read_test.img
+debugfs -w -R 'write large.bin large.bin'       read_test.img
+debugfs -w -R 'write hole_raw.bin hole.bin'     read_test.img
+debugfs -w -R 'write prehole.bin sparse.bin'    read_test.img
+# Hole-punch sparse.bin — inode number matches the fourth `write`.
+for i in 1 2 3 4 5 6 7 8 9; do
+    echo "set_inode_field <15> block[$i] 0"
+done | debugfs -w -f /dev/stdin read_test.img
+```
+
+Assigned inos on a deterministic `mkfs.ext2` run of the above: `small.bin = 12`, `large.bin = 13`, `hole.bin = 14`, `sparse.bin = 15`.
 
 Byte offsets for the 1 MiB slices are computed from:
 - Superblock at byte 1024 regardless of block size.

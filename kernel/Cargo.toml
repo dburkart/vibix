@@ -365,3 +365,8 @@ harness = false
 name = "ext2_inode_iget"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_file_read"
+harness = false
+required-features = ["ext2"]

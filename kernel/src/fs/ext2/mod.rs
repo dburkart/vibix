@@ -50,8 +50,19 @@ pub mod fs;
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod inode;
 
+// Regular-file `FileOps::read` path (#561). Same gate as `inode` — it
+// consumes `Ext2Super` + `Ext2Inode`. The `read_file_at` free function
+// exported here is also the integration-test entry point so tests
+// don't need to route through an `OpenFile` just to assert on a slice
+// of file bytes.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod file;
+
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use fs::{Ext2Fs, Ext2MountFlags, Ext2Super, SUPERBLOCK_BYTE_OFFSET};
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use inode::{iget, iget_root, Ext2FileOps, Ext2Inode, Ext2InodeMeta};
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use file::read_file_at;
