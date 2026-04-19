@@ -31,7 +31,7 @@ use crate::fs::vfs::super_block::{SbActiveGuard, SuperBlock};
 use crate::fs::vfs::{
     root as vfs_root, GlobalMountResolver, Inode, InodeKind, OpenFile, VfsBackend,
 };
-use crate::fs::vfs::{Access, Credential};
+use crate::fs::vfs::{Access, Credential, Timespec};
 use crate::fs::{
     flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR,
     ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS,
@@ -1545,6 +1545,266 @@ fn do_truncate(inode: &Arc<Inode>, length: i64, cred: &Credential) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// utimensat / futimens (issue #544, RFC 0004 §Kernel-Userspace Interface)
+//
+// POSIX.1-2017 §utimensat. The semantics are subtle enough that every
+// case is spelled out — see RFC 0004 §"utimensat(2) semantics" for the
+// spec we implement.
+//
+// - `times == NULL` → set atime+mtime to the current wall-clock (same
+//   as both-UTIME_NOW).
+// - `times[i].tv_nsec == UTIME_NOW`  → set that field to now.
+// - `times[i].tv_nsec == UTIME_OMIT` → leave that field unchanged.
+// - `flags & AT_SYMLINK_NOFOLLOW`    → do not follow a trailing symlink.
+// - ctime is always bumped on a successful update.
+//
+// Permission matrix (POSIX-required — see RFC 0004 §Permission model):
+// - Explicit timestamps (any tv_nsec outside [UTIME_NOW, UTIME_OMIT]):
+//   caller must be the file owner or root. Write permission alone is
+//   *insufficient* — backdating mtime is an anti-forensics primitive.
+//   Non-owner → `EPERM`.
+// - UTIME_NOW / `times == NULL`: owner / root always allowed; anyone
+//   else needs write permission on the file. Missing both → `EACCES`.
+// - UTIME_OMIT on both fields with no other change: permit-and-skip
+//   (POSIX lets implementations no-op; we do, and bump ctime only if
+//   any real change was requested).
+//
+// futimens(fd, times) is expressed via the same core helper: the
+// standard idiom on Linux is `utimensat(fd, NULL, times, 0)` and our
+// dispatcher maps SYS_utimensat with `path_uva == 0` onto `fd`-rooted
+// behaviour. A dedicated `sys_futimens_impl` is provided for tests /
+// future inline callers.
+// ---------------------------------------------------------------------------
+
+/// Linux x86_64 syscall number for `utimensat(2)`. Exposed so integration
+/// tests can reach the dispatcher directly without re-hardcoding it.
+pub const SYS_UTIMENSAT_NR: u64 = 280;
+
+/// `UTIME_NOW` sentinel for `timespec.tv_nsec`. Matches the Linux /
+/// POSIX value: `(1 << 30) - 1`.
+pub const UTIME_NOW: u32 = (1 << 30) - 1;
+
+/// `UTIME_OMIT` sentinel for `timespec.tv_nsec`. Matches the Linux /
+/// POSIX value: `(1 << 30) - 2`.
+pub const UTIME_OMIT: u32 = (1 << 30) - 2;
+
+/// Userspace-visible layout of `struct timespec` on x86_64 Linux: two
+/// 8-byte words, `tv_sec` then `tv_nsec`. We copy pairs of these in
+/// raw bytes through `uaccess::copy_from_user`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct UserTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<UserTimespec>() == 16);
+    assert!(core::mem::align_of::<UserTimespec>() == 8);
+};
+
+/// Resolved per-field request after sentinel classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeReq {
+    /// Set to the given Timespec.
+    Set(Timespec),
+    /// Set to current wall-clock ("now").
+    Now,
+    /// Leave the field unchanged.
+    Omit,
+}
+
+/// Classify a single user-supplied `timespec` into a [`TimeReq`].
+///
+/// Rejects out-of-range `tv_nsec` (outside `[0, 1e9)`) unless it is
+/// one of the two sentinels — matches Linux's `EINVAL` behaviour.
+fn classify_timespec(ts: &UserTimespec) -> Result<TimeReq, i64> {
+    // The sentinels use the tv_nsec slot; tv_sec is ignored for them.
+    let nsec = ts.tv_nsec as u32;
+    if ts.tv_nsec == UTIME_NOW as i64 || nsec == UTIME_NOW {
+        return Ok(TimeReq::Now);
+    }
+    if ts.tv_nsec == UTIME_OMIT as i64 || nsec == UTIME_OMIT {
+        return Ok(TimeReq::Omit);
+    }
+    if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(EINVAL);
+    }
+    Ok(TimeReq::Set(Timespec {
+        sec: ts.tv_sec,
+        nsec: ts.tv_nsec as u32,
+    }))
+}
+
+/// Copy the two-entry `times[2]` array from user memory. Returns
+/// `(TimeReq, TimeReq)` on success; `(Now, Now)` if `times_uva == 0`
+/// (the POSIX `times == NULL` spelling).
+fn read_times(times_uva: u64) -> Result<(TimeReq, TimeReq), i64> {
+    if times_uva == 0 {
+        return Ok((TimeReq::Now, TimeReq::Now));
+    }
+    let mut buf = [0u8; core::mem::size_of::<UserTimespec>() * 2];
+    match unsafe { uaccess::copy_from_user(&mut buf, times_uva as usize) } {
+        Ok(()) => {}
+        Err(e) => return Err(e.as_errno()),
+    }
+    let a = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const UserTimespec) };
+    let m = unsafe {
+        core::ptr::read_unaligned(
+            buf.as_ptr().add(core::mem::size_of::<UserTimespec>()) as *const UserTimespec
+        )
+    };
+    Ok((classify_timespec(&a)?, classify_timespec(&m)?))
+}
+
+/// True if the caller owns `inode` or is root. Matches the POSIX
+/// "appropriate privileges" predicate used by every non-write-perm
+/// timestamp path.
+fn is_owner_or_root(inode: &Inode, cred: &Credential) -> bool {
+    cred.euid == 0 || cred.euid == inode.meta.read().uid
+}
+
+/// Enforce the utimensat permission matrix and compute the final
+/// `SetAttr` to hand to the FS driver.
+///
+/// - `atime_req` / `mtime_req` describe what the caller wants for each
+///   field (from [`classify_timespec`]).
+/// - Explicit-time on either side requires owner/root (`EPERM` else).
+/// - UTIME_NOW on either side (including `times == NULL`, surfaced as
+///   `(Now, Now)` upstream) is permitted for owner/root OR anyone with
+///   write permission on the file (`EACCES` else).
+///
+/// On a successful call, ctime is always bumped to "now" — POSIX
+/// requires it whenever *any* field actually changes. A call whose
+/// effect reduces to `(OMIT, OMIT)` returns `Ok(None)`: the caller
+/// should short-circuit to success without touching the inode.
+fn build_utime_setattr(
+    inode: &Inode,
+    cred: &Credential,
+    atime_req: TimeReq,
+    mtime_req: TimeReq,
+) -> Result<Option<SetAttr>, i64> {
+    let has_explicit = matches!(atime_req, TimeReq::Set(_)) || matches!(mtime_req, TimeReq::Set(_));
+    let has_any_write = atime_req != TimeReq::Omit || mtime_req != TimeReq::Omit;
+
+    if !has_any_write {
+        // Both fields OMIT — nothing to do, permit unconditionally.
+        return Ok(None);
+    }
+
+    if has_explicit {
+        // Anti-forensics rule: explicit timestamps require ownership.
+        // Write permission alone is NOT sufficient.
+        if !is_owner_or_root(inode, cred) {
+            return Err(EPERM);
+        }
+    } else {
+        // Every non-omit request is UTIME_NOW. Owner/root always OK;
+        // otherwise caller needs write permission on the file.
+        if !is_owner_or_root(inode, cred) {
+            // default_permission (or the driver's override) maps a
+            // missing W bit to EACCES.
+            if let Err(e) = inode.ops.permission(inode, cred, Access::WRITE) {
+                // default_permission returns EACCES for write denial;
+                // surface that directly so the errno table holds.
+                return Err(e);
+            }
+        }
+    }
+
+    // Resolve each field to a concrete Timespec (or leave it alone).
+    let mut mask = SetAttrMask::default();
+    let mut attr = SetAttr::default();
+    let now = Timespec::now();
+    match atime_req {
+        TimeReq::Omit => {}
+        TimeReq::Now => {
+            mask = mask | SetAttrMask::ATIME;
+            attr.atime = now;
+        }
+        TimeReq::Set(ts) => {
+            mask = mask | SetAttrMask::ATIME;
+            attr.atime = ts;
+        }
+    }
+    match mtime_req {
+        TimeReq::Omit => {}
+        TimeReq::Now => {
+            mask = mask | SetAttrMask::MTIME;
+            attr.mtime = now;
+        }
+        TimeReq::Set(ts) => {
+            mask = mask | SetAttrMask::MTIME;
+            attr.mtime = ts;
+        }
+    }
+    // ctime always bumped when any field actually changes (POSIX).
+    mask = mask | SetAttrMask::CTIME;
+    attr.ctime = now;
+    attr.mask = mask;
+    Ok(Some(attr))
+}
+
+/// Core utimensat body. `path_uva == 0` with a real `dfd` means
+/// "operate on the file behind `dfd`" — this is how futimens is
+/// expressed (glibc: `futimens(fd, times) == utimensat(fd, NULL,
+/// times, 0)`). `dfd == AT_FDCWD` with a zero path is rejected with
+/// `EFAULT` (no path and no fd).
+fn utimensat_impl(dfd: i32, path_uva: u64, times_uva: u64, flags: u32) -> i64 {
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return EINVAL;
+    }
+    let (atime_req, mtime_req) = match read_times(times_uva) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let cred = crate::task::current_credentials();
+
+    // Resolve the target inode. Two paths:
+    //   - `path_uva == 0` with `dfd >= 0`: futimens style — look up by fd.
+    //   - otherwise: path-walk under the given dfd.
+    let inode: Arc<Inode> = if path_uva == 0 {
+        if dfd == AT_FDCWD {
+            // POSIX says EFAULT here (null path without a fd).
+            return crate::fs::EFAULT;
+        }
+        match fd_to_inode(dfd as u64) {
+            Ok(i) => i,
+            Err(e) => return e,
+        }
+    } else {
+        let buf = match copy_user_path(path_uva) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let path = buf.as_slice();
+        let is_absolute = path.first() == Some(&b'/');
+        if dfd != AT_FDCWD && !is_absolute {
+            return EINVAL;
+        }
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (i, _nd) = match resolve_inode_as(path, follow, (*cred).clone()) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        i
+    };
+
+    let attr = match build_utime_setattr(&inode, &cred, atime_req, mtime_req) {
+        Ok(Some(a)) => a,
+        // (OMIT, OMIT): POSIX-allowed no-op; return success.
+        Ok(None) => return 0,
+        Err(e) => return e,
+    };
+
+    match inode.ops.setattr(&inode, &attr) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
 /// `truncate(path, length)` — set the file at `path` to `length` bytes.
 ///
 /// Follows a trailing symlink (POSIX defines no `AT_SYMLINK_NOFOLLOW`
@@ -1593,4 +1853,21 @@ pub unsafe fn sys_ftruncate_impl(fd_raw: u64, length: i64) -> i64 {
     };
     let cred = crate::task::current_credentials();
     do_truncate(&inode, length, &cred)
+}
+
+/// `utimensat(dirfd, path, times, flags)` — update atime/mtime on
+/// `path` (or on the file behind `dirfd` when `path` is NULL, a.k.a.
+/// the futimens idiom).
+pub unsafe fn sys_utimensat_impl(dfd: i32, path_uva: u64, times_uva: u64, flags: u32) -> i64 {
+    utimensat_impl(dfd, path_uva, times_uva, flags)
+}
+
+/// `futimens(fd, times)` — update atime/mtime on an already-open fd.
+/// Equivalent to `utimensat(fd, NULL, times, 0)` per POSIX; provided
+/// as a standalone entry for tests and future inline callers.
+pub unsafe fn sys_futimens_impl(fd_raw: u64, times_uva: u64) -> i64 {
+    if fd_raw > i32::MAX as u64 {
+        return EBADF;
+    }
+    utimensat_impl(fd_raw as i32, 0, times_uva, 0)
 }
