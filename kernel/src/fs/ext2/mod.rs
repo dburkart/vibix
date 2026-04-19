@@ -32,5 +32,15 @@ pub mod disk;
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod fs;
 
+// The inode / iget / inode cache / orphan list surface. Same feature
+// gate as `fs` because it consumes `Ext2Super`; host unit tests for
+// pure functions inside live under `#[cfg(test)]` and run under the
+// kernel target alongside `fs`'s tests.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod inode;
+
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use fs::{Ext2Fs, Ext2MountFlags, Ext2Super, SUPERBLOCK_BYTE_OFFSET};
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use inode::{iget, iget_root, Ext2FileOps, Ext2Inode, Ext2InodeMeta};

@@ -352,3 +352,8 @@ required-features = ["ext2"]
 [[test]]
 name = "block_writeback"
 harness = false
+
+[[test]]
+name = "ext2_inode_iget"
+harness = false
+required-features = ["ext2"]
