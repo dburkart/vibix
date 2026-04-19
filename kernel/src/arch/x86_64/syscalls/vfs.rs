@@ -1957,11 +1957,41 @@ fn linkat_impl(
     }
 
     // Resolve the source. Hard-linking names the underlying inode, not
-    // the link, so the default is NOT to follow a terminal symlink.
-    // AT_SYMLINK_FOLLOW flips that to POSIX `link(2)`-style following.
-    let (src_inode, _src_nd) = match resolve_inode(old_path, follow_source) {
-        Ok(v) => v,
-        Err(e) => return e,
+    // the link, so the default is NOT to follow a terminal symlink —
+    // but we must NOT error on a terminal symlink either: POSIX default
+    // `link(2)` hard-links the symlink itself. `resolve_inode(path,
+    // false)` sets `LookupFlags::NOFOLLOW` which returns `ELOOP` on a
+    // terminal symlink (correct for `O_NOFOLLOW`, wrong here), so we
+    // walk with default flags when the caller asked for the default.
+    // `AT_SYMLINK_FOLLOW` flips to POSIX-`link`-style following.
+    let src_inode = if follow_source {
+        match resolve_inode(old_path, /* follow */ true) {
+            Ok((i, _)) => i,
+            Err(e) => return e,
+        }
+    } else {
+        // Manual walk with `LookupFlags::default()` — intermediates still
+        // chase through symlinks (so a link under `/var` works when
+        // `/var` is itself a symlink), but the terminal component is
+        // returned as-is without the NOFOLLOW ELOOP trap.
+        let root = match vfs_root() {
+            Some(r) => r,
+            None => return ENOENT,
+        };
+        let cwd = if old_path.first() == Some(&b'/') {
+            root.clone()
+        } else {
+            crate::task::current_cwd().unwrap_or_else(|| root.clone())
+        };
+        let flags = LookupFlags::default();
+        let mut nd = match NameIdata::new(root, cwd, Credential::kernel(), flags) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if let Err(e) = path_walk(&mut nd, old_path, &GlobalMountResolver) {
+            return e;
+        }
+        nd.path.inode.clone()
     };
 
     // Directories are never hard-linkable (EPERM). Check here so every

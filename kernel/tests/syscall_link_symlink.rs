@@ -135,6 +135,10 @@ fn run_tests() {
             "readlinkat_atfdcwd_absolute",
             &(readlinkat_atfdcwd_absolute as fn()),
         ),
+        (
+            "link_on_symlink_default_hard_links_the_symlink",
+            &(link_on_symlink_default_hard_links_the_symlink as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -510,4 +514,39 @@ fn readlinkat_atfdcwd_absolute() {
     let got = read_staging_c(16);
     assert_eq!(&got[..3], b"xyz");
     cleanup(b"/tmp/rlat");
+}
+
+/// Regression for CodeRabbit finding: default POSIX `link(2)` on a
+/// symlink source must hard-link the symlink itself, not return ELOOP.
+/// Without `AT_SYMLINK_FOLLOW` the source must resolve to the terminal
+/// symlink inode, not chase through it.
+fn link_on_symlink_default_hard_links_the_symlink() {
+    cleanup(b"/tmp/lk-sym-src");
+    cleanup(b"/tmp/lk-sym-dst");
+
+    // Create /tmp/lk-sym-src as a symlink pointing at a nonexistent
+    // target. A real target isn't needed: the default `link(2)` walk
+    // must never dereference the terminal symlink, so the target's
+    // existence is irrelevant.
+    let t = stage_a(b"/nowhere");
+    let l = stage_b(b"/tmp/lk-sym-src");
+    assert_eq!(
+        unsafe { sys_symlink_impl(t, l) },
+        0,
+        "setup: symlink must succeed"
+    );
+
+    // Default link: must succeed (not ELOOP). The new name points at
+    // the symlink inode itself.
+    let old_uva = stage_a(b"/tmp/lk-sym-src");
+    let new_uva = stage_b(b"/tmp/lk-sym-dst");
+    let r = unsafe { sys_link_impl(old_uva, new_uva) };
+    assert_eq!(
+        r, 0,
+        "default link on a symlink source must succeed (POSIX), got {}",
+        r
+    );
+
+    cleanup(b"/tmp/lk-sym-dst");
+    cleanup(b"/tmp/lk-sym-src");
 }
