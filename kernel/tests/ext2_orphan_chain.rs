@@ -116,7 +116,9 @@ fn run_tests() {
 }
 
 // ---------------------------------------------------------------------------
-// RamDisk (mirrors ext2_mount.rs / ext2_inode_iget.rs)
+// RamDisk (mirrors ext2_mount.rs / ext2_inode_iget.rs, simplified to a
+// single owning constructor since every test here patches the image
+// in-place before mount).
 // ---------------------------------------------------------------------------
 
 struct RamDisk {
@@ -126,11 +128,11 @@ struct RamDisk {
 }
 
 impl RamDisk {
-    fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
+    fn new(bytes: Vec<u8>, block_size: u32) -> Arc<Self> {
         assert!(bytes.len() % block_size as usize == 0);
         Arc::new(Self {
             block_size,
-            storage: Mutex::new(bytes.to_vec()),
+            storage: Mutex::new(bytes),
             writes: AtomicU32::new(0),
         })
     }
@@ -230,7 +232,7 @@ fn mount_with(
     Arc<vibix::fs::ext2::Ext2Fs>,
     Arc<vibix::fs::ext2::Ext2Super>,
 ) {
-    let disk = Arc::new(RamDiskOwned::new(img, 512));
+    let disk = RamDisk::new(img, 512);
     let fs = Ext2Fs::new_with_device(disk as Arc<dyn BlockDevice>);
     let sb = fs
         .mount(MountSource::None, flags)
@@ -239,37 +241,6 @@ fn mount_with(
         .current_super()
         .expect("current_super must upgrade after a successful mount");
     (sb, fs, super_arc)
-}
-
-// A RamDisk that owns its starting bytes (mirrors the `from_image`
-// constructor but takes an owned Vec so each test can patch
-// independently).
-struct RamDiskOwned(RamDisk);
-
-impl RamDiskOwned {
-    fn new(bytes: Vec<u8>, block_size: u32) -> Self {
-        assert!(bytes.len() % block_size as usize == 0);
-        Self(RamDisk {
-            block_size,
-            storage: Mutex::new(bytes),
-            writes: AtomicU32::new(0),
-        })
-    }
-}
-
-impl BlockDevice for RamDiskOwned {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        self.0.read_at(offset, buf)
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        self.0.write_at(offset, buf)
-    }
-    fn block_size(&self) -> u32 {
-        self.0.block_size()
-    }
-    fn capacity(&self) -> u64 {
-        self.0.capacity()
-    }
 }
 
 // ---------------------------------------------------------------------------

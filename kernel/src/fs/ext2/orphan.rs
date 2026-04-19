@@ -179,11 +179,16 @@ fn read_disk_inode(
 
 /// Classify an on-disk inode read during the orphan walk.
 ///
-/// A valid orphan has `i_links_count == 0` and some nonzero `i_mode`
-/// (the mode stays set while the inode is still open — Linux only
-/// zeroes it after the last close). The next-pointer lives in
-/// `i_dtime` until the chain is drained. Anything else is treated as
-/// corruption and the walk is aborted with [`Corruption::NotOrphan`].
+/// A valid orphan has `i_links_count == 0`; the next-pointer lives in
+/// `i_dtime` until the chain is drained. A nonzero `i_links_count` is
+/// the only condition this helper treats as corruption —
+/// [`Corruption::NotOrphan`] is returned in that case and the walk
+/// aborts. `i_mode` is **not** checked: Linux leaves `i_mode` set
+/// while the inode is open and only zeroes it on the last close, but
+/// a crash mid-unlink can leave either state on disk, so a lenient
+/// parse that accepts both is what `e2fsck` does. The bookkeeping is
+/// safe either way — we only consume `i_dtime` (the next-pointer)
+/// and the `i_links_count` gate.
 ///
 /// Return value is the chain's next pointer (the on-disk `i_dtime`),
 /// to be consumed by the walk loop. A terminator (next == 0) ends
