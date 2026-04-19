@@ -662,6 +662,15 @@ impl InodeOps for RamfsInode {
         if attr.mask.contains(SetAttrMask::GID) {
             meta.gid = attr.gid;
         }
+        if attr.mask.contains(SetAttrMask::ATIME) {
+            meta.atime = attr.atime;
+        }
+        if attr.mask.contains(SetAttrMask::MTIME) {
+            meta.mtime = attr.mtime;
+        }
+        if attr.mask.contains(SetAttrMask::CTIME) {
+            meta.ctime = attr.ctime;
+        }
         Ok(())
     }
 }

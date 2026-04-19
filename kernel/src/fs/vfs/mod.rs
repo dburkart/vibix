@@ -96,6 +96,27 @@ pub struct Timespec {
     pub nsec: u32,
 }
 
+impl Timespec {
+    /// Current wall-clock as a `Timespec`.
+    ///
+    /// Uses monotonic uptime (`crate::time::uptime_ns`) as the time
+    /// source — it's always available, strictly monotonic, and cheap
+    /// on both the kernel target and the host test build. The RTC is
+    /// not queried here: it only resolves to 1-second precision and is
+    /// a stub on the host. For filesystem timestamps that is fine —
+    /// callers that want absolute wall-clock correctness must feed it
+    /// through NTP / a userspace date service that adjusts the VFS
+    /// epoch; an in-kernel "touch" syscall just needs a value that
+    /// moves forward on each call.
+    pub fn now() -> Self {
+        let ns = crate::time::uptime_ns();
+        Self {
+            sec: (ns / 1_000_000_000) as i64,
+            nsec: (ns % 1_000_000_000) as u32,
+        }
+    }
+}
+
 /// Caller credentials consulted by [`InodeOps::permission`].
 ///
 /// Carries the full POSIX.1-2017 §2.4 saved-set-user-ID model: a real,

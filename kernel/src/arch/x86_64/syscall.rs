@@ -900,6 +900,15 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         FTRUNCATE => super::syscalls::vfs::sys_ftruncate_impl(a0, a1 as i64),
 
+        // utimensat(dirfd, path, times[2], flags) — update atime/mtime
+        // (issue #544, RFC 0004 §utimensat). futimens(fd, times) is
+        // expressed as utimensat(fd, NULL, times, 0) per POSIX; no
+        // separate syscall number exists. Same A↔B gate as the other
+        // DAC-sensitive metadata mutators — absent arm without
+        // `vfs_creds` falls through to the dispatcher's `-ENOSYS`.
+        #[cfg(feature = "vfs_creds")]
+        UTIMENSAT => super::syscalls::vfs::sys_utimensat_impl(a0 as i32, a1, a2, a3 as u32),
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1550,6 +1559,7 @@ pub mod syscall_nr {
     pub const LCHOWN: u64 = 94;
     pub const FCHOWNAT: u64 = 260;
     pub const FCHMODAT: u64 = 268;
+    pub const UTIMENSAT: u64 = 280;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1671,5 +1681,8 @@ mod tests {
         // File truncation (issue #543)
         assert_eq!(syscall_nr::TRUNCATE, 76, "SYS_truncate must be 76");
         assert_eq!(syscall_nr::FTRUNCATE, 77, "SYS_ftruncate must be 77");
+
+        // utimensat (issue #544)
+        assert_eq!(syscall_nr::UTIMENSAT, 280, "SYS_utimensat must be 280");
     }
 }
