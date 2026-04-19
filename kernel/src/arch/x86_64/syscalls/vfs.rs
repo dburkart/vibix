@@ -33,8 +33,8 @@ use crate::fs::vfs::{
 };
 use crate::fs::vfs::{Access, Credential, Timespec};
 use crate::fs::{
-    flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR,
-    ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS,
+    flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL,
+    EISDIR, ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS, EXDEV,
 };
 
 /// Linux x86_64 value of the "use the current working directory"
@@ -53,6 +53,12 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 /// `AT_REMOVEDIR` — flag to `unlinkat(2)` that dispatches to `rmdir`
 /// semantics instead of `unlink`. Mirrors Linux's value.
 pub const AT_REMOVEDIR: u32 = 0x200;
+
+/// `AT_SYMLINK_FOLLOW` — flag to `linkat(2)` that asks the resolver to
+/// follow a terminal symlink on the *source* path. Default (no flag)
+/// is to hard-link the symlink itself, per POSIX. Mirrors Linux's
+/// value (RFC 0002 §flags).
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
 
 /// `S_ISVTX` — the POSIX "sticky bit" in `InodeMeta.mode`. When set on
 /// a directory, `unlink`/`rename` require the caller to own either the
@@ -1870,4 +1876,396 @@ pub unsafe fn sys_futimens_impl(fd_raw: u64, times_uva: u64) -> i64 {
         return EBADF;
     }
     utimensat_impl(fd_raw as i32, 0, times_uva, 0)
+}
+
+// ---------------------------------------------------------------------
+// link / linkat / symlink / symlinkat / readlink / readlinkat
+//
+// Issue #540, RFC 0004 Workstream A wave 1. Each syscall wires through
+// to the existing `InodeOps::link` / `InodeOps::symlink` /
+// `InodeOps::readlink` trait method; the per-FS side is already
+// implemented for RamFs (ext2 is #570, separate workstream). The
+// dispatcher arms in `syscall.rs` are gated behind `vfs_creds` per the
+// A-before-B convention established by mkdir/unlink; tests call the
+// `sys_*_impl` entry points directly.
+// ---------------------------------------------------------------------
+
+/// Shared body for `link(2)` / `linkat(2)`.
+///
+/// Resolves the source inode (following a terminal symlink only when
+/// `AT_SYMLINK_FOLLOW` is set — POSIX defaults to *not* following),
+/// splits the new path into parent + leaf, and dispatches to
+/// [`crate::fs::vfs::ops::InodeOps::link`] on the new parent.
+///
+/// Shaping done here (POSIX deltas the per-FS op can't see):
+/// - `EPERM` if the source inode is a directory (hard-linking
+///   directories is forbidden to all users on every modern POSIX).
+/// - `EXDEV` if the source and new-parent live on different
+///   superblocks (cross-mount hard-link rejection).
+/// - `EEXIST` if the new path already exists (pre-check before the
+///   driver re-validates under its own dir-rwsem).
+/// - `ENOTDIR` if the new parent is not a directory.
+/// - `EINVAL` if unknown flag bits are set in `flags`.
+///
+/// `EMLINK` (nlink already at `LINK_MAX`), `ENOSPC`, `EIO`, and
+/// `EACCES` are surfaced by the FS driver's `link` body. The RFC 0004
+/// errno table is therefore fully covered jointly by this arm and
+/// the driver.
+fn linkat_impl(
+    old_dfd: i32,
+    old_path_uva: u64,
+    new_dfd: i32,
+    new_path_uva: u64,
+    flags: u32,
+) -> i64 {
+    // AT_EMPTY_PATH turns `linkat(olddfd, "", newdfd, new, AT_EMPTY_PATH)`
+    // into "hard-link the file behind `olddfd`" — we don't support that
+    // until fd-rooted walks land (#239), but we still accept the flag in
+    // `flags` for forward compatibility. AT_SYMLINK_FOLLOW is the only
+    // other recognised bit. Silent-accept of unknown bits would mask
+    // future ABI surface, so whitelist strictly.
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    let follow_source = flags & AT_SYMLINK_FOLLOW != 0;
+    let empty_path = flags & AT_EMPTY_PATH != 0;
+
+    let old_buf = match copy_user_path(old_path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let old_path = old_buf.as_slice();
+    let new_buf = match copy_user_path(new_path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let new_path = new_buf.as_slice();
+
+    // Per-process cwd / fd-rooted walks don't exist yet — accept only
+    // AT_FDCWD for relative paths. AT_EMPTY_PATH would need an fd-rooted
+    // walk, so reject with EINVAL until #239 lands.
+    if empty_path {
+        return EINVAL;
+    }
+    let old_abs = old_path.first() == Some(&b'/');
+    if old_dfd != AT_FDCWD && !old_abs {
+        return EINVAL;
+    }
+    let new_abs = new_path.first() == Some(&b'/');
+    if new_dfd != AT_FDCWD && !new_abs {
+        return EINVAL;
+    }
+
+    // Resolve the source. Hard-linking names the underlying inode, not
+    // the link, so the default is NOT to follow a terminal symlink —
+    // but we must NOT error on a terminal symlink either: POSIX default
+    // `link(2)` hard-links the symlink itself. `resolve_inode(path,
+    // false)` sets `LookupFlags::NOFOLLOW` which returns `ELOOP` on a
+    // terminal symlink (correct for `O_NOFOLLOW`, wrong here), so we
+    // walk with default flags when the caller asked for the default.
+    // `AT_SYMLINK_FOLLOW` flips to POSIX-`link`-style following.
+    let src_inode = if follow_source {
+        match resolve_inode(old_path, /* follow */ true) {
+            Ok((i, _)) => i,
+            Err(e) => return e,
+        }
+    } else {
+        // Manual walk with `LookupFlags::default()` — intermediates still
+        // chase through symlinks (so a link under `/var` works when
+        // `/var` is itself a symlink), but the terminal component is
+        // returned as-is without the NOFOLLOW ELOOP trap.
+        let root = match vfs_root() {
+            Some(r) => r,
+            None => return ENOENT,
+        };
+        let cwd = if old_path.first() == Some(&b'/') {
+            root.clone()
+        } else {
+            crate::task::current_cwd().unwrap_or_else(|| root.clone())
+        };
+        let flags = LookupFlags::default();
+        let mut nd = match NameIdata::new(root, cwd, Credential::kernel(), flags) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        if let Err(e) = path_walk(&mut nd, old_path, &GlobalMountResolver) {
+            return e;
+        }
+        nd.path.inode.clone()
+    };
+
+    // Directories are never hard-linkable (EPERM). Check here so every
+    // FS backend gets the same errno without each reimplementing it.
+    if src_inode.kind == InodeKind::Dir {
+        return EPERM;
+    }
+
+    // Reject if the new path already exists. This races with a
+    // concurrent creator, but the driver re-validates under dir-rwsem
+    // and surfaces EEXIST on the losing side either way. Pre-checking
+    // lets us skip the parent-resolve round-trip when the answer is
+    // already known.
+    if resolve_inode(new_path, /* follow */ false).is_ok() {
+        return EEXIST;
+    }
+
+    let (new_parent_path, new_leaf) = match split_parent(new_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (new_parent, _pnd) = match resolve_inode(new_parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if new_parent.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    // Cross-superblock hard-link rejection (EXDEV). The driver also
+    // checks this (see ramfs::link), but catching it here guarantees
+    // the errno for every backend and saves the dir-rwsem round-trip.
+    let src_sb = src_inode.sb.upgrade();
+    let new_sb = new_parent.sb.upgrade();
+    match (src_sb, new_sb) {
+        (Some(a), Some(b)) if !Arc::ptr_eq(&a, &b) => return EXDEV,
+        (None, _) | (_, None) => return ENOENT,
+        _ => {}
+    }
+
+    // DAC check: writer needs W|X on the new parent directory.
+    // Credential is `kernel()` until Workstream B (#546) plumbs the
+    // per-task credential through — the dispatch arm is feature-gated
+    // so this placeholder is never reachable from ring-3.
+    let cred = Credential::kernel();
+    if let Err(e) = new_parent
+        .ops
+        .permission(&new_parent, &cred, Access::WRITE | Access::EXECUTE)
+    {
+        return e;
+    }
+
+    match new_parent.ops.link(&new_parent, new_leaf, &src_inode) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `link(oldpath, newpath)` — create a hard link `newpath` to the file
+/// named by `oldpath`. Source symlinks are **not** followed (POSIX).
+///
+/// Reachable from ring-3 only when `vfs_creds` is on (the dispatch arm
+/// in `syscall.rs` is gated). Tests call this entry point directly.
+pub unsafe fn sys_link_impl(old_path_uva: u64, new_path_uva: u64) -> i64 {
+    linkat_impl(AT_FDCWD, old_path_uva, AT_FDCWD, new_path_uva, 0)
+}
+
+/// `linkat(olddfd, oldpath, newdfd, newpath, flags)` — `*at` form of
+/// link. Honors `AT_SYMLINK_FOLLOW` (follow a terminal symlink on
+/// `oldpath`) and `AT_EMPTY_PATH` (reserved for fd-rooted walks,
+/// rejected today). Only `AT_FDCWD` and absolute paths are honored
+/// for the dfd arguments until #239 lands.
+pub unsafe fn sys_linkat_impl(
+    old_dfd: i32,
+    old_path_uva: u64,
+    new_dfd: i32,
+    new_path_uva: u64,
+    flags: u32,
+) -> i64 {
+    linkat_impl(old_dfd, old_path_uva, new_dfd, new_path_uva, flags)
+}
+
+/// Shared body for `symlink(2)` / `symlinkat(2)`.
+///
+/// The `target` argument is a C string in user memory — **not** a
+/// path to be resolved. Per POSIX we store the exact bytes the caller
+/// passed (minus the terminating NUL) so `readlink` round-trips them
+/// verbatim; intermediate-component resolution happens at
+/// path-walk time.
+///
+/// Shaping done here:
+/// - `EEXIST` if the link path already exists.
+/// - `ENOTDIR` if the containing directory isn't one.
+/// - `ENOENT` on an empty `target` (POSIX behaviour is implementation-
+///   defined but Linux returns `ENOENT`).
+/// - `ENAMETOOLONG` if `target` exceeds `PATH_MAX`.
+fn symlinkat_impl(target_uva: u64, new_dfd: i32, link_path_uva: u64) -> i64 {
+    let target_buf = match copy_user_path(target_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let target = target_buf.as_slice();
+    if target.is_empty() {
+        return ENOENT;
+    }
+
+    let link_buf = match copy_user_path(link_path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let link_path = link_buf.as_slice();
+
+    let is_absolute = link_path.first() == Some(&b'/');
+    if new_dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    if resolve_inode(link_path, /* follow */ false).is_ok() {
+        return EEXIST;
+    }
+
+    let (parent_path, leaf) = match split_parent(link_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (parent, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if parent.kind != InodeKind::Dir {
+        return ENOTDIR;
+    }
+
+    // DAC: writer needs W|X on the new parent directory.
+    let cred = Credential::kernel();
+    if let Err(e) = parent
+        .ops
+        .permission(&parent, &cred, Access::WRITE | Access::EXECUTE)
+    {
+        return e;
+    }
+
+    match parent.ops.symlink(&parent, leaf, target) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `symlink(target, linkpath)` — create a symbolic link `linkpath`
+/// whose contents are the bytes of `target`. Target is stored
+/// verbatim; it is *not* path-resolved at creation time.
+pub unsafe fn sys_symlink_impl(target_uva: u64, link_path_uva: u64) -> i64 {
+    symlinkat_impl(target_uva, AT_FDCWD, link_path_uva)
+}
+
+/// `symlinkat(target, newdfd, linkpath)` — `*at` form of symlink.
+/// Only `AT_FDCWD` and absolute paths are honored until #239 lands.
+pub unsafe fn sys_symlinkat_impl(target_uva: u64, new_dfd: i32, link_path_uva: u64) -> i64 {
+    symlinkat_impl(target_uva, new_dfd, link_path_uva)
+}
+
+/// Shared body for `readlink(2)` / `readlinkat(2)`.
+///
+/// Resolves `path` **without** following the terminal symlink
+/// (`lstat`-style walk), calls `InodeOps::readlink` to copy the
+/// target bytes into a kernel staging buffer, then copies at most
+/// `bufsize` bytes to the user `buf`.
+///
+/// POSIX specifics enforced here:
+/// - The output is **not** NUL-terminated. The returned length
+///   counts bytes written; the caller appends `\0` if it wants a
+///   C string.
+/// - `EINVAL` if the terminal inode is not a symlink (the default
+///   `InodeOps::readlink` body also returns `EINVAL` for non-links,
+///   but catching it up front is clearer and skips the trait call).
+/// - `EINVAL` if `bufsize` is zero. POSIX allows either `EINVAL` or
+///   `0`; Linux returns `EINVAL` and we follow that.
+/// - `EFAULT` if the user buffer is not mapped.
+/// - `ENAMETOOLONG` is *not* a readlink error — the output is
+///   truncated to `bufsize` bytes silently, matching POSIX/Linux.
+fn readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
+    if bufsize == 0 {
+        return EINVAL;
+    }
+    // Clamp kernel staging to PATH_MAX — any symlink longer than that
+    // is already out of spec. `bufsize` can exceed PATH_MAX (userspace
+    // convention: pass a generous buffer), we just never stage more
+    // than PATH_MAX bytes because no on-disk target can be larger.
+    let staging_len = core::cmp::min(bufsize as usize, PATH_MAX);
+
+    let pbuf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = pbuf.as_slice();
+
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        return EINVAL;
+    }
+
+    // readlink(2) / readlinkat(2) operate on the symlink itself, so
+    // the terminal component must NOT be followed. `resolve_inode`'s
+    // `follow=false` mode sets `LookupFlags::NOFOLLOW`, which makes a
+    // terminal symlink return `ELOOP` — that's the right behaviour for
+    // `O_NOFOLLOW` but wrong for `readlink`, which must succeed on a
+    // terminal symlink. Walk with default flags instead: path_walk
+    // only follows a symlink when it is NOT final, so a terminal
+    // symlink falls through to the final-checks arm with its own
+    // inode on the cursor.
+    let root = match vfs_root() {
+        Some(r) => r,
+        None => return ENOENT,
+    };
+    let cwd = if path.first() == Some(&b'/') {
+        root.clone()
+    } else {
+        crate::task::current_cwd().unwrap_or_else(|| root.clone())
+    };
+    let cred = Credential::kernel();
+    let flags = LookupFlags::default();
+    let mut nd = match NameIdata::new(root, cwd, cred, flags) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Err(e) = path_walk(&mut nd, path, &GlobalMountResolver) {
+        return e;
+    }
+    let inode = nd.path.inode.clone();
+    if inode.kind != InodeKind::Link {
+        return EINVAL;
+    }
+
+    // Stage into a heap buffer; the user buffer may be unaligned /
+    // unmapped, and we must only cross the user/kernel boundary via
+    // `copy_to_user`. Fallible allocation → ENOMEM so syscall pressure
+    // never panics the kernel.
+    let mut staging: Vec<u8> = Vec::new();
+    if staging.try_reserve_exact(staging_len).is_err() {
+        return ENOMEM;
+    }
+    staging.resize(staging_len, 0u8);
+
+    let n = match inode.ops.readlink(&inode, &mut staging[..]) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // Defensive clamp: a misbehaving driver might claim it wrote more
+    // than the staging buffer. Truncate to the smaller of the reported
+    // length and the staging-buffer length.
+    let n = core::cmp::min(n, staging.len());
+
+    // Copy exactly `n` bytes to userspace. No NUL terminator — POSIX
+    // `readlink` returns the byte count and leaves termination to the
+    // caller. Treating the user buffer as "write exactly these bytes"
+    // preserves the invariant that a short symlink does not clobber
+    // bytes past the returned length.
+    if n > 0 {
+        if let Err(e) = unsafe { uaccess::copy_to_user(buf_uva as usize, &staging[..n]) } {
+            let _ = e;
+            return EFAULT;
+        }
+    }
+    n as i64
+}
+
+/// `readlink(path, buf, bufsize)` — read the contents of a symlink.
+/// Output is **not** NUL-terminated.
+pub unsafe fn sys_readlink_impl(path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
+    readlinkat_impl(AT_FDCWD, path_uva, buf_uva, bufsize)
+}
+
+/// `readlinkat(dfd, path, buf, bufsize)` — `*at` form of readlink.
+/// Only `AT_FDCWD` and absolute paths are honored until #239 lands.
+pub unsafe fn sys_readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
+    readlinkat_impl(dfd, path_uva, buf_uva, bufsize)
 }
