@@ -445,6 +445,7 @@ impl FileSystem for Ext2Fs {
             owner: self.self_ref.clone(),
             inode_cache: super::inode::new_inode_cache(),
             orphan_list: super::inode::new_orphan_list(),
+            alloc_mutex: spin::Mutex::new(()),
             self_ref: weak.clone(),
         });
 
@@ -553,6 +554,16 @@ pub struct Ext2Super {
     /// invariant). Wave 3 constructs it empty; the unlink path (E)
     /// and mount-time orphan replay (#564) populate it.
     pub orphan_list: super::inode::OrphanList,
+    /// Serializes the inode / block allocator paths (#566, #565). The
+    /// allocator reads the on-disk superblock, BGDT, and bitmap blocks
+    /// fresh through the buffer cache on every call — the disk is the
+    /// source of truth; the in-memory `sb_disk` / `bgdt` snapshots are
+    /// mount-time copies used for geometry lookups only and may be
+    /// stale after an allocation. Held uncontended in the single-
+    /// threaded test harness; a future Workstream E concurrency pass
+    /// may promote this to a sleeping mutex when long I/O stalls
+    /// appear on real hardware.
+    pub alloc_mutex: spin::Mutex<()>,
     /// Self-reference so [`SuperOps::root_inode`] can hand `iget_root`
     /// a strong `Arc<Ext2Super>` without the caller threading one in.
     /// Filled in by [`Arc::new_cyclic`] at mount time.
