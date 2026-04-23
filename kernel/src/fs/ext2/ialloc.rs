@@ -118,7 +118,7 @@ pub fn alloc_inode(
         return Err(EIO);
     }
 
-    let hint = parent_group_hint.filter(|g| *g < n_groups).unwrap_or(0);
+    let hint = parent_group_hint.filter(|g| *g < n_groups);
     let order = build_group_order(&bgdt, hint, n_groups);
 
     for bg_idx in order {
@@ -307,12 +307,14 @@ pub fn free_inode(super_: &Arc<Ext2Super>, ino: u32, was_dir: bool) -> Result<()
 /// groups sorted by in-memory `bg_free_inodes_count` (greatest first —
 /// locality + spread-then-fill). Takes the BGDT as a live slice under
 /// the caller's lock; no blocking, no I/O.
-fn build_group_order(bgdt: &[Ext2GroupDesc], hint: u32, n_groups: u32) -> Vec<u32> {
+fn build_group_order(bgdt: &[Ext2GroupDesc], hint: Option<u32>, n_groups: u32) -> Vec<u32> {
     let mut order: Vec<u32> = Vec::with_capacity(n_groups as usize);
-    order.push(hint);
+    if let Some(h) = hint {
+        order.push(h);
+    }
     let mut rest: Vec<(u32, u16)> = Vec::with_capacity(n_groups as usize);
     for g in 0..n_groups {
-        if g == hint {
+        if Some(g) == hint {
             continue;
         }
         rest.push((g, bgdt[g as usize].bg_free_inodes_count));
@@ -496,7 +498,32 @@ mod tests {
             }
         }
         let bgdt = [bg(2), bg(5), bg(0), bg(7)];
-        let order = build_group_order(&bgdt, 2, 4);
+        let order = build_group_order(&bgdt, Some(2), 4);
         assert_eq!(order, alloc::vec![2, 3, 1, 0]);
+    }
+
+    #[test]
+    fn build_group_order_no_hint_most_free_first() {
+        // No hint → every group is sorted by free-count descending;
+        // ties resolve to lower-numbered group first.
+        fn bg(free: u16) -> Ext2GroupDesc {
+            Ext2GroupDesc {
+                bg_block_bitmap: 0,
+                bg_inode_bitmap: 0,
+                bg_inode_table: 0,
+                bg_free_blocks_count: 0,
+                bg_free_inodes_count: free,
+                bg_used_dirs_count: 0,
+                bg_pad: 0,
+                bg_reserved: [0u8; 12],
+            }
+        }
+        let bgdt = [bg(2), bg(5), bg(0), bg(7)];
+        let order = build_group_order(&bgdt, None, 4);
+        assert_eq!(
+            order,
+            alloc::vec![3, 1, 0, 2],
+            "unhinted → purely free-count-desc, no group-0 bias"
+        );
     }
 }
