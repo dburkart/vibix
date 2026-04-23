@@ -425,6 +425,10 @@ name = "umount2_flags"
 harness = false
 
 [[test]]
+name = "dentry_pin_unmount"
+harness = false
+
+[[test]]
 name = "ext2_orphan_finalize"
 harness = false
 required-features = ["ext2"]

@@ -831,8 +831,10 @@ mod tests {
             ops: hello.file_ops.clone(),
             sb: sb.clone(),
         };
-        // Pin sb_active so Drop's fetch_sub doesn't underflow.
-        sb.sb_active.fetch_add(1, Ordering::SeqCst);
+        // Pin dentry_pin_count so OpenFile::drop's fetch_sub doesn't
+        // underflow — matches the counter OpenFile::new would bump
+        // on the real open-path.
+        sb.dentry_pin_count.fetch_add(1, Ordering::SeqCst);
 
         let mut buf = [0u8; 16];
         let n = hello.file_ops.read(&of, &mut buf, 0).expect("read");

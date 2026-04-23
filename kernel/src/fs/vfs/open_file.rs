@@ -17,6 +17,7 @@ use crate::sync::BlockingMutex;
 
 use super::dentry::Dentry;
 use super::inode::Inode;
+use super::mount_table::finalize_pending_detach;
 use super::ops::FileOps;
 use super::super_block::{SbActiveGuard, SuperBlock};
 
@@ -39,12 +40,23 @@ pub struct OpenFile {
 }
 
 impl OpenFile {
-    /// Construct an `OpenFile`, transferring the `sb_active` pin held
-    /// by `guard` into the new file. `mem::forget`ting the guard hands
-    /// the matching `fetch_sub` over to `OpenFile::drop`, so the SB
-    /// remains pinned for the file's whole lifetime and the unmount
-    /// barrier sees zero pending callers exactly when no `OpenFile`
-    /// for the SB is live.
+    /// Construct an `OpenFile`, converting the syscall-scope
+    /// [`SbActiveGuard`] into a long-lived `dentry_pin_count` bump.
+    ///
+    /// `guard`'s `fetch_add` on `sb_active` would normally be undone
+    /// by its `Drop`; `mem::forget`ting it here instead hands ownership
+    /// of that pin to this `OpenFile`. To keep `sb_active` honest — it
+    /// should only count in-flight syscalls, never long-lived
+    /// storage — the constructor immediately `fetch_sub`s it and in the
+    /// same motion `fetch_add`s `dentry_pin_count`, which is the
+    /// counter that `umount2`'s default busy-check and the
+    /// `MNT_DETACH` finalize-gate consult for open files.
+    ///
+    /// The net effect on `sb_active` is zero, which is correct: the
+    /// in-flight syscall that called `open(2)` is about to return to
+    /// userspace (its guard scope ends) and there is no further
+    /// in-flight work on this SB for this open. The SB stays pinned
+    /// by `dentry_pin_count` for the file's lifetime instead.
     pub fn new(
         dentry: Arc<Dentry>,
         inode: Arc<Inode>,
@@ -58,6 +70,25 @@ impl OpenFile {
             "OpenFile::new: SbActiveGuard must pin the same SuperBlock"
         );
         mem::forget(guard);
+        // Hand the guard's pin off to `dentry_pin_count` before any
+        // other code observes a zero edge on `sb_active`. Use a single
+        // SeqCst fence-ordered pair: bump dentry_pin_count first so
+        // any racing umount that reads sb_active==0 also sees a
+        // nonzero dentry_pin_count.
+        sb.dentry_pin_count.fetch_add(1, Ordering::SeqCst);
+        let old = sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(old > 0, "OpenFile::new: sb_active underflow");
+        if old == 1 {
+            // The sub drove sb_active to zero; if a lazy-detach was
+            // waiting only on us and the new dentry_pin is invisible
+            // to its check, the finalize-gate would fire prematurely.
+            // finalize_pending_detach re-reads both counters under
+            // the PENDING_DETACH mutex and will see dentry_pin_count
+            // > 0, so we stay pending. Calling it is still the right
+            // thing: it's a no-op when the SB isn't in the pending
+            // list.
+            finalize_pending_detach(&sb);
+        }
         Arc::new(Self {
             dentry,
             inode,
@@ -69,12 +100,16 @@ impl OpenFile {
     }
 }
 
-/// Releases the `sb_active` pin transferred into `OpenFile::new`. The
-/// matching `fetch_add` lives on the [`SbActiveGuard`] that the
-/// caller passed to `new`.
+/// Releases the `dentry_pin_count` pin transferred into
+/// [`OpenFile::new`]. If this drops the count to zero, any lazily
+/// -detached SB waiting on the pin has its finalizer fire here.
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        self.sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+        let old = self.sb.dentry_pin_count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(old > 0, "OpenFile::drop: dentry_pin_count underflow");
+        if old == 1 {
+            finalize_pending_detach(&self.sb);
+        }
     }
 }
 
@@ -130,7 +165,8 @@ mod tests {
         let file_ops: Arc<dyn FileOps> = Arc::new(StubFile);
         let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
         let of = OpenFile::new(dentry, inode, file_ops, sb.clone(), 0, guard);
-        assert_eq!(sb.sb_active.load(Ordering::SeqCst), 1);
+        assert_eq!(sb.sb_active.load(Ordering::SeqCst), 0);
+        assert_eq!(sb.dentry_pin_count.load(Ordering::SeqCst), 1);
 
         // Drop the local strong ref; the OpenFile still pins the SB.
         let weak = Arc::downgrade(&sb);
@@ -140,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn open_file_drop_releases_sb_active() {
+    fn open_file_drop_releases_dentry_pin() {
         let sb = Arc::new(SuperBlock::new(
             FsId(2),
             Arc::new(StubSuper),
@@ -160,8 +196,10 @@ mod tests {
         let file_ops: Arc<dyn FileOps> = Arc::new(StubFile);
         let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
         let of = OpenFile::new(dentry, inode, file_ops, sb.clone(), 0, guard);
-        assert_eq!(sb.sb_active.load(Ordering::SeqCst), 1);
+        assert_eq!(sb.sb_active.load(Ordering::SeqCst), 0);
+        assert_eq!(sb.dentry_pin_count.load(Ordering::SeqCst), 1);
         drop(of);
         assert_eq!(sb.sb_active.load(Ordering::SeqCst), 0);
+        assert_eq!(sb.dentry_pin_count.load(Ordering::SeqCst), 0);
     }
 }

@@ -242,7 +242,14 @@ pub(super) fn finalize_pending_detach(sb: &SuperBlock) {
         let mut i = 0;
         while i < pending.len() {
             let entry_ptr: *const SuperBlock = &*pending[i];
-            if core::ptr::eq(entry_ptr, sb_ptr) && pending[i].sb_active.load(Ordering::SeqCst) == 0
+            // Finalize only when *both* counters are zero. Either can
+            // be the last to drop: a syscall's `SbActiveGuard` or a
+            // long-lived dentry pin (cwd, OpenFile). The last drop in
+            // either class calls this function from its Drop impl, so
+            // whichever edge wins the race finds both at zero.
+            if core::ptr::eq(entry_ptr, sb_ptr)
+                && pending[i].sb_active.load(Ordering::SeqCst) == 0
+                && pending[i].dentry_pin_count.load(Ordering::SeqCst) == 0
             {
                 ready.push(pending.swap_remove(i));
             } else {
@@ -302,16 +309,30 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
 
         // Default-flag busy check: a single two-phase commit around
         // the `draining` flag closes the zero->one window.
+        //
+        // We require *both* counters to be zero. `sb_active` catches
+        // in-flight syscalls; `dentry_pin_count` catches long-lived
+        // dentry refs that outlive a syscall (chdir cwd, open fds,
+        // future getcwd caches). Either being nonzero means a user-
+        // observable thing would break if we tore the SB down.
         if !force && !detach {
-            // Pre-check sb_active before publishing `draining=true`,
+            // Pre-check both counters before publishing `draining=true`,
             // so racing SbActiveGuard::try_acquire callers don't
-            // observe a transient drain we'd roll back.
-            if sb.sb_active.load(Ordering::SeqCst) != 0 {
+            // observe a transient drain we'd roll back. Note:
+            // `dentry_pin_count` is not gated by `draining` — a new
+            // chdir/open still goes via path_walk which does acquire
+            // `SbActiveGuard`, so publishing `draining=true` also
+            // fences new dentry pins from being created on this SB.
+            if sb.sb_active.load(Ordering::SeqCst) != 0
+                || sb.dentry_pin_count.load(Ordering::SeqCst) != 0
+            {
                 *edge_slot = Some(edge);
                 return Err(EBUSY);
             }
             sb.draining.store(true, Ordering::SeqCst);
-            if sb.sb_active.load(Ordering::SeqCst) != 0 {
+            if sb.sb_active.load(Ordering::SeqCst) != 0
+                || sb.dentry_pin_count.load(Ordering::SeqCst) != 0
+            {
                 sb.draining.store(false, Ordering::SeqCst);
                 *edge_slot = Some(edge);
                 return Err(EBUSY);
@@ -329,9 +350,12 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
         drop(edge_slot);
         drop(table);
 
-        // Decide finalize path: DETACH defers if any guard still
-        // holds the SB; every other path runs Phase B inline.
-        let defer = detach && sb.sb_active.load(Ordering::SeqCst) != 0;
+        // Decide finalize path: DETACH defers if any guard *or* any
+        // long-lived dentry pin still holds the SB; every other path
+        // runs Phase B inline.
+        let defer = detach
+            && (sb.sb_active.load(Ordering::SeqCst) != 0
+                || sb.dentry_pin_count.load(Ordering::SeqCst) != 0);
         if defer {
             PENDING_DETACH.lock().push(sb.clone());
         }
@@ -339,12 +363,15 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
     };
 
     if defer_finalize {
-        // Race window: a guard may have dropped to zero between our
-        // `defer` check and the push above. Re-check and finalize
-        // inline if so; otherwise the guard's Drop will run it.
-        // `finalize_pending_detach` will pop the entry and run the
-        // finalizer exactly once.
-        if sb.sb_active.load(Ordering::SeqCst) == 0 {
+        // Race window: a guard or dentry pin may have dropped to zero
+        // between our `defer` check and the push above. Re-check both
+        // counters and finalize inline if they are now zero;
+        // otherwise the last Drop on whichever counter is still
+        // nonzero will run it. `finalize_pending_detach` pops the
+        // entry and runs the finalizer exactly once.
+        if sb.sb_active.load(Ordering::SeqCst) == 0
+            && sb.dentry_pin_count.load(Ordering::SeqCst) == 0
+        {
             finalize_pending_detach(&sb);
         }
     } else {

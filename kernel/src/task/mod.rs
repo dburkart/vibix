@@ -482,7 +482,11 @@ pub fn replace_current_credentials(new_cred: crate::fs::vfs::Credential) {
 ///
 /// Briefly locks the scheduler to clone the `Arc`, then releases it.
 pub fn current_cwd() -> Option<alloc::sync::Arc<crate::fs::vfs::Dentry>> {
-    SCHED.lock().current.as_ref().and_then(|t| t.cwd.clone())
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .and_then(|t| t.cwd.as_ref().map(|p| p.clone_arc()))
 }
 
 /// Replace the currently-running task's `Credential` snapshot.
@@ -504,9 +508,20 @@ pub fn set_current_credentials(cred: crate::fs::vfs::Credential) {
 /// Called by `sys_chdir` after successfully resolving and verifying
 /// that the target is a directory.
 pub fn set_current_cwd(dentry: alloc::sync::Arc<crate::fs::vfs::Dentry>) {
-    if let Some(cur) = SCHED.lock().current.as_mut() {
-        cur.cwd = Some(dentry);
-    }
+    // Construct the `PinnedDentry` *before* taking the SCHED lock: the
+    // old cwd's Drop may run during the replacement and calls
+    // `finalize_pending_detach`, which takes the `PENDING_DETACH`
+    // blocking mutex. Doing that work under SCHED would invert the
+    // lock order against every other finalize path.
+    let new_cwd = crate::fs::vfs::PinnedDentry::new(dentry);
+    let _old = {
+        let mut sched = SCHED.lock();
+        sched
+            .current
+            .as_mut()
+            .and_then(|cur| cur.cwd.replace(new_cwd))
+    };
+    // `_old` drops here with no locks held.
 }
 
 /// Return the current scheduling priority of the currently-running
