@@ -85,7 +85,7 @@ use super::inode::{iget, Ext2Inode};
 use crate::fs::vfs::inode::{Inode, InodeKind};
 use crate::fs::vfs::super_block::SuperBlock;
 use crate::fs::vfs::Timespec;
-use crate::fs::{EEXIST, EINVAL, EIO, ENAMETOOLONG, ENOSPC, ENOTDIR, EPERM, EROFS};
+use crate::fs::{EEXIST, EINVAL, EIO, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS};
 
 /// POSIX `NAME_MAX` for ext2. On-disk `name_len` is `u8`; the spec caps
 /// file names at 255 bytes, matching the field width.
@@ -253,9 +253,14 @@ fn create_common(
     // atomic from the caller's perspective.
     let _parent_guard = parent_vfs.dir_rwsem.write();
 
-    // Reject duplicate name up front. `EEXIST` matches POSIX.
-    if super::dir::lookup(super_, parent, name).is_ok() {
-        return Err(EEXIST);
+    // Reject duplicate name up front. `EEXIST` matches POSIX. Only
+    // `ENOENT` (no such entry) is "name is free"; any other error (I/O,
+    // corruption) must propagate rather than be papered over with an
+    // allocation attempt that might land on a half-readable directory.
+    match super::dir::lookup(super_, parent, name) {
+        Ok(_) => return Err(EEXIST),
+        Err(e) if e == ENOENT => {}
+        Err(e) => return Err(e),
     }
 
     // Group hint: place the new inode in the parent's group to
@@ -272,8 +277,15 @@ fn create_common(
 
     // Everything below cleans up the inode via `free_inode` on failure.
     // For `mkdir`, also free the allocated data block if we get past
-    // step 3.
+    // step 3. Once `add_link` succeeds, the parent dirent is visible on
+    // disk and points at `new_ino` — from that point forward a failure
+    // on a *subsequent* step (bump_parent_links / iget) must NOT free
+    // the inode or the data block, or we'd leave a dangling dirent
+    // behind. The `linked` flag gates the unwind path accordingly; per
+    // RFC 0004 §Write Ordering this is preferable to rolling back the
+    // dirent (which would race against concurrent readers).
     let mut dir_block: Option<u32> = None;
+    let mut linked = false;
 
     let outcome: Result<Arc<Inode>, i64> = (|| {
         let links_count: u16 = if nn.is_dir() { 2 } else { 1 };
@@ -336,9 +348,13 @@ fn create_common(
 
         // Step 4: link the new inode into the parent directory.
         add_link(super_, parent, name, new_ino, nn.file_type())?;
+        linked = true;
 
         // Step 5 (mkdir only): bump parent's `i_links_count` for the
-        // new subdir's `..`.
+        // new subdir's `..`. If this fails after the dirent is visible,
+        // we leave the inode + dirent in place (the stale parent
+        // `i_links_count` is something `e2fsck` reconciles cheaply —
+        // rolling back the dirent would be worse).
         if nn.is_dir() {
             bump_parent_links(super_, parent, parent_vfs.ino as u32, 1)?;
         }
@@ -350,13 +366,24 @@ fn create_common(
     match outcome {
         Ok(inode) => Ok(inode),
         Err(e) => {
-            // Unwind: free the data block first (if we allocated one
-            // for a dir), then the inode. Log-and-drop secondary
-            // failures — we already have an error to propagate.
-            if let Some(blk) = dir_block {
-                let _ = super::balloc::free_block(super_, blk);
+            if linked {
+                // The parent dirent is on disk pointing at `new_ino`.
+                // Freeing the inode or its data block would corrupt the
+                // directory — leave them and let the (eventual)
+                // secondary failure propagate. `e2fsck` can reconcile a
+                // stale parent `i_links_count`; it cannot reconcile a
+                // dirent whose target inode has been handed back to the
+                // allocator under concurrent reads.
+            } else {
+                // Pre-link unwind: free the data block first (if we
+                // allocated one for a dir), then the inode. Log-and-
+                // drop secondary failures — we already have an error
+                // to propagate.
+                if let Some(blk) = dir_block {
+                    let _ = super::balloc::free_block(super_, blk);
+                }
+                let _ = free_inode(super_, new_ino, nn.is_dir());
             }
-            let _ = free_inode(super_, new_ino, nn.is_dir());
             Err(e)
         }
     }
@@ -399,16 +426,26 @@ fn write_new_inode(super_: &Arc<Ext2Super>, ino: u32, disk: &DiskInode) -> Resul
         .checked_add(block_in_table)
         .ok_or(EIO)?;
 
+    let slot_len = super_.inode_size as usize;
+    if slot_len < EXT2_INODE_SIZE_V0 {
+        // rev-0 images are always exactly 128 bytes; rev-1 images have
+        // `s_inode_size >= 128`. A smaller value is a malformed
+        // superblock and would make `encode_to_slot` write out of
+        // bounds.
+        return Err(EIO);
+    }
     let bh = super_
         .cache
         .bread(super_.device_id, absolute_block)
         .map_err(|_| EIO)?;
     {
         let mut data = bh.data.write();
-        if offset_in_block + EXT2_INODE_SIZE_V0 > data.len() {
+        if offset_in_block + slot_len > data.len() {
             return Err(EIO);
         }
-        disk.encode_to_slot(&mut data[offset_in_block..offset_in_block + EXT2_INODE_SIZE_V0]);
+        // Hand the full slot to `encode_to_slot`; it overlays the
+        // driver-owned prefix and leaves the rev-1 tail intact.
+        disk.encode_to_slot(&mut data[offset_in_block..offset_in_block + slot_len]);
     }
     super_.cache.mark_dirty(&bh);
     super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
@@ -493,9 +530,17 @@ fn add_link(
         return Err(e);
     }
 
-    // Update the parent inode: pointer + size + i_blocks.
+    // Update the parent inode: pointer + size + i_blocks. If the
+    // parent-inode RMW fails the freshly-allocated block was never
+    // linked into the directory — free it before propagating so the
+    // bitmap and `s_free_blocks_count` don't leak.
     let new_size = dir_size.saturating_add(block_size as u64);
-    patch_parent_inode_block(super_, parent, free_idx, new_blk, new_size, block_size)?;
+    if let Err(e) =
+        patch_parent_inode_block(super_, parent, free_idx, new_blk, new_size, block_size)
+    {
+        let _ = super::balloc::free_block(super_, new_blk);
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -764,9 +809,13 @@ fn bump_parent_links(
     Ok(())
 }
 
-/// Read a 128-byte inode slot through the buffer cache. Shared with
-/// [`write_new_inode`]; kept as a helper so the RMW discipline in the
-/// module docs stays honest.
+/// Read a full on-disk inode slot through the buffer cache. Returns a
+/// `Vec` sized to `super_.inode_size` so rev-1 images with a >128-byte
+/// slot carry the rev-1 tail back to the caller (`write_new_inode`
+/// overlays the driver-owned prefix and writes the whole slot back,
+/// preserving the tail by construction). Shared with `write_new_inode`;
+/// kept as a helper so the RMW discipline in the module docs stays
+/// honest.
 fn read_inode_slot(super_: &Arc<Ext2Super>, ino: u32) -> Result<alloc::vec::Vec<u8>, i64> {
     if ino == 0 {
         return Err(EINVAL);
@@ -784,6 +833,10 @@ fn read_inode_slot(super_: &Arc<Ext2Super>, ino: u32) -> Result<alloc::vec::Vec<
         }
         bgdt[group as usize].bg_inode_table
     };
+    let slot_len = super_.inode_size as usize;
+    if slot_len < EXT2_INODE_SIZE_V0 {
+        return Err(EIO);
+    }
     let inode_size = super_.inode_size as u64;
     let block_size = super_.block_size as u64;
     let byte_offset = (index_in_group as u64) * inode_size;
@@ -797,13 +850,13 @@ fn read_inode_slot(super_: &Arc<Ext2Super>, ino: u32) -> Result<alloc::vec::Vec<
         .cache
         .bread(super_.device_id, absolute_block)
         .map_err(|_| EIO)?;
-    let mut out = vec![0u8; EXT2_INODE_SIZE_V0];
+    let mut out = vec![0u8; slot_len];
     {
         let data = bh.data.read();
-        if offset_in_block + EXT2_INODE_SIZE_V0 > data.len() {
+        if offset_in_block + slot_len > data.len() {
             return Err(EIO);
         }
-        out.copy_from_slice(&data[offset_in_block..offset_in_block + EXT2_INODE_SIZE_V0]);
+        out.copy_from_slice(&data[offset_in_block..offset_in_block + slot_len]);
     }
     Ok(out)
 }
