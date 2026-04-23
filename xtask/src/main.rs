@@ -755,6 +755,25 @@ fn inject_limine_cmdline(body: &str, value: &str) -> String {
     // `protocol: limine` line. Keeping the two cases disjoint avoids
     // the duplicate-line bug an earlier single-pass version shipped
     // with (flagged by CodeRabbit on PR #630).
+    // A line terminates the current stanza when it's at column 0 and
+    // isn't blank / a comment. Limine stanza headers are `/name` at
+    // column 0; continuation lines inside a stanza are indented. This
+    // matters because without it, a later top-level stanza could be
+    // mistaken for still-being-inside the limine block and mutate
+    // something we shouldn't touch.
+    let ends_stanza = |line: &str| -> bool {
+        let first = line.chars().next();
+        match first {
+            Some(c) if !c.is_whitespace() => {
+                // Top-level line. A comment (`#`) doesn't count — those
+                // can appear between stanzas without closing one.
+                let t = line.trim_start();
+                !t.is_empty() && !t.starts_with('#')
+            }
+            _ => false,
+        }
+    };
+
     let mut has_existing_cmdline = false;
     {
         let mut in_block = false;
@@ -762,7 +781,15 @@ fn inject_limine_cmdline(body: &str, value: &str) -> String {
             let trimmed = line.trim_start();
             if trimmed == "protocol: limine" {
                 in_block = true;
-            } else if in_block && trimmed.starts_with("cmdline:") {
+                continue;
+            }
+            if in_block && ends_stanza(line) {
+                // Left the first limine stanza without seeing a
+                // `cmdline:` — stop so a later stanza can't flip the
+                // flag.
+                break;
+            }
+            if in_block && trimmed.starts_with("cmdline:") {
                 has_existing_cmdline = true;
                 break;
             }
@@ -773,6 +800,10 @@ fn inject_limine_cmdline(body: &str, value: &str) -> String {
     let mut in_block = false;
     for line in body.lines() {
         let trimmed_start = line.trim_start();
+        // A new top-level stanza closes the previous one.
+        if in_block && trimmed_start != "protocol: limine" && ends_stanza(line) {
+            in_block = false;
+        }
         // Replace an existing cmdline line in-place.
         if in_block && has_existing_cmdline && trimmed_start.starts_with("cmdline:") {
             out.push_str(indent);
@@ -784,12 +815,12 @@ fn inject_limine_cmdline(body: &str, value: &str) -> String {
         }
         out.push_str(line);
         out.push('\n');
-        if trimmed_start == "protocol: limine" {
+        if trimmed_start == "protocol: limine" && !inserted {
             in_block = true;
             // Only append a new cmdline line when there isn't one
             // downstream to replace. Otherwise the replace-in-place
             // branch above handles it on a later iteration.
-            if !has_existing_cmdline && !inserted {
+            if !has_existing_cmdline {
                 out.push_str(indent);
                 out.push_str("cmdline: ");
                 out.push_str(value);
@@ -1824,6 +1855,36 @@ serial: yes
     fn appends_at_end_if_no_protocol_line() {
         let out = inject_limine_cmdline("# no protocol here\n", "root=ramfs");
         assert!(out.ends_with("cmdline: root=ramfs\n"));
+    }
+
+    #[test]
+    fn does_not_mutate_later_stanzas() {
+        // A later top-level stanza (e.g. a second boot entry) must
+        // not be treated as still-inside the first limine block.
+        // Specifically: a `cmdline:` line inside an unrelated later
+        // stanza should not be rewritten, and the new cmdline should
+        // be inserted only under the first `protocol: limine`.
+        let cfg = "\
+/vibix
+    protocol: limine
+    kernel_path: boot():/boot/vibix
+
+/other
+    protocol: multiboot2
+    cmdline: should-not-be-touched
+";
+        let out = inject_limine_cmdline(cfg, "root=/dev/vda");
+        // New cmdline appears under /vibix.
+        assert!(out.contains("    protocol: limine\n    cmdline: root=/dev/vda\n"));
+        // The later stanza's cmdline is preserved verbatim.
+        assert!(out.contains("cmdline: should-not-be-touched"));
+        // Exactly two cmdline lines total: the injected one + the
+        // untouched one in /other.
+        assert_eq!(
+            out.matches("cmdline:").count(),
+            2,
+            "expected exactly 2 cmdline lines (1 injected, 1 preserved), got:\n{out}",
+        );
     }
 
     #[test]
