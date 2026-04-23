@@ -78,6 +78,18 @@ fn run_tests() {
         ),
         ("symlink_slow_61_bytes", &(symlink_slow_61_bytes as fn())),
         (
+            "symlink_slow_200_bytes_walker",
+            &(symlink_slow_200_bytes_walker as fn()),
+        ),
+        (
+            "symlink_slow_multi_block_via_walker",
+            &(symlink_slow_multi_block_via_walker as fn()),
+        ),
+        (
+            "symlink_read_rejects_oversize_i_size",
+            &(symlink_read_rejects_oversize_i_size as fn()),
+        ),
+        (
             "symlink_boundary_60_vs_61",
             &(symlink_boundary_60_vs_61 as fn()),
         ),
@@ -461,6 +473,235 @@ fn symlink_slow_61_bytes() {
     let n = read_symlink(&d, &super_arc, &mut buf).expect("read back slow symlink");
     assert_eq!(n, target.len());
     assert_eq!(&buf[..n], &target);
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Issue #603: wire the slow-symlink read through the indirect walker
+/// rather than the interim direct-only path. A 200-byte target stored
+/// in a single 1 KiB data block exercises the walker's direct-slot
+/// branch on the slow-symlink read code path. We can't construct a
+/// multi-block slow symlink yet because the write side
+/// (`write_slow_symlink_target`) still refuses targets larger than one
+/// block — that's tracked as its own follow-up — but the walker plumbs
+/// the same code path as regular-file reads, so exercising it here
+/// catches any regression in the slow-symlink pipeline.
+fn symlink_slow_200_bytes_walker() {
+    let (sb, _fs, super_arc, _disk) = mount_golden_rw();
+    let parent_vfs = iget(&super_arc, &sb, 2).expect("iget root");
+    let parent = make_ext2_inode_from_disk(&super_arc, &sb, 2);
+
+    // 200-byte target: well past the 60-byte fast boundary, still
+    // inside a single 1 KiB block so the write side is happy. The
+    // pattern is non-repeating enough that a mis-aligned or truncated
+    // read surfaces immediately.
+    let target: [u8; 200] = core::array::from_fn(|i| ((i as u32 * 131 + 17) & 0xff) as u8);
+    let sl = ext2_symlink(&super_arc, &parent, &parent_vfs, &sb, b"long200", &target)
+        .expect("symlink slow 200");
+    let sl_ino = sl.ino as u32;
+
+    let d = read_disk_inode(&super_arc, sl_ino);
+    assert!(is_symlink(&d));
+    assert!(
+        !is_fast_symlink(&d),
+        "200-byte target is past the inline boundary"
+    );
+    assert_eq!(d.i_size as usize, target.len());
+    assert_ne!(d.i_blocks, 0, "slow symlink allocates a data block");
+
+    // Full readback through the walker-backed slow path. Sentinel-fill
+    // the buffer so we catch a reader that over-writes past `i_size`.
+    let mut buf = [0xa5u8; 256];
+    let n = read_symlink(&d, &super_arc, &mut buf).expect("readback 200");
+    assert_eq!(n, target.len());
+    assert_eq!(&buf[..n], &target);
+    // Byte past the end must be untouched (no zero-terminate, no
+    // stray block copy).
+    assert_eq!(buf[n], 0xa5, "reader must not write past i_size");
+
+    // Short buffer: reader clamps to `buf.len()` without error.
+    let mut short = [0u8; 50];
+    let n = read_symlink(&d, &super_arc, &mut short).expect("readback short");
+    assert_eq!(n, 50);
+    assert_eq!(&short[..], &target[..50]);
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Issue #603: the walker-backed slow reader must resolve logical
+/// block 1 — not just block 0 — when `i_size > block_size`. The
+/// symlink write path still caps slow symlinks at one data block (see
+/// `write_slow_symlink_target`), so we can't build this on top of
+/// `ext2_symlink` alone. Instead we allocate two data blocks by hand,
+/// write the target halves into them via the buffer cache, and feed
+/// the reader a synthetic `disk::Ext2Inode` whose `i_block[0..2]`
+/// points at those blocks. This is exactly what a hostile (or more
+/// capable) writer would produce on disk, and it forces the walker
+/// to step off the first direct slot.
+fn symlink_slow_multi_block_via_walker() {
+    use vibix::fs::ext2::alloc_block;
+    use vibix::fs::ext2::disk::Ext2Inode as DiskInode;
+    use vibix::fs::ext2::symlink::{read_symlink as read_symlink_fn, EXT2_S_IFLNK};
+
+    let (sb, _fs, super_arc, _disk) = mount_golden_rw();
+    // The golden image is 1 KiB blocks; we need a target length > one
+    // block so logical block 1 is reached, but still <= PATH_MAX - 1.
+    let block_size = super_arc.block_size as usize;
+    assert_eq!(
+        block_size, 1024,
+        "this test assumes the 1 KiB-block golden image"
+    );
+    let target_len: usize = block_size + 200; // 1224 bytes, spans 2 blocks
+
+    // Allocate two fresh data blocks on the image. `alloc_block`
+    // consults the block bitmap so the pointers it returns are legal
+    // data-block numbers, not metadata.
+    let blk0 = alloc_block(&super_arc, None).expect("alloc_block 0");
+    let blk1 = alloc_block(&super_arc, None).expect("alloc_block 1");
+    assert_ne!(blk0, blk1, "allocator must hand back distinct blocks");
+
+    // Deterministic per-byte pattern, easy to spot a mis-alignment.
+    let target: alloc::vec::Vec<u8> = (0..target_len)
+        .map(|i| ((i as u32 * 37 + 11) & 0xff) as u8)
+        .collect();
+
+    // Stamp the first block_size bytes into blk0 …
+    {
+        let bh = super_arc
+            .cache
+            .bread(super_arc.device_id, blk0 as u64)
+            .expect("bread blk0");
+        {
+            let mut data = bh.data.write();
+            for b in data.iter_mut() {
+                *b = 0;
+            }
+            data[..block_size].copy_from_slice(&target[..block_size]);
+        }
+        super_arc.cache.mark_dirty(&bh);
+        super_arc.cache.sync_dirty_buffer(&bh).expect("sync blk0");
+    }
+    // … and the remaining 200 bytes into blk1.
+    let tail_len = target_len - block_size;
+    {
+        let bh = super_arc
+            .cache
+            .bread(super_arc.device_id, blk1 as u64)
+            .expect("bread blk1");
+        {
+            let mut data = bh.data.write();
+            for b in data.iter_mut() {
+                *b = 0;
+            }
+            data[..tail_len].copy_from_slice(&target[block_size..]);
+        }
+        super_arc.cache.mark_dirty(&bh);
+        super_arc.cache.sync_dirty_buffer(&bh).expect("sync blk1");
+    }
+
+    // Synthetic disk inode: S_IFLNK, two direct pointers, i_size
+    // spanning the two blocks. This struct is never written back —
+    // the reader operates on whatever `&Ext2Inode` it's handed.
+    let mut i_block = [0u32; 15];
+    i_block[0] = blk0;
+    i_block[1] = blk1;
+    let d = DiskInode {
+        i_mode: EXT2_S_IFLNK | 0o777,
+        i_uid: 0,
+        i_size: target_len as u32,
+        i_atime: 0,
+        i_ctime: 0,
+        i_mtime: 0,
+        i_dtime: 0,
+        i_gid: 0,
+        i_links_count: 1,
+        // `i_blocks` is in 512-byte units.
+        i_blocks: (2 * block_size as u32) / 512,
+        i_flags: 0,
+        i_block,
+        i_dir_acl_or_size_high: 0,
+        l_i_uid_high: 0,
+        l_i_gid_high: 0,
+    };
+    assert!(is_symlink(&d));
+    assert!(
+        !is_fast_symlink(&d),
+        "multi-block synthetic must not match the fast-symlink gate"
+    );
+
+    // Full readback: the walker must stitch blocks 0 and 1 together.
+    // Sentinel-fill past the expected end so we can prove the reader
+    // stops at `i_size`.
+    let mut buf = alloc::vec![0xc3u8; target_len + 32];
+    let n = read_symlink_fn(&d, &super_arc, &mut buf).expect("readback multi-block");
+    assert_eq!(n, target_len);
+    assert_eq!(&buf[..n], target.as_slice());
+    for &b in &buf[n..] {
+        assert_eq!(b, 0xc3, "reader wrote past i_size");
+    }
+
+    // Mid-block short buffer exercises the logical-block-0 tail copy
+    // while still proving the walker index math.
+    let mut short = [0u8; 42];
+    let n = read_symlink_fn(&d, &super_arc, &mut short).expect("readback short");
+    assert_eq!(n, 42);
+    assert_eq!(&short[..], &target[..42]);
+
+    // Cross-boundary short buffer (block_size - 3 .. block_size + 5
+    // worth of read) catches an off-by-one at the direct -> direct
+    // seam on logical block 1.
+    let mut cross = alloc::vec![0u8; block_size + 5];
+    let n = read_symlink_fn(&d, &super_arc, &mut cross).expect("readback cross");
+    assert_eq!(n, block_size + 5);
+    assert_eq!(&cross[..block_size], &target[..block_size]);
+    assert_eq!(
+        &cross[block_size..block_size + 5],
+        &target[block_size..block_size + 5]
+    );
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Issue #603: an `i_size` above `PATH_MAX - 1` (4095) is either
+/// image corruption or a hostile image trying to spill the reader
+/// past the allocated extent. The walker-backed slow-symlink reader
+/// must surface `ENAMETOOLONG` before issuing any `bread`. We
+/// construct the bogus state by creating a legal 64-byte slow
+/// symlink, then synthesising a disk inode with `i_size` poked up
+/// past the cap and running the reader against that struct directly.
+fn symlink_read_rejects_oversize_i_size() {
+    use vibix::fs::ext2::symlink::read_symlink as read_symlink_fn;
+
+    let (sb, _fs, super_arc, _disk) = mount_golden_rw();
+    let parent_vfs = iget(&super_arc, &sb, 2).expect("iget root");
+    let parent = make_ext2_inode_from_disk(&super_arc, &sb, 2);
+
+    // Create a real 64-byte slow symlink so we have a well-formed
+    // inode to mutate.
+    let target: [u8; 64] = core::array::from_fn(|i| b'z' - (i % 26) as u8);
+    let sl = ext2_symlink(
+        &super_arc,
+        &parent,
+        &parent_vfs,
+        &sb,
+        b"oversizebase",
+        &target,
+    )
+    .expect("symlink base");
+    let sl_ino = sl.ino as u32;
+
+    let mut d = read_disk_inode(&super_arc, sl_ino);
+    // 4096 == one past the legal cap. Don't write this back to disk —
+    // the test exercises the reader's in-memory guard only.
+    d.i_size = 4096;
+    let mut buf = [0u8; 256];
+    let err = read_symlink_fn(&d, &super_arc, &mut buf)
+        .err()
+        .expect("oversize i_size must fail");
+    assert_eq!(err, ENAMETOOLONG);
 
     sb.ops.unmount();
     drop(super_arc);
