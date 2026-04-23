@@ -370,3 +370,8 @@ required-features = ["ext2"]
 name = "ext2_file_read"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_orphan_chain"
+harness = false
+required-features = ["ext2"]
