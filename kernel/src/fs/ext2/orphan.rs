@@ -242,11 +242,20 @@ pub fn validate_orphan_chain(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>) -
 /// `SuperBlock::new`. The caller phase-2s the pinning after building
 /// the sb, via [`pin_orphans`].
 pub fn walk_orphan_chain(super_ref: &Arc<Ext2Super>) -> (ForceRo, Vec<u32>) {
+    // `sb_disk` and `bgdt` became `spin::Mutex<...>` in #565 (balloc).
+    // We only read from them here — take short-lived locks in the
+    // documented order (bgdt before sb_disk) and pass the referents to
+    // the raw variant. Holding both across the full walk is fine: the
+    // walk is bounded by `s_inodes_count` iterations and the only
+    // potential concurrent contender is the allocator, which runs on
+    // demand after mount and will briefly spin.
+    let bgdt = super_ref.bgdt.lock();
+    let sb_disk = super_ref.sb_disk.lock();
     walk_orphan_chain_raw(
         &super_ref.cache,
         super_ref.device_id,
-        &super_ref.sb_disk,
-        &super_ref.bgdt,
+        &sb_disk,
+        &bgdt,
         super_ref.inode_size,
         super_ref.block_size,
     )

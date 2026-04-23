@@ -358,7 +358,19 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
     if ino == 0 {
         return Err(EINVAL);
     }
-    if ino > super_ref.sb_disk.s_inodes_count {
+    // Snapshot the handful of superblock fields the iget arithmetic
+    // depends on up front so the allocator (#565/#566) can hold the
+    // `sb_disk` lock to update counters without blocking the read path
+    // for the duration of a `bread`.
+    let (s_inodes_count, inodes_per_group, ro_compat) = {
+        let sb = super_ref.sb_disk.lock();
+        (
+            sb.s_inodes_count,
+            sb.s_inodes_per_group,
+            sb.s_feature_ro_compat,
+        )
+    };
+    if ino > s_inodes_count {
         return Err(EINVAL);
     }
 
@@ -373,17 +385,19 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
     }
 
     // 2. Miss: compute the inode-table slot location.
-    let inodes_per_group = super_ref.sb_disk.s_inodes_per_group;
     if inodes_per_group == 0 {
         return Err(EIO);
     }
     let group = (ino - 1) / inodes_per_group;
     let index_in_group = (ino - 1) % inodes_per_group;
     let group_idx = group as usize;
-    if group_idx >= super_ref.bgdt.len() {
-        return Err(EIO);
-    }
-    let bg = &super_ref.bgdt[group_idx];
+    let bg_inode_table = {
+        let bgdt = super_ref.bgdt.lock();
+        if group_idx >= bgdt.len() {
+            return Err(EIO);
+        }
+        bgdt[group_idx].bg_inode_table
+    };
 
     let inode_size = super_ref.inode_size;
     let block_size = super_ref.block_size;
@@ -392,7 +406,7 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
     let byte_offset = (index_in_group as u64) * (inode_size as u64);
     let block_in_table = byte_offset / (block_size as u64);
     let offset_in_block = (byte_offset % (block_size as u64)) as usize;
-    let absolute_block = (bg.bg_inode_table as u64)
+    let absolute_block = (bg_inode_table as u64)
         .checked_add(block_in_table)
         .ok_or(EIO)?;
 
@@ -416,7 +430,7 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
     // 4. Build the in-memory Ext2Inode + InodeMeta. `large_file` says
     //    how to interpret the `i_dir_acl_or_size_high` slot on reg
     //    files; see RFC 0004 §On-disk types.
-    let large_file = (super_ref.sb_disk.s_feature_ro_compat & RO_COMPAT_LARGE_FILE) != 0;
+    let large_file = (ro_compat & RO_COMPAT_LARGE_FILE) != 0;
     let ext2_meta = Ext2InodeMeta::from_disk(&disk_inode, large_file);
     let kind = inode_kind_from_mode(ext2_meta.mode)?;
     let vfs_meta = vfs_meta_from(&ext2_meta, block_size);

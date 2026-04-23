@@ -65,6 +65,16 @@ pub mod file;
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod orphan;
 
+// Block bitmap allocator (#565). Same gate as `fs` / `inode` — it
+// mutates `Ext2Super::bgdt` + `Ext2Super::sb_disk` through the buffer
+// cache, both of which are gated on `target_os = "none"`. The pure
+// bit-manipulation and metadata-bounds helpers inside have host unit
+// tests that run under `cargo test --lib`; the full `alloc_block` /
+// `free_block` surface is exercised by the QEMU integration test
+// `kernel/tests/ext2_block_alloc.rs`.
+#[cfg(any(all(feature = "ext2", target_os = "none"), test))]
+pub mod balloc;
+
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use fs::{Ext2Fs, Ext2MountFlags, Ext2Super, SUPERBLOCK_BYTE_OFFSET};
 
@@ -76,3 +86,6 @@ pub use file::read_file_at;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use orphan::{validate_orphan_chain, ForceRo};
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use balloc::{alloc_block, free_block};
