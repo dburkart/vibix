@@ -423,3 +423,8 @@ required-features = ["ext2"]
 [[test]]
 name = "umount2_flags"
 harness = false
+
+[[test]]
+name = "ext2_orphan_finalize"
+harness = false
+required-features = ["ext2"]

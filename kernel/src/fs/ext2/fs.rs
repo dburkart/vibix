@@ -625,6 +625,56 @@ impl SuperOps for Ext2Super {
         })
     }
 
+    /// VFS eviction hook: the last `Arc<Inode>` for `ino` (excluding
+    /// any orphan-list pin) just dropped, and the `gc_queue` drainer
+    /// is calling us to finalize.
+    ///
+    /// If `ino` is present in [`Ext2Super::orphan_list`], run the
+    /// RFC 0004 §Final-close sequence via
+    /// [`super::orphan_finalize::finalize`]: truncate-to-zero,
+    /// unchain from the on-disk orphan list (stamp `i_dtime` tombstone),
+    /// free the inode in the bitmap, then drop the in-memory pin.
+    /// Ordering note: unchain-before-free is load-bearing — see the
+    /// `orphan_finalize` module docs. A non-orphan ino (a normal inode falling out of
+    /// the VFS cache) is a no-op — ext2 has no dirty-inode writeback
+    /// yet; that lives behind the future `sync` path.
+    ///
+    /// Errors are swallowed with a `kwarn!`: the VFS drainer has no
+    /// useful fallback and leaving the orphan-list pin in place means
+    /// the next mount-time replay (#564) will see the entry and retry
+    /// the sequence.
+    fn evict_inode(&self, ino: u64) -> Result<(), i64> {
+        // ino comes in as u64 from the VFS; ext2's ino space is u32.
+        // Values above u32::MAX can't reference a real on-disk inode.
+        let Ok(ext2_ino) = u32::try_from(ino) else {
+            return Ok(());
+        };
+        // Fast path: non-orphan cache eviction. Nothing to do.
+        let is_orphan = { self.orphan_list.lock().contains_key(&ext2_ino) };
+        if !is_orphan {
+            return Ok(());
+        }
+        // Upgrade the self_ref to a strong Arc<Ext2Super> so the
+        // finalize free-function can be called. The Arc is live because
+        // `gc_queue` upgraded its own Weak<SuperBlock> before calling
+        // us, and that SuperBlock holds an Arc<dyn SuperOps> = Arc of
+        // this very Ext2Super.
+        let Some(super_arc) = self.self_ref.upgrade() else {
+            return Ok(());
+        };
+        match super::orphan_finalize::finalize(&super_arc, ext2_ino) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                crate::kwarn!(
+                    "ext2: orphan finalize ino {}: errno={}, leaving pin for replay",
+                    ext2_ino,
+                    e,
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn sync_fs(&self, _sb: &SuperBlock) -> Result<(), i64> {
         // Scope the flush to just this mount's DeviceId — shared-device
         // concurrent mounts (RFC 0004 §Buffer cache) must not leak.
