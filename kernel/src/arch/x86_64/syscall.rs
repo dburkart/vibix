@@ -954,6 +954,13 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         MOUNT => unsafe { super::syscalls::vfs::sys_mount_impl(a0, a1, a2, a3, a4) },
 
+        // umount2(target, flags) — RFC 0004 §umount2(2). Issue #576.
+        // Superuser-only; MNT_FORCE = abort in-flight I/O + detach
+        // (refuses nested mounts with EBUSY); MNT_DETACH = lazy unmount
+        // (unlink now, finalize when last SbActiveGuard drops).
+        #[cfg(feature = "vfs_creds")]
+        UMOUNT2 => unsafe { super::syscalls::vfs::sys_umount2_impl(a0, a1 as u32) },
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1645,6 +1652,7 @@ pub mod syscall_nr {
     pub const FCHMODAT: u64 = 268;
     pub const UTIMENSAT: u64 = 280;
     pub const MOUNT: u64 = 165;
+    pub const UMOUNT2: u64 = 166;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1780,5 +1788,7 @@ mod tests {
 
         // Mount plumbing (issue #575, RFC 0004 Workstream F)
         assert_eq!(syscall_nr::MOUNT, 165, "SYS_mount must be 165");
+        // Umount plumbing (issue #576, RFC 0004 Workstream F)
+        assert_eq!(syscall_nr::UMOUNT2, 166, "SYS_umount2 must be 166");
     }
 }

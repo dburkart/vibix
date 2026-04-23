@@ -2490,6 +2490,135 @@ pub unsafe fn sys_mount_impl(
     }
 }
 
+// ---------------------------------------------------------------------------
+// umount2(2) — issue #576, RFC 0004 §umount2.
+//
+// Signature: `umount2(target, flags)`
+//   a0 = target : *const u8
+//   a1 = flags  : u32 (MNT_FORCE=0x1, MNT_DETACH=0x2, MNT_EXPIRE=0x4
+//                      is rejected, UMOUNT_NOFOLLOW=0x8 rejected too)
+// ---------------------------------------------------------------------------
+
+/// `MNT_FORCE` — abort in-flight I/O and detach immediately.
+pub const MNT_FORCE: u32 = 0x0000_0001;
+/// `MNT_DETACH` — lazy unmount. Unlink now, finalize when the last
+/// [`SbActiveGuard`] drops.
+pub const MNT_DETACH: u32 = 0x0000_0002;
+
+/// Mask of `MNT_*` bits this revision accepts. Unknown bits are
+/// rejected with `-EINVAL` so future additions (`MNT_EXPIRE`,
+/// `UMOUNT_NOFOLLOW`) can't sneak through as a silently-ignored bit.
+const MNT_SUPPORTED: u32 = MNT_FORCE | MNT_DETACH;
+
+/// `umount2(target, flags)` — tear down a mounted filesystem.
+///
+/// Contract (mirrors Linux `umount2(2)` for the subset vibix
+/// implements):
+/// - `euid == 0` only — non-root callers see `-EPERM` before any
+///   user pointer is dereferenced.
+/// - Unknown flag bits → `-EINVAL`.
+/// - `MNT_FORCE | MNT_DETACH` is accepted (lazy wins; Phase-B is
+///   deferred and the FORCE nested-mount refusal is skipped).
+/// - `target` fails to resolve → walk's errno (typically `-ENOENT`).
+/// - `target` is not itself the mountpoint of a live mount →
+///   `-EINVAL`.
+/// - Default flags, SB still pinned → `-EBUSY`.
+/// - `MNT_FORCE` without `MNT_DETACH`, nested child mount still
+///   present → `-EBUSY`.
+///
+/// The success path always detaches; Phase-B flush + driver
+/// teardown is synchronous for the default / FORCE cases and
+/// deferred for DETACH.
+pub unsafe fn sys_umount2_impl(target_uva: u64, flags: u32) -> i64 {
+    // 1. Superuser-only. Mirrors Linux's CAP_SYS_ADMIN gate at the
+    //    entry of `path_umount`.
+    let cred = crate::task::current_credentials();
+    if cred.euid != 0 {
+        return EPERM;
+    }
+
+    // 2. Reject unknown flag bits.
+    if flags & !MNT_SUPPORTED != 0 {
+        return EINVAL;
+    }
+
+    // 3. Copy the target path. Empty path is -ENOENT, matching the
+    //    rest of the VFS surface.
+    let target_buf = match copy_user_path(target_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if target_buf.is_empty() {
+        return ENOENT;
+    }
+
+    // 4. Resolve the target path. We want the mountpoint *dentry*
+    //    (the one the mount edge is installed on), not the root of
+    //    the mounted filesystem, so the resolver must not cross the
+    //    mount into the new filesystem. `path_walk` follows mounts
+    //    by default; for umount we walk to the parent directory
+    //    and look up the final component without mount-following.
+    //
+    //    However, Linux `umount2` actually *does* accept a path
+    //    that lands on the mounted root and then peels back one
+    //    level via `follow_down`. For the vibix subset — where
+    //    only one mount currently lives on any given dentry — we
+    //    mirror the simpler semantic: walk the path, then look
+    //    for `dentry.mount`. If absent, check whether the dentry
+    //    is itself a mount root and walk up to its mountpoint via
+    //    the global table.
+    let root = match vfs_root() {
+        Some(r) => r,
+        None => return ENOENT,
+    };
+    let cwd = if target_buf.first() == Some(&b'/') {
+        root.clone()
+    } else {
+        crate::task::current_cwd().unwrap_or_else(|| root.clone())
+    };
+    let mut nd = match NameIdata::new(
+        root,
+        cwd,
+        (*cred).clone(),
+        LookupFlags::default() | LookupFlags::FOLLOW,
+    ) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Err(e) = path_walk(&mut nd, &target_buf, &GlobalMountResolver) {
+        return e;
+    }
+    let resolved = nd.path.dentry.clone();
+
+    // 5. If the resolved dentry is itself the root of a mounted
+    //    filesystem (path walk crossed the mount for us), walk
+    //    back up to the mountpoint dentry — that's what
+    //    `mount_table::unmount` expects.
+    let target_dentry = match GlobalMountResolver.mount_above(&resolved) {
+        Some(edge) => match edge.mountpoint.upgrade() {
+            Some(mp) => mp,
+            // Mountpoint weak ref is dead — the mount is already
+            // being torn down on another thread; treat as EINVAL.
+            None => return EINVAL,
+        },
+        None => resolved,
+    };
+
+    // 6. Translate MNT_* to UmountFlags and hand off to the VFS.
+    let mut uflags = crate::fs::vfs::UmountFlags::default();
+    if flags & MNT_FORCE != 0 {
+        uflags = uflags | crate::fs::vfs::UmountFlags::FORCE;
+    }
+    if flags & MNT_DETACH != 0 {
+        uflags = uflags | crate::fs::vfs::UmountFlags::DETACH;
+    }
+
+    match crate::fs::vfs::unmount(&target_dentry, uflags) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
 #[cfg(test)]
 mod mount_tests {
     use super::*;

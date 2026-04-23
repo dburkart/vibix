@@ -419,3 +419,7 @@ required-features = ["ext2"]
 name = "ext2_link"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "umount2_flags"
+harness = false

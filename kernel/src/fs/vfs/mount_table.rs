@@ -19,11 +19,16 @@
 //!       pre-check `sb_active==0` *before* publishing `draining=true`
 //!       so racing callers don't see a transient drain we'll roll
 //!       back; set `draining=true`; re-check `sb_active==0` (or
-//!       honour `MNT_FORCE`) to close the zero->one window; unlink.
-//!       If either check fails and force is off, clear `draining`
-//!       (if set), reinstate the edge, return `EBUSY`.
+//!       honour `MNT_FORCE`/`MNT_DETACH`) to close the zero->one
+//!       window; unlink. If either check fails and force/detach are
+//!       off, clear `draining` (if set), reinstate the edge, return
+//!       `EBUSY`. `MNT_FORCE` additionally refuses if a nested
+//!       child mount still pins this SB (EBUSY).
 //!     - Phase B (no VFS locks held): `gc_drain_for(&sb)` to flush any
-//!       pending evictions, then `sb.ops.unmount()`.
+//!       pending evictions, then `sb.ops.sync_fs` + `sb.ops.unmount()`.
+//!       For `MNT_DETACH`, Phase B is deferred: the `Arc<SuperBlock>`
+//!       is stashed in `PENDING_DETACH` and the finalizer runs from
+//!       [`SbActiveGuard::drop`] when the last guard releases.
 //!
 //! - The mount table is the only strong-reference holder for a
 //!   mounted SB. Phase A keeps `sb` as a local `Arc` for the duration
@@ -42,7 +47,7 @@ use super::path_walk::MountResolver;
 use super::super_block::SuperBlock;
 use super::FsId;
 use crate::fs::{EBUSY, EINVAL, ENOTDIR};
-use crate::sync::BlockingRwLock;
+use crate::sync::{BlockingMutex, BlockingRwLock};
 
 /// Caller-supplied flags to [`unmount`]. Distinct from
 /// [`MountFlags`]: those decorate the persistent edge; these gate
@@ -55,7 +60,19 @@ impl UmountFlags {
     /// `MNT_FORCE` analogue: tear the mount down even if syscalls are
     /// still pinning it. The in-flight callers will trip the
     /// `draining` flag on their next [`SbActiveGuard::try_acquire`].
+    ///
+    /// Per the umount2(2) contract, `MNT_FORCE` is refused with
+    /// `-EBUSY` on mounts that still have nested (child) mounts — the
+    /// caller must tear those down first, either by direct umount or
+    /// by using [`DETACH`](Self::DETACH) below.
     pub const FORCE: UmountFlags = UmountFlags(1 << 0);
+
+    /// `MNT_DETACH` analogue: lazy unmount. Unlink the mount from the
+    /// namespace now so no new syscalls can enter, but defer
+    /// `sync_fs` + `SuperOps::unmount` until the last in-flight
+    /// [`SbActiveGuard`] drops. In-flight I/O completes normally
+    /// instead of being aborted.
+    pub const DETACH: UmountFlags = UmountFlags(1 << 1);
 
     pub const fn contains(self, other: UmountFlags) -> bool {
         (self.0 & other.0) == other.0
@@ -143,62 +160,196 @@ pub fn mount(
     }
 }
 
-/// Unmount the filesystem rooted at `target` (the mountpoint dentry,
-/// not the mount's own root). Returns `EINVAL` if `target` doesn't
-/// host a mount; `EBUSY` if syscalls still pin the SB and `FORCE`
-/// isn't set.
+/// Global list of super-blocks whose mount edge has been detached
+/// lazily (`MNT_DETACH`) and whose final `sync_fs` + `ops.unmount()`
+/// must fire when their last [`SbActiveGuard`] drops. Owning the
+/// `Arc<SuperBlock>` here keeps the driver state alive across the
+/// interval between detach and the last guard drop, and is the only
+/// anchor that holds an `Arc` reference to a detached SB.
 ///
-/// Phase A acquires the table write lock; Phase B releases it before
-/// touching the FS driver.
-pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
-    let force = flags.contains(UmountFlags::FORCE);
+/// Contention is trivial: entries are pushed at most once per
+/// successful umount2 call, and drained inside
+/// [`finalize_pending_detach`] which is called by
+/// `SbActiveGuard::drop`.
+static PENDING_DETACH: BlockingMutex<Vec<Arc<SuperBlock>>> = BlockingMutex::new(Vec::new());
 
-    let sb = {
-        let mut table = MOUNT_TABLE.write();
-        let mut edge_slot = target.mount.write();
-        let edge = edge_slot.take().ok_or(EINVAL)?;
-        let sb = edge.super_block.clone();
-        // Pre-check sb_active before publishing `draining=true`, so racing
-        // SbActiveGuard::try_acquire callers don't observe a transient
-        // drain when we're going to roll back anyway. Then publish
-        // draining and re-check to close the zero->one window.
-        if !force && sb.sb_active.load(Ordering::SeqCst) != 0 {
-            *edge_slot = Some(edge);
-            return Err(EBUSY);
+/// Return true if any edge in `MOUNT_TABLE` is mounted on a dentry
+/// that belongs to `sb`'s subtree — i.e. `sb` has a nested child
+/// mount. Used by the umount2 path to refuse `MNT_FORCE` when a
+/// child mount pins the parent (RFC 0004 §Forced unmount).
+///
+/// Walks the mount table under its read lock and inspects each
+/// edge's mountpoint dentry; a dentry whose inode's superblock
+/// matches `sb` is, by construction, a path inside `sb`. The
+/// candidate edge itself is excluded via pointer identity.
+fn has_child_mounts(
+    table: &[Arc<MountEdge>],
+    self_edge: &Arc<MountEdge>,
+    sb: &Arc<SuperBlock>,
+) -> bool {
+    let self_ptr = Arc::as_ptr(self_edge);
+    for edge in table.iter() {
+        if core::ptr::eq(Arc::as_ptr(edge), self_ptr) {
+            continue;
         }
-        sb.draining.store(true, Ordering::SeqCst);
-        if !force && sb.sb_active.load(Ordering::SeqCst) != 0 {
-            sb.draining.store(false, Ordering::SeqCst);
-            *edge_slot = Some(edge);
-            return Err(EBUSY);
+        let Some(mp) = edge.mountpoint.upgrade() else {
+            continue;
+        };
+        let inode_slot = mp.inode.read();
+        if let Some(inode) = inode_slot.as_ref() {
+            if let Some(other_sb) = inode.sb.upgrade() {
+                if Arc::ptr_eq(&other_sb, sb) {
+                    return true;
+                }
+            }
         }
-        let edge_ptr = Arc::as_ptr(&edge);
-        table.retain(|e| !core::ptr::eq(Arc::as_ptr(e), edge_ptr));
-        drop(edge_slot);
-        drop(table);
-        sb
-    };
+    }
+    false
+}
 
-    gc_drain_for(&sb);
-    // Phase B: flush any dirty buffers this mount owns *before*
-    // `sb.ops.unmount()` tears the driver's device plumbing down. Errors
-    // are logged and absorbed — the detach is unconditional, matching
-    // `SuperOps::unmount`'s infallibility contract. A later retry can
-    // pick up buffers that `sync_fs` failed to flush via the writeback
-    // daemon or an explicit `sync(2)`.
-    //
-    // See RFC 0004 §Buffer cache and issue #554 for the normative
-    // contract on flush-before-detach ordering.
-    if let Err(errno) = sb.ops.sync_fs(&sb) {
+/// Drain the Phase-B work for an SB: `gc_drain_for` + `sync_fs` +
+/// `ops.unmount`. Always returns `Ok(())` — driver errors from
+/// `sync_fs` are logged and absorbed (matches the
+/// `SuperOps::unmount` infallibility contract).
+fn finalize_detach(sb: &Arc<SuperBlock>) {
+    gc_drain_for(sb);
+    if let Err(errno) = sb.ops.sync_fs(sb) {
         crate::serial_println!(
             "vfs: sync_fs failed during unmount ({}): errno={}",
             sb.fs_type,
             errno,
         );
     }
-    // Phase B cont.: sb.ops.unmount() is infallible per the SuperOps
-    // contract — the mount is already detached; we always return Ok(()).
     sb.ops.unmount();
+}
+
+/// Run the deferred finalizer for any lazily-detached SB whose last
+/// [`SbActiveGuard`] has just dropped. Called from the guard's
+/// `Drop` impl after it decrements `sb_active`.
+///
+/// Lifts entries out of [`PENDING_DETACH`] under the mutex, then
+/// drops the lock before calling `ops.unmount` — driver impls must
+/// not be run under a VFS-internal lock.
+pub(super) fn finalize_pending_detach(sb: &SuperBlock) {
+    // Fast path: nothing pending at all.
+    let mut ready: Vec<Arc<SuperBlock>> = Vec::new();
+    {
+        let mut pending = PENDING_DETACH.lock();
+        if pending.is_empty() {
+            return;
+        }
+        let sb_ptr: *const SuperBlock = sb;
+        let mut i = 0;
+        while i < pending.len() {
+            let entry_ptr: *const SuperBlock = &*pending[i];
+            if core::ptr::eq(entry_ptr, sb_ptr) && pending[i].sb_active.load(Ordering::SeqCst) == 0
+            {
+                ready.push(pending.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for sb in ready {
+        finalize_detach(&sb);
+    }
+}
+
+/// Unmount the filesystem rooted at `target` (the mountpoint dentry,
+/// not the mount's own root).
+///
+/// Returns:
+/// - `EINVAL` if `target` doesn't host a mount.
+/// - `EBUSY` (default flags) if any syscall still pins the SB.
+/// - `EBUSY` (`MNT_FORCE`) if the mount has a nested child mount —
+///   the caller must tear those down first.
+///
+/// Flag semantics (mirror Linux umount2(2)):
+/// - Default (`flags == 0`): strict busy check. EBUSY if `sb_active`
+///   is nonzero at phase-A commit.
+/// - [`UmountFlags::FORCE`]: bypass the busy check for in-flight
+///   syscalls (they observe `draining` and error out), but *refuse*
+///   if any nested child mount still pins this SB. `sync_fs` +
+///   `ops.unmount` run synchronously.
+/// - [`UmountFlags::DETACH`]: always succeeds at detach (no busy
+///   check, no nested-mount refusal). Unlinks from the mount table
+///   and dentry right away so no new path walk can enter. The
+///   Phase-B finalize (`sync_fs` + `ops.unmount`) is deferred until
+///   the last active [`SbActiveGuard`] drops, giving in-flight I/O a
+///   chance to complete normally.
+///
+/// Phase A acquires the table write lock; Phase B releases it before
+/// touching the FS driver.
+pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
+    let force = flags.contains(UmountFlags::FORCE);
+    let detach = flags.contains(UmountFlags::DETACH);
+
+    let (sb, defer_finalize) = {
+        let mut table = MOUNT_TABLE.write();
+        let mut edge_slot = target.mount.write();
+        let edge = edge_slot.take().ok_or(EINVAL)?;
+        let sb = edge.super_block.clone();
+
+        // Nested-mount refusal for MNT_FORCE: forcing a tear-down
+        // with a child mount still pinning the parent would strand
+        // the child on top of a torn-down SB. DETACH explicitly
+        // opts out of this check — the child mount's own Arc chain
+        // keeps its SB alive past the parent's detach.
+        if force && !detach && has_child_mounts(&table, &edge, &sb) {
+            *edge_slot = Some(edge);
+            return Err(EBUSY);
+        }
+
+        // Default-flag busy check: a single two-phase commit around
+        // the `draining` flag closes the zero->one window.
+        if !force && !detach {
+            // Pre-check sb_active before publishing `draining=true`,
+            // so racing SbActiveGuard::try_acquire callers don't
+            // observe a transient drain we'd roll back.
+            if sb.sb_active.load(Ordering::SeqCst) != 0 {
+                *edge_slot = Some(edge);
+                return Err(EBUSY);
+            }
+            sb.draining.store(true, Ordering::SeqCst);
+            if sb.sb_active.load(Ordering::SeqCst) != 0 {
+                sb.draining.store(false, Ordering::SeqCst);
+                *edge_slot = Some(edge);
+                return Err(EBUSY);
+            }
+        } else {
+            // FORCE or DETACH: publish draining unconditionally so
+            // no *new* guards enter after we unlink the edge. FORCE
+            // relies on in-flight guards erroring out on their
+            // next VFS entry; DETACH waits for them to drain.
+            sb.draining.store(true, Ordering::SeqCst);
+        }
+
+        let edge_ptr = Arc::as_ptr(&edge);
+        table.retain(|e| !core::ptr::eq(Arc::as_ptr(e), edge_ptr));
+        drop(edge_slot);
+        drop(table);
+
+        // Decide finalize path: DETACH defers if any guard still
+        // holds the SB; every other path runs Phase B inline.
+        let defer = detach && sb.sb_active.load(Ordering::SeqCst) != 0;
+        if defer {
+            PENDING_DETACH.lock().push(sb.clone());
+        }
+        (sb, defer)
+    };
+
+    if defer_finalize {
+        // Race window: a guard may have dropped to zero between our
+        // `defer` check and the push above. Re-check and finalize
+        // inline if so; otherwise the guard's Drop will run it.
+        // `finalize_pending_detach` will pop the entry and run the
+        // finalizer exactly once.
+        if sb.sb_active.load(Ordering::SeqCst) == 0 {
+            finalize_pending_detach(&sb);
+        }
+    } else {
+        finalize_detach(&sb);
+    }
     Ok(())
 }
 
@@ -513,4 +664,175 @@ mod tests {
 
     #[allow(dead_code)]
     fn _touch(_: DString) {}
+
+    // -----------------------------------------------------------------
+    // umount2 flag-surface tests (issue #576).
+    // -----------------------------------------------------------------
+
+    /// `MNT_DETACH` with an in-flight guard must succeed at the
+    /// detach step (mount table / dentry edge both cleared) but
+    /// defer `ops.unmount` until the guard drops.
+    #[test]
+    fn detach_defers_ops_unmount_until_guard_drops() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let target = make_dir_dentry();
+        let fs = make_fs();
+        let edge = mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
+        let sb = edge.super_block.clone();
+        let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
+
+        // DETACH succeeds even with a live guard, and the edge
+        // unlinks synchronously. But `ops.unmount` must NOT have
+        // been called yet — Phase B is deferred.
+        unmount(&target, UmountFlags::DETACH).expect("detach unmount");
+        assert!(target.mount.read().is_none(), "edge unlinked synchronously");
+        assert_eq!(
+            MOUNT_TABLE.read().len(),
+            0,
+            "table entry removed synchronously"
+        );
+        assert_eq!(
+            fs.ops.unmount_calls.load(Ordering::SeqCst),
+            0,
+            "ops.unmount must be deferred until guard drops"
+        );
+
+        // Dropping the last guard fires the deferred finalize.
+        drop(guard);
+        assert_eq!(
+            fs.ops.unmount_calls.load(Ordering::SeqCst),
+            1,
+            "guard drop must run deferred finalize exactly once"
+        );
+    }
+
+    /// `MNT_DETACH` with no guards currently held must finalize
+    /// synchronously — there's no future guard-drop to hook.
+    #[test]
+    fn detach_with_no_guards_finalizes_inline() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let target = make_dir_dentry();
+        let fs = make_fs();
+        mount(
+            MountSource::None,
+            &target,
+            fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("mount");
+
+        unmount(&target, UmountFlags::DETACH).expect("detach unmount");
+        assert_eq!(
+            fs.ops.unmount_calls.load(Ordering::SeqCst),
+            1,
+            "no in-flight guard: ops.unmount runs inline"
+        );
+    }
+
+    /// `MNT_FORCE` refuses with `EBUSY` when another mount is
+    /// nested on top of this one, to avoid stranding the child on a
+    /// torn-down parent SB.
+    #[test]
+    fn force_refuses_nested_child_mount() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let parent_target = make_dir_dentry();
+        let parent_fs = make_fs();
+        let parent_edge = mount(
+            MountSource::None,
+            &parent_target,
+            parent_fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("parent mount");
+
+        // Build a dentry whose inode belongs to parent's SB — this
+        // is the mount-point for a nested child.
+        let parent_sb = parent_edge.super_block.clone();
+        let child_mp_inode = Arc::new(Inode::new(
+            2,
+            Arc::downgrade(&parent_sb),
+            Arc::new(StubInode),
+            Arc::new(StubFile),
+            InodeKind::Dir,
+            InodeMeta {
+                mode: 0o755,
+                nlink: 2,
+                ..Default::default()
+            },
+        ));
+        let child_mp = Dentry::new_root(child_mp_inode);
+        let child_fs = make_fs();
+        mount(
+            MountSource::None,
+            &child_mp,
+            child_fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("child mount");
+
+        // FORCE-unmounting the parent must refuse because a child
+        // mount still pins it.
+        let r = unmount(&parent_target, UmountFlags::FORCE);
+        assert_eq!(r.err(), Some(EBUSY), "FORCE must refuse nested mounts");
+        // Parent edge must be restored.
+        assert!(parent_target.mount.read().is_some());
+        assert!(!parent_sb.draining.load(Ordering::SeqCst));
+        // Cleanup: detach both to leave a clean table.
+        unmount(&child_mp, UmountFlags::default()).expect("cleanup child");
+        unmount(&parent_target, UmountFlags::default()).expect("cleanup parent");
+    }
+
+    /// `MNT_DETACH` with a nested child mount still succeeds —
+    /// DETACH is the cooperative variant and opts out of the
+    /// FORCE nested-mount refusal.
+    #[test]
+    fn detach_allows_nested_child_mount() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let parent_target = make_dir_dentry();
+        let parent_fs = make_fs();
+        let parent_edge = mount(
+            MountSource::None,
+            &parent_target,
+            parent_fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("parent mount");
+        let parent_sb = parent_edge.super_block.clone();
+        let child_mp_inode = Arc::new(Inode::new(
+            2,
+            Arc::downgrade(&parent_sb),
+            Arc::new(StubInode),
+            Arc::new(StubFile),
+            InodeKind::Dir,
+            InodeMeta {
+                mode: 0o755,
+                nlink: 2,
+                ..Default::default()
+            },
+        ));
+        let child_mp = Dentry::new_root(child_mp_inode);
+        let child_fs = make_fs();
+        mount(
+            MountSource::None,
+            &child_mp,
+            child_fs.clone(),
+            MountFlags::default(),
+        )
+        .expect("child mount");
+
+        unmount(&parent_target, UmountFlags::DETACH).expect("detach parent");
+        assert!(parent_target.mount.read().is_none());
+        // Cleanup the child.
+        unmount(&child_mp, UmountFlags::default()).expect("cleanup child");
+    }
 }
