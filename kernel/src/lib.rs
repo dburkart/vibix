@@ -40,6 +40,7 @@ pub mod arch;
 pub mod bench;
 #[cfg(target_os = "none")]
 pub mod boot;
+pub mod boot_cmdline;
 pub mod fbview;
 #[cfg(target_os = "none")]
 pub mod framebuffer;

@@ -71,6 +71,21 @@ pub extern "C" fn _start() -> ! {
                 core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
             );
         }
+        // Parse root=<source> + rootflags=<csv> per RFC 0004 Workstream F
+        // (#577). The result is logged unconditionally; the VFS mount
+        // path consumes it via `vfs::init::init_with` (host tests and
+        // any future prod caller). Today the prod boot path does not
+        // itself call `vfs::init::init_with`, so this is a pure
+        // observability hop — the cmdline is surfaced in the serial log
+        // so operators can confirm Limine delivered what they set.
+        let root_args = vibix::boot_cmdline::parse(bytes);
+        serial_println!(
+            "rootfs: source={:?} flags={:#x} explicit_ro={:?}",
+            root_args.source,
+            root_args.mount_flags.0,
+            root_args.explicit_ro,
+        );
+
         if vibix::block::writeback::parse_cmdline(bytes) {
             serial_println!(
                 "writeback: cadence configured to {} s ({})",

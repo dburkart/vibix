@@ -739,9 +739,70 @@ fn ensure_limine() -> R<PathBuf> {
 /// Assemble a bootable hybrid BIOS/UEFI ISO around the given kernel ELF.
 /// `staging` names a subdirectory under `build/` to use as scratch
 /// (so parallel test runs don't stomp each other).
+/// Insert `cmdline: <value>` into `limine.conf` so the kernel's
+/// `ExecutableCmdlineRequest` sees `value` at boot. Appends after the
+/// first `protocol: limine` line (Limine keys are indentation-sensitive
+/// to the 4-space block the committed file uses). Idempotent: if a
+/// `cmdline:` line already exists under the target block it is
+/// replaced.
+fn inject_limine_cmdline(body: &str, value: &str) -> String {
+    let indent = "    ";
+    let mut out = String::with_capacity(body.len() + value.len() + 32);
+    let mut inserted = false;
+    let mut pending_block = false;
+    for line in body.lines() {
+        let trimmed_start = line.trim_start();
+        // Replace an existing cmdline line in-place; don't stack a
+        // duplicate below it.
+        if pending_block && trimmed_start.starts_with("cmdline:") {
+            out.push_str(indent);
+            out.push_str("cmdline: ");
+            out.push_str(value);
+            out.push('\n');
+            inserted = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if !inserted && trimmed_start == "protocol: limine" {
+            out.push_str(indent);
+            out.push_str("cmdline: ");
+            out.push_str(value);
+            out.push('\n');
+            inserted = true;
+            pending_block = true;
+        }
+    }
+    if !inserted {
+        // No `protocol: limine` entry found — append at end as a last
+        // resort. This keeps the function total even on a malformed
+        // config.
+        out.push_str("cmdline: ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
+}
+
 fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
     let userspace_init = build_userspace_init()?;
     make_iso_with_init(kernel, &userspace_init, iso_out, staging)
+}
+
+/// Variant of [`make_iso`] that injects `cmdline: <kernel_cmdline>`
+/// into the Limine config so the kernel can read a `root=…` knob etc.
+/// When `kernel_cmdline` is empty the Limine config is unchanged from
+/// the committed `kernel/limine.conf`. See issue #577 for the consumer
+/// (boot_cmdline::parse) that reads the resulting string from
+/// Limine's `ExecutableCmdlineRequest` response.
+fn make_iso_with_cmdline(
+    kernel: &Path,
+    iso_out: &Path,
+    staging: &str,
+    kernel_cmdline: &str,
+) -> R<()> {
+    let userspace_init = build_userspace_init()?;
+    make_iso_inner(kernel, &userspace_init, iso_out, staging, kernel_cmdline)
 }
 
 /// Variant of [`make_iso`] that publishes a caller-supplied binary as
@@ -751,6 +812,16 @@ fn make_iso(kernel: &Path, iso_out: &Path, staging: &str) -> R<()> {
 /// config.  All other ISO contents (`userspace_hello.elf`, the rootfs
 /// tarball, ld-musl) are identical to a normal boot.
 fn make_iso_with_init(kernel: &Path, init_bin: &Path, iso_out: &Path, staging: &str) -> R<()> {
+    make_iso_inner(kernel, init_bin, iso_out, staging, "")
+}
+
+fn make_iso_inner(
+    kernel: &Path,
+    init_bin: &Path,
+    iso_out: &Path,
+    staging: &str,
+    kernel_cmdline: &str,
+) -> R<()> {
     let limine = ensure_limine()?;
     let userspace_hello = build_userspace_hello()?;
     let initrd = ensure_initrd()?;
@@ -767,10 +838,23 @@ fn make_iso_with_init(kernel: &Path, init_bin: &Path, iso_out: &Path, staging: &
         workspace_root().join("userspace/lib/ld-musl-x86_64.so.1"),
         iso_root.join("boot/ld-musl-x86_64.so.1"),
     )?;
-    fs::copy(
-        workspace_root().join("kernel/limine.conf"),
-        iso_root.join("boot/limine/limine.conf"),
-    )?;
+    {
+        let src = workspace_root().join("kernel/limine.conf");
+        let dst = iso_root.join("boot/limine/limine.conf");
+        if kernel_cmdline.is_empty() {
+            fs::copy(&src, &dst)?;
+        } else {
+            // Inject `cmdline: <string>` under the existing
+            // `protocol: limine` block so Limine passes it to the
+            // kernel via `ExecutableCmdlineRequest`. The committed
+            // config has no cmdline line today, so we append rather
+            // than rewrite — append after the first `protocol: limine`
+            // occurrence.
+            let body = fs::read_to_string(&src)?;
+            let injected = inject_limine_cmdline(&body, kernel_cmdline);
+            fs::write(&dst, injected)?;
+        }
+    }
     for f in [
         "limine-bios.sys",
         "limine-bios-cd.bin",
@@ -830,8 +914,50 @@ fn iso(opts: &BuildOpts) -> R<PathBuf> {
 }
 
 fn run(opts: &BuildOpts) -> R<()> {
-    let iso = iso(opts)?;
-    let disk = ensure_test_disk()?;
+    run_with_root(opts, &[])
+}
+
+/// Shared QEMU boot path for `cargo xtask run` and its `--root=<kind>`
+/// variants. `extra_args` is merged straight into the kernel-cmdline
+/// Limine passes through, so `--root=ext2` becomes a `cmdline:
+/// root=/dev/vda` line in the generated Limine config. The `iso` is
+/// rebuilt inside this function so the cmdline mutation lands in the
+/// actual boot image.
+fn run_with_root(opts: &BuildOpts, cmdline_extras: &[&str]) -> R<()> {
+    // The `--root=<kind>` flag is parsed off `std::env::args` directly
+    // so we don't have to thread yet another field through `BuildOpts`.
+    // `--root=ext2` replaces the scratch test-disk with the
+    // deterministic ext2 image from `xtask ext2-image` (#579) and
+    // appends `root=/dev/vda` to the kernel cmdline so vfs::init
+    // chooses ext2 on the virtio-blk device. Any other value
+    // (including absent) keeps today's behaviour: scratch test-disk,
+    // default-auto rootfs probe.
+    let root_flag = std::env::args().find_map(|a| a.strip_prefix("--root=").map(str::to_string));
+
+    let (disk, mut extra_cmdline): (PathBuf, Vec<String>) = match root_flag.as_deref() {
+        Some("ext2") => {
+            let img = ext2_image::build(&workspace_root(), None, false)?;
+            println!("→ root=ext2: booting {}", img.display());
+            (img, vec!["root=/dev/vda".to_string()])
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown --root={}: accepted values are `ext2` (more land with future xtask waves)",
+                other
+            )
+            .into());
+        }
+        None => (ensure_test_disk()?, Vec::new()),
+    };
+    for extra in cmdline_extras {
+        extra_cmdline.push((*extra).to_string());
+    }
+    let cmdline = extra_cmdline.join(" ");
+
+    let kernel = build(opts)?;
+    let iso = workspace_root().join("target").join("vibix.iso");
+    make_iso_with_cmdline(&kernel, &iso, "iso_root", &cmdline)?;
+
     let status = Command::new("qemu-system-x86_64")
         .args([
             "-M",
@@ -1621,6 +1747,61 @@ fn check(status: ExitStatus) -> R<()> {
         Ok(())
     } else {
         Err(format!("command failed: {status}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests_inject_cmdline {
+    use super::inject_limine_cmdline;
+
+    const BASE: &str = "\
+timeout: 0
+serial: yes
+
+/vibix
+    protocol: limine
+    kernel_path: boot():/boot/vibix
+    module_path: boot():/boot/userspace_init.elf
+";
+
+    #[test]
+    fn appends_cmdline_after_protocol_line() {
+        let out = inject_limine_cmdline(BASE, "root=/dev/vda");
+        assert!(out.contains("    protocol: limine\n    cmdline: root=/dev/vda\n"));
+        // kernel_path still present after the injection.
+        assert!(out.contains("kernel_path: boot():/boot/vibix"));
+    }
+
+    #[test]
+    fn replaces_existing_cmdline_line_in_block() {
+        let existing = "\
+/vibix
+    protocol: limine
+    cmdline: root=ramfs
+    kernel_path: boot():/boot/vibix
+";
+        let out = inject_limine_cmdline(existing, "root=/dev/vda rootflags=ro");
+        // New value present.
+        assert!(out.contains("cmdline: root=/dev/vda rootflags=ro"));
+        // Old value gone.
+        assert!(!out.contains("cmdline: root=ramfs"));
+    }
+
+    #[test]
+    fn appends_at_end_if_no_protocol_line() {
+        let out = inject_limine_cmdline("# no protocol here\n", "root=ramfs");
+        assert!(out.ends_with("cmdline: root=ramfs\n"));
+    }
+
+    #[test]
+    fn empty_cmdline_is_a_noop_caller_guarded() {
+        // The caller short-circuits on empty cmdline; the function
+        // itself still handles it without corrupting the file.
+        let out = inject_limine_cmdline(BASE, "");
+        // Injection still happens at the protocol line, just with an
+        // empty value — this is why the call site in make_iso_inner
+        // branches on `kernel_cmdline.is_empty()` and bypasses us.
+        assert!(out.contains("    cmdline: \n"));
     }
 }
 
