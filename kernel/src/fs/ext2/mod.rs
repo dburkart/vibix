@@ -150,3 +150,9 @@ pub mod orphan_finalize;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use orphan_finalize::finalize as finalize_orphan;
+
+// Rename path (#571). Same feature gate as the rest of the write-path
+// modules; implements RFC 0004 §Rename ordering (link-count-first) and
+// §Cross-directory loop check.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod rename;

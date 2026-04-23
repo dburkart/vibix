@@ -288,6 +288,55 @@ impl InodeOps for Ext2Inode {
         super::create::create_dir(&super_ref, self, dir, &sb, name, mode)
     }
 
+    /// Rename `old_name` in this directory to `new_name` in `new_dir`.
+    ///
+    /// Dispatches to [`super::rename::rename`]; the normative
+    /// link-count-first sequence and cross-directory ancestor check
+    /// live there (RFC 0004 §Rename ordering / §Cross-directory loop
+    /// check).
+    fn rename(
+        &self,
+        old_dir: &Inode,
+        old_name: &[u8],
+        new_dir: &Inode,
+        new_name: &[u8],
+    ) -> Result<(), i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        // Resolve the driver-private `Ext2Inode` for `new_dir` via
+        // the parallel cache that `iget` publishes. On a well-formed
+        // call path this is always a hit — the caller holds an
+        // Arc<Inode> for new_dir, which keeps the Arc<Ext2Inode>
+        // alive through `inode.ops`.
+        let new_dir_arc_vfs = {
+            let cache = super_ref.inode_cache.lock();
+            cache
+                .get(&(new_dir.ino as u32))
+                .and_then(Weak::upgrade)
+                .ok_or(EIO)?
+        };
+        // Identity check by raw pointer equality: inode numbers are
+        // only unique within a mount, so an ino match alone would
+        // accept an inode from a different mount that happens to share
+        // `new_dir.ino` (root is usually 2 on every ext2 image). The
+        // only safe acceptance criterion is "the cached Arc<Inode> is
+        // the exact same allocation the caller handed us". The cross-
+        // mount rejection also happens in `rename::rename` via
+        // `Arc::ptr_eq` on the superblocks, but rejecting here keeps
+        // the failure deterministic even if a future caller routes
+        // around that check.
+        if !core::ptr::eq(Arc::as_ref(&new_dir_arc_vfs), new_dir) {
+            return Err(EIO);
+        }
+        let new_dir_ext2 = {
+            let ecache = super_ref.ext2_inode_cache.lock();
+            ecache
+                .get(&(new_dir.ino as u32))
+                .and_then(Weak::upgrade)
+                .ok_or(EIO)?
+        };
+        super::rename::rename(self, old_dir, old_name, &new_dir_ext2, new_dir, new_name)
+    }
+
     /// Create a FIFO named `name` under `dir`.
     ///
     /// Dispatches to [`super::create::mknod`] with `InodeKind::Fifo`

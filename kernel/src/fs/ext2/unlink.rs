@@ -61,14 +61,14 @@ use core::sync::atomic::Ordering;
 /// target is first-in-block), the target record's `rec_len`, and the
 /// target's ino + file_type.
 #[derive(Debug, Clone, Copy)]
-struct DirentLocation {
-    abs_block: u32,
-    offset_in_block: usize,
-    prev_offset_in_block: Option<usize>,
-    rec_len: usize,
-    child_ino: u32,
+pub(super) struct DirentLocation {
+    pub(super) abs_block: u32,
+    pub(super) offset_in_block: usize,
+    pub(super) prev_offset_in_block: Option<usize>,
+    pub(super) rec_len: usize,
+    pub(super) child_ino: u32,
     #[allow(dead_code)]
-    file_type: u8,
+    pub(super) file_type: u8,
 }
 
 /// Walk `dir`'s data blocks until `name` is found, returning the exact
@@ -76,7 +76,7 @@ struct DirentLocation {
 /// to locate the dirent they're about to remove.
 ///
 /// Returns `ENOENT` if the name isn't present.
-fn locate_dirent(
+pub(super) fn locate_dirent(
     super_: &Arc<Ext2Super>,
     dir: &Ext2Inode,
     name: &[u8],
@@ -175,7 +175,7 @@ fn locate_dirent(
 /// formerly-full directory can have multiple allocated blocks with
 /// only `.` / `..` still live. A single non-`.`/`..` live record
 /// anywhere in the walk proves the directory is non-empty.
-fn dir_is_empty(super_: &Arc<Ext2Super>, dir: &Ext2Inode) -> Result<bool, i64> {
+pub(super) fn dir_is_empty(super_: &Arc<Ext2Super>, dir: &Ext2Inode) -> Result<bool, i64> {
     let block_size = super_.block_size;
     let (s_first_data_block, s_blocks_count, s_feature_incompat) = {
         let sb = super_.sb_disk.lock();
@@ -234,7 +234,7 @@ fn dir_is_empty(super_: &Arc<Ext2Super>, dir: &Ext2Inode) -> Result<bool, i64> {
 /// or (if the target is first-in-block) turns it into a tombstone by
 /// zeroing the `inode` field. The block is marked dirty and synced
 /// before returning.
-fn remove_dirent_at(super_: &Arc<Ext2Super>, loc: &DirentLocation) -> Result<(), i64> {
+pub(super) fn remove_dirent_at(super_: &Arc<Ext2Super>, loc: &DirentLocation) -> Result<(), i64> {
     let bh = super_
         .cache
         .bread(super_.device_id, loc.abs_block as u64)
@@ -318,7 +318,7 @@ fn read_disk_inode(super_: &Arc<Ext2Super>, ino: u32) -> Result<(DiskInode, u64,
 }
 
 /// RMW an on-disk inode slot with `writer` and sync the block.
-fn rmw_disk_inode<F>(super_: &Arc<Ext2Super>, ino: u32, writer: F) -> Result<(), i64>
+pub(super) fn rmw_disk_inode<F>(super_: &Arc<Ext2Super>, ino: u32, writer: F) -> Result<(), i64>
 where
     F: FnOnce(&mut DiskInode),
 {
@@ -370,7 +370,7 @@ fn flush_superblock(super_: &Arc<Ext2Super>, sb: &Ext2SuperBlock) -> Result<(), 
 /// Decrement `bg_used_dirs_count` on the BGDT entry for the group that
 /// owns `ino`. Called from `rmdir` when a directory inode has its link
 /// count driven to zero.
-fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
+pub(super) fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
     use super::disk::EXT2_GROUP_DESC_SIZE;
     let (s_inodes_per_group, s_first_data_block) = {
         let sb = super_.sb_disk.lock();
@@ -435,7 +435,7 @@ fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
 /// Caller contract: `child.meta.links_count == 0`, the child's
 /// `unlinked` atomic has already been set to `true`, and the on-disk
 /// `i_links_count` has been flushed.
-fn push_on_orphan_list(
+pub(super) fn push_on_orphan_list(
     super_: &Arc<Ext2Super>,
     child_ino: u32,
     child_inode: &Arc<Inode>,
@@ -480,7 +480,7 @@ fn push_on_orphan_list(
 /// UTIME_NOW` uses. Ext2 timestamps are second-granularity on rev-0;
 /// the nsec is dropped here.
 #[inline]
-fn now_secs() -> u32 {
+pub(super) fn now_secs() -> u32 {
     crate::fs::vfs::Timespec::now().sec as u32
 }
 
@@ -624,7 +624,7 @@ pub fn rmdir(parent_dir: &Ext2Inode, parent_vfs: &Inode, name: &[u8]) -> Result<
 /// pins the sb through its `Weak<SuperBlock>`). We ask the cache's
 /// root-ino slot, which [`super::fs::Ext2Fs::mount`] pins before
 /// returning.
-fn resolve_sb_for_super(super_: &Arc<Ext2Super>) -> Result<Arc<SuperBlock>, i64> {
+pub(super) fn resolve_sb_for_super(super_: &Arc<Ext2Super>) -> Result<Arc<SuperBlock>, i64> {
     let cache = super_.inode_cache.lock();
     // Any cached entry will do; root is guaranteed cached at mount.
     for (_, weak) in cache.iter() {
@@ -643,7 +643,10 @@ fn resolve_sb_for_super(super_: &Arc<Ext2Super>) -> Result<Arc<SuperBlock>, i64>
 /// impossible on a well-formed call path because the caller always
 /// holds a strong `Arc<Inode>` keeping the concrete `Arc<Ext2Inode>`
 /// alive through `inode.ops`.
-fn ext2_inode_from_vfs(super_: &Arc<Ext2Super>, inode: &Arc<Inode>) -> Option<Arc<Ext2Inode>> {
+pub(super) fn ext2_inode_from_vfs(
+    super_: &Arc<Ext2Super>,
+    inode: &Arc<Inode>,
+) -> Option<Arc<Ext2Inode>> {
     let cache = super_.ext2_inode_cache.lock();
     cache.get(&(inode.ino as u32)).and_then(|w| w.upgrade())
 }
