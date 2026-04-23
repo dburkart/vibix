@@ -158,7 +158,6 @@ pub fn finalize(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
         }
     }
 
-    let _kind = pinned.kind;
     // `free_inode`'s `was_dir` flag drives a `bg_used_dirs_count`
     // decrement. The unlink path (#569) already decrements that counter
     // inside `rmdir` via `decrement_used_dirs`, *before* it hands the

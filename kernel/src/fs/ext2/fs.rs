@@ -631,9 +631,11 @@ impl SuperOps for Ext2Super {
     ///
     /// If `ino` is present in [`Ext2Super::orphan_list`], run the
     /// RFC 0004 §Final-close sequence via
-    /// [`super::orphan_finalize::finalize`]: truncate-to-zero, free
-    /// the inode, unchain from the on-disk orphan list, drop the
-    /// in-memory pin. A non-orphan ino (a normal inode falling out of
+    /// [`super::orphan_finalize::finalize`]: truncate-to-zero,
+    /// unchain from the on-disk orphan list (stamp `i_dtime` tombstone),
+    /// free the inode in the bitmap, then drop the in-memory pin.
+    /// Ordering note: unchain-before-free is load-bearing — see the
+    /// `orphan_finalize` module docs. A non-orphan ino (a normal inode falling out of
     /// the VFS cache) is a no-op — ext2 has no dirty-inode writeback
     /// yet; that lives behind the future `sync` path.
     ///
