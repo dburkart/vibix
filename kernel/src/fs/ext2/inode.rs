@@ -264,6 +264,39 @@ impl InodeOps for Ext2Inode {
     fn setattr(&self, inode: &Inode, attr: &crate::fs::vfs::ops::SetAttr) -> Result<(), i64> {
         super::setattr::setattr(self, inode, attr)
     }
+
+    /// Create a regular file named `name` under `dir`.
+    ///
+    /// Dispatches to [`super::create::create_file`], which implements
+    /// the RFC 0004 §Write Ordering sequence (bitmap -> inode-table ->
+    /// dirent). Returns the fresh `Arc<Inode>` published through the
+    /// per-mount inode cache.
+    fn create(&self, dir: &Inode, name: &[u8], mode: u16) -> Result<Arc<Inode>, i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let sb = dir.sb.upgrade().ok_or(EIO)?;
+        super::create::create_file(&super_ref, self, dir, &sb, name, mode)
+    }
+
+    /// Create a subdirectory named `name` under `dir`.
+    ///
+    /// Dispatches to [`super::create::create_dir`]. Allocates a data
+    /// block for the new directory and stamps `.` / `..`, then bumps
+    /// the parent's `i_links_count` for the new subdir's back-link.
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: u16) -> Result<Arc<Inode>, i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let sb = dir.sb.upgrade().ok_or(EIO)?;
+        super::create::create_dir(&super_ref, self, dir, &sb, name, mode)
+    }
+
+    /// Create a FIFO named `name` under `dir`.
+    ///
+    /// Dispatches to [`super::create::mknod`] with `InodeKind::Fifo`
+    /// and `rdev = 0` (FIFOs carry no device number).
+    fn mkfifo(&self, dir: &Inode, name: &[u8], mode: u16) -> Result<Arc<Inode>, i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let sb = dir.sb.upgrade().ok_or(EIO)?;
+        super::create::mknod(&super_ref, self, dir, &sb, name, InodeKind::Fifo, mode, 0)
+    }
 }
 
 /// Zero-sized marker type re-exported from wave 2 as the `FileOps`

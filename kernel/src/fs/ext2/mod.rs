@@ -120,3 +120,13 @@ pub mod unlink;
 // the write-path modules.
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod setattr;
+
+// Inode create/mkdir/mknod surface (#568). Same feature gate as the rest
+// of the driver; the module implements RFC 0004 §Write Ordering
+// (bitmap -> inode -> dirent) and exports free-function entry points the
+// `InodeOps` impls on `Ext2Inode` dispatch to.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod create;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use create::{create_dir, create_file, mknod};
