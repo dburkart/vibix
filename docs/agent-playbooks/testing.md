@@ -56,6 +56,35 @@ then checks that every marker in `SMOKE_MARKERS` is present.
 When a new boot-phase log line becomes part of the expected healthy path, add it to
 `SMOKE_MARKERS` so the smoke lane protects it.
 
+## Layer 4 - pjdfstest conformance (ext2)
+
+`cargo xtask pjdfstest` builds the vendored pjdfstest fork (#580), stages it into the
+deterministic ext2 rootfs image (#579), boots vibix under QEMU with that image as root,
+and scrapes `TEST_PASS:<name>` / `TEST_FAIL:<name>:<reason>` markers off the serial
+console into `target/pjdfstest-results.json`.
+
+CI runs this with `--compare-baseline`, which diffs the emitted JSON against the
+committed baseline at `tests/pjdfstest/baseline/expected.json`. The diff fails the job
+on any of:
+
+- A `pass` in the baseline is now `fail` (real regression).
+- A `fail` in the baseline is now `pass` without the baseline being bumped in the same
+  PR (silent-upgrade; update the baseline explicitly so the improvement is visible in
+  review).
+- A case present in the current run is absent from the baseline, or vice-versa (new
+  surface must be reflected in the baseline).
+
+When a real FS change intentionally moves verdicts, run
+`cargo xtask pjdfstest --update-baseline` locally and commit
+`tests/pjdfstest/baseline/expected.json` in the same PR as the driver change. The CI
+artefact `pjdfstest-results` contains the emitted JSON from every run so you can
+download it and commit the diff without re-running locally.
+
+At landing (#582) the baseline is 0/0/0 — vibix has no std-capable userspace target
+yet, so the runner boots as a placeholder. The CI gate still earns its keep by failing
+on harness regressions (kernel panic, QEMU watchdog timeout, ext2 image builder
+break). Real conformance signal arrives when #642 ports the runner to vibix userspace.
+
 ## Gotchas
 
 - Do not add `-no-shutdown` to the `test_runner` QEMU args. It breaks the
