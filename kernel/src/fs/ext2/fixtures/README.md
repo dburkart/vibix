@@ -51,6 +51,7 @@ E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
 | `golden_root_dir.bin` | `[13312, 13376)` | 64 | root dir first block prefix (1 MiB image) |
 | `golden.img` | `[0, 65536)` | 65536 | full 64 KiB mkfs.ext2 image (mount tests) |
 | `read_test.img` | — | 1048576 | 1 MiB mkfs.ext2 image pre-populated with `small.bin` (26 B), `large.bin` (300 KiB crossing single-indirect), `hole.bin` (3 KiB dense), and `sparse.bin` (11 KiB with logical blocks 1..9 hole-punched via `debugfs set_inode_field block[n] 0`). Used by `kernel/tests/ext2_file_read.rs` (issue #561). |
+| `balloc_test.img` | — | 524288 | 512 KiB mkfs.ext2 image with **two block groups** (256 blocks each), 128 inodes, 1 KiB blocks. Used by `kernel/tests/ext2_block_alloc.rs` (issue #565) to exercise the block-bitmap allocator, including cross-group spill when the first group is full. |
 
 ## `read_test.img` generator
 
@@ -98,6 +99,30 @@ done | debugfs -w -f /dev/stdin read_test.img
 ```
 
 Assigned inos on a deterministic `mkfs.ext2` run of the above: `small.bin = 12`, `large.bin = 13`, `hole.bin = 14`, `sparse.bin = 15`.
+
+## `balloc_test.img` generator
+
+```sh
+dd if=/dev/zero of=balloc_test.img bs=1024 count=512
+E2FSPROGS_FAKE_TIME=1000000000 mkfs.ext2 \
+    -b 1024 -N 128 -I 128 -F -g 256 \
+    -U 00000000-0000-0000-0000-000000000003 \
+    -E hash_seed=11111111-2222-3333-4444-555555555555 \
+    -M / -t ext2 \
+    -O '^dir_index,^has_journal,^ext_attr,^resize_inode,^sparse_super' \
+    balloc_test.img
+```
+
+Geometry (per `dumpe2fs`): 512 blocks total, 256 blocks per group →
+two groups; 128 inodes; 1 KiB blocks; features = `filetype
+large_file` (no `sparse_super`). Group 0 metadata occupies blocks
+1..25 (SB at 1, BGDT at 2, block bitmap at 3, inode bitmap at 4,
+inode table at 5..12); group 1 metadata occupies 257..268 (SB backup
+at 257, BGDT copy at 258, bitmaps at 259/260, inode table at
+261..268). The feature gate `^sparse_super` was intended to strip the
+group-1 backup but mkfs retains it on 2-group images; that does not
+affect the allocator test (the backup blocks are not used by the
+driver's RW path and are included in the metadata-forbidden map).
 
 Byte offsets for the 1 MiB slices are computed from:
 - Superblock at byte 1024 regardless of block size.

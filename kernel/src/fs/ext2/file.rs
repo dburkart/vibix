@@ -134,12 +134,12 @@ pub fn read_file_at(
     let block_size = super_ref.block_size as u64;
     debug_assert!(block_size > 0, "mount validated block_size != 0");
 
-    let geom = Geometry::new(
-        super_ref.block_size,
-        super_ref.sb_disk.s_first_data_block,
-        super_ref.sb_disk.s_blocks_count,
-    )
-    .ok_or(EIO)?;
+    let (s_first_data_block, s_blocks_count) = {
+        let sb = super_ref.sb_disk.lock();
+        (sb.s_first_data_block, sb.s_blocks_count)
+    };
+    let geom =
+        Geometry::new(super_ref.block_size, s_first_data_block, s_blocks_count).ok_or(EIO)?;
     let md = build_metadata_map(&super_ref);
 
     let mut copied = 0usize;
@@ -235,7 +235,11 @@ fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
     use super::disk::EXT2_GROUP_DESC_SIZE;
 
     let block_size = super_.block_size;
-    let sb = &super_.sb_disk;
+    let (s_first_data_block, inodes_per_group) = {
+        let sb = super_.sb_disk.lock();
+        (sb.s_first_data_block, sb.s_inodes_per_group as u64)
+    };
+    let bgdt_snapshot: alloc::vec::Vec<_> = super_.bgdt.lock().clone();
     let inode_size = super_.inode_size as u64;
 
     // Raw (unsorted) collection, then sort + coalesce once.
@@ -249,12 +253,12 @@ fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
 
     // BGDT. Starts at `s_first_data_block + 1` and spans
     // `ceil(group_count * 32 / block_size)` blocks.
-    let groups = super_.bgdt.len() as u32;
+    let groups = bgdt_snapshot.len() as u32;
     if groups > 0 {
         let entries_per_block = block_size / EXT2_GROUP_DESC_SIZE as u32;
         if entries_per_block > 0 {
             let bgdt_blocks = groups.div_ceil(entries_per_block);
-            let bgdt_start = sb.s_first_data_block.saturating_add(1);
+            let bgdt_start = s_first_data_block.saturating_add(1);
             if let Some(end) = bgdt_start.checked_add(bgdt_blocks) {
                 raw.push((bgdt_start, end));
             }
@@ -263,14 +267,13 @@ fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
 
     // Per-group bitmaps + inode table. The inode-table-block count per
     // group is `ceil(s_inodes_per_group * inode_size / block_size)`.
-    let inodes_per_group = sb.s_inodes_per_group as u64;
     let inode_table_bytes = inodes_per_group.saturating_mul(inode_size);
     let inode_table_blocks: u32 = inode_table_bytes
         .div_ceil(block_size as u64)
         .try_into()
         .unwrap_or(u32::MAX);
 
-    for bg in &super_.bgdt {
+    for bg in &bgdt_snapshot {
         // Each bitmap occupies exactly one block. (Ext2 caps
         // `blocks_per_group` / `inodes_per_group` at `block_size * 8`
         // precisely so a single-block bitmap covers the whole group.)

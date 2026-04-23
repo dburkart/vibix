@@ -375,3 +375,8 @@ required-features = ["ext2"]
 name = "ext2_orphan_chain"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_block_alloc"
+harness = false
+required-features = ["ext2"]

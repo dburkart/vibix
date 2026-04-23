@@ -439,8 +439,8 @@ impl FileSystem for Ext2Fs {
             block_size,
             inode_size,
             first_ino,
-            sb_disk: on_disk_sb,
-            bgdt,
+            sb_disk: spin::Mutex::new(on_disk_sb),
+            bgdt: spin::Mutex::new(bgdt),
             ext2_flags,
             owner: self.self_ref.clone(),
             inode_cache: super::inode::new_inode_cache(),
@@ -522,14 +522,20 @@ pub struct Ext2Super {
     /// First user-allocatable inode number. 11 on rev-0; `s_first_ino`
     /// on rev-1. Needed by the allocator (#560).
     pub first_ino: u32,
-    /// The last parsed superblock. Updated on sync by the allocator
-    /// (#560) when it decrements `s_free_blocks_count` /
-    /// `s_free_inodes_count`; wave 2 reads it for `statfs` only.
-    pub sb_disk: Ext2SuperBlock,
+    /// The last parsed superblock. Updated by the allocator (#565, #566)
+    /// when it decrements / increments `s_free_blocks_count` /
+    /// `s_free_inodes_count`; `statfs` snapshots fields under the lock.
+    ///
+    /// Lock ordering: acquire `sb_disk` **after** `bgdt` when both are
+    /// needed in the same critical section. The allocator paths observe
+    /// this by updating the group descriptor first, then the superblock
+    /// counter (matching the RFC 0004 §Write Ordering rule: bitmap
+    /// clear+flush → group-descriptor update → superblock update).
+    pub sb_disk: spin::Mutex<Ext2SuperBlock>,
     /// Block group descriptor table. One entry per group; the
-    /// allocator updates free-counts in-place and the next sync flushes
-    /// them back.
-    pub bgdt: Vec<Ext2GroupDesc>,
+    /// allocator updates free-counts in-place and flushes them back to
+    /// the on-disk BGDT block in the same critical section.
+    pub bgdt: spin::Mutex<Vec<Ext2GroupDesc>>,
     /// Driver-level mount flags — atime skip, forced-RO, NOSUID, etc.
     pub ext2_flags: Ext2MountFlags,
     /// Back-reference to the owning factory so `unmount` can clear the
@@ -582,23 +588,21 @@ impl SuperOps for Ext2Super {
     }
 
     fn statfs(&self) -> Result<StatFs, i64> {
+        let sb = self.sb_disk.lock();
         Ok(StatFs {
             // `EXT2_SUPER_MAGIC` as seen by Linux userspace `statfs(2)`
             // — the on-disk magic promoted to a 64-bit u64 slot.
             f_type: EXT2_MAGIC as u64,
             f_bsize: self.block_size as u64,
-            f_blocks: self.sb_disk.s_blocks_count as u64,
-            f_bfree: self.sb_disk.s_free_blocks_count as u64,
+            f_blocks: sb.s_blocks_count as u64,
+            f_bfree: sb.s_free_blocks_count as u64,
             // `f_bavail` = unreserved free blocks. RFC 0004 §Mount
             // permits reporting `f_bfree` directly until the
             // reservation accounting in the allocator (#560) lands; do
             // the subtraction anyway when it doesn't underflow.
-            f_bavail: self
-                .sb_disk
-                .s_free_blocks_count
-                .saturating_sub(self.sb_disk.s_r_blocks_count) as u64,
-            f_files: self.sb_disk.s_inodes_count as u64,
-            f_ffree: self.sb_disk.s_free_inodes_count as u64,
+            f_bavail: sb.s_free_blocks_count.saturating_sub(sb.s_r_blocks_count) as u64,
+            f_files: sb.s_inodes_count as u64,
+            f_ffree: sb.s_free_inodes_count as u64,
             f_namelen: crate::fs::vfs::NAME_MAX as u64,
         })
     }

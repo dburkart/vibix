@@ -157,10 +157,14 @@ pub fn read_slow_symlink_direct_only(
     // metadata-forbidden bitmap; here we only need the minimum
     // sanity check — a hostile image could otherwise read any
     // device sector.
-    if (blk as u64) >= super_.sb_disk.s_blocks_count as u64 {
+    let (s_first_data_block, s_blocks_count) = {
+        let sb = super_.sb_disk.lock();
+        (sb.s_first_data_block, sb.s_blocks_count)
+    };
+    if (blk as u64) >= s_blocks_count as u64 {
         return Err(EIO);
     }
-    if (blk as u64) < super_.sb_disk.s_first_data_block as u64 {
+    if (blk as u64) < s_first_data_block as u64 {
         return Err(EIO);
     }
 
