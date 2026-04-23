@@ -130,3 +130,13 @@ pub mod create;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use create::{create_dir, create_file, mknod};
+
+// InodeOps::link + InodeOps::symlink (#570). Same feature gate — the
+// module reuses create.rs's `add_link` / `write_new_inode` /
+// `read_inode_slot` helpers and touches the buffer cache directly for
+// slow-symlink target writes.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod link;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use link::{link, symlink};

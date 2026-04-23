@@ -397,7 +397,11 @@ fn create_common(
 /// fields of `disk`. Preserves the tail (on-disk rev-1 images store a
 /// larger slot that carries fields we don't decode) via
 /// [`DiskInode::encode_to_slot`].
-fn write_new_inode(super_: &Arc<Ext2Super>, ino: u32, disk: &DiskInode) -> Result<(), i64> {
+pub(super) fn write_new_inode(
+    super_: &Arc<Ext2Super>,
+    ino: u32,
+    disk: &DiskInode,
+) -> Result<(), i64> {
     if ino == 0 {
         return Err(EINVAL);
     }
@@ -470,7 +474,7 @@ fn write_new_inode(super_: &Arc<Ext2Super>, ino: u32, disk: &DiskInode) -> Resul
 /// Only uses the inode's direct pointers (`i_block[0..12]`) in this
 /// wave; directories that outgrow 12 blocks need the indirect-block
 /// walker's write path, which is Workstream F scope.
-fn add_link(
+pub(super) fn add_link(
     super_: &Arc<Ext2Super>,
     parent: &Ext2Inode,
     name: &[u8],
@@ -816,7 +820,10 @@ fn bump_parent_links(
 /// preserving the tail by construction). Shared with `write_new_inode`;
 /// kept as a helper so the RMW discipline in the module docs stays
 /// honest.
-fn read_inode_slot(super_: &Arc<Ext2Super>, ino: u32) -> Result<alloc::vec::Vec<u8>, i64> {
+pub(super) fn read_inode_slot(
+    super_: &Arc<Ext2Super>,
+    ino: u32,
+) -> Result<alloc::vec::Vec<u8>, i64> {
     if ino == 0 {
         return Err(EINVAL);
     }
@@ -872,7 +879,7 @@ fn read_inode_slot(super_: &Arc<Ext2Super>, ino: u32) -> Result<alloc::vec::Vec<
 /// - Not `.` or `..` (these are synthesised by `mkdir` / the iterator,
 ///   not creatable by userspace).
 /// - Contains no NUL bytes or `/` separators.
-fn validate_name(name: &[u8]) -> Result<(), i64> {
+pub(super) fn validate_name(name: &[u8]) -> Result<(), i64> {
     if name.is_empty() {
         return Err(EINVAL);
     }
