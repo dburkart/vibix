@@ -75,6 +75,12 @@ pub enum BlockError {
     Enospc,
     /// The requested byte range lies outside `[0, capacity())`.
     OutOfRange,
+    /// Write attempted against a read-only backend (e.g. a RO-mounted
+    /// image or a test harness deliberately rejecting writes). Distinct
+    /// from [`BlockError::DeviceError`] because the caller knows the
+    /// backend is intentionally immutable and can surface `EROFS` /
+    /// equivalent rather than a generic I/O error.
+    ReadOnly,
     /// Cache is full and eviction could find no victim buffer to reclaim.
     /// Every resident entry was either pinned (external `Arc` handle held
     /// by a caller) or mid-I/O (`DIRTY | LOCKED_IO`). Returned by

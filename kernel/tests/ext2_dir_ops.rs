@@ -98,6 +98,7 @@ struct RamDisk {
     block_size: u32,
     storage: Mutex<Vec<u8>>,
     writes: AtomicU32,
+    read_only: AtomicBool,
 }
 
 impl RamDisk {
@@ -107,7 +108,16 @@ impl RamDisk {
             block_size,
             storage: Mutex::new(bytes.to_vec()),
             writes: AtomicU32::new(0),
+            read_only: AtomicBool::new(false),
         })
+    }
+
+    fn set_read_only(&self, ro: bool) {
+        self.read_only.store(ro, Ordering::Relaxed);
+    }
+
+    fn writes(&self) -> u32 {
+        self.writes.load(Ordering::Relaxed)
     }
 }
 
@@ -129,6 +139,14 @@ impl BlockDevice for RamDisk {
         Ok(())
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
+        // Honor the harness-level RO flag: a read-only mount must never
+        // reach the backend with a write. Returning ReadOnly (instead of
+        // silently mutating) lets the RO test assert writes() == 0 and
+        // catches regressions where a future dirty-writeback path
+        // forgets to gate on MS_RDONLY.
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(BlockError::ReadOnly);
+        }
         let bs = self.block_size as u64;
         if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
             return Err(BlockError::BadAlign);
@@ -157,16 +175,23 @@ fn mount_golden_ro() -> (
     Arc<vibix::fs::vfs::super_block::SuperBlock>,
     Arc<Ext2Fs>,
     Arc<Ext2Super>,
+    Arc<RamDisk>,
 ) {
     let disk = RamDisk::from_image(GOLDEN_IMG.as_slice(), 512);
-    let fs = Ext2Fs::new_with_device(disk as Arc<dyn BlockDevice>);
+    // Latch the RO flag *after* the mount has completed. The mount
+    // itself only reads, but pinning RO on the disk now means any
+    // subsequent write (a forgotten dirty-inode flush, a buggy
+    // metadata update) will surface as BlockError::ReadOnly instead
+    // of silently mutating the in-memory image.
+    let fs = Ext2Fs::new_with_device(disk.clone() as Arc<dyn BlockDevice>);
     let sb = fs
         .mount(MountSource::None, MountFlags::RDONLY)
         .expect("RO mount must succeed");
+    disk.set_read_only(true);
     let super_arc = fs
         .current_super()
         .expect("Ext2Fs::current_super must upgrade after a successful mount");
-    (sb, fs, super_arc)
+    (sb, fs, super_arc, disk)
 }
 
 /// Pull the concrete `Ext2Inode`'s decoded fields out of a mounted
@@ -242,30 +267,33 @@ fn make_ext2_inode_from_stat(
 // ---------------------------------------------------------------------------
 
 fn lookup_finds_lost_found() {
-    let (sb, _fs, super_arc) = mount_golden_ro();
+    let (sb, _fs, super_arc, disk) = mount_golden_ro();
     let root = make_ext2_inode_from_stat(&super_arc, &sb, 2);
     let ino = dir::lookup(&super_arc, &root, b"lost+found").expect("lookup lost+found");
     assert_eq!(ino, 11, "mkfs.ext2 places lost+found at ino 11");
     sb.ops.unmount();
     drop(super_arc);
+    assert_eq!(disk.writes(), 0, "RO mount must not issue any writes");
 }
 
 fn lookup_missing_name_is_enoent() {
-    let (sb, _fs, super_arc) = mount_golden_ro();
+    let (sb, _fs, super_arc, disk) = mount_golden_ro();
     let root = make_ext2_inode_from_stat(&super_arc, &sb, 2);
     let err = dir::lookup(&super_arc, &root, b"does-not-exist").unwrap_err();
     assert_eq!(err, ENOENT);
     sb.ops.unmount();
     drop(super_arc);
+    assert_eq!(disk.writes(), 0, "RO mount must not issue any writes");
 }
 
 fn lookup_empty_name_is_enoent() {
-    let (sb, _fs, super_arc) = mount_golden_ro();
+    let (sb, _fs, super_arc, disk) = mount_golden_ro();
     let root = make_ext2_inode_from_stat(&super_arc, &sb, 2);
     let err = dir::lookup(&super_arc, &root, b"").unwrap_err();
     assert_eq!(err, ENOENT);
     sb.ops.unmount();
     drop(super_arc);
+    assert_eq!(disk.writes(), 0, "RO mount must not issue any writes");
 }
 
 fn parse_names(buf: &[u8], n: usize) -> Vec<(Vec<u8>, u64)> {
@@ -289,7 +317,7 @@ fn parse_names(buf: &[u8], n: usize) -> Vec<(Vec<u8>, u64)> {
 }
 
 fn getdents_returns_dot_dotdot_and_lost_found() {
-    let (sb, _fs, super_arc) = mount_golden_ro();
+    let (sb, _fs, super_arc, disk) = mount_golden_ro();
     let root = make_ext2_inode_from_stat(&super_arc, &sb, 2);
 
     let mut buf = vec![0u8; 1024];
@@ -318,10 +346,11 @@ fn getdents_returns_dot_dotdot_and_lost_found() {
 
     sb.ops.unmount();
     drop(super_arc);
+    assert_eq!(disk.writes(), 0, "RO mount must not issue any writes");
 }
 
 fn getdents_small_buffer_advances_cookie() {
-    let (sb, _fs, super_arc) = mount_golden_ro();
+    let (sb, _fs, super_arc, disk) = mount_golden_ro();
     let root = make_ext2_inode_from_stat(&super_arc, &sb, 2);
 
     // Size the buffer so at most one record fits per call: the ".",
@@ -348,12 +377,22 @@ fn getdents_small_buffer_advances_cookie() {
     assert!(all_names.iter().any(|n| n == b"."));
     assert!(all_names.iter().any(|n| n == b".."));
     assert!(all_names.iter().any(|n| n == b"lost+found"));
-    // Each live record must appear exactly once.
+    // Each live record must appear exactly once across the whole
+    // small-buffer walk; any dup means the cookie either reset or
+    // failed to advance past an emitted record.
     let dot_count = all_names.iter().filter(|n| n.as_slice() == b".").count();
-    assert_eq!(dot_count, 1);
+    assert_eq!(dot_count, 1, "`.` must appear exactly once");
+    let dotdot_count = all_names.iter().filter(|n| n.as_slice() == b"..").count();
+    assert_eq!(dotdot_count, 1, "`..` must appear exactly once");
+    let lost_found_count = all_names
+        .iter()
+        .filter(|n| n.as_slice() == b"lost+found")
+        .count();
+    assert_eq!(lost_found_count, 1, "`lost+found` must appear exactly once");
 
     sb.ops.unmount();
     drop(super_arc);
+    assert_eq!(disk.writes(), 0, "RO mount must not issue any writes");
 }
 
 // Sanity: the imports above ensure the harness links even when tests
