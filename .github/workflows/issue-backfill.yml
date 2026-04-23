@@ -46,7 +46,8 @@ jobs:
             "Skill(file-issue)"
             "mcp__github__search_issues"
             "mcp__github__add_issue_comment"
-            "mcp__github__issue_write"
+            "mcp__github__create_issue"
+            "mcp__github__update_issue"
           prompt: |
             You are a technical project manager for the vibix kernel — a hobby OS kernel written in Rust.
 
@@ -112,7 +113,7 @@ jobs:
             For each gap, invoke the `file-issue` skill (`/file-issue`). The skill handles
             dedupe, enforces the label taxonomy from `docs/agent-playbooks/prioritization.md`,
             and writes the canonical body template. Do **not** call `gh issue create` or
-            `mcp__github__issue_write` directly — go through the skill so every filed issue
+            `mcp__github__create_issue` directly — go through the skill so every filed issue
             is triaged on creation.
 
             Feed the skill, per issue:
