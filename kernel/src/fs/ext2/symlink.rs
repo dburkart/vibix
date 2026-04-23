@@ -1,4 +1,4 @@
-//! ext2 symlink read path — fast (inline) and slow (first data block).
+//! ext2 symlink read path — fast (inline) and slow (indirect walker).
 //!
 //! RFC 0004 (`docs/RFC/0004-ext2-filesystem-driver.md`), Workstream D
 //! wave 2, issue #563. ext2 stores the target of a symbolic link in one
@@ -17,30 +17,42 @@
 //! confusion". Missing any leg lets a crafted image leak up to 60 bytes
 //! of inode-table memory to userspace through `readlink`. The copy is
 //! always clamped to `min(i_size, 60, user_buflen)` on the fast path
-//! and `min(i_size, block_size, user_buflen)` on the slow path.
+//! and `min(i_size, user_buflen)` on the slow path (with `i_size`
+//! itself bounded by `EXT2_SYMLINK_READ_MAX`).
 //!
 //! `readlink(2)` is **not** NUL-terminated — POSIX mandates that
 //! callers use the return value as the byte count. This module returns
 //! the byte count; callers (`InodeOps::readlink`) must never append a
 //! trailing zero.
 //!
-//! # Slow-symlink scope in this wave
+//! # Slow-symlink read path
 //!
-//! Targets > 60 bytes live in the inode's data blocks. The full read
-//! path requires the indirect-block walker (issue #560, not yet
-//! merged). Until #560 lands, this module only handles slow symlinks
-//! whose entire target fits in the first direct block
-//! (`i_block[0]`) — i.e. `i_size <= block_size`. In practice every
-//! POSIX symlink target fits in a single 1 KiB / 4 KiB block (the
-//! hard cap is `PATH_MAX == 4096`), so the "walker required" case is
-//! only hit on ≤ 1 KiB-block filesystems with targets > 1 KiB, which
-//! are exceptionally rare. A target that would need indirect lookup
-//! returns `EIO` for now; the follow-up issue (linked at #563's close)
-//! wires the slow path through the walker in a later change.
+//! Targets > 60 bytes live in the inode's data blocks. The reader
+//! walks the block chain through [`super::indirect::resolve_block`] —
+//! the same routine that backs regular-file reads (see
+//! [`super::file::read_file_at`]) — and concatenates each block into
+//! the caller buffer. `PATH_MAX` (4096 including the implicit NUL,
+//! i.e. `EXT2_SYMLINK_TARGET_MAX == 4095` bytes) bounds the walk, so a
+//! legal symlink never chases past single-indirect even on a 1 KiB-
+//! block filesystem (4 × 1 KiB direct + 1 KiB indirect would already
+//! exceed the cap). An `i_size` above the cap surfaces as
+//! `ENAMETOOLONG` — image corruption rather than an honest POSIX
+//! symlink. Sparse holes inside a symlink body are structurally
+//! impossible; if [`resolve_block`] surfaces `Ok(None)` the image is
+//! treated as corrupt and the read returns `EIO`.
 
 #![allow(dead_code)]
 
 use super::disk::{Ext2Inode, EXT2_N_BLOCKS};
+
+/// Upper bound on a legal symlink target's `i_size`. POSIX caps a path
+/// at 4096 bytes including the trailing NUL; the on-disk symlink stores
+/// the target **without** a NUL, so the largest honest `i_size` is
+/// 4095. An `i_size` above this is image corruption — either a hostile
+/// image trying to spill the reader past a single allocated block, or
+/// a filesystem writer that didn't clamp. Matches
+/// [`super::link::EXT2_SYMLINK_TARGET_MAX`] on the write side.
+pub const EXT2_SYMLINK_READ_MAX: u32 = 4095;
 
 /// ext2 `i_mode` file-type mask. Matches the POSIX `S_IFMT` bitmask
 /// (top 4 bits of the 16-bit mode word).
@@ -113,25 +125,34 @@ pub fn read_fast_symlink(inode: &Ext2Inode, buf: &mut [u8]) -> Result<usize, i64
     Ok(n)
 }
 
-/// Copy the slow-symlink target out of the inode's **first direct
-/// block** into `buf`.
+/// Copy a slow-symlink target into `buf` via the indirect-block
+/// walker, returning the number of bytes written.
 ///
-/// This is the interim slow path while the indirect walker (#560) is
-/// in flight: it reads `inode.i_block[0]` through the buffer cache,
-/// clamps to `min(i_size, block_size, buf.len())`, and returns. A
-/// target that spills past the first direct block (requires `i_size >
-/// block_size`, i.e. `> 4 KiB` on a 4 KiB filesystem) returns `EIO` —
-/// callers that hit this case are blocked on the walker follow-up.
+/// Walks logical blocks `0..ceil(i_size / block_size)` through
+/// [`super::indirect::resolve_block`] — the same routine that backs
+/// regular-file reads — concatenating each block's contents into
+/// `buf`. The copy is clamped to `min(i_size, buf.len())`; on an
+/// attacker-forged image with `i_size > EXT2_SYMLINK_READ_MAX` the
+/// read surfaces `ENAMETOOLONG` before any `bread`, so a crafted
+/// inode cannot coax the reader into stitching together arbitrary
+/// amounts of disk content.
+///
+/// A zero pointer anywhere along the walk — including a sparse hole
+/// that [`resolve_block`] would normally report as `Ok(None)` — maps
+/// to `EIO`. A symlink is either wholly allocated or doesn't exist;
+/// a partially-allocated body is image corruption.
 ///
 /// Callers must have checked `is_symlink(inode) == true` and
-/// `is_fast_symlink(inode) == false` before entering.
+/// `is_fast_symlink(inode) == false` before entering. The dispatcher
+/// [`read_symlink`] already enforces this.
 #[cfg(all(feature = "ext2", target_os = "none"))]
-pub fn read_slow_symlink_direct_only(
+pub fn read_slow_symlink(
     inode: &Ext2Inode,
-    super_: &super::fs::Ext2Super,
+    super_: &alloc::sync::Arc<super::fs::Ext2Super>,
     buf: &mut [u8],
 ) -> Result<usize, i64> {
-    use crate::fs::{EINVAL, EIO};
+    use super::indirect::{resolve_block, Geometry, WalkError};
+    use crate::fs::{EINVAL, EIO, ENAMETOOLONG};
 
     if !is_symlink(inode) {
         return Err(EINVAL);
@@ -140,44 +161,69 @@ pub fn read_slow_symlink_direct_only(
         // Caller confusion: this entry point is the slow path only.
         return Err(EINVAL);
     }
+    // PATH_MAX guard. A legal POSIX symlink target is ≤ 4095 bytes
+    // (4096 including the implicit trailing NUL that userspace appends,
+    // which we do not store on disk). `i_size` above this is either
+    // corruption or a hostile image trying to spill the reader past
+    // the allocated extent; refuse loudly. Note the write path
+    // (`link::symlink`) clamps to the same cap before allocation, so
+    // no honest vibix-written symlink ever trips this.
+    if inode.i_size > EXT2_SYMLINK_READ_MAX {
+        return Err(ENAMETOOLONG);
+    }
+
     let block_size = super_.block_size as u64;
-    // Interim restriction: only the first direct block. Indirect walk
-    // lands with #560.
-    if (inode.i_size as u64) > block_size {
-        return Err(EIO);
-    }
-    let blk = inode.i_block[0];
-    if blk == 0 {
-        // Sparse / hole in a symlink is nonsense — symlinks are never
-        // partially allocated. Treat as EIO (image corruption).
-        return Err(EIO);
-    }
-    // Bounds-check against the filesystem extent. The full walker
-    // (#560) also rejects block pointers that fall inside the
-    // metadata-forbidden bitmap; here we only need the minimum
-    // sanity check — a hostile image could otherwise read any
-    // device sector.
+    debug_assert!(block_size > 0, "mount validated block_size != 0");
+
     let (s_first_data_block, s_blocks_count) = {
         let sb = super_.sb_disk.lock();
         (sb.s_first_data_block, sb.s_blocks_count)
     };
-    if (blk as u64) >= s_blocks_count as u64 {
-        return Err(EIO);
-    }
-    if (blk as u64) < s_first_data_block as u64 {
-        return Err(EIO);
+    let geom = Geometry::new(super_.block_size, s_first_data_block, s_blocks_count).ok_or(EIO)?;
+    let md = super::file::build_metadata_map(super_);
+
+    let total = core::cmp::min(inode.i_size as usize, buf.len());
+    if total == 0 {
+        return Ok(0);
     }
 
-    let bh = super_
-        .cache
-        .bread(super_.device_id, blk as u64)
-        .map_err(|_| EIO)?;
-    let data = bh.data.read();
-    let n = core::cmp::min(inode.i_size as usize, block_size as usize);
-    let n = core::cmp::min(n, buf.len());
-    let n = core::cmp::min(n, data.len());
-    buf[..n].copy_from_slice(&data[..n]);
-    Ok(n)
+    let mut copied = 0usize;
+    while copied < total {
+        let logical = (copied as u64 / block_size) as u32;
+        let in_block = copied % block_size as usize;
+        let remaining_in_block = block_size as usize - in_block;
+        let chunk = core::cmp::min(remaining_in_block, total - copied);
+
+        match resolve_block(
+            &super_.cache,
+            super_.device_id,
+            &geom,
+            &md,
+            &inode.i_block,
+            logical,
+            None,
+        ) {
+            Ok(Some(abs)) => {
+                let bh = super_
+                    .cache
+                    .bread(super_.device_id, abs as u64)
+                    .map_err(|_| EIO)?;
+                let data = bh.data.read();
+                debug_assert!(in_block + chunk <= data.len());
+                buf[copied..copied + chunk].copy_from_slice(&data[in_block..in_block + chunk]);
+            }
+            // A symlink body with a hole is corruption — see module
+            // docs. `write_slow_symlink_target` allocates every
+            // logical block before publishing the inode, so a hole
+            // means the image is lying to us.
+            Ok(None) => return Err(EIO),
+            Err(WalkError::Io) => return Err(EIO),
+            Err(WalkError::Corrupt) => return Err(EIO),
+        }
+        copied += chunk;
+    }
+
+    Ok(copied)
 }
 
 /// Dispatch entry point: copy a symlink's target into `buf`, returning
@@ -185,15 +231,15 @@ pub fn read_slow_symlink_direct_only(
 /// wires to for ext2 inodes (#559 wires the `InodeOps` impl itself).
 ///
 /// * Fast symlinks (target ≤ 60 bytes, stored inline) always succeed.
-/// * Slow symlinks fall back to the direct-block-only path while #560
-///   is in flight; targets > `block_size` return `EIO` until the
-///   indirect walker lands.
+/// * Slow symlinks walk the inode's data-block chain through the
+///   indirect walker ([`read_slow_symlink`]); `i_size >
+///   EXT2_SYMLINK_READ_MAX` surfaces as `ENAMETOOLONG`.
 /// * Non-symlink inodes return `EINVAL` — the POSIX errno for
 ///   `readlink` on a non-link.
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub fn read_symlink(
     inode: &Ext2Inode,
-    super_: &super::fs::Ext2Super,
+    super_: &alloc::sync::Arc<super::fs::Ext2Super>,
     buf: &mut [u8],
 ) -> Result<usize, i64> {
     if !is_symlink(inode) {
@@ -202,7 +248,7 @@ pub fn read_symlink(
     if is_fast_symlink(inode) {
         read_fast_symlink(inode, buf)
     } else {
-        read_slow_symlink_direct_only(inode, super_, buf)
+        read_slow_symlink(inode, super_, buf)
     }
 }
 

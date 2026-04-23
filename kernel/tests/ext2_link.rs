@@ -78,6 +78,14 @@ fn run_tests() {
         ),
         ("symlink_slow_61_bytes", &(symlink_slow_61_bytes as fn())),
         (
+            "symlink_slow_200_bytes_walker",
+            &(symlink_slow_200_bytes_walker as fn()),
+        ),
+        (
+            "symlink_read_rejects_oversize_i_size",
+            &(symlink_read_rejects_oversize_i_size as fn()),
+        ),
+        (
             "symlink_boundary_60_vs_61",
             &(symlink_boundary_60_vs_61 as fn()),
         ),
@@ -461,6 +469,100 @@ fn symlink_slow_61_bytes() {
     let n = read_symlink(&d, &super_arc, &mut buf).expect("read back slow symlink");
     assert_eq!(n, target.len());
     assert_eq!(&buf[..n], &target);
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Issue #603: wire the slow-symlink read through the indirect walker
+/// rather than the interim direct-only path. A 200-byte target stored
+/// in a single 1 KiB data block exercises the walker's direct-slot
+/// branch on the slow-symlink read code path. We can't construct a
+/// multi-block slow symlink yet because the write side
+/// (`write_slow_symlink_target`) still refuses targets larger than one
+/// block — that's tracked as its own follow-up — but the walker plumbs
+/// the same code path as regular-file reads, so exercising it here
+/// catches any regression in the slow-symlink pipeline.
+fn symlink_slow_200_bytes_walker() {
+    let (sb, _fs, super_arc, _disk) = mount_golden_rw();
+    let parent_vfs = iget(&super_arc, &sb, 2).expect("iget root");
+    let parent = make_ext2_inode_from_disk(&super_arc, &sb, 2);
+
+    // 200-byte target: well past the 60-byte fast boundary, still
+    // inside a single 1 KiB block so the write side is happy. The
+    // pattern is non-repeating enough that a mis-aligned or truncated
+    // read surfaces immediately.
+    let target: [u8; 200] = core::array::from_fn(|i| ((i as u32 * 131 + 17) & 0xff) as u8);
+    let sl = ext2_symlink(&super_arc, &parent, &parent_vfs, &sb, b"long200", &target)
+        .expect("symlink slow 200");
+    let sl_ino = sl.ino as u32;
+
+    let d = read_disk_inode(&super_arc, sl_ino);
+    assert!(is_symlink(&d));
+    assert!(
+        !is_fast_symlink(&d),
+        "200-byte target is past the inline boundary"
+    );
+    assert_eq!(d.i_size as usize, target.len());
+    assert_ne!(d.i_blocks, 0, "slow symlink allocates a data block");
+
+    // Full readback through the walker-backed slow path. Sentinel-fill
+    // the buffer so we catch a reader that over-writes past `i_size`.
+    let mut buf = [0xa5u8; 256];
+    let n = read_symlink(&d, &super_arc, &mut buf).expect("readback 200");
+    assert_eq!(n, target.len());
+    assert_eq!(&buf[..n], &target);
+    // Byte past the end must be untouched (no zero-terminate, no
+    // stray block copy).
+    assert_eq!(buf[n], 0xa5, "reader must not write past i_size");
+
+    // Short buffer: reader clamps to `buf.len()` without error.
+    let mut short = [0u8; 50];
+    let n = read_symlink(&d, &super_arc, &mut short).expect("readback short");
+    assert_eq!(n, 50);
+    assert_eq!(&short[..], &target[..50]);
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Issue #603: an `i_size` above `PATH_MAX - 1` (4095) is either
+/// image corruption or a hostile image trying to spill the reader
+/// past the allocated extent. The walker-backed slow-symlink reader
+/// must surface `ENAMETOOLONG` before issuing any `bread`. We
+/// construct the bogus state by creating a legal 64-byte slow
+/// symlink, then synthesising a disk inode with `i_size` poked up
+/// past the cap and running the reader against that struct directly.
+fn symlink_read_rejects_oversize_i_size() {
+    use vibix::fs::ext2::symlink::read_symlink as read_symlink_fn;
+
+    let (sb, _fs, super_arc, _disk) = mount_golden_rw();
+    let parent_vfs = iget(&super_arc, &sb, 2).expect("iget root");
+    let parent = make_ext2_inode_from_disk(&super_arc, &sb, 2);
+
+    // Create a real 64-byte slow symlink so we have a well-formed
+    // inode to mutate.
+    let target: [u8; 64] = core::array::from_fn(|i| b'z' - (i % 26) as u8);
+    let sl = ext2_symlink(
+        &super_arc,
+        &parent,
+        &parent_vfs,
+        &sb,
+        b"oversizebase",
+        &target,
+    )
+    .expect("symlink base");
+    let sl_ino = sl.ino as u32;
+
+    let mut d = read_disk_inode(&super_arc, sl_ino);
+    // 4096 == one past the legal cap. Don't write this back to disk —
+    // the test exercises the reader's in-memory guard only.
+    d.i_size = 4096;
+    let mut buf = [0u8; 256];
+    let err = read_symlink_fn(&d, &super_arc, &mut buf)
+        .err()
+        .expect("oversize i_size must fail");
+    assert_eq!(err, ENAMETOOLONG);
 
     sb.ops.unmount();
     drop(super_arc);
