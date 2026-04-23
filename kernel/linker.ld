@@ -60,7 +60,7 @@ SECTIONS
     } :data :dynamic
 
     /*
-     * The 256 KiB ksymtab reservation lives as a plain static in
+     * The 384 KiB ksymtab reservation lives as a plain static in
      * `.rodata` — no custom output section. Giving it its own output
      * section tripped rust-lld into merging `.data`/`.bss` into the
      * read-only rodata PT_LOAD, leaving writable globals mapped RO.
