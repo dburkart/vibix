@@ -64,6 +64,7 @@ const GOLDEN_IMG: &[u8; 65_536] = include_bytes!("../src/fs/ext2/fixtures/golden
 const SB_OFF_STATE: usize = 58;
 const SB_OFF_FEATURE_INCOMPAT: usize = 96;
 const SB_OFF_FEATURE_RO_COMPAT: usize = 100;
+const SB_OFF_MNT_COUNT: usize = 52;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -102,6 +103,22 @@ fn run_tests() {
         (
             "single_mount_latch_rejects_double_mount",
             &(single_mount_latch_rejects_double_mount as fn()),
+        ),
+        (
+            "rw_mount_bumps_mnt_count",
+            &(rw_mount_bumps_mnt_count as fn()),
+        ),
+        (
+            "clean_unmount_restores_valid_fs",
+            &(clean_unmount_restores_valid_fs as fn()),
+        ),
+        (
+            "dirty_mount_proceeds_with_warning",
+            &(dirty_mount_proceeds_with_warning as fn()),
+        ),
+        (
+            "ro_mount_does_not_rewrite_valid_fs",
+            &(ro_mount_does_not_rewrite_valid_fs as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -230,6 +247,13 @@ fn read_sb_state(disk: &RamDisk) -> u16 {
     let mut slot = [0u8; EXT2_SUPERBLOCK_SIZE];
     disk.read_slot(1024, &mut slot);
     u16::from_le_bytes([slot[SB_OFF_STATE], slot[SB_OFF_STATE + 1]])
+}
+
+/// Read the on-disk `s_mnt_count`.
+fn read_sb_mnt_count(disk: &RamDisk) -> u16 {
+    let mut slot = [0u8; EXT2_SUPERBLOCK_SIZE];
+    disk.read_slot(1024, &mut slot);
+    u16::from_le_bytes([slot[SB_OFF_MNT_COUNT], slot[SB_OFF_MNT_COUNT + 1]])
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +498,123 @@ fn single_mount_latch_rejects_double_mount() {
         .mount(MountSource::None, MountFlags::RDONLY)
         .expect("post-unmount mount must succeed");
     sb2.ops.unmount();
+}
+
+/// RW mount increments `s_mnt_count` on disk — the counter that an
+/// `e2fsck -p` uses (together with `s_max_mnt_count`) to decide when a
+/// periodic check is due. Also exercises that the in-memory `sb_disk`
+/// mirror reflects the stamped state: if it didn't, a follow-up
+/// allocator flush would clobber ERROR_FS with the stale pre-mount
+/// VALID_FS (#617 item 5).
+fn rw_mount_bumps_mnt_count() {
+    let disk = fresh_disk();
+    let before = read_sb_mnt_count(&disk);
+
+    let fs = Ext2Fs::new_with_device(disk.clone() as Arc<dyn BlockDevice>);
+    let sb = fs
+        .mount(MountSource::None, MountFlags::default())
+        .expect("RW mount must succeed");
+
+    let after = read_sb_mnt_count(&disk);
+    assert_eq!(
+        after,
+        before + 1,
+        "RW mount must increment s_mnt_count ({} -> {})",
+        before,
+        after,
+    );
+    assert_eq!(read_sb_state(&disk), EXT2_ERROR_FS);
+
+    sb.ops.unmount();
+}
+
+/// Clean unmount must rewrite `s_state = EXT2_VALID_FS`. A subsequent
+/// mount of the same image then sees a clean filesystem.
+fn clean_unmount_restores_valid_fs() {
+    let disk = fresh_disk();
+    assert_eq!(read_sb_state(&disk), EXT2_VALID_FS);
+
+    let fs = Ext2Fs::new_with_device(disk.clone() as Arc<dyn BlockDevice>);
+    let sb = fs
+        .mount(MountSource::None, MountFlags::default())
+        .expect("RW mount must succeed");
+
+    // During the mount, disk state is ERROR_FS.
+    assert_eq!(
+        read_sb_state(&disk),
+        EXT2_ERROR_FS,
+        "RW mount stamped ERROR_FS",
+    );
+
+    // Clean unmount restores VALID_FS.
+    sb.ops.unmount();
+    assert_eq!(
+        read_sb_state(&disk),
+        EXT2_VALID_FS,
+        "clean unmount must write EXT2_VALID_FS back",
+    );
+
+    // A second mount of the same factory (same disk) must see a clean
+    // state at mount-time entry — proving the re-mount cycle works.
+    let sb2 = fs
+        .mount(MountSource::None, MountFlags::default())
+        .expect("re-mount after clean unmount must succeed");
+    // Again stamped ERROR_FS during the mount body.
+    assert_eq!(read_sb_state(&disk), EXT2_ERROR_FS);
+    sb2.ops.unmount();
+    assert_eq!(read_sb_state(&disk), EXT2_VALID_FS);
+}
+
+/// A mount that finds `s_state != VALID_FS` (simulating an unclean
+/// crash) must still succeed — we log a warning but proceed. The new
+/// mount then re-stamps ERROR_FS (so the counter is consistent) and a
+/// clean unmount closes the cycle back to VALID_FS.
+fn dirty_mount_proceeds_with_warning() {
+    let disk = fresh_disk();
+    // Pretend the last mount crashed: zero out `s_state` on disk. This
+    // is NOT the same as ERROR_FS (0x2) nor VALID_FS (0x1); it exercises
+    // the "not clean" branch without pre-staining ERROR_FS.
+    disk.patch(|storage| {
+        let off = 1024 + SB_OFF_STATE;
+        storage[off] = 0;
+        storage[off + 1] = 0;
+    });
+    assert_eq!(read_sb_state(&disk), 0);
+
+    let fs = Ext2Fs::new_with_device(disk.clone() as Arc<dyn BlockDevice>);
+    let sb = fs
+        .mount(MountSource::None, MountFlags::default())
+        .expect("dirty mount must still succeed");
+
+    // ERROR_FS stamp landed.
+    assert_eq!(read_sb_state(&disk), EXT2_ERROR_FS);
+
+    sb.ops.unmount();
+    assert_eq!(
+        read_sb_state(&disk),
+        EXT2_VALID_FS,
+        "clean unmount writes VALID_FS even if prior mount found dirty fs",
+    );
+}
+
+/// RO mount's unmount path must not touch `s_state` — it never stamped
+/// ERROR_FS at mount, so rewriting VALID_FS would be a spurious device
+/// write. Verified by write-counter on the ramdisk.
+fn ro_mount_does_not_rewrite_valid_fs() {
+    let disk = fresh_disk();
+    let fs = Ext2Fs::new_with_device(disk.clone() as Arc<dyn BlockDevice>);
+    let sb = fs
+        .mount(MountSource::None, MountFlags::RDONLY)
+        .expect("RO mount succeeds");
+
+    let writes_before_unmount = disk.writes();
+    sb.ops.unmount();
+    assert_eq!(
+        disk.writes(),
+        writes_before_unmount,
+        "RO mount's unmount must not drive any writes",
+    );
+    assert_eq!(read_sb_state(&disk), EXT2_VALID_FS);
 }
 
 /// Quiet an unused-import warning when `alloc::vec!` and friends are
