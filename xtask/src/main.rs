@@ -4,6 +4,8 @@
 //!   build         — cargo-build the kernel for x86_64-unknown-none
 //!   initrd        — build target/rootfs.tar (minimal USTAR rootfs tarball)
 //!   ext2-image    — build target/vibix-root.ext2 (deterministic ext2 rootfs; #579)
+//!   pjdfstest     — build pjdfstest runner, embed into ext2 image, boot under
+//!                   QEMU, parse TEST_PASS/TEST_FAIL serial markers (#581)
 //!   iso           — build, fetch Limine, produce target/vibix.iso
 //!   run           — iso, then boot under QEMU with serial-stdio
 //!   test          — run host unit tests + QEMU integration tests
@@ -28,6 +30,7 @@ use std::time::Duration;
 mod ext2_image;
 mod isr_audit;
 mod lntab;
+mod pjdfstest;
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -178,11 +181,28 @@ fn main() -> R<()> {
             let path = ext2_image::build(&workspace_root(), None, update_hash)?;
             println!("→ ext2-image: {}", path.display());
         }
+        "pjdfstest" => {
+            // Build closure is injected so the pjdfstest module doesn't
+            // need to see the `BuildOpts` type — it just needs a kernel
+            // ELF path.
+            let opts_clone = BuildOpts {
+                release: opts.release,
+                fault_test: opts.fault_test,
+                panic_test: opts.panic_test,
+                bench: opts.bench,
+                fork_trace: opts.fork_trace,
+            };
+            pjdfstest::run(
+                &workspace_root(),
+                move || build(&opts_clone),
+                "iso_pjdfstest",
+            )?;
+        }
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }

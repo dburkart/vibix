@@ -32,7 +32,9 @@ use crate::{
 crate::test_case! {
     /// link creates hardlinks which share the same metadata
     // link/00.t#23-41
-    share_metadata, root => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix — matrix compiles on host
+    // but the corresponding syscalls (mkfifo/mknod) aren't implemented (#581).
+    share_metadata, root => [Regular, Socket]
 }
 fn share_metadata(ctx: &mut TestContext, ft: FileType) {
     let file = ctx.create(ft).unwrap();
@@ -88,7 +90,8 @@ fn share_metadata(ctx: &mut TestContext, ft: FileType) {
 crate::test_case! {
     /// Removing a link should only change the number of links
     // link/00.t
-    remove_link => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    remove_link => [Regular, Socket]
 }
 fn remove_link(ctx: &mut TestContext, ft: FileType) {
     let file = ctx.create(ft).unwrap();
@@ -122,7 +125,8 @@ fn remove_link(ctx: &mut TestContext, ft: FileType) {
 crate::test_case! {
     /// link changes ctime of file along with ctime and mtime of parent when sucessful
     // link/00.t
-    changed_ctime_success => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    changed_ctime_success => [Regular, Socket]
 }
 fn changed_ctime_success(ctx: &mut TestContext, ft: FileType) {
     let file = ctx.create(ft).unwrap();
@@ -138,7 +142,8 @@ fn changed_ctime_success(ctx: &mut TestContext, ft: FileType) {
 crate::test_case! {
     /// link changes neither ctime of file nor ctime or mtime of parent when it fails
     // link/00.t#77
-    unchanged_ctime_fails, serialized, root => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    unchanged_ctime_fails, serialized, root => [Regular, Socket]
 }
 fn unchanged_ctime_fails(ctx: &mut SerializedTestContext, ft: FileType) {
     let file = ctx.create(ft).unwrap();
@@ -235,7 +240,8 @@ fn enoent_source_not_exists(ctx: &mut TestContext) {
 crate::test_case! {
     /// link returns EEXIST if the destination file exists
     // link/10.t
-    eexist_dest_exists => [Regular, Dir, Fifo, Block, Char, Socket, Symlink(None)]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    eexist_dest_exists => [Regular, Dir, Socket, Symlink(None)]
 }
 fn eexist_dest_exists(ctx: &mut TestContext, ft: FileType) {
     let path = ctx.create(ft).unwrap();
