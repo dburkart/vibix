@@ -146,9 +146,10 @@ pub fn setattr(ext2_inode: &Ext2Inode, inode: &Inode, attr: &SetAttr) -> Result<
             shrunk_blocks = 0;
         }
     } else {
-        new_size = ext2_inode.meta.read().size;
-        new_i_block = ext2_inode.meta.read().i_block;
-        new_i_blocks_512 = ext2_inode.meta.read().i_blocks;
+        let m = ext2_inode.meta.read();
+        new_size = m.size;
+        new_i_block = m.i_block;
+        new_i_blocks_512 = m.i_blocks;
         shrunk_blocks = 0;
     }
 
@@ -168,6 +169,20 @@ pub fn setattr(ext2_inode: &Ext2Inode, inode: &Inode, attr: &SetAttr) -> Result<
     // lock, so the RMW critical section below does not nest `sb_disk`
     // inside `ext2_meta` / `vfs_meta`.
     let large_file = (super_ref.sb_disk.lock().s_feature_ro_compat & RO_COMPAT_LARGE_FILE) != 0;
+
+    // Validate the in-block inode-slot range *before* we mutate any
+    // in-memory meta — once we've taken the `ext2_meta` / `vfs_meta`
+    // write locks below, any fallible step would leave the in-memory
+    // and on-disk views diverged (stat(2) would see the new values
+    // but a remount would revert). `locate_inode_slot` already
+    // bounds-checks the offset against the block table, so this is
+    // paranoid; we keep it to keep the post-lock path infallible.
+    {
+        let data_len = bh.data.read().len();
+        if offset_in_block + EXT2_INODE_SIZE_V0 > data_len {
+            return Err(EIO);
+        }
+    }
 
     // Compute the new disk view + write back atomically under the
     // buffer's write guard. Holding the ext2 meta write-lock across

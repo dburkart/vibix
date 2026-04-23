@@ -58,9 +58,13 @@ const READ_IMG: &[u8; 1_048_576] = include_bytes!("../src/fs/ext2/fixtures/read_
 const INO_SMALL: u32 = 12;
 const INO_LARGE: u32 = 13;
 
-// `large.bin` is 300 × 1 KiB blocks = 12 direct + 1 indirect block + 288
-// single-indirect data blocks. The count of indirect blocks held by
-// the file is therefore 1 (single-indirect root only).
+// `large.bin` is 300 × 1 KiB blocks (ppb = 256, so 1024/4 ptrs per
+// block): 12 direct + 256 single-indirect data + 32 double-indirect
+// data. The indirect-tree spine costs 3 blocks on top: 1 single-
+// indirect root, 1 double-indirect root, 1 inner single-indirect.
+// Hence `truncate_to_zero_frees_every_block` expects 303 freed, and a
+// shrink to 4 KiB (4 direct blocks retained) frees 296 data + 3
+// indirect = 299.
 const LARGE_SIZE: u64 = 300 * 1024;
 
 #[no_mangle]
