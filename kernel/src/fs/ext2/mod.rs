@@ -98,3 +98,12 @@ pub use orphan::{validate_orphan_chain, ForceRo};
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use balloc::{alloc_block, free_block};
+
+// Inode-bitmap allocator (#566). Same feature gate as `fs` / `inode`
+// because it consumes `Ext2Super` and drives the buffer cache. The
+// public surface is two free functions: `alloc_inode` / `free_inode`.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod ialloc;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use ialloc::{alloc_inode, free_inode};
