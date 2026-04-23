@@ -175,12 +175,19 @@ pub fn build(workspace_root: &Path, init_src: Option<&Path>, update_hash: bool) 
                 }
             }
         }
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = expected_path.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&expected_path, format!("{got}\n"))?;
             eprintln!("→ ext2-image: seeded {}", expected_path.display());
+        }
+        Err(e) => {
+            return Err(format!(
+                "ext2-image: failed reading expected hash {}: {e}",
+                expected_path.display()
+            )
+            .into());
         }
     }
 
