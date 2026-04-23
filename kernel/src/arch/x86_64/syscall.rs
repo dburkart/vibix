@@ -1042,6 +1042,39 @@ pub fn exec_atomic(elf_bytes: &[u8]) -> Result<core::convert::Infallible, i64> {
     use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
     use x86_64::VirtAddr;
 
+    // 0. Gate: refuse dynamically-linked binaries (issue #578).
+    //
+    //    Until a userspace dynamic linker (ld.so) is implemented, vibix
+    //    cannot run ELFs that request an interpreter via `PT_INTERP`.
+    //    Partially loading such an image (or jumping to an unresolved
+    //    entry) would crash the process; refusing it cleanly with
+    //    ENOEXEC lets the caller observe a normal error return and
+    //    fall back to whatever shell / launcher semantics apply.
+    //
+    //    The check lives here (in the execve syscall path) rather than
+    //    inside `load_user_elf_with_vmas` so that kernel bootstrap paths
+    //    — which can still ship an interpreter via a Limine module —
+    //    remain free to use the loader's PT_INTERP plumbing directly.
+    if let Some(parsed) = crate::mem::elf::try_parse_elf64(elf_bytes) {
+        if let Some(interp) = parsed.interp_path() {
+            // Decode the interpreter path up to the first non-printable
+            // byte so the log line is human-readable without pulling in
+            // a full UTF-8 validator; malformed paths still print, just
+            // truncated at the first unprintable byte.
+            let printable_len = interp
+                .iter()
+                .position(|&b| !(0x20..0x7f).contains(&b))
+                .unwrap_or(interp.len());
+            let printable = core::str::from_utf8(&interp[..printable_len]).unwrap_or("<?>");
+            crate::serial_println!(
+                "execve: refusing dynamically-linked binary (PT_INTERP=\"{}\"): \
+                 dynamic linking not supported yet — returning ENOEXEC",
+                printable
+            );
+            return Err(-8i64); // ENOEXEC
+        }
+    }
+
     // 1. Build a fresh AddressSpace with its own PML4.
     let mut new_aspace = AddressSpace::try_new_empty().map_err(|_| -12i64)?;
     let new_pml4 = new_aspace.page_table_frame();

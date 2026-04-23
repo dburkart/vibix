@@ -193,6 +193,10 @@ name = "execve_atomic"
 harness = false
 
 [[test]]
+name = "execve_rejects_ptinterp"
+harness = false
+
+[[test]]
 name = "fork_cow"
 harness = false
 
