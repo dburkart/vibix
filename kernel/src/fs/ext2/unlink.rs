@@ -170,10 +170,11 @@ fn locate_dirent(
     Err(ENOENT)
 }
 
-/// Is `dir`'s content limited to `.` and `..`? Walks the first block
-/// only (RFC 0004: empty directories always fit in their first data
-/// block; a directory larger than one block is by definition
-/// non-empty).
+/// Is `dir`'s content limited to `.` and `..`? Walks every allocated
+/// block: ext2 directories don't shrink when names are removed, so a
+/// formerly-full directory can have multiple allocated blocks with
+/// only `.` / `..` still live. A single non-`.`/`..` live record
+/// anywhere in the walk proves the directory is non-empty.
 fn dir_is_empty(super_: &Arc<Ext2Super>, dir: &Ext2Inode) -> Result<bool, i64> {
     let block_size = super_.block_size;
     let (s_first_data_block, s_blocks_count, s_feature_incompat) = {
@@ -436,7 +437,6 @@ fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
 /// `i_links_count` has been flushed.
 fn push_on_orphan_list(
     super_: &Arc<Ext2Super>,
-    sb_vfs: &Arc<SuperBlock>,
     child_ino: u32,
     child_inode: &Arc<Inode>,
 ) -> Result<(), i64> {
@@ -466,7 +466,6 @@ fn push_on_orphan_list(
     //    caller-supplied Inode Arc; this is the same object the VFS
     //    holds through any still-open fd, so the refcount-based
     //    "last close" detection (#573) will work directly against it.
-    let _ = sb_vfs;
     super_
         .orphan_list
         .lock()
@@ -603,7 +602,7 @@ fn unlink_common(
     // 8. On hit-zero: mark unlinked, push on orphan list.
     if new_links == 0 {
         child_ext2.unlinked.store(true, Ordering::SeqCst);
-        push_on_orphan_list(&super_, &parent_sb, loc.child_ino, &child_arc)?;
+        push_on_orphan_list(&super_, loc.child_ino, &child_arc)?;
     }
 
     Ok(())
