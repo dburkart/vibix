@@ -254,6 +254,16 @@ impl InodeOps for Ext2Inode {
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), i64> {
         super::unlink::rmdir(self, dir, name)
     }
+
+    /// Persist a subset of the inode's metadata fields (mode / uid /
+    /// gid / size / {a,m,c}time) to the on-disk inode slot via the
+    /// buffer cache. Truncate — i.e. `SetAttrMask::SIZE` with a smaller
+    /// `size` — also frees data + indirect blocks beyond the new EOF
+    /// through [`super::balloc::free_block`]. See
+    /// [`super::setattr::setattr`] for the full semantics.
+    fn setattr(&self, inode: &Inode, attr: &crate::fs::vfs::ops::SetAttr) -> Result<(), i64> {
+        super::setattr::setattr(self, inode, attr)
+    }
 }
 
 /// Zero-sized marker type re-exported from wave 2 as the `FileOps`
