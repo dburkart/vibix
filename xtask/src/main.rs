@@ -51,7 +51,7 @@ const QEMU_EXIT_FAILURE: i32 = 33; // (0x10 << 1) | 1
 
 /// Hard ceiling on an individual QEMU boot during tests — most real
 /// tests finish in <1 s; this catches hangs. Sized for un-accelerated
-/// QEMU on shared CI runners where boot + 80-ish spawn/reap rounds
+/// QEMU on shared CI runners where boot + ~40 spawn/reap cycles
 /// (`wait4_condvar_race::wait4_repeated_rounds_no_wedge`) can
 /// legitimately take double-digit seconds under load (see #619).
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
