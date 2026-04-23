@@ -110,7 +110,14 @@ impl<'a> SbActiveGuard<'a> {
 
 impl Drop for SbActiveGuard<'_> {
     fn drop(&mut self) {
-        self.sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+        // `fetch_sub` returns the old value; old==1 means this drop
+        // brought the pin count to zero. If the mount was
+        // lazy-detached via `MNT_DETACH`, that zero edge is our
+        // signal to run the deferred `sync_fs` + `ops.unmount`.
+        let old = self.sb.sb_active.fetch_sub(1, Ordering::SeqCst);
+        if old == 1 {
+            super::mount_table::finalize_pending_detach(self.sb);
+        }
     }
 }
 
