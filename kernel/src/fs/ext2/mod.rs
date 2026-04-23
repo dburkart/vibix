@@ -22,6 +22,15 @@
 pub mod disk;
 pub mod symlink;
 
+// Directory iterator (RFC 0004 §Directory operations). The per-block
+// iterator and its validators are pure logic and host-testable, so the
+// module is always compiled. The `lookup` / `getdents64` entry points
+// that walk a whole directory live inside a `#[cfg(all(feature =
+// "ext2", target_os = "none"))]` block inside `dir.rs` itself — they
+// need `Ext2Super` and the buffer cache, which are gated on the same
+// envelope.
+pub mod dir;
+
 // The indirect-block walker is gated on the same `any(test, target_os =
 // "none")` envelope the rest of the block-backed code uses: it depends on
 // [`crate::block::cache::BlockCache`], which in turn is only compiled for

@@ -384,3 +384,8 @@ required-features = ["ext2"]
 name = "ext2_block_alloc"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_dir_ops"
+harness = false
+required-features = ["ext2"]
