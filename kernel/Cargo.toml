@@ -414,3 +414,8 @@ required-features = ["ext2"]
 name = "ext2_create"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_link"
+harness = false
+required-features = ["ext2"]

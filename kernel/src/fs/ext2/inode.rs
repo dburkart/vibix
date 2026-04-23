@@ -297,6 +297,32 @@ impl InodeOps for Ext2Inode {
         let sb = dir.sb.upgrade().ok_or(EIO)?;
         super::create::mknod(&super_ref, self, dir, &sb, name, InodeKind::Fifo, mode, 0)
     }
+
+    /// Create a hard link `name` under `dir` pointing at `target`.
+    ///
+    /// Dispatches to [`super::link::link`]. Bumps the target inode's
+    /// `i_links_count`, flushes the slot, then splices a new dirent
+    /// into the parent's directory block. Directory targets are
+    /// refused with `EPERM`; cross-superblock links with `EXDEV`.
+    fn link(&self, dir: &Inode, name: &[u8], target: &Inode) -> Result<(), i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        super::link::link(&super_ref, self, dir, target, name)
+    }
+
+    /// Create a symbolic link `name` under `dir` whose target path is
+    /// `target`.
+    ///
+    /// Dispatches to [`super::link::symlink`]. Targets ≤ 60 bytes are
+    /// stored inline in `i_block[]` (fast symlink); longer targets
+    /// allocate one data block via [`super::balloc::alloc_block`] and
+    /// write the bytes there (slow symlink). `i_mode` is `S_IFLNK |
+    /// 0o777` regardless of any caller-supplied mode — POSIX mandates
+    /// 0777 for symlinks.
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let sb = dir.sb.upgrade().ok_or(EIO)?;
+        super::link::symlink(&super_ref, self, dir, &sb, name, target)
+    }
 }
 
 /// Zero-sized marker type re-exported from wave 2 as the `FileOps`
