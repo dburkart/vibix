@@ -122,6 +122,10 @@ fn main() -> R<()> {
     let panic_test = take_flag(&mut args, "--panic-test");
     let bench = take_flag(&mut args, "--bench");
     let fork_trace = take_flag(&mut args, "--fork-trace");
+    // `--root=<kind>` must be extracted before we index into `args` for
+    // the subcommand, otherwise `cargo xtask --root=ext2 run` would
+    // treat `--root=ext2` as the subcommand name and fail.
+    let root_flag = take_value(&mut args, "--root=");
 
     let cmd = args
         .first()
@@ -145,7 +149,7 @@ fn main() -> R<()> {
             iso(&opts)?;
         }
         "run" => {
-            run(&opts)?;
+            run(&opts, root_flag.as_deref())?;
         }
         "test" => test_all()?,
         "test-unit" => test_unit()?,
@@ -193,6 +197,16 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Take a `--key=value` style flag out of the pre-subcommand args so
+/// it can't be confused with the subcommand itself (e.g.
+/// `cargo xtask --root=ext2 run` must not treat `--root=ext2` as the
+/// subcommand). Returns the extracted value, if present.
+fn take_value(args: &mut Vec<String>, prefix: &str) -> Option<String> {
+    let pos = args.iter().position(|a| a.starts_with(prefix))?;
+    let removed = args.remove(pos);
+    removed.strip_prefix(prefix).map(str::to_string)
 }
 
 struct BuildOpts {
@@ -969,28 +983,33 @@ fn iso(opts: &BuildOpts) -> R<PathBuf> {
     Ok(iso)
 }
 
-fn run(opts: &BuildOpts) -> R<()> {
-    run_with_root(opts, &[])
+fn run(opts: &BuildOpts, root_flag: Option<&str>) -> R<()> {
+    run_with_root(opts, root_flag, &[])
 }
 
 /// Shared QEMU boot path for `cargo xtask run` and its `--root=<kind>`
-/// variants. `extra_args` is merged straight into the kernel-cmdline
+/// variants. `cmdline_extras` is merged straight into the kernel-cmdline
 /// Limine passes through, so `--root=ext2` becomes a `cmdline:
 /// root=/dev/vda` line in the generated Limine config. The `iso` is
 /// rebuilt inside this function so the cmdline mutation lands in the
 /// actual boot image.
-fn run_with_root(opts: &BuildOpts, cmdline_extras: &[&str]) -> R<()> {
-    // The `--root=<kind>` flag is parsed off `std::env::args` directly
-    // so we don't have to thread yet another field through `BuildOpts`.
-    // `--root=ext2` replaces the scratch test-disk with the
-    // deterministic ext2 image from `xtask ext2-image` (#579) and
-    // appends `root=/dev/vda` to the kernel cmdline so vfs::init
-    // chooses ext2 on the virtio-blk device. Any other value
-    // (including absent) keeps today's behaviour: scratch test-disk,
-    // default-auto rootfs probe.
-    let root_flag = std::env::args().find_map(|a| a.strip_prefix("--root=").map(str::to_string));
-
-    let (disk, mut extra_cmdline): (PathBuf, Vec<String>) = match root_flag.as_deref() {
+///
+/// `--root=ext2` replaces the scratch test-disk with the deterministic
+/// ext2 image from `xtask ext2-image` (#579) and appends `root=/dev/vda`
+/// to the kernel cmdline so `vfs::init` can choose ext2 on the
+/// virtio-blk device. Any other value (including absent) keeps today's
+/// behaviour: scratch test-disk, default-auto rootfs probe.
+///
+/// Note (tracked as a follow-up): the prod `_start` path in
+/// `kernel/src/main.rs` parses the cmdline but does not yet call
+/// `vfs::init::init_with(root_args)` — it calls the individual subsystem
+/// bring-up functions without touching the VFS. So `--root=ext2` today
+/// is primarily useful for QEMU-side verification (virtio disk, cmdline
+/// plumbing) and the ext2 mount path continues to be exercised via the
+/// integration tests that call `vibix::init` through `init_with`. Wiring
+/// the prod boot path end-to-end is deferred so this PR stays small.
+fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&str]) -> R<()> {
+    let (disk, mut extra_cmdline): (PathBuf, Vec<String>) = match root_flag {
         Some("ext2") => {
             let img = ext2_image::build(&workspace_root(), None, false)?;
             println!("→ root=ext2: booting {}", img.display());
