@@ -43,7 +43,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::disk::{
     Ext2GroupDesc, Ext2SuperBlock, EXT2_DYNAMIC_REV, EXT2_ERROR_FS, EXT2_GOOD_OLD_FIRST_INO,
     EXT2_GOOD_OLD_INODE_SIZE, EXT2_GOOD_OLD_REV, EXT2_GROUP_DESC_SIZE, EXT2_MAGIC,
-    EXT2_SUPERBLOCK_SIZE, INCOMPAT_FILETYPE, RO_COMPAT_LARGE_FILE, RO_COMPAT_SPARSE_SUPER,
+    EXT2_SUPERBLOCK_SIZE, EXT2_VALID_FS, INCOMPAT_FILETYPE, RO_COMPAT_LARGE_FILE,
+    RO_COMPAT_SPARSE_SUPER,
 };
 
 use crate::block::cache::{BlockCache, DeviceId};
@@ -387,7 +388,30 @@ impl FileSystem for Ext2Fs {
         //    crash is detectable on the next mount. The canonical
         //    `VALID_FS` is rewritten only by a clean unmount. RO
         //    mounts MUST NOT touch the device.
+        //
+        //    Also bump `s_mnt_count` and refresh `s_mtime` per RFC 0004
+        //    §s_state. If the on-disk `s_state` is *not* `VALID_FS`, the
+        //    previous mount was unclean — we log and proceed; no fsck
+        //    is wired up in this epic (RFC 0004 §Out of scope).
+        //
+        //    `sb_after_stamp` captures what actually went to disk so
+        //    the in-memory `sb_disk` mirror (used by `flush_superblock`
+        //    in the allocator paths and by `statfs`) is coherent with
+        //    the device. Without this refresh, a later allocator write
+        //    would re-encode the pre-stamp `s_state` = `VALID_FS` and
+        //    clobber the ERROR_FS marker (#617 item 5).
+        let mut sb_after_stamp = on_disk_sb.clone();
         if !effective_rdonly {
+            if on_disk_sb.s_state & EXT2_VALID_FS == 0 {
+                crate::kwarn!(
+                    "ext2: mount on dirty filesystem (s_state={:#x}); fsck recommended",
+                    on_disk_sb.s_state,
+                );
+            }
+            sb_after_stamp.s_state = EXT2_ERROR_FS;
+            sb_after_stamp.s_mnt_count = on_disk_sb.s_mnt_count.saturating_add(1);
+            sb_after_stamp.s_mtime = now_secs();
+
             // Fetch the superblock block through the cache (block `s_first_data_block`
             // on 1 KiB filesystems = block 1; on ≥ 2 KiB = block 0).
             let sb_block_no = sb_block_for(block_size);
@@ -402,9 +426,7 @@ impl FileSystem for Ext2Fs {
             {
                 let mut data = sb_bh.data.write();
                 let slot = &mut data[sb_offset_in_block..sb_offset_in_block + EXT2_SUPERBLOCK_SIZE];
-                let mut updated = on_disk_sb.clone();
-                updated.s_state = EXT2_ERROR_FS;
-                updated.encode_to_slot(slot);
+                sb_after_stamp.encode_to_slot(slot);
             }
             cache.mark_dirty(&sb_bh);
             if cache.sync_dirty_buffer(&sb_bh).is_err() {
@@ -439,7 +461,7 @@ impl FileSystem for Ext2Fs {
             block_size,
             inode_size,
             first_ino,
-            sb_disk: spin::Mutex::new(on_disk_sb),
+            sb_disk: spin::Mutex::new(sb_after_stamp),
             bgdt: spin::Mutex::new(bgdt),
             ext2_flags,
             owner: self.self_ref.clone(),
@@ -687,17 +709,33 @@ impl SuperOps for Ext2Super {
 
     fn unmount(&self) {
         // Contract: unmount must not propagate errors (see SuperOps
-        // docs, §Phase B contract). Best-effort flush the dirty set.
-        // An error here is logged-and-dropped; a retry is a no-op at
-        // this point because the VFS has already detached the mount.
+        // docs, §Phase B contract). Best-effort:
+        //
+        //   1. Flush any dirty buffers accumulated by the write path.
+        //   2. On a writable mount, stamp `s_state := EXT2_VALID_FS`
+        //      and refresh `s_wtime` (RFC 0004 §s_state). A wave-2 RO
+        //      mount never touched the device, so we skip the stamp
+        //      there — the prior `s_state` is still the caller's truth.
+        //   3. Flush once more so the VALID_FS marker reaches the
+        //      device before the cache is dropped.
+        //
+        // An error anywhere here is logged-and-dropped; a retry is a
+        // no-op at this point because the VFS has already detached the
+        // mount.
         let _ = self.cache.sync_fs(self.device_id);
 
-        // TODO(#559+): rewrite `s_state := EXT2_VALID_FS` on a clean
-        // unmount. Requires wave 3 to have touched the filesystem
-        // through the mutating surface; a wave-2 unmount that ran no
-        // writes can safely leave s_state as ERROR_FS (the next mount
-        // will still recognise it as ext2 and a later fsck will be
-        // run anyway).
+        // Only writable mounts should rewrite `s_state`. A forced-RO
+        // or caller-RO mount never stamped ERROR_FS in the first
+        // place, so leaving `s_state` alone is correct.
+        if !self.ext2_flags.contains(Ext2MountFlags::RDONLY)
+            && !self.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
+        {
+            if let Err(e) = self.write_clean_state() {
+                crate::kwarn!("ext2: unmount: failed to write clean s_state: errno={}", e,);
+            } else {
+                let _ = self.cache.sync_fs(self.device_id);
+            }
+        }
 
         // Release the single-mount latch so a subsequent mount of the
         // same factory can succeed. Also clear the weak back-reference
@@ -708,6 +746,51 @@ impl SuperOps for Ext2Super {
             *fs.current_super.lock() = Weak::new();
             fs.mounted.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+impl Ext2Super {
+    /// Write `s_state = EXT2_VALID_FS` and refresh `s_wtime` on the
+    /// clean-unmount path. Reads the live `sb_disk` mirror, mutates
+    /// those two fields, then RMWs the superblock buffer and flushes
+    /// synchronously. The `sb_disk` mirror is updated in-place so a
+    /// later allocator `flush_superblock()` (on a re-mount path that
+    /// shared this Ext2Super — currently impossible, but cheap to
+    /// keep coherent) sees VALID_FS too.
+    fn write_clean_state(&self) -> Result<(), i64> {
+        let block_size = self.block_size as u64;
+        if block_size == 0 {
+            return Err(EIO);
+        }
+        let sb_block = SUPERBLOCK_BYTE_OFFSET / block_size;
+        let sb_offset_in_block = (SUPERBLOCK_BYTE_OFFSET % block_size) as usize;
+
+        // Update the in-memory mirror first. If the RMW below fails,
+        // the mirror is still a truthful reflection of the *intended*
+        // clean state — any follow-up flush attempt will carry it
+        // through.
+        let mut sb = self.sb_disk.lock();
+        sb.s_state = EXT2_VALID_FS;
+        sb.s_wtime = now_secs();
+        let sb_snapshot = sb.clone();
+        drop(sb);
+
+        let bh = self
+            .cache
+            .bread(self.device_id, sb_block)
+            .map_err(|_| EIO)?;
+        {
+            let mut data = bh.data.write();
+            if sb_offset_in_block + EXT2_SUPERBLOCK_SIZE > data.len() {
+                return Err(EIO);
+            }
+            sb_snapshot.encode_to_slot(
+                &mut data[sb_offset_in_block..sb_offset_in_block + EXT2_SUPERBLOCK_SIZE],
+            );
+        }
+        self.cache.mark_dirty(&bh);
+        self.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+        Ok(())
     }
 }
 
@@ -735,6 +818,15 @@ fn sb_block_for(block_size: u32) -> u64 {
 /// Byte offset of the primary superblock inside its cache block.
 fn sb_offset_within_block(block_size: u32) -> usize {
     (SUPERBLOCK_BYTE_OFFSET % block_size as u64) as usize
+}
+
+/// Current wall-clock seconds for stamping `s_mtime` / `s_wtime`.
+/// Routes through [`crate::fs::vfs::Timespec::now`] — the same source
+/// the inode-timestamp paths use. Ext2 superblock timestamps are
+/// second-granularity; the nsec component is dropped here.
+#[inline]
+fn now_secs() -> u32 {
+    crate::fs::vfs::Timespec::now().sec as u32
 }
 
 #[cfg(test)]
