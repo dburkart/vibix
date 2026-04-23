@@ -114,3 +114,9 @@ pub use ialloc::{alloc_inode, free_inode};
 // by `kernel/tests/ext2_unlink.rs`.
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod unlink;
+
+// `InodeOps::setattr` — truncate / chmod / chown / utimensat persisted
+// through the buffer cache (#572). Same feature gate as the rest of
+// the write-path modules.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod setattr;
