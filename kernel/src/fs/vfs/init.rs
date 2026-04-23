@@ -60,7 +60,27 @@ pub fn root() -> Option<Arc<Dentry>> {
 ///
 /// Called from `vibix::init()` after `mem::init()` so the heap is
 /// available for `Arc` / `Vec` allocation done by the FS drivers.
+///
+/// Equivalent to [`init_with`] with `RootArgs::auto()` — the default
+/// "try ext2-on-virtio-blk, fall back to tarfs module, fall back to
+/// ramfs" auto-probe that this path used before #577. Existing
+/// callers (integration tests, `lib::init()`) keep working unchanged.
 pub fn init() {
+    init_with(crate::boot_cmdline::RootArgs::auto());
+}
+
+/// Cmdline-aware variant of [`init`]. Selects the root filesystem
+/// per the caller-supplied [`RootArgs`] (parsed from the kernel
+/// cmdline by [`boot_cmdline::parse`]).
+///
+/// Fallback policy when the configured source cannot be mounted (e.g.
+/// `root=/dev/vda` but the default block device holds no ext2
+/// superblock): log and try the next source in preference order
+/// (tarfs module → ramfs). A ramfs mount always succeeds so this path
+/// never panics pre-PID-1 unless all three are broken simultaneously.
+pub fn init_with(args: crate::boot_cmdline::RootArgs) {
+    use crate::boot_cmdline::RootSource;
+
     if ROOT_DENTRY.get().is_some() {
         return;
     }
@@ -73,43 +93,41 @@ pub fn init() {
 
     let bootstrap = bootstrap_target();
 
-    // On the bare-metal target, prefer tarfs-on-ramdisk-module for `/` per
-    // RFC 0002. Fall back to ramfs when the module is absent (host tests,
-    // early-boot without the ISO, or any future build that omits it).
-    #[cfg(target_os = "none")]
-    let root_edge = {
-        if let Some(module_bytes) = find_rootfs_module() {
-            let source = MountSource::RamdiskModule(module_bytes);
-            let edge = mount(
-                source,
-                &bootstrap,
-                TarFs::new_arc() as Arc<dyn super::ops::FileSystem>,
-                MountFlags::default(),
-            )
-            .unwrap_or_else(|e| panic!("vfs::init: mount tarfs / failed: errno={}", e));
-            crate::serial_println!("vfs: mounted tarfs at /");
-            edge
-        } else {
-            let edge = mount(
-                MountSource::None,
-                &bootstrap,
-                Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
-                MountFlags::default(),
-            )
-            .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e));
-            crate::serial_println!("vfs: mounted ramfs at /");
-            edge
-        }
-    };
+    // `rootflags=` already carries the caller's mount-flag intent;
+    // `RDONLY` is the default for now until #564's orphan-replay soak
+    // has been exercised in CI with RW mounts. Callers that want RW
+    // pass `rootflags=rw` (explicit_ro = Some(false)).
+    let mut mount_flags: MountFlags = args.mount_flags.into();
+    if args.explicit_ro.is_none() && matches!(args.source, RootSource::VirtioBlk) {
+        // Default to read-only on ext2 boots until rw is explicitly
+        // opted in. The TarFs / RamFs paths below have never honoured
+        // a writeable mount flag so their behaviour is unchanged.
+        mount_flags = mount_flags | MountFlags::RDONLY;
+    }
 
+    // Selection order per RFC 0004 Workstream F (#577):
+    //   - RootSource::VirtioBlk  → try ext2 on default_device, else fall through.
+    //   - RootSource::TarfsModule → try tarfs module, else fall through.
+    //   - RootSource::Ramfs      → mount empty ramfs.
+    //   - RootSource::Default    → try ext2 → tarfs → ramfs in order.
+    #[cfg(target_os = "none")]
+    let root_edge = try_mount_selected_root(&bootstrap, args.source, mount_flags);
+
+    // Host-side tests don't have a block device or a Limine module, so
+    // the mount path collapses to "always ramfs" — matches the pre-#577
+    // behaviour of this branch and keeps every `#[cfg(test)]` caller
+    // green without having to stub up a disk fixture.
     #[cfg(not(target_os = "none"))]
-    let root_edge = mount(
-        MountSource::None,
-        &bootstrap,
-        Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
-        MountFlags::default(),
-    )
-    .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e));
+    let root_edge = {
+        let _ = args; // silence unused-warning on host
+        mount(
+            MountSource::None,
+            &bootstrap,
+            Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+            MountFlags::default(),
+        )
+        .unwrap_or_else(|e| panic!("vfs::init: mount ramfs / failed: errno={}", e))
+    };
 
     let root = root_edge.root_dentry.clone();
     ROOT_DENTRY.call_once(|| root.clone());
@@ -127,6 +145,119 @@ pub fn init() {
         Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
     );
     crate::serial_println!("vfs: mounted ramfs at /tmp");
+}
+
+/// Try each root-filesystem candidate in priority order, returning the
+/// first successful [`MountEdge`]. Ramfs is always the final fallback
+/// and cannot fail, so this function never returns `None`.
+#[cfg(target_os = "none")]
+fn try_mount_selected_root(
+    bootstrap: &Arc<Dentry>,
+    source: crate::boot_cmdline::RootSource,
+    flags: MountFlags,
+) -> Arc<super::dentry::MountEdge> {
+    use crate::boot_cmdline::RootSource;
+
+    // Build the ordered attempt list. `Default` walks the full
+    // preference chain; explicit sources attempt only themselves, then
+    // fall through to the safe-but-empty ramfs floor so a single
+    // misconfigured `root=` doesn't wedge the boot.
+    let attempts: &[RootSource] = match source {
+        RootSource::Default => &[
+            RootSource::VirtioBlk,
+            RootSource::TarfsModule,
+            RootSource::Ramfs,
+        ],
+        RootSource::VirtioBlk => &[
+            RootSource::VirtioBlk,
+            RootSource::TarfsModule,
+            RootSource::Ramfs,
+        ],
+        RootSource::TarfsModule => &[RootSource::TarfsModule, RootSource::Ramfs],
+        RootSource::Ramfs => &[RootSource::Ramfs],
+    };
+
+    for &attempt in attempts {
+        match try_mount_one(bootstrap, attempt, flags) {
+            Ok(edge) => {
+                crate::serial_println!(
+                    "vfs: mounted {} at / (requested={:?})",
+                    source_label(attempt),
+                    source
+                );
+                return edge;
+            }
+            Err(errno) => {
+                crate::serial_println!(
+                    "vfs: mount {} / failed: errno={} (trying next)",
+                    source_label(attempt),
+                    errno
+                );
+            }
+        }
+    }
+
+    // Unreachable in practice: ramfs has no failure mode that isn't a
+    // memory-exhaustion panic inside `mount_table::mount`. If we get
+    // here every option including the synthesised ramfs floor failed.
+    panic!("vfs::init: every root-fs candidate failed to mount");
+}
+
+#[cfg(target_os = "none")]
+fn source_label(s: crate::boot_cmdline::RootSource) -> &'static str {
+    use crate::boot_cmdline::RootSource;
+    match s {
+        RootSource::Default => "default",
+        RootSource::VirtioBlk => "ext2 (virtio-blk)",
+        RootSource::TarfsModule => "tarfs (module)",
+        RootSource::Ramfs => "ramfs",
+    }
+}
+
+/// Attempt a single mount for `source`. Returns the resulting edge on
+/// success or the first errno encountered on failure. Never panics.
+#[cfg(target_os = "none")]
+fn try_mount_one(
+    bootstrap: &Arc<Dentry>,
+    source: crate::boot_cmdline::RootSource,
+    flags: MountFlags,
+) -> Result<Arc<super::dentry::MountEdge>, i64> {
+    use crate::boot_cmdline::RootSource;
+
+    match source {
+        RootSource::VirtioBlk => {
+            #[cfg(feature = "ext2")]
+            {
+                let dev = crate::block::default_device().ok_or(crate::fs::ENODEV)?;
+                let fs = crate::fs::ext2::Ext2Fs::new_with_device(dev)
+                    as Arc<dyn super::ops::FileSystem>;
+                mount(MountSource::None, bootstrap, fs, flags)
+            }
+            #[cfg(not(feature = "ext2"))]
+            {
+                // ext2 compiled out — treat as "device not available"
+                // so the fallback chain still walks to tarfs/ramfs.
+                let _ = (bootstrap, flags);
+                Err(crate::fs::ENODEV)
+            }
+        }
+        RootSource::TarfsModule => {
+            let module_bytes = find_rootfs_module().ok_or(crate::fs::ENOENT)?;
+            let src = MountSource::RamdiskModule(module_bytes);
+            mount(
+                src,
+                bootstrap,
+                TarFs::new_arc() as Arc<dyn super::ops::FileSystem>,
+                flags,
+            )
+        }
+        RootSource::Ramfs | RootSource::Default => mount(
+            MountSource::None,
+            bootstrap,
+            Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
+            flags,
+        ),
+    }
 }
 
 /// Locate the rootfs tarball module from the Limine module response and
