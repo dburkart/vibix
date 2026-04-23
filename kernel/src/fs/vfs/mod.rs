@@ -56,6 +56,7 @@ pub mod open_file;
 pub mod ops;
 pub mod path_walk;
 pub mod ramfs;
+pub mod registry;
 pub mod super_block;
 pub mod tarfs;
 
@@ -75,6 +76,7 @@ pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
 pub use ramfs::RamFs;
+pub use registry::{is_registered, lookup_and_build, register_filesystem, FsFactory};
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};
 pub use tarfs::TarFs;
 
