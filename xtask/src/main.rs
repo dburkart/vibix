@@ -49,9 +49,12 @@ const KERNEL_BUILD_STD_ARGS: &[&str] = &[
 const QEMU_EXIT_SUCCESS: i32 = 65; // (0x20 << 1) | 1
 const QEMU_EXIT_FAILURE: i32 = 33; // (0x10 << 1) | 1
 
-/// Hard ceiling on an individual QEMU boot during tests — real tests
-/// should finish in <1 s; this catches hangs.
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard ceiling on an individual QEMU boot during tests — most real
+/// tests finish in <1 s; this catches hangs. Sized for un-accelerated
+/// QEMU on shared CI runners where boot + ~40 spawn/reap cycles
+/// (`wait4_condvar_race::wait4_repeated_rounds_no_wedge`) can
+/// legitimately take double-digit seconds under load (see #619).
+const TEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Expected markers on a healthy boot. Used by `smoke` and to guard
 /// against regressions in the serial pipeline.

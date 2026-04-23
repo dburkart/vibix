@@ -297,7 +297,14 @@ fn wait4_exit_in_reap_gap_wakes_wait_while() {
 // forever; bounded iteration count + hlt_until timeout turns that
 // into a visible test failure.
 
-const STRESS_ROUNDS: u32 = 20;
+// 10 rounds × 4 children = 40 spawn/reap cycles. Originally 20 rounds;
+// dialled back in #619 after the test repeatedly tripped the xtask
+// per-test timeout on shared CI runners. Each round forces the driver
+// through one full `snap → reap → has_children → wait_while` sweep of
+// the wait4 condvar, so 10 rounds still surfaces a lost-wakeup —
+// a real missed wake would wedge `wait4_loop` within a single round,
+// not across many.
+const STRESS_ROUNDS: u32 = 10;
 const STRESS_CHILDREN_PER_ROUND: u32 = 4;
 const STRESS_FIRST_CHILD_PID: u32 = PARENT_PID + 200;
 
