@@ -748,13 +748,33 @@ fn ensure_limine() -> R<PathBuf> {
 fn inject_limine_cmdline(body: &str, value: &str) -> String {
     let indent = "    ";
     let mut out = String::with_capacity(body.len() + value.len() + 32);
+
+    // Pre-scan: does a `cmdline:` line already exist inside a
+    // `protocol: limine` block? If so the second pass *replaces* it
+    // in-place (no duplicate). If not, we insert one right after the
+    // `protocol: limine` line. Keeping the two cases disjoint avoids
+    // the duplicate-line bug an earlier single-pass version shipped
+    // with (flagged by CodeRabbit on PR #630).
+    let mut has_existing_cmdline = false;
+    {
+        let mut in_block = false;
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed == "protocol: limine" {
+                in_block = true;
+            } else if in_block && trimmed.starts_with("cmdline:") {
+                has_existing_cmdline = true;
+                break;
+            }
+        }
+    }
+
     let mut inserted = false;
-    let mut pending_block = false;
+    let mut in_block = false;
     for line in body.lines() {
         let trimmed_start = line.trim_start();
-        // Replace an existing cmdline line in-place; don't stack a
-        // duplicate below it.
-        if pending_block && trimmed_start.starts_with("cmdline:") {
+        // Replace an existing cmdline line in-place.
+        if in_block && has_existing_cmdline && trimmed_start.starts_with("cmdline:") {
             out.push_str(indent);
             out.push_str("cmdline: ");
             out.push_str(value);
@@ -764,13 +784,18 @@ fn inject_limine_cmdline(body: &str, value: &str) -> String {
         }
         out.push_str(line);
         out.push('\n');
-        if !inserted && trimmed_start == "protocol: limine" {
-            out.push_str(indent);
-            out.push_str("cmdline: ");
-            out.push_str(value);
-            out.push('\n');
-            inserted = true;
-            pending_block = true;
+        if trimmed_start == "protocol: limine" {
+            in_block = true;
+            // Only append a new cmdline line when there isn't one
+            // downstream to replace. Otherwise the replace-in-place
+            // branch above handles it on a later iteration.
+            if !has_existing_cmdline && !inserted {
+                out.push_str(indent);
+                out.push_str("cmdline: ");
+                out.push_str(value);
+                out.push('\n');
+                inserted = true;
+            }
         }
     }
     if !inserted {
@@ -1785,6 +1810,14 @@ serial: yes
         assert!(out.contains("cmdline: root=/dev/vda rootflags=ro"));
         // Old value gone.
         assert!(!out.contains("cmdline: root=ramfs"));
+        // Exactly one cmdline line (regression guard: an earlier
+        // single-pass version produced two, one inserted after the
+        // protocol marker plus one at the replace site).
+        assert_eq!(
+            out.matches("cmdline:").count(),
+            1,
+            "should have exactly one cmdline line, got:\n{out}",
+        );
     }
 
     #[test]
