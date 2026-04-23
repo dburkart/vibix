@@ -394,3 +394,8 @@ required-features = ["ext2"]
 name = "ext2_ialloc"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_file_write"
+harness = false
+required-features = ["ext2"]
