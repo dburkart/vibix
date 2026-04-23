@@ -431,12 +431,199 @@ fn boot_and_capture(
     Ok((transcript, saw_done, exit_status))
 }
 
+/// Baseline-gating mode for `cargo xtask pjdfstest`.
+///
+/// See `main.rs` for the CLI surface — `--compare-baseline` maps to
+/// [`BaselineMode::Compare`] (CI gate), `--update-baseline` maps to
+/// [`BaselineMode::Update`] (explicit baseline bump), and no flag maps
+/// to [`BaselineMode::None`] (the default developer flow, which only
+/// writes the results artefact).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineMode {
+    /// Do not touch or compare against the baseline file. Default.
+    None,
+    /// Compare emitted results against the committed baseline; fail on
+    /// any regression or silent upgrade.
+    Compare,
+    /// Overwrite the committed baseline with the current run's results.
+    Update,
+}
+
+/// Canonical location of the committed expected-pass baseline. Relative
+/// to the workspace root. Consumers may parse this textually.
+pub const BASELINE_REL_PATH: &str = "tests/pjdfstest/baseline/expected.json";
+
+/// Parse a results JSON document into a [`Results`] bag. Narrow
+/// hand-written parser — paired with [`Results::to_json`], so the two
+/// must agree on field names. Only the fields we actually consume
+/// (`cases[].name`, `cases[].status`) are extracted; `total` / `passed`
+/// / `failed` are recomputed from the case list.
+///
+/// This deliberately does not pull in serde to avoid bloating xtask's
+/// dependency graph for one call site. The format is pinned; if we ever
+/// need richer parsing this is the place to swap it out.
+pub fn parse_results_json(s: &str) -> R<Results> {
+    // Find the "cases" array, then iterate objects inside it. The
+    // emitter pins one case per line, so a line-oriented scan is enough.
+    let cases_start = s
+        .find("\"cases\"")
+        .ok_or("results JSON: missing \"cases\" key")?;
+    let bracket = s[cases_start..]
+        .find('[')
+        .ok_or("results JSON: \"cases\" not followed by '['")?
+        + cases_start;
+    let end = s[bracket..]
+        .find(']')
+        .ok_or("results JSON: unterminated \"cases\" array")?
+        + bracket;
+    let body = &s[bracket + 1..end];
+
+    let mut cases: Vec<CaseResult> = Vec::new();
+    for raw in body.split('\n') {
+        let line = raw.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let name = extract_json_string_field(line, "name")
+            .ok_or_else(|| format!("results JSON: case missing \"name\": {line}"))?;
+        let status_str = extract_json_string_field(line, "status")
+            .ok_or_else(|| format!("results JSON: case missing \"status\": {line}"))?;
+        let status = match status_str.as_str() {
+            "pass" => Status::Pass,
+            "fail" => Status::Fail,
+            other => return Err(format!("results JSON: unknown status {other:?}").into()),
+        };
+        let reason = extract_json_string_field(line, "reason");
+        cases.push(CaseResult {
+            name,
+            status,
+            reason,
+        });
+    }
+    Ok(Results { cases })
+}
+
+/// Extract the string value of a `"field": "..."` pair from one line of
+/// the emitted JSON. Handles the escape sequences produced by
+/// [`json_string`] above — `\"`, `\\`, `\n`, `\r`, `\t`, and `\uXXXX`.
+fn extract_json_string_field(line: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let key_at = line.find(&needle)?;
+    let after_key = &line[key_at + needle.len()..];
+    let colon_at = after_key.find(':')?;
+    let after_colon = &after_key[colon_at + 1..];
+    // Skip whitespace, then require an opening quote.
+    let trimmed = after_colon.trim_start();
+    let mut chars = trimmed.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    loop {
+        let c = chars.next()?;
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let hex: String = (&mut chars).take(4).collect();
+                    if hex.len() != 4 {
+                        return None;
+                    }
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    out.push(char::from_u32(code)?);
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+}
+
+/// Diff the current results against the committed baseline and return
+/// a list of human-readable failure reasons. An empty vec means the
+/// run is CI-green.
+///
+/// Fail conditions (#582):
+///   1. A case that was `pass` in the baseline is `fail` (or absent) in
+///      the current run — this is a real regression.
+///   2. A case that was `fail` in the baseline is `pass` in the current
+///      run, **without** the baseline being updated in the same change.
+///      This catches silent upgrades: a PR that accidentally fixes a
+///      previously-failing test must commit the baseline bump so the
+///      improvement is explicit in review.
+///   3. A case present in the current run is absent from the baseline
+///      — new test surface must be reflected in the baseline before it
+///      can gate CI.
+///
+/// Returns `Vec<String>` of one line per violation.
+pub fn diff_against_baseline(baseline: &Results, current: &Results) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // Index by name for O(n+m) lookup.
+    let baseline_by_name: std::collections::BTreeMap<&str, &CaseResult> = baseline
+        .cases
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+    let current_by_name: std::collections::BTreeMap<&str, &CaseResult> =
+        current.cases.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    // Baseline PASSes that are now absent or failing, and baseline
+    // FAILs that are now PASSing.
+    for (name, b) in &baseline_by_name {
+        match current_by_name.get(name) {
+            None => {
+                if b.status == Status::Pass {
+                    violations.push(format!(
+                        "regression: {name} was pass in baseline but is missing from current run"
+                    ));
+                }
+                // A baseline-fail vanishing is tolerated — the test may
+                // have been removed. It is NOT a silent-upgrade.
+            }
+            Some(cur) => match (b.status, cur.status) {
+                (Status::Pass, Status::Fail) => {
+                    let reason = cur.reason.as_deref().unwrap_or("<no reason>");
+                    violations.push(format!("regression: {name} pass -> fail ({reason})"));
+                }
+                (Status::Fail, Status::Pass) => {
+                    violations.push(format!(
+                        "silent-upgrade: {name} fail -> pass — update the baseline in this PR with `cargo xtask pjdfstest --update-baseline`"
+                    ));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    // Cases present in current but absent from baseline — new surface.
+    for (name, cur) in &current_by_name {
+        if !baseline_by_name.contains_key(name) {
+            let label = match cur.status {
+                Status::Pass => "new-pass",
+                Status::Fail => "new-fail",
+            };
+            violations.push(format!(
+                "{label}: {name} is in current results but absent from baseline — update with `cargo xtask pjdfstest --update-baseline`"
+            ));
+        }
+    }
+
+    violations
+}
+
 /// `cargo xtask pjdfstest` entry point. Signature mirrors the other
 /// subcommands so `main.rs` can dispatch uniformly.
 pub fn run(
     workspace_root: &Path,
     build: impl FnOnce() -> R<PathBuf>,
     iso_root_name: &str,
+    baseline_mode: BaselineMode,
 ) -> R<()> {
     // 1. Attempt to build the pjdfstest runner. Fall back to a placeholder
     //    if that fails — the rest of the harness is still useful to exercise.
@@ -535,13 +722,74 @@ pub fn run(
             let reason = c.reason.as_deref().unwrap_or("<no reason>");
             println!("  - {}: {}", c.name, reason);
         }
-        return Err(format!("pjdfstest: {} case(s) failed", results.failed()).into());
+        // Fall through: even with raw-run failures, honour the baseline
+        // mode first so --update-baseline can record the current (bad)
+        // verdicts intentionally if a human is explicitly bumping the
+        // expected set.
     }
 
     // Baseline-at-landing is zero cases: no vibix-side runner exists yet, so
     // a healthy boot produces no TEST_* markers. The harness is still green
     // in that case — #582 and the real port will drive the pass count up
     // from there.
+    let baseline_path = workspace_root.join(BASELINE_REL_PATH);
+    match baseline_mode {
+        BaselineMode::None => {
+            if results.failed() > 0 {
+                return Err(format!("pjdfstest: {} case(s) failed", results.failed()).into());
+            }
+        }
+        BaselineMode::Update => {
+            if let Some(parent) = baseline_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&baseline_path, results.to_json())?;
+            println!(
+                "→ pjdfstest: baseline updated at {}",
+                baseline_path.display()
+            );
+        }
+        BaselineMode::Compare => {
+            if !baseline_path.is_file() {
+                return Err(format!(
+                    "pjdfstest --compare-baseline: no baseline at {} (commit one with `cargo xtask pjdfstest --update-baseline`)",
+                    baseline_path.display()
+                )
+                .into());
+            }
+            let baseline_text = fs::read_to_string(&baseline_path)?;
+            let baseline = parse_results_json(&baseline_text).map_err(|e| {
+                format!(
+                    "pjdfstest --compare-baseline: baseline at {} is malformed: {e}",
+                    baseline_path.display()
+                )
+            })?;
+            let violations = diff_against_baseline(&baseline, &results);
+            if !violations.is_empty() {
+                println!();
+                println!(
+                    "pjdfstest --compare-baseline: {} violation(s) vs {}:",
+                    violations.len(),
+                    baseline_path.display()
+                );
+                for v in &violations {
+                    println!("  - {v}");
+                }
+                return Err(format!(
+                    "pjdfstest --compare-baseline: {} violation(s) vs committed baseline",
+                    violations.len()
+                )
+                .into());
+            }
+            println!(
+                "→ pjdfstest --compare-baseline: no regressions vs {}",
+                baseline_path.display()
+            );
+            // A raw-run failure when every case was already expected-fail
+            // in the baseline is still CI-green; only regressions / silent
+            // upgrades are fatal in Compare mode.
+        }
+    }
     Ok(())
 }
 
@@ -617,6 +865,149 @@ mod tests {
         let json = r.to_json();
         assert!(json.contains("\"total\": 0"));
         assert!(json.contains("\"cases\": ["));
+    }
+
+    #[test]
+    fn results_json_round_trip() {
+        let original = Results {
+            cases: vec![
+                CaseResult {
+                    name: "case.a".to_string(),
+                    status: Status::Pass,
+                    reason: None,
+                },
+                CaseResult {
+                    name: "case.b".to_string(),
+                    status: Status::Fail,
+                    reason: Some("ENOENT on unlink".to_string()),
+                },
+            ],
+        };
+        let json = original.to_json();
+        let parsed = parse_results_json(&json).expect("parse must succeed");
+        assert_eq!(parsed.cases.len(), 2);
+        assert_eq!(parsed.cases[0].name, "case.a");
+        assert_eq!(parsed.cases[0].status, Status::Pass);
+        assert!(parsed.cases[0].reason.is_none());
+        assert_eq!(parsed.cases[1].name, "case.b");
+        assert_eq!(parsed.cases[1].status, Status::Fail);
+        assert_eq!(parsed.cases[1].reason.as_deref(), Some("ENOENT on unlink"));
+    }
+
+    #[test]
+    fn results_json_parses_empty_baseline() {
+        // The committed baseline at landing has zero cases — the
+        // compare path must handle it.
+        let baseline =
+            "{\n  \"total\": 0,\n  \"passed\": 0,\n  \"failed\": 0,\n  \"cases\": [\n  ]\n}\n";
+        let r = parse_results_json(baseline).expect("parse must succeed");
+        assert_eq!(r.cases.len(), 0);
+    }
+
+    #[test]
+    fn diff_flags_pass_to_fail_as_regression() {
+        let baseline = Results {
+            cases: vec![CaseResult {
+                name: "case.x".to_string(),
+                status: Status::Pass,
+                reason: None,
+            }],
+        };
+        let current = Results {
+            cases: vec![CaseResult {
+                name: "case.x".to_string(),
+                status: Status::Fail,
+                reason: Some("broke".to_string()),
+            }],
+        };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert_eq!(violations.len(), 1, "got: {violations:?}");
+        assert!(
+            violations[0].contains("regression") && violations[0].contains("case.x"),
+            "got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn diff_flags_fail_to_pass_as_silent_upgrade() {
+        let baseline = Results {
+            cases: vec![CaseResult {
+                name: "case.y".to_string(),
+                status: Status::Fail,
+                reason: None,
+            }],
+        };
+        let current = Results {
+            cases: vec![CaseResult {
+                name: "case.y".to_string(),
+                status: Status::Pass,
+                reason: None,
+            }],
+        };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert_eq!(violations.len(), 1, "got: {violations:?}");
+        assert!(
+            violations[0].contains("silent-upgrade"),
+            "got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn diff_flags_missing_baseline_pass_as_regression() {
+        let baseline = Results {
+            cases: vec![CaseResult {
+                name: "case.z".to_string(),
+                status: Status::Pass,
+                reason: None,
+            }],
+        };
+        let current = Results { cases: vec![] };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("regression"));
+    }
+
+    #[test]
+    fn diff_flags_new_case_as_baseline_drift() {
+        let baseline = Results { cases: vec![] };
+        let current = Results {
+            cases: vec![CaseResult {
+                name: "case.new".to_string(),
+                status: Status::Pass,
+                reason: None,
+            }],
+        };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("new-pass") && violations[0].contains("case.new"),
+            "got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn diff_empty_vs_empty_is_clean() {
+        // The at-landing 0/0/0 baseline must be CI-green.
+        let baseline = Results { cases: vec![] };
+        let current = Results { cases: vec![] };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert!(violations.is_empty(), "got: {violations:?}");
+    }
+
+    #[test]
+    fn diff_tolerates_removed_baseline_fail() {
+        // A test that was expected-fail and has since been removed is
+        // not a silent-upgrade — it's just gone. Don't flag it.
+        let baseline = Results {
+            cases: vec![CaseResult {
+                name: "case.removed".to_string(),
+                status: Status::Fail,
+                reason: None,
+            }],
+        };
+        let current = Results { cases: vec![] };
+        let violations = diff_against_baseline(&baseline, &current);
+        assert!(violations.is_empty(), "got: {violations:?}");
     }
 
     #[test]

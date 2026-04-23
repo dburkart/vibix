@@ -6,6 +6,8 @@
 //!   ext2-image    — build target/vibix-root.ext2 (deterministic ext2 rootfs; #579)
 //!   pjdfstest     — build pjdfstest runner, embed into ext2 image, boot under
 //!                   QEMU, parse TEST_PASS/TEST_FAIL serial markers (#581)
+//!                   flags: --compare-baseline (CI gate; #582)
+//!                          --update-baseline  (rewrite tests/pjdfstest/baseline/expected.json)
 //!   iso           — build, fetch Limine, produce target/vibix.iso
 //!   run           — iso, then boot under QEMU with serial-stdio
 //!   test          — run host unit tests + QEMU integration tests
@@ -192,10 +194,36 @@ fn main() -> R<()> {
                 bench: opts.bench,
                 fork_trace: opts.fork_trace,
             };
+            // --compare-baseline (#582): after the harness emits
+            // target/pjdfstest-results.json, diff it against the
+            // committed baseline at tests/pjdfstest/baseline/expected.json
+            // and fail on any regression (pass → fail) or any silent
+            // upgrade (fail → pass without the baseline being bumped in
+            // the same change).
+            //
+            // --update-baseline (#582): after the harness emits results,
+            // overwrite the committed baseline with the current run's
+            // verdicts. Used by a human (or a follow-up PR that
+            // intentionally changes expected verdicts) to bump the
+            // baseline.
+            let compare_baseline = rest.iter().any(|a| a == "--compare-baseline");
+            let update_baseline = rest.iter().any(|a| a == "--update-baseline");
+            let mode = match (compare_baseline, update_baseline) {
+                (true, true) => {
+                    return Err(
+                        "pjdfstest: --compare-baseline and --update-baseline are mutually exclusive"
+                            .into(),
+                    );
+                }
+                (true, false) => pjdfstest::BaselineMode::Compare,
+                (false, true) => pjdfstest::BaselineMode::Update,
+                (false, false) => pjdfstest::BaselineMode::None,
+            };
             pjdfstest::run(
                 &workspace_root(),
                 move || build(&opts_clone),
                 "iso_pjdfstest",
+                mode,
             )?;
         }
         "clean" => clean()?,

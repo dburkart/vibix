@@ -274,3 +274,65 @@ jobs:
           name: smoke-debugcon-log
           path: target/debugcon.log
           if-no-files-found: ignore
+
+  # RFC 0004 Workstream G P2 (#582): run the vendored pjdfstest harness
+  # (#580 + #581) and fail if the emitted
+  # `target/pjdfstest-results.json` diverges from the committed baseline
+  # at `tests/pjdfstest/baseline/expected.json`.
+  #
+  # At landing, vibix has no std-capable userspace target, so the
+  # runner runs as a placeholder and emits 0 cases. The baseline is
+  # therefore 0/0/0 and the job primarily guards against harness
+  # regressions (kernel panic, QEMU watchdog, ext2 image builder break)
+  # rather than real conformance signal. Once #642 ports the runner to
+  # vibix userspace, this job starts seeing real markers and the
+  # baseline will be bumped via `cargo xtask pjdfstest --update-baseline`.
+  #
+  # Required (not advisory) check: "does the harness run cleanly" is
+  # already worth enforcing, and flipping from required-advisory later
+  # is harder than starting required.
+  pjdfstest-conformance:
+    name: pjdfstest conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso e2fsprogs build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-pjdfstest-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs', 'xtask/src/pjdfstest.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pjdfstest-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo xtask pjdfstest --compare-baseline
+        run: cargo xtask pjdfstest --compare-baseline
+
+      # Always upload the emitted results artefact so a maintainer
+      # updating the baseline can just download it and commit the diff.
+      - name: Upload pjdfstest results JSON
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pjdfstest-results
+          path: target/pjdfstest-results.json
+          if-no-files-found: warn
