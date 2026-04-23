@@ -107,3 +107,10 @@ pub mod ialloc;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use ialloc::{alloc_inode, free_inode};
+
+// Unlink / rmdir path (#569). Same feature gate as `fs` / `inode` —
+// it consumes `Ext2Super` + `Ext2Inode` + the buffer cache. Pure
+// helpers inside have host unit tests; the full surface is exercised
+// by `kernel/tests/ext2_unlink.rs`.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod unlink;
