@@ -257,6 +257,13 @@ impl FileOps for Ext2Inode {
     fn read(&self, f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
         super::file::read_file_at(&f.inode, self, buf, off)
     }
+
+    /// Regular-file write with lazy indirect-block allocation. See
+    /// [`super::file::write_file_at`] for the normative pipeline and
+    /// ordering rules (RFC 0004 §Write extend + §Write Ordering).
+    fn write(&self, f: &OpenFile, buf: &[u8], off: u64) -> Result<usize, i64> {
+        super::file::write_file_at(&f.inode, self, buf, off)
+    }
 }
 
 /// Infer an [`InodeKind`] from the on-disk `i_mode` S_IFMT bits.

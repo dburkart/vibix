@@ -66,10 +66,18 @@
 
 use alloc::sync::Arc;
 
-use super::fs::Ext2Super;
-use super::indirect::{resolve_block, Geometry, MetadataMap, WalkError};
+use super::balloc::alloc_block;
+use super::disk::{
+    Ext2Inode as DiskInode, EXT2_INODE_SIZE_V0, EXT2_N_BLOCKS, RO_COMPAT_LARGE_FILE,
+};
+use super::fs::{Ext2MountFlags, Ext2Super};
+use super::indirect::{
+    resolve_block, Geometry, MetadataMap, WalkError, EXT2_DIND_BLOCK, EXT2_DIRECT_BLOCKS,
+    EXT2_IND_BLOCK, EXT2_TIND_BLOCK,
+};
 use crate::fs::vfs::inode::Inode;
-use crate::fs::{EIO, EISDIR};
+use crate::fs::vfs::Timespec;
+use crate::fs::{EFBIG, EINVAL, EIO, EISDIR, EROFS};
 
 /// Read at most `buf.len()` bytes from `inode` starting at byte
 /// offset `off`. Short reads (fewer bytes than requested) indicate
@@ -293,6 +301,619 @@ pub(super) fn build_metadata_map(super_: &Arc<Ext2Super>) -> MetadataMap {
     // by dropping later-starting duplicates via `dedup_contiguous`.
     dedup_contiguous(&mut raw);
     MetadataMap::from_sorted_ranges(raw)
+}
+
+/// Write up to `buf.len()` bytes into `inode` starting at byte offset
+/// `off`, extending the file as needed.
+///
+/// RFC 0004 §Write extend + §Write Ordering (`docs/RFC/0004-ext2-
+/// filesystem-driver.md`) is the normative spec. The pipeline mirrors
+/// [`read_file_at`] with three mutation points layered on top:
+///
+/// 1. **Allocate** any missing indirect-block pointers for the logical
+///    blocks in `[off, off+len)` via [`super::balloc::alloc_block`],
+///    zero each freshly-allocated pointer block through the buffer
+///    cache, and only then **link** the pointer into its parent slot.
+///    Ordering matters: a crash between allocate-and-zero and link
+///    leaks a block (bitmap says "used", no parent points at it — a
+///    fixable `e2fsck` warning). The reverse order could leave a
+///    parent pointing at uninitialised bytes that the next reader
+///    would interpret as indirect pointers — a structural corruption.
+/// 2. **Allocate** the data block itself, `bread` its cache entry,
+///    overlay the user bytes, `mark_dirty`, `sync_dirty_buffer`. The
+///    data block is linked into its parent (direct slot or indirect
+///    leaf) *before* the user bytes are copied — because the block is
+///    freshly allocated, nothing else can observe it yet, so zero-on-
+///    allocate is the only pre-link invariant we need.
+/// 3. **Update** `i_size`, `i_blocks`, `i_mtime`, `i_ctime` on both
+///    the driver-owned [`super::inode::Ext2InodeMeta`] and the
+///    VFS-level [`crate::fs::vfs::inode::InodeMeta`]; flush the inode
+///    slot back to disk. `i_size` update is last in the sequence so a
+///    crash between data-block write and size update leaves readers
+///    seeing the *old* size (correct, just short), never a size that
+///    claims blocks that weren't written.
+///
+/// # Return value
+///
+/// - `Ok(n)` where `0 <= n <= buf.len()`. A short write indicates
+///   `ENOSPC` or `EFBIG` hit mid-buffer — the bytes already committed
+///   remain visible to subsequent reads. The caller (syscall layer)
+///   surfaces the partial-write count to userspace; a final `Err(_)`
+///   is only returned when *no* bytes were committed.
+/// - `Err(EROFS)` — mount is RO (user-requested or feature-forced).
+/// - `Err(EISDIR)` — write(2) on a directory.
+/// - `Err(EINVAL)` — write(2) on a symlink / device node / FIFO (same
+///   dispatch rule as [`read_file_at`]; the open path is expected to
+///   bind a driver-specific FileOps at the fd).
+/// - `Err(EFBIG)` — `off + len` exceeds the maximum file size the
+///   driver can address (past triple-indirect or past `u32::MAX`
+///   logical blocks or past `i64::MAX` bytes on a 32-bit-size image).
+/// - `Err(ENOSPC)` — no free blocks anywhere *and* no bytes committed
+///   yet.
+/// - `Err(EIO)` — buffer-cache I/O failure or an image-forged
+///   pointer tripped the walker's corruption detector.
+pub fn write_file_at(
+    inode: &Inode,
+    ext2_inode: &super::inode::Ext2Inode,
+    buf: &[u8],
+    off: u64,
+) -> Result<usize, i64> {
+    use crate::fs::vfs::inode::InodeKind;
+
+    match inode.kind {
+        InodeKind::Reg => {}
+        InodeKind::Dir => return Err(EISDIR),
+        InodeKind::Link => return Err(EINVAL),
+        InodeKind::Chr | InodeKind::Blk | InodeKind::Fifo | InodeKind::Sock => return Err(EINVAL),
+    }
+
+    let super_ref = ext2_inode.super_ref.upgrade().ok_or(EIO)?;
+
+    if super_ref.ext2_flags.contains(Ext2MountFlags::RDONLY)
+        || super_ref.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
+    {
+        return Err(EROFS);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+
+    let block_size = super_ref.block_size as u64;
+    debug_assert!(block_size > 0, "mount validated block_size != 0");
+
+    // Structural upper bound on file size. Ext2 can address
+    // `12 + p + p^2 + p^3` logical blocks where `p = block_size / 4`.
+    // That's well under `u64::MAX * block_size` for any legal block
+    // size, but we still compute it in `u64` to stay overflow-safe on
+    // 64 KiB blocks (`p = 16384`, `p^3 = 2^42`).
+    let p64 = block_size / 4;
+    let max_logical_blocks: u64 = (EXT2_DIRECT_BLOCKS as u64) + p64 + p64 * p64 + p64 * p64 * p64;
+    let max_file_size: u64 = max_logical_blocks.saturating_mul(block_size);
+
+    let off_end = off.checked_add(buf.len() as u64).ok_or(EFBIG)?;
+    if off_end > max_file_size {
+        return Err(EFBIG);
+    }
+    // i_size on disk maxes out at 2^63 - 1 even with large_file
+    // (s_size + s_size_high is u64 on disk but POSIX `off_t` is `i64`).
+    // Reject anything past that.
+    if off_end > i64::MAX as u64 {
+        return Err(EFBIG);
+    }
+
+    let (s_first_data_block, s_blocks_count, s_inodes_per_group) = {
+        let sb = super_ref.sb_disk.lock();
+        (
+            sb.s_first_data_block,
+            sb.s_blocks_count,
+            sb.s_inodes_per_group,
+        )
+    };
+    let geom =
+        Geometry::new(super_ref.block_size, s_first_data_block, s_blocks_count).ok_or(EIO)?;
+    let md = build_metadata_map(&super_ref);
+
+    // Hold the inode's metadata lock write-locked across the whole
+    // extend. RFC 0004 §Write extend mandates this against concurrent
+    // truncate (truncate will acquire the same lock in Workstream E);
+    // it also serialises two racing `write(2)`s on the same inode so
+    // their block allocations don't trample each other.
+    let mut meta = ext2_inode.meta.write();
+
+    // Hint-group for `alloc_block`: the ext2 "data locality" heuristic
+    // is to allocate each new block in the same group as the inode
+    // itself. Compute the inode's group once up front.
+    let inode_group = if s_inodes_per_group == 0 {
+        0
+    } else {
+        (ext2_inode.ino - 1) / s_inodes_per_group
+    };
+
+    let mut copied = 0usize;
+    let mut new_i_blocks_bump: u64 = 0;
+    let mut last_error: Option<i64> = None;
+
+    while copied < buf.len() {
+        let cur = off + copied as u64;
+        let logical: u32 = (cur / block_size).try_into().map_err(|_| EFBIG)?;
+        let in_block = (cur % block_size) as usize;
+        let remaining_in_block = block_size as usize - in_block;
+        let chunk = core::cmp::min(remaining_in_block, buf.len() - copied);
+
+        // Ensure the full path to `logical` is allocated. Each new
+        // pointer / data block counts toward `new_i_blocks_bump` in
+        // 512-byte units.
+        let data_block = match ensure_block_allocated(
+            &super_ref,
+            &geom,
+            &md,
+            &mut meta.i_block,
+            logical,
+            inode_group,
+            &mut new_i_blocks_bump,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                // Out-of-space or I/O error part-way through a
+                // multi-block write. Preserve the copied count and
+                // surface the error to the caller only if nothing has
+                // landed yet — otherwise fall through to the metadata
+                // flush and report a short write.
+                last_error = Some(e);
+                break;
+            }
+        };
+
+        // RMW the data block through the buffer cache: read, overlay,
+        // sync. `bread` on a freshly-allocated block still routes
+        // through the cache; our own `zero_block` populated the entry
+        // above with a zeroed page, so the RMW sees the expected
+        // zero prefix + suffix outside our chunk.
+        let bh = match super_ref
+            .cache
+            .bread(super_ref.device_id, data_block as u64)
+        {
+            Ok(b) => b,
+            Err(_) => {
+                last_error = Some(EIO);
+                break;
+            }
+        };
+        {
+            let mut data = bh.data.write();
+            debug_assert!(in_block + chunk <= data.len());
+            data[in_block..in_block + chunk].copy_from_slice(&buf[copied..copied + chunk]);
+        }
+        super_ref.cache.mark_dirty(&bh);
+        if super_ref.cache.sync_dirty_buffer(&bh).is_err() {
+            last_error = Some(EIO);
+            break;
+        }
+
+        copied += chunk;
+    }
+
+    // If we got zero bytes out, surface the error instead of an
+    // empty-success return.
+    if copied == 0 {
+        return Err(last_error.unwrap_or(EIO));
+    }
+
+    // Update in-memory metadata. `i_blocks` is in on-disk 512-byte
+    // units; `new_i_blocks_bump` was accumulated in those same units.
+    let new_size = meta.size.max(off + copied as u64);
+    meta.size = new_size;
+    meta.i_blocks = meta.i_blocks.saturating_add(new_i_blocks_bump as u32);
+    let now = Timespec::now();
+    meta.mtime = now.sec as u32;
+    meta.ctime = now.sec as u32;
+
+    // Mirror the size / block count / mtime / ctime onto the VFS-layer
+    // `Inode::meta` so subsequent `stat(2)` sees the fresh values.
+    {
+        let mut vfs_meta = inode.meta.write();
+        vfs_meta.size = new_size;
+        vfs_meta.blocks = meta.i_blocks as u64;
+        vfs_meta.mtime = now;
+        vfs_meta.ctime = now;
+    }
+
+    // Flush the inode slot to disk. This carries the updated `i_size`,
+    // `i_blocks`, `i_mtime`, `i_ctime`, and the fresh `i_block[]`
+    // pointers. RFC 0004 §Write Ordering: the inode flush is last so a
+    // crash leaves readers with at-worst the *old* size — never an
+    // `i_size` that claims blocks whose data hasn't hit the device.
+    flush_inode_slot(&super_ref, ext2_inode.ino, &meta)?;
+
+    Ok(copied)
+}
+
+/// Ensure the logical block `logical` has an allocated data block
+/// backing it, creating any missing indirect-block pointers along the
+/// way. Returns the absolute data block number.
+///
+/// Mutates `i_block_mut` in place to install new top-level (direct /
+/// indirect / double-indirect / triple-indirect) pointers. Each
+/// newly-allocated indirect block is zeroed through the buffer cache
+/// before the parent pointer is updated — the RFC 0004 §Write Ordering
+/// rule.
+///
+/// `new_blocks_bump` accumulates the *on-disk 512-byte-unit* cost of
+/// every block this call allocated (one fs-block = `block_size / 512`
+/// 512-byte units), so the caller can bump `i_blocks` once at the end
+/// of the write.
+fn ensure_block_allocated(
+    super_: &Arc<Ext2Super>,
+    geom: &Geometry,
+    md: &MetadataMap,
+    i_block_mut: &mut [u32; EXT2_N_BLOCKS],
+    logical: u32,
+    hint_group: u32,
+    new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    let p = geom.ptrs_per_block as u64;
+    let direct_limit = EXT2_DIRECT_BLOCKS as u64;
+    let single_limit = direct_limit + p;
+    let double_limit = single_limit + p * p;
+    let triple_limit = double_limit + p * p * p;
+    let logical64 = logical as u64;
+
+    let blocks_per_512 = (geom.block_size / 512) as u64;
+
+    if logical64 < direct_limit {
+        // Direct: slot `i_block[logical]` *is* the data block pointer.
+        let slot = &mut i_block_mut[logical as usize];
+        if *slot != 0 {
+            validate_existing_pointer(*slot, geom, md)?;
+            return Ok(*slot);
+        }
+        let data_blk = alloc_and_zero_data_block(super_, hint_group, new_blocks_bump)?;
+        *slot = data_blk;
+        *new_blocks_bump += blocks_per_512;
+        Ok(data_blk)
+    } else if logical64 < single_limit {
+        let idx0 = (logical64 - direct_limit) as u32;
+        let ind = ensure_indirect_ptr(
+            super_,
+            &mut i_block_mut[EXT2_IND_BLOCK],
+            geom,
+            md,
+            hint_group,
+            new_blocks_bump,
+        )?;
+        finish_leaf_slot(super_, ind, idx0, geom, md, hint_group, new_blocks_bump)
+    } else if logical64 < double_limit {
+        let rel = logical64 - single_limit;
+        let idx_outer = (rel / p) as u32;
+        let idx_inner = (rel % p) as u32;
+        let dind = ensure_indirect_ptr(
+            super_,
+            &mut i_block_mut[EXT2_DIND_BLOCK],
+            geom,
+            md,
+            hint_group,
+            new_blocks_bump,
+        )?;
+        let ind = ensure_slot_block(
+            super_,
+            dind,
+            idx_outer,
+            geom,
+            md,
+            hint_group,
+            new_blocks_bump,
+        )?;
+        finish_leaf_slot(
+            super_,
+            ind,
+            idx_inner,
+            geom,
+            md,
+            hint_group,
+            new_blocks_bump,
+        )
+    } else if logical64 < triple_limit {
+        let rel = logical64 - double_limit;
+        let p_sq = p * p;
+        let idx_l0 = (rel / p_sq) as u32;
+        let rem = rel % p_sq;
+        let idx_l1 = (rem / p) as u32;
+        let idx_l2 = (rem % p) as u32;
+        let tind = ensure_indirect_ptr(
+            super_,
+            &mut i_block_mut[EXT2_TIND_BLOCK],
+            geom,
+            md,
+            hint_group,
+            new_blocks_bump,
+        )?;
+        let dind = ensure_slot_block(super_, tind, idx_l0, geom, md, hint_group, new_blocks_bump)?;
+        let ind = ensure_slot_block(super_, dind, idx_l1, geom, md, hint_group, new_blocks_bump)?;
+        finish_leaf_slot(super_, ind, idx_l2, geom, md, hint_group, new_blocks_bump)
+    } else {
+        Err(EFBIG)
+    }
+}
+
+/// Validate that `p` — an in-memory pointer we already committed to
+/// `i_block[]` or read back out of an indirect block — is a legal
+/// data-block pointer (non-zero, in `[s_first_data_block,
+/// s_blocks_count)`, not in a metadata range). A malformed pointer
+/// here is the same attacker-forged-image confused-deputy vector the
+/// read walker guards against.
+fn validate_existing_pointer(p: u32, geom: &Geometry, md: &MetadataMap) -> Result<(), i64> {
+    if !geom.in_data_range(p) || md.contains(p) {
+        return Err(EIO);
+    }
+    Ok(())
+}
+
+/// Ensure a top-level indirect slot (single, double, or triple) is
+/// populated. If the slot is zero, allocate a fresh indirect block,
+/// zero it through the cache, then install the pointer. Returns the
+/// absolute indirect-block number.
+fn ensure_indirect_ptr(
+    super_: &Arc<Ext2Super>,
+    slot: &mut u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    hint_group: u32,
+    new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    if *slot != 0 {
+        validate_existing_pointer(*slot, geom, md)?;
+        return Ok(*slot);
+    }
+    let new_blk = alloc_and_zero_pointer_block(super_, hint_group, new_blocks_bump)?;
+    *slot = new_blk;
+    *new_blocks_bump += (geom.block_size / 512) as u64;
+    Ok(new_blk)
+}
+
+/// Ensure slot `index` of the pointer block at absolute `parent_blk`
+/// holds a non-zero pointer. If it's zero, allocate a new pointer
+/// block, zero it, link it into the parent (RMW the parent through
+/// the buffer cache), and flush the parent. Returns the absolute
+/// pointer-block number now installed at `parent[index]`.
+fn ensure_slot_block(
+    super_: &Arc<Ext2Super>,
+    parent_blk: u32,
+    index: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    hint_group: u32,
+    new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    let (existing, bh) = read_pointer_slot_raw(super_, parent_blk, index, geom)?;
+    if existing != 0 {
+        validate_existing_pointer(existing, geom, md)?;
+        return Ok(existing);
+    }
+    // Allocate + zero the child before linking.
+    let child = alloc_and_zero_pointer_block(super_, hint_group, new_blocks_bump)?;
+    *new_blocks_bump += (geom.block_size / 512) as u64;
+    // Link into the parent at slot `index`.
+    {
+        let mut data = bh.data.write();
+        let off = (index as usize) * 4;
+        debug_assert!(off + 4 <= data.len());
+        data[off..off + 4].copy_from_slice(&child.to_le_bytes());
+    }
+    super_.cache.mark_dirty(&bh);
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+    Ok(child)
+}
+
+/// Leaf path: `parent_blk[index]` holds (or will hold) a data-block
+/// pointer. If the slot is zero, allocate + zero a fresh data block,
+/// link it into the parent, flush. Returns the absolute data-block
+/// number.
+fn finish_leaf_slot(
+    super_: &Arc<Ext2Super>,
+    parent_blk: u32,
+    index: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    hint_group: u32,
+    new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    let (existing, bh) = read_pointer_slot_raw(super_, parent_blk, index, geom)?;
+    if existing != 0 {
+        validate_existing_pointer(existing, geom, md)?;
+        return Ok(existing);
+    }
+    let data_blk = alloc_and_zero_data_block(super_, hint_group, new_blocks_bump)?;
+    *new_blocks_bump += (geom.block_size / 512) as u64;
+    {
+        let mut data = bh.data.write();
+        let off = (index as usize) * 4;
+        debug_assert!(off + 4 <= data.len());
+        data[off..off + 4].copy_from_slice(&data_blk.to_le_bytes());
+    }
+    super_.cache.mark_dirty(&bh);
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+    Ok(data_blk)
+}
+
+/// Read the pointer at slot `index` out of the indirect block `abs`
+/// and return both the decoded pointer *and* the buffer-cache handle
+/// so the caller can RMW the same slot on a miss without a second
+/// `bread`.
+fn read_pointer_slot_raw(
+    super_: &Arc<Ext2Super>,
+    abs: u32,
+    index: u32,
+    geom: &Geometry,
+) -> Result<(u32, Arc<crate::block::cache::BufferHead>), i64> {
+    debug_assert!(index < geom.ptrs_per_block);
+    let bh = super_
+        .cache
+        .bread(super_.device_id, abs as u64)
+        .map_err(|_| EIO)?;
+    let val = {
+        let data = bh.data.read();
+        let off = (index as usize) * 4;
+        let slot: [u8; 4] = data[off..off + 4]
+            .try_into()
+            .expect("pointer slot is exactly 4 bytes");
+        u32::from_le_bytes(slot)
+    };
+    Ok((val, bh))
+}
+
+/// Allocate a new block and synchronously zero it through the buffer
+/// cache. Used for both newly-allocated indirect pointer blocks and
+/// for freshly-allocated data blocks (so a crash between allocate-
+/// and-link leaves a zeroed block, never random recycled data from an
+/// earlier file's reuse). Returns the absolute block number.
+fn alloc_and_zero_pointer_block(
+    super_: &Arc<Ext2Super>,
+    hint_group: u32,
+    _new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    let blk = alloc_block(super_, Some(hint_group))?;
+    zero_block(super_, blk)?;
+    Ok(blk)
+}
+
+/// Same as [`alloc_and_zero_pointer_block`] but semantically marked
+/// "data" — distinguished so a reader of the write path sees that the
+/// zero-fill on data blocks is *intentional* (POSIX requires a sparse
+/// read of a hole-free-allocated-but-not-yet-written region to return
+/// zeros, and a crash after alloc + before the caller's `copy_from`
+/// is effectively that case).
+fn alloc_and_zero_data_block(
+    super_: &Arc<Ext2Super>,
+    hint_group: u32,
+    _new_blocks_bump: &mut u64,
+) -> Result<u32, i64> {
+    let blk = alloc_block(super_, Some(hint_group))?;
+    zero_block(super_, blk)?;
+    Ok(blk)
+}
+
+/// Zero the block at absolute `abs` through the per-mount buffer
+/// cache and flush it synchronously. A freshly-allocated block's
+/// cache entry can contain whatever bytes were previously resident at
+/// that physical position on disk — typically zeros on a fresh mkfs,
+/// but *not* guaranteed for a block reclaimed from a deleted file.
+fn zero_block(super_: &Arc<Ext2Super>, abs: u32) -> Result<(), i64> {
+    let bh = super_
+        .cache
+        .bread(super_.device_id, abs as u64)
+        .map_err(|_| EIO)?;
+    {
+        let mut data = bh.data.write();
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+    }
+    super_.cache.mark_dirty(&bh);
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+    Ok(())
+}
+
+/// Flush the in-memory `Ext2InodeMeta` for `ino` back to its on-disk
+/// slot. RMW through the buffer cache: read the inode-table block,
+/// decode the 128-byte slot, overlay our driver-owned fields, encode
+/// back, `mark_dirty`, `sync_dirty_buffer`.
+///
+/// Intentionally spelled out here rather than factored with `iget` —
+/// the writeback surface for the full inode (setattr, truncate, link-
+/// count) will land with Workstream E's `write_inode` helper; until
+/// then `write_file_at` is the only site that needs to persist the
+/// fields it mutates (`i_size`, `i_blocks`, `i_mtime`, `i_ctime`,
+/// `i_block[]`). Using a local helper keeps the scope tight.
+fn flush_inode_slot(
+    super_: &Arc<Ext2Super>,
+    ino: u32,
+    meta: &super::inode::Ext2InodeMeta,
+) -> Result<(), i64> {
+    let inodes_per_group = {
+        let sb = super_.sb_disk.lock();
+        sb.s_inodes_per_group
+    };
+    if inodes_per_group == 0 {
+        return Err(EIO);
+    }
+    let group = (ino - 1) / inodes_per_group;
+    let index_in_group = (ino - 1) % inodes_per_group;
+    let bg_inode_table = {
+        let bgdt = super_.bgdt.lock();
+        if (group as usize) >= bgdt.len() {
+            return Err(EIO);
+        }
+        bgdt[group as usize].bg_inode_table
+    };
+
+    let inode_size = super_.inode_size;
+    let block_size = super_.block_size;
+    let byte_offset = (index_in_group as u64) * (inode_size as u64);
+    let block_in_table = byte_offset / (block_size as u64);
+    let offset_in_block = (byte_offset % (block_size as u64)) as usize;
+    let absolute_block = (bg_inode_table as u64)
+        .checked_add(block_in_table)
+        .ok_or(EIO)?;
+
+    let bh = super_
+        .cache
+        .bread(super_.device_id, absolute_block)
+        .map_err(|_| EIO)?;
+    {
+        let mut data = bh.data.write();
+        if offset_in_block + EXT2_INODE_SIZE_V0 > data.len() {
+            return Err(EIO);
+        }
+        let slot = &mut data[offset_in_block..offset_in_block + EXT2_INODE_SIZE_V0];
+        // Decode the current on-disk slot so we preserve the fields
+        // `Ext2InodeMeta` doesn't carry (`i_generation`, `i_file_acl`,
+        // `i_osd1`, fragment bits, …) via `DiskInode::encode_to_slot`'s
+        // byte-wise preservation guarantee.
+        let mut disk = DiskInode::decode(slot);
+        apply_meta_to_disk(meta, &mut disk, super_);
+        disk.encode_to_slot(slot);
+    }
+    super_.cache.mark_dirty(&bh);
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+    Ok(())
+}
+
+/// Overlay the fields `Ext2InodeMeta` owns onto a decoded on-disk
+/// `DiskInode`, preparing it for re-encode. Large-file size-high
+/// handling matches the read path's `Ext2InodeMeta::from_disk`:
+/// regular files with `RO_COMPAT_LARGE_FILE` set split `size` across
+/// `i_size` + `i_dir_acl_or_size_high`; everything else keeps the
+/// low 32 bits only.
+fn apply_meta_to_disk(
+    meta: &super::inode::Ext2InodeMeta,
+    disk: &mut DiskInode,
+    super_: &Arc<Ext2Super>,
+) {
+    let ro_compat = super_.sb_disk.lock().s_feature_ro_compat;
+    let large_file = (ro_compat & RO_COMPAT_LARGE_FILE) != 0;
+    let is_reg = (meta.mode & 0o170_000) == 0o100_000;
+
+    disk.i_mode = meta.mode;
+    if is_reg && large_file {
+        disk.i_size = (meta.size & 0xffff_ffff) as u32;
+        disk.i_dir_acl_or_size_high = (meta.size >> 32) as u32;
+    } else {
+        // Clamp to 32 bits — directories and non-large-file regular
+        // files can't go past `u32::MAX` bytes. The caller already
+        // rejected `off + len > max_file_size`, but guard here too.
+        disk.i_size = (meta.size & 0xffff_ffff) as u32;
+        // Don't clobber `i_dir_acl` on directories.
+    }
+    disk.set_uid(meta.uid);
+    disk.set_gid(meta.gid);
+    disk.i_atime = meta.atime;
+    disk.i_ctime = meta.ctime;
+    disk.i_mtime = meta.mtime;
+    disk.i_dtime = meta.dtime;
+    disk.i_links_count = meta.links_count;
+    disk.i_blocks = meta.i_blocks;
+    disk.i_flags = meta.flags;
+    disk.i_block = meta.i_block;
 }
 
 /// Merge overlapping / touching ranges in a sorted list into
