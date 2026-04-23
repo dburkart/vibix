@@ -444,6 +444,7 @@ impl FileSystem for Ext2Fs {
             ext2_flags,
             owner: self.self_ref.clone(),
             inode_cache: super::inode::new_inode_cache(),
+            ext2_inode_cache: super::inode::new_ext2_inode_cache(),
             orphan_list: super::inode::new_orphan_list(),
             alloc_mutex: spin::Mutex::new(()),
             self_ref: weak.clone(),
@@ -548,6 +549,12 @@ pub struct Ext2Super {
     /// `Arc<Inode>` so repeat lookups dedup. Wave 3 (#559) introduces
     /// this; Workstream E populates it on every inode read.
     pub inode_cache: super::inode::InodeCache,
+    /// Driver-private parallel cache of `Weak<Ext2Inode>` keyed on the
+    /// same ext2 ino as [`inode_cache`]. The unlink path (#569) and
+    /// future setattr/truncate paths consume this to recover the
+    /// concrete `Arc<Ext2Inode>` without a dyn-Any downcast on
+    /// `Arc<dyn InodeOps>`.
+    pub ext2_inode_cache: super::inode::Ext2InodeCache,
     /// Strong-ref orphan list. Holds `Arc<Inode>` for every
     /// unlinked-but-open inode on this mount so its blocks aren't
     /// freed before the last close (RFC 0004 §Orphan-list residency

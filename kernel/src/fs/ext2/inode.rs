@@ -239,6 +239,21 @@ impl InodeOps for Ext2Inode {
     fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, i64> {
         Err(ENOENT)
     }
+
+    /// Remove a non-directory name from this directory. See
+    /// [`super::unlink::unlink`] for the normative body (RFC 0004
+    /// §Unlink semantics). The generic VFS layer permission-checks
+    /// the parent (`MAY_WRITE | MAY_EXEC`) before dispatching here.
+    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), i64> {
+        super::unlink::unlink(self, dir, name)
+    }
+
+    /// Remove an empty directory. See [`super::unlink::rmdir`] for the
+    /// normative body (RFC 0004 §Unlink semantics — "rmdir: directory
+    /// must contain only `.` and `..`").
+    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), i64> {
+        super::unlink::rmdir(self, dir, name)
+    }
 }
 
 /// Zero-sized marker type re-exported from wave 2 as the `FileOps`
@@ -322,6 +337,14 @@ fn vfs_meta_from(ext2_meta: &Ext2InodeMeta, block_size: u32) -> InodeMeta {
 /// `u32::MAX` (it's the on-disk slot width).
 pub type InodeCache = Mutex<BTreeMap<u32, Weak<Inode>>>;
 
+/// Driver-private parallel cache that stores a `Weak<Ext2Inode>` next
+/// to each `Weak<Inode>` in [`InodeCache`]. Populated by [`iget`] at
+/// the same moment it publishes the VFS cache entry. Consumers that
+/// need the concrete type (the unlink path in #569, setattr in #544+)
+/// upgrade this `Weak` instead of round-tripping an `Arc<dyn InodeOps>`
+/// downcast — the trait object has no `Any` bound to support that.
+pub type Ext2InodeCache = Mutex<BTreeMap<u32, Weak<Ext2Inode>>>;
+
 /// Per-mount orphan list. `Arc<Inode>` strong refs keep an unlinked-
 /// but-open inode resident so its blocks aren't freed before the last
 /// close; RFC 0004 §Orphan-list residency invariant is normative.
@@ -335,6 +358,12 @@ pub type OrphanList = Mutex<BTreeMap<u32, Arc<Inode>>>;
 /// Construct an empty inode cache. Called once at mount by
 /// [`Ext2Super`]'s constructor.
 pub fn new_inode_cache() -> InodeCache {
+    Mutex::new(BTreeMap::new())
+}
+
+/// Construct an empty driver-private Ext2Inode cache. Called once at
+/// mount by [`Ext2Super`]'s constructor.
+pub fn new_ext2_inode_cache() -> Ext2InodeCache {
     Mutex::new(BTreeMap::new())
 }
 
@@ -462,6 +491,13 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
             return Ok(existing);
         }
         cache.insert(ino, Arc::downgrade(&inode));
+    }
+    // Publish a parallel `Weak<Ext2Inode>` so the driver-private
+    // consumers (unlink, setattr, …) can recover the concrete type
+    // without a dyn-Any downcast on `Arc<dyn InodeOps>`.
+    {
+        let mut ecache = super_ref.ext2_inode_cache.lock();
+        ecache.insert(ino, Arc::downgrade(&ext2_inode));
     }
     // Keep ext2_inode alive past the Arc::downgrade above by implicitly
     // referencing it. The `inode.ops` Arc holds the last strong ref
