@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   build         — cargo-build the kernel for x86_64-unknown-none
 //!   initrd        — build target/rootfs.tar (minimal USTAR rootfs tarball)
+//!   ext2-image    — build target/vibix-root.ext2 (deterministic ext2 rootfs; #579)
 //!   iso           — build, fetch Limine, produce target/vibix.iso
 //!   run           — iso, then boot under QEMU with serial-stdio
 //!   test          — run host unit tests + QEMU integration tests
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
+mod ext2_image;
 mod isr_audit;
 mod lntab;
 
@@ -160,11 +162,20 @@ fn main() -> R<()> {
             let path = ensure_initrd()?;
             println!("→ initrd: {}", path.display());
         }
+        "ext2-image" => {
+            // `--update-hash` accepts a new image hash into the
+            // committed fixture. Callers intentionally changing the
+            // fixture tree or bumping e2fsprogs pass this; CI never
+            // does, so a drifting hash fails there loudly.
+            let update_hash = rest.iter().any(|a| a == "--update-hash");
+            let path = ext2_image::build(&workspace_root(), None, update_hash)?;
+            println!("→ ext2-image: {}", path.display());
+        }
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|test-integration|smoke|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -1904,15 +1915,24 @@ harness = false
         // CodeRabbit on PR #529: a bare `contains("repro-fork-build")`
         // check always passes because the dispatcher arm, comments,
         // and this very test all contain that substring.  Pin the
-        // assertion to the literal usage banner so a future edit that
-        // drops the token from the `eprintln!` arm actually fails.
+        // assertion to the literal usage-banner prefix plus the
+        // `repro-fork-build` token *inside* that banner, so a future
+        // edit that drops the token from the `eprintln!` arm actually
+        // fails.  Extracting the banner substring instead of matching
+        // the whole line keeps the check robust against cosmetic
+        // edits elsewhere in the usage list (e.g. adding new
+        // subcommands like `ext2-image` in #579).
+        let banner_start = source
+            .find("usage: cargo xtask [")
+            .expect("usage banner missing");
+        let banner_end = banner_start
+            + source[banner_start..]
+                .find(']')
+                .expect("usage banner has no closing ']'");
+        let banner = &source[banner_start..=banner_end];
         assert!(
-            source.contains(
-                "usage: cargo xtask [build|initrd|iso|run|test|test-unit|\
-                 test-integration|smoke|repro-fork|repro-fork-build|lint|\
-                 isr-audit|clean]"
-            ),
-            "usage string must list repro-fork-build"
+            banner.contains("repro-fork-build"),
+            "usage string must list repro-fork-build, got: {banner:?}"
         );
     }
 

@@ -180,6 +180,54 @@ jobs:
       - name: cargo xtask test-integration
         run: cargo xtask test-integration
 
+  ext2-image:
+    name: ext2 rootfs image (determinism + hash)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ext2-${{ hashFiles('**/Cargo.lock', 'xtask/src/ext2_image.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ext2-
+            ${{ runner.os }}-cargo-
+
+      # First build — must match the committed sha256 fixture.
+      - name: cargo xtask ext2-image
+        run: cargo xtask ext2-image
+
+      # Second build into a separate path — byte-identity check. A
+      # diff here means the build is not reproducible, even if the
+      # hash gate happened to pass (e.g. a fix-up that touched bytes
+      # but kept the hash stable, which is impossible under SHA-256
+      # but cheap to double-check by direct compare).
+      - name: Byte-identical rebuild
+        run: |
+          cp target/vibix-root.ext2 /tmp/vibix-root.ext2.first
+          rm target/vibix-root.ext2
+          cargo xtask ext2-image
+          cmp /tmp/vibix-root.ext2.first target/vibix-root.ext2
+
   smoke:
     name: smoke test
     runs-on: ubuntu-latest
