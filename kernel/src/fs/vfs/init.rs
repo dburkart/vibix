@@ -32,10 +32,13 @@
 use alloc::sync::Arc;
 use spin::Once;
 
+use alloc::boxed::Box;
+
 use super::dentry::{ChildState, Dentry, MountFlags};
 use super::inode::{Inode, InodeKind, InodeMeta};
 use super::mount_table::{alloc_fs_id, mount};
-use super::ops::{FileOps, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
+use super::ops::{FileOps, FileSystem, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
+use super::registry::register_filesystem;
 use super::super_block::{SbFlags, SuperBlock};
 use super::{DevFs, RamFs, TarFs};
 
@@ -61,6 +64,12 @@ pub fn init() {
     if ROOT_DENTRY.get().is_some() {
         return;
     }
+
+    // Populate the fstype registry so `mount(2)` can resolve names. The
+    // factories here are stateless: ramfs/devfs/tarfs each mint a fresh
+    // `Arc<dyn FileSystem>` per mount. ext2 is feature-gated and
+    // registered separately below.
+    register_builtin_filesystems();
 
     let bootstrap = bootstrap_target();
 
@@ -249,6 +258,42 @@ fn bootstrap_target() -> Arc<Dentry> {
     core::mem::forget(bootstrap_sb);
 
     target
+}
+
+/// Register every built-in fstype (`ramfs`, `tmpfs`, `devfs`, `tarfs`,
+/// and — when the `ext2` feature is on — `ext2`) with the fstype
+/// registry. Called once from [`init`]; the registry itself is idempotent
+/// on re-registration so a second call is harmless.
+///
+/// `tmpfs` is intentionally aliased to the ramfs factory: vibix does
+/// not yet distinguish the two, but Linux userspace scripts reach for
+/// `tmpfs` by default and nothing about our ramfs semantics violates
+/// the tmpfs contract for the operations that currently exist.
+fn register_builtin_filesystems() {
+    register_filesystem(
+        "ramfs",
+        Box::new(|_src| Ok(Arc::new(RamFs) as Arc<dyn FileSystem>)),
+    );
+    register_filesystem(
+        "tmpfs",
+        Box::new(|_src| Ok(Arc::new(RamFs) as Arc<dyn FileSystem>)),
+    );
+    register_filesystem(
+        "devfs",
+        Box::new(|_src| Ok(Arc::new(DevFs) as Arc<dyn FileSystem>)),
+    );
+    register_filesystem(
+        "tarfs",
+        Box::new(|_src| Ok(TarFs::new_arc() as Arc<dyn FileSystem>)),
+    );
+    #[cfg(feature = "ext2")]
+    register_filesystem(
+        "ext2",
+        Box::new(|_src| match crate::block::default_device() {
+            Some(dev) => Ok(crate::fs::ext2::Ext2Fs::new_with_device(dev) as Arc<dyn FileSystem>),
+            None => Err(crate::fs::ENODEV),
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------

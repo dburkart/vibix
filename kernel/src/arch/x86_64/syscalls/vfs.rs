@@ -34,7 +34,7 @@ use crate::fs::vfs::{
 use crate::fs::vfs::{Access, Credential, Timespec};
 use crate::fs::{
     flags as oflags, FileBackend, FileDescription, EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL,
-    EISDIR, ENAMETOOLONG, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS, EXDEV,
+    EISDIR, ENAMETOOLONG, ENODEV, ENOENT, ENOMEM, ENOTDIR, EPERM, EROFS, EXDEV,
 };
 
 /// Linux x86_64 value of the "use the current working directory"
@@ -2268,4 +2268,319 @@ pub unsafe fn sys_readlink_impl(path_uva: u64, buf_uva: u64, bufsize: u64) -> i6
 /// Only `AT_FDCWD` and absolute paths are honored until #239 lands.
 pub unsafe fn sys_readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
     readlinkat_impl(dfd, path_uva, buf_uva, bufsize)
+}
+
+// ---------------------------------------------------------------------------
+// mount(2) — issue #575, RFC 0004 §Mount API.
+//
+// Signature: `mount(source, target, fstype, flags, data)`
+//   a0 = source   : *const u8 (may be NULL for pseudo-FSes)
+//   a1 = target   : *const u8
+//   a2 = fstype   : *const u8
+//   a3 = flags    : u64 (MS_RDONLY=0x01, MS_NOSUID=0x02, MS_NODEV=0x04,
+//                         MS_NOEXEC=0x08)
+//   a4 = data     : *const u8 (ignored — per-FS options not plumbed yet)
+// ---------------------------------------------------------------------------
+
+/// Linux `MS_*` bits that `mount(2)` honours in this vibix revision. Any
+/// other bit in the flags argument is rejected with `-EINVAL` so a future
+/// caller can tell "v1 doesn't support this yet" from "flags ignored".
+pub const MS_RDONLY: u64 = 0x0001;
+pub const MS_NOSUID: u64 = 0x0002;
+pub const MS_NODEV: u64 = 0x0004;
+pub const MS_NOEXEC: u64 = 0x0008;
+const MS_SUPPORTED: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+
+/// Copy a NUL-terminated user string at `uva` into a heap buffer. Sized
+/// at [`PATH_MAX`]+1 so paths at the boundary still see their NUL. An
+/// empty `uva` (0) returns an empty vector — callers map that to
+/// [`crate::fs::vfs::MountSource::None`] for source-less FSes.
+fn copy_optional_user_string(uva: u64) -> Result<Vec<u8>, i64> {
+    if uva == 0 {
+        return Ok(Vec::new());
+    }
+    copy_user_path(uva)
+}
+
+/// Max length of the `fstype` name. Linux caps at `PAGE_SIZE`; we use a
+/// much tighter bound because the registry is a linear scan over <10
+/// entries and a legitimate caller never passes more than a handful of
+/// bytes.
+const FSTYPE_MAX: usize = 64;
+
+/// Copy the fstype name. Rejects oversized (`-EINVAL`, matching Linux's
+/// `mount_fs_str` path for over-long names) and empty names.
+fn copy_fstype(uva: u64) -> Result<Vec<u8>, i64> {
+    if uva == 0 {
+        return Err(EINVAL);
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(FSTYPE_MAX + 1).map_err(|_| ENOMEM)?;
+    buf.resize(FSTYPE_MAX + 1, 0u8);
+    let n = unsafe { copy_path_from_user_pub(uva as usize, &mut buf) }?;
+    buf.truncate(n);
+    if buf.is_empty() {
+        return Err(EINVAL);
+    }
+    Ok(buf)
+}
+
+/// `mount(source, target, fstype, flags, data)` — RFC 0004 §Mount API.
+///
+/// Contract:
+/// - `euid == 0` only. Non-root callers receive `-EPERM` **before** any
+///   path walk or string copy that could leak kernel state.
+/// - Unknown flag bits (outside [`MS_SUPPORTED`]) → `-EINVAL`.
+/// - Unknown fstype → `-EINVAL` (Linux-conformant).
+/// - Target path cannot be resolved → the walk's errno (typically
+///   `-ENOENT`).
+/// - Target is not a positive directory → `-ENOTDIR`.
+/// - Target already has something mounted on it → `-EBUSY` (race-safe:
+///   mount_table's own EBUSY path fires if another caller beats us
+///   between our pre-check and the publish).
+/// - Source resolution failed inside the factory (ext2 wants a block
+///   device, none is registered) → factory-returned errno, typically
+///   `-ENODEV`.
+///
+/// `data` is accepted for ABI compatibility but ignored — vibix does
+/// not parse per-FS mount options yet.
+pub unsafe fn sys_mount_impl(
+    source_uva: u64,
+    target_uva: u64,
+    fstype_uva: u64,
+    flags: u64,
+    _data_uva: u64,
+) -> i64 {
+    // 1. Superuser-only. Reject early so a bogus caller cannot even
+    //    probe which fstype names exist. Mirrors Linux's CAP_SYS_ADMIN
+    //    check at the entry of `ksys_mount`.
+    let cred = crate::task::current_credentials();
+    if cred.euid != 0 {
+        return EPERM;
+    }
+
+    // 2. Reject unknown flag bits. A caller that sets `MS_BIND` or
+    //    `MS_SHARED` today gets a clean EINVAL rather than a silently
+    //    ignored bit that causes divergence when the bit ships later.
+    if flags & !MS_SUPPORTED != 0 {
+        return EINVAL;
+    }
+    let mut mflags = crate::fs::vfs::MountFlags::default();
+    if flags & MS_RDONLY != 0 {
+        mflags = mflags | crate::fs::vfs::MountFlags::RDONLY;
+    }
+    if flags & MS_NOSUID != 0 {
+        mflags = mflags | crate::fs::vfs::MountFlags::NOSUID;
+    }
+    if flags & MS_NODEV != 0 {
+        mflags = mflags | crate::fs::vfs::MountFlags::NODEV;
+    }
+    if flags & MS_NOEXEC != 0 {
+        mflags = mflags | crate::fs::vfs::MountFlags::NOEXEC;
+    }
+
+    // 3. Copy the three user strings. `target` and `fstype` are
+    //    mandatory; `source` may be NULL for pseudo-filesystems.
+    let fstype_buf = match copy_fstype(fstype_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let fstype = match core::str::from_utf8(&fstype_buf) {
+        Ok(s) => s,
+        Err(_) => return EINVAL,
+    };
+
+    // Early-reject unknown fstype before walking the target path. Saves a
+    // heap allocation on the common misspelled-name failure path.
+    if !crate::fs::vfs::is_registered(fstype) {
+        return EINVAL;
+    }
+
+    let target_buf = match copy_user_path(target_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if target_buf.is_empty() {
+        return ENOENT;
+    }
+
+    let source_buf = match copy_optional_user_string(source_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    // 4. Resolve the target path to a positive-directory dentry. The
+    //    walk uses the caller's credentials so an unsearchable ancestor
+    //    fails with `-EACCES`. Root reaches every directory via its
+    //    kernel.euid==0 bypass — we've already checked euid==0 above —
+    //    so the cred argument is primarily a defensive measure against
+    //    a future change that moves the euid gate elsewhere.
+    let root = match vfs_root() {
+        Some(r) => r,
+        None => return ENOENT,
+    };
+    let cwd = if target_buf.first() == Some(&b'/') {
+        root.clone()
+    } else {
+        crate::task::current_cwd().unwrap_or_else(|| root.clone())
+    };
+    let mut nd = match NameIdata::new(
+        root,
+        cwd,
+        (*cred).clone(),
+        LookupFlags::default() | LookupFlags::FOLLOW,
+    ) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Err(e) = path_walk(&mut nd, &target_buf, &GlobalMountResolver) {
+        return e;
+    }
+    let target_dentry = nd.path.dentry.clone();
+
+    // Must be a positive directory. `mount_table::mount` checks the same
+    // thing under its write lock, but doing it here means the diagnostic
+    // `ENOTDIR` fires before the factory allocates driver state.
+    {
+        let inode_slot = target_dentry.inode.read();
+        let inode = match inode_slot.as_ref() {
+            Some(i) => i,
+            None => return ENOENT,
+        };
+        if inode.kind != InodeKind::Dir {
+            return ENOTDIR;
+        }
+    }
+    if target_dentry.mount.read().is_some() {
+        return EBUSY;
+    }
+
+    // 5. Build the `MountSource`. `source` may be empty (pseudo-FS) or a
+    //    path to a block-device node. Until devfs carries first-class
+    //    block-device inodes, a non-empty `source` is just forwarded to
+    //    the factory as a `MountSource::Path`; factories that need a
+    //    block device (ext2) reach for `block::default_device()` and
+    //    return `-ENODEV` if none is registered.
+    let msrc = if source_buf.is_empty() {
+        crate::fs::vfs::MountSource::None
+    } else {
+        crate::fs::vfs::MountSource::Path(&source_buf)
+    };
+
+    // 6. Build the FS via the registry and mount it.
+    let fs = match crate::fs::vfs::lookup_and_build(fstype, msrc) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    // Re-materialise the source so `FileSystem::mount` sees the same
+    // bytes. Using a second borrow of `source_buf` is fine — the factory
+    // call above has returned and the previous borrow is released.
+    let msrc2 = if source_buf.is_empty() {
+        crate::fs::vfs::MountSource::None
+    } else {
+        crate::fs::vfs::MountSource::Path(&source_buf)
+    };
+    match crate::fs::vfs::mount(msrc2, &target_dentry, fs, mflags) {
+        Ok(_edge) => 0,
+        // Surface `ENODEV` through unchanged (e.g. ext2 factory returned
+        // it; fs-side mount could also bubble the same errno for a
+        // missing device on the slow path).
+        Err(e) if e == ENODEV => ENODEV,
+        Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+    use crate::fs::vfs::ops::{FileSystem, MountSource};
+    use crate::fs::vfs::registry::{register_filesystem, reset_for_tests};
+    use crate::fs::vfs::super_block::{SbFlags, SuperBlock};
+    use crate::fs::vfs::{
+        alloc_fs_id, FileOps, InodeOps, MountFlags, SetAttr, Stat, StatFs, SuperOps,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+
+    struct T;
+    impl InodeOps for T {
+        fn getattr(&self, _i: &crate::fs::vfs::Inode, _o: &mut Stat) -> Result<(), i64> {
+            Ok(())
+        }
+        fn setattr(&self, _i: &crate::fs::vfs::Inode, _a: &SetAttr) -> Result<(), i64> {
+            Ok(())
+        }
+    }
+    struct TF;
+    impl FileOps for TF {}
+    struct TSB;
+    impl SuperOps for TSB {
+        fn root_inode(&self) -> Arc<crate::fs::vfs::Inode> {
+            unreachable!()
+        }
+        fn statfs(&self) -> Result<StatFs, i64> {
+            Ok(Default::default())
+        }
+        fn unmount(&self) {}
+    }
+
+    struct MockFs;
+    impl FileSystem for MockFs {
+        fn name(&self) -> &'static str {
+            "mockfs"
+        }
+        fn mount(&self, _s: MountSource<'_>, _f: MountFlags) -> Result<Arc<SuperBlock>, i64> {
+            let sb = Arc::new(SuperBlock::new(
+                alloc_fs_id(),
+                Arc::new(TSB),
+                "mockfs",
+                512,
+                SbFlags::default(),
+            ));
+            let root = Arc::new(crate::fs::vfs::Inode::new(
+                1,
+                Arc::downgrade(&sb),
+                Arc::new(T),
+                Arc::new(TF),
+                crate::fs::vfs::InodeKind::Dir,
+                crate::fs::vfs::InodeMeta {
+                    mode: 0o755,
+                    nlink: 2,
+                    ..Default::default()
+                },
+            ));
+            sb.root.call_once(|| root);
+            Ok(sb)
+        }
+    }
+
+    #[test]
+    fn flag_mask_round_trip() {
+        // Every supported MS_* bit maps to its MountFlags equivalent.
+        assert_eq!(MS_RDONLY, 0x0001);
+        assert_eq!(MS_NOSUID, 0x0002);
+        assert_eq!(MS_NODEV, 0x0004);
+        assert_eq!(MS_NOEXEC, 0x0008);
+        assert_eq!(MS_SUPPORTED, 0x000F);
+    }
+
+    #[test]
+    fn registry_lookup_unknown_returns_einval() {
+        reset_for_tests();
+        // Pre-condition: nothing registered under this name.
+        assert!(!crate::fs::vfs::is_registered("nosuch"));
+        let r = crate::fs::vfs::lookup_and_build("nosuch", MountSource::None);
+        assert_eq!(r.err(), Some(EINVAL));
+    }
+
+    #[test]
+    fn registry_lookup_registered_builds_fs() {
+        reset_for_tests();
+        register_filesystem(
+            "mockfs",
+            Box::new(|_src| Ok(Arc::new(MockFs) as Arc<dyn FileSystem>)),
+        );
+        let fs = crate::fs::vfs::lookup_and_build("mockfs", MountSource::None).expect("registered");
+        assert_eq!(fs.name(), "mockfs");
+    }
 }

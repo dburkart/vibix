@@ -944,6 +944,16 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         UTIMENSAT => super::syscalls::vfs::sys_utimensat_impl(a0 as i32, a1, a2, a3 as u32),
 
+        // mount(source, target, fstype, flags, data) — RFC 0004 §Mount API.
+        // Superuser-only; rejects unknown flag bits; resolves fstype by name
+        // against the fstype registry populated by `vfs::init`. See issue #575.
+        // Gated on `vfs_creds` so the euid==0 check has real task credentials
+        // to consult — before Workstream B wires them through every path,
+        // this arm would always let `kernel()`-rooted kernel tasks through,
+        // which is correct but only meaningful once userspace callers exist.
+        #[cfg(feature = "vfs_creds")]
+        MOUNT => unsafe { super::syscalls::vfs::sys_mount_impl(a0, a1, a2, a3, a4) },
+
         // poll(fds, nfds, timeout_ms) — wait for readiness on a set of fds.
         POLL => crate::poll::syscalls::sys_poll(a0, a1, a2 as i64),
 
@@ -1634,6 +1644,7 @@ pub mod syscall_nr {
     pub const FCHOWNAT: u64 = 260;
     pub const FCHMODAT: u64 = 268;
     pub const UTIMENSAT: u64 = 280;
+    pub const MOUNT: u64 = 165;
     pub const POLL: u64 = 7;
     pub const SELECT: u64 = 23;
     pub const PSELECT6: u64 = 270;
@@ -1766,5 +1777,8 @@ mod tests {
 
         // utimensat (issue #544)
         assert_eq!(syscall_nr::UTIMENSAT, 280, "SYS_utimensat must be 280");
+
+        // Mount plumbing (issue #575, RFC 0004 Workstream F)
+        assert_eq!(syscall_nr::MOUNT, 165, "SYS_mount must be 165");
     }
 }
