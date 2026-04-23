@@ -32,8 +32,11 @@ const VERSION: u8 = 1;
 
 /// Fixed reservation for the symbol table. Patched in place by xtask.
 /// Sized so a debug kernel's full symbol set fits with headroom; debug
-/// builds today come in around 2–3k symbols × ~50 bytes/entry.
-pub const KSYMTAB_BYTES: usize = 320 * 1024;
+/// builds today come in around 2–3k symbols × ~50 bytes/entry. Bumped
+/// to 384 KiB (from 320 KiB) after the test-crate symbol set grew past
+/// the old cap on ext2 integration tests (observed 263912 bytes on
+/// `ext2_file_read`).
+pub const KSYMTAB_BYTES: usize = 384 * 1024;
 
 /// Fixed-size reservation patched in place by xtask after linking. We
 /// deliberately DO NOT use a custom `#[link_section]` — a separate
