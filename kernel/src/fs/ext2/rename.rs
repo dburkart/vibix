@@ -65,8 +65,8 @@ use super::disk::{
 use super::fs::{Ext2MountFlags, Ext2Super};
 use super::inode::{iget, Ext2Inode};
 use super::unlink::{
-    dir_is_empty, ext2_inode_from_vfs, locate_dirent, now_secs, push_on_orphan_list,
-    remove_dirent_at, resolve_sb_for_super, rmw_disk_inode,
+    decrement_used_dirs, dir_is_empty, ext2_inode_from_vfs, locate_dirent, now_secs,
+    push_on_orphan_list, remove_dirent_at, resolve_sb_for_super, rmw_disk_inode,
 };
 
 use crate::fs::vfs::inode::{Inode, InodeKind};
@@ -262,11 +262,11 @@ pub fn rename(
     super::create::validate_name(old_name)?;
     super::create::validate_name(new_name)?;
 
-    // Same-parent same-name is always a successful no-op.
     let same_parent = old_parent.ino == new_parent.ino;
-    if same_parent && old_name == new_name {
-        return Ok(());
-    }
+    // NB: the same-parent same-name "no-op" return moved *after*
+    // `locate_dirent(old_name)` below — returning Ok(()) up here would
+    // paper over a missing source (rename("missing","missing") must be
+    // ENOENT, not success).
 
     // Acquire locks.
     //  - Cross-dir: take `sb.rename_mutex` first (global tiebreaker),
@@ -299,6 +299,11 @@ pub fn rename(
 
     // 1. Locate the source dirent and load the source inode.
     let src_loc = locate_dirent(&super_, old_parent, old_name)?;
+    // Now that we've proved `old_name` exists, a same-parent rename
+    // onto the same name is a successful no-op.
+    if same_parent && old_name == new_name {
+        return Ok(());
+    }
     let parent_sb = resolve_sb_for_super(&super_)?;
     let source_vfs = iget(&super_, &parent_sb, src_loc.child_ino)?;
     let source_ext2 = ext2_inode_from_vfs(&super_, &source_vfs).ok_or(EIO)?;
@@ -429,6 +434,14 @@ pub fn rename(
         }
         if new_links == 0 {
             victim_hit_zero = Some(vloc.child_ino);
+            // When the victim was a directory, its block group's
+            // `bg_used_dirs_count` must be decremented — same as the
+            // rmdir path does in `unlink.rs`. Without this the BGDT
+            // directory counts drift after a directory-over-directory
+            // rename.
+            if source_is_dir {
+                decrement_used_dirs(&super_, vloc.child_ino)?;
+            }
         }
     }
 

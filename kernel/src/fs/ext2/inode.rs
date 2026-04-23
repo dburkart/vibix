@@ -314,9 +314,17 @@ impl InodeOps for Ext2Inode {
                 .and_then(Weak::upgrade)
                 .ok_or(EIO)?
         };
-        // Sanity: the cached Arc must be the same VFS inode the
-        // caller handed us.
-        if new_dir_arc_vfs.ino != new_dir.ino {
+        // Identity check by raw pointer equality: inode numbers are
+        // only unique within a mount, so an ino match alone would
+        // accept an inode from a different mount that happens to share
+        // `new_dir.ino` (root is usually 2 on every ext2 image). The
+        // only safe acceptance criterion is "the cached Arc<Inode> is
+        // the exact same allocation the caller handed us". The cross-
+        // mount rejection also happens in `rename::rename` via
+        // `Arc::ptr_eq` on the superblocks, but rejecting here keeps
+        // the failure deterministic even if a future caller routes
+        // around that check.
+        if !core::ptr::eq(Arc::as_ref(&new_dir_arc_vfs), new_dir) {
             return Err(EIO);
         }
         let new_dir_ext2 = {

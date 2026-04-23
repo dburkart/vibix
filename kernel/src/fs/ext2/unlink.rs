@@ -370,7 +370,7 @@ fn flush_superblock(super_: &Arc<Ext2Super>, sb: &Ext2SuperBlock) -> Result<(), 
 /// Decrement `bg_used_dirs_count` on the BGDT entry for the group that
 /// owns `ino`. Called from `rmdir` when a directory inode has its link
 /// count driven to zero.
-fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
+pub(super) fn decrement_used_dirs(super_: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
     use super::disk::EXT2_GROUP_DESC_SIZE;
     let (s_inodes_per_group, s_first_data_block) = {
         let sb = super_.sb_disk.lock();

@@ -43,7 +43,7 @@ use vibix::block::{BlockDevice, BlockError};
 use vibix::fs::ext2::{dir, iget, Ext2Fs, Ext2Inode, Ext2InodeMeta, Ext2Super};
 use vibix::fs::vfs::ops::{FileSystem as _, MountSource};
 use vibix::fs::vfs::MountFlags;
-use vibix::fs::{EINVAL, EROFS};
+use vibix::fs::{EINVAL, ENOENT, EROFS};
 use vibix::sync::BlockingRwLock;
 use vibix::{
     exit_qemu, serial_println,
@@ -90,6 +90,10 @@ fn run_tests() {
             &(rename_dot_and_dotdot_einval as fn()),
         ),
         ("rename_same_name_noop", &(rename_same_name_noop as fn())),
+        (
+            "rename_missing_same_name_is_enoent",
+            &(rename_missing_same_name_is_enoent as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -519,6 +523,24 @@ fn rename_same_name_noop() {
         dir::lookup(&super_arc, &root_e2, b"keep").expect("still there"),
         a_ino,
     );
+
+    sb.ops.unmount();
+    drop(super_arc);
+}
+
+/// Regression: renaming a missing source onto the same missing name
+/// in the same parent must still fail with ENOENT, not succeed as a
+/// no-op. Previously a fast path returned Ok(()) for same-parent,
+/// same-name renames before verifying the source even existed.
+fn rename_missing_same_name_is_enoent() {
+    let (sb, _fs, super_arc, _disk) = mount_rw();
+    let root_arc = get(&super_arc, &sb, 2);
+
+    let err = root_arc
+        .ops
+        .rename(&root_arc, b"does-not-exist", &root_arc, b"does-not-exist")
+        .expect_err("missing source must not succeed");
+    assert_eq!(err, ENOENT);
 
     sb.ops.unmount();
     drop(super_arc);
