@@ -28,7 +28,8 @@ use super::{
 crate::test_case! {
     /// rename preserve file metadata
     // rename/00.t
-    preserve_metadata => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    preserve_metadata => [Regular, Socket]
 }
 fn preserve_metadata(ctx: &mut TestContext, ft: FileType) {
     let old_path = ctx.create(ft).unwrap();
@@ -127,7 +128,8 @@ fn preserve_metadata_symlink(ctx: &mut TestContext) {
 crate::test_case! {
     /// rename should not update ctime if it fails
     // rename/00.t
-    unchanged_ctime_failed, serialized, root => [Regular, Dir, Fifo, Block, Char, Socket, Symlink(None)]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    unchanged_ctime_failed, serialized, root => [Regular, Dir, Socket, Symlink(None)]
 }
 fn unchanged_ctime_failed(ctx: &mut SerializedTestContext, ft: FileType) {
     let file = ctx.new_file(ft).mode(0o600).create().unwrap();
@@ -202,7 +204,8 @@ fn write_access_required_subdir(ctx: &mut SerializedTestContext) {
 crate::test_case! {
     /// rename should update ctime if it succeeds
     // rename/22.t
-    changed_ctime_success, FileSystemFeature::RenameCtime => [Regular, Dir, Fifo, Block, Char, Socket, Symlink(None)]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    changed_ctime_success, FileSystemFeature::RenameCtime => [Regular, Dir, Socket, Symlink(None)]
 }
 fn changed_ctime_success(ctx: &mut TestContext, ft: FileType) {
     let old_path = ctx.create(ft).unwrap();
@@ -222,7 +225,8 @@ fn changed_ctime_success(ctx: &mut TestContext, ft: FileType) {
 crate::test_case! {
     /// rename succeeds when to is multiply linked
     // rename/23.t
-    to_multiply_linked => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    to_multiply_linked => [Regular, Socket]
 }
 fn to_multiply_linked(ctx: &mut TestContext, ft: FileType) {
     let src = ctx.create(ft.clone()).unwrap();
@@ -283,7 +287,8 @@ crate::test_case! {
     /// rename returns ENOTDIR when the 'from' argument is a directory,
     /// but 'to' is not a directory
     // rename/13.t
-    enotdir_from_dir_to_not_dir => [Regular, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    enotdir_from_dir_to_not_dir => [Regular, Socket]
 }
 fn enotdir_from_dir_to_not_dir(ctx: &mut TestContext, ft: FileType) {
     let path = ctx.create(ft).unwrap();
@@ -307,7 +312,8 @@ eloop_either_test_case!(rename);
 crate::test_case! {
     /// rename returns EISDIR when the 'to' argument is a directory, but 'from' is not a directory
     // rename/14.t
-    eisdir_to_dir_from_not_dir => [Regular, Fifo, Block, Char, Socket, Symlink(None)]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    eisdir_to_dir_from_not_dir => [Regular, Socket, Symlink(None)]
 }
 fn eisdir_to_dir_from_not_dir(ctx: &mut TestContext, ft: FileType) {
     let dir = ctx.create(FileType::Dir).unwrap();
@@ -362,7 +368,8 @@ fn einval_ebusy_dot_dotdot(ctx: &mut TestContext) {
 crate::test_case! {
     /// rename returns EEXIST or ENOTEMPTY if the 'to' argument is a directory and is not empty
     // rename/20.t
-    eexist_enotempty_to_non_empty => [Regular, Dir, Fifo, Block, Char, Socket, Symlink(None)]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    eexist_enotempty_to_non_empty => [Regular, Dir, Socket, Symlink(None)]
 }
 fn eexist_enotempty_to_non_empty(ctx: &mut TestContext, ft: FileType) {
     let from_dir = ctx.create(FileType::Dir).unwrap();

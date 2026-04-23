@@ -24,7 +24,8 @@ const UTIME_OMIT: TimeSpec = TimeSpec::new(0, nix::libc::UTIME_OMIT);
 crate::test_case! {
     /// utimensat changes timestamps on any type of file
     // utimensat/00.t
-    changes_timestamps, FileSystemFeature::Utimensat => [Regular, Dir, Fifo, Block, Char, Socket]
+    // FileType::{Fifo,Block,Char} trimmed for vibix (#581).
+    changes_timestamps, FileSystemFeature::Utimensat => [Regular, Dir, Socket]
 }
 fn changes_timestamps(ctx: &mut TestContext, f_type: FileType) {
     let date1 = TimeSpec::seconds(1900000000); // Sun Mar 17 11:46:40 MDT 2030

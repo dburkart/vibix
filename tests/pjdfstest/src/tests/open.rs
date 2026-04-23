@@ -193,19 +193,9 @@ fn socket_error(ctx: &mut TestContext) {
     ));
 }
 
-crate::test_case! {
-    /// open returns ENXIO when O_NONBLOCK is set, the named file is a fifo, O_WRONLY is set,
-    /// and no process has the file open for reading
-    // open/17.t
-    fifo_nonblock_wronly
-}
-fn fifo_nonblock_wronly(ctx: &mut TestContext) {
-    let fifo = ctx.create(FileType::Fifo).unwrap();
-    assert_eq!(
-        open(&fifo, OFlag::O_WRONLY | OFlag::O_NONBLOCK, Mode::empty()),
-        Err(Errno::ENXIO)
-    );
-}
+// `fifo_nonblock_wronly` (open/17.t) removed for vibix — exercises FileType::Fifo
+// which requires mkfifo(2), not implemented (#581). Tracked with the other
+// {Fifo,Block,Char} matrix trims in link/rename/utimensat.
 
 // open/02.t
 enametoolong_comp_test_case!(open(~path, OFlag::O_CREAT, Mode::empty()));
