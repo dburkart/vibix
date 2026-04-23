@@ -6,6 +6,11 @@ members = [
     "userspace/init",
     "userspace/repro_fork",
 ]
+# tests/pjdfstest is a vendored copy of saidsay-so/pjdfstest (2-clause BSD). It
+# is intentionally kept outside the workspace until #581 wires it into xtask —
+# its nightly target, dep versions, and unstable features must not leak into
+# the kernel build graph.
+exclude = ["tests/pjdfstest"]
 resolver = "2"
 
 [workspace.package]
