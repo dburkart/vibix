@@ -15,13 +15,21 @@
 //!    directories (which `setattr` refuses with `EISDIR`) — an orphaned
 //!    empty directory may still own its data block until finalize
 //!    releases it.
-//! 2. **Free the inode**: call [`super::ialloc::free_inode`] to clear
-//!    the inode bitmap bit and bump `s_free_inodes_count`.
-//! 3. **Remove from the on-disk orphan chain**: update the predecessor
-//!    that points at this ino (via `s_last_orphan` or another orphan's
-//!    `i_dtime`) to skip over it. Then stamp this inode's `i_dtime`
-//!    with the current wall-clock time so an `e2fsck` / remount sees it
-//!    as fully deleted rather than as an orphan-chain terminator.
+//! 2. **Unchain from the on-disk orphan list and stamp the tombstone**:
+//!    update the predecessor that points at this ino (via
+//!    `s_last_orphan` or another orphan's `i_dtime`) to skip over it,
+//!    then stamp this inode's `i_dtime` with the current wall-clock
+//!    time. This step **must** land before step 3 — see below.
+//! 3. **Free the inode**: call [`super::ialloc::free_inode`] to clear
+//!    the inode bitmap bit and bump `s_free_inodes_count`. Ordering
+//!    unchain-before-free is load-bearing: once the bitmap bit is
+//!    cleared, a concurrent `create(2)` can reallocate the ino. If
+//!    unchain ran after free, the allocator could hand the ino to a new
+//!    inode before the tombstone `i_dtime` write landed — and the
+//!    orphan-chain walk would then either rewrite the new inode's
+//!    `i_dtime` or leave `s_last_orphan` transiently pointing at a
+//!    reallocated, non-orphan inode. Doing unchain first keeps those
+//!    two worlds (orphan chain vs. live allocation) disjoint.
 //! 4. **Drop the `Arc<Inode>` pin** from
 //!    [`super::inode::OrphanList`]. This releases the residency root;
 //!    any still-live cache `Weak<Inode>` will upgrade to `None` on the
@@ -39,19 +47,20 @@
 //! - After step 1, blocks that were freed back to the allocator won't
 //!   be double-freed on replay because step 1 rereads the current
 //!   on-disk `i_block[]` each time — already-cleared slots are no-ops.
-//! - Step 2 (`free_inode`) tolerates a second call only if the bitmap
-//!   bit is still set; a second call from replay would see a cleared
-//!   bit and return `EIO`. The mount-replay (#564) orphan-chain walker
-//!   already gates the finalize on `i_links_count == 0` — after step 2
-//!   the inode's on-disk `i_links_count` is still 0 (we never clear the
-//!   inode-slot; `free_inode` only flips the bitmap), so replay
-//!   proceeds. The double-free is avoided because step 3's `i_dtime`
-//!   stamp (a nonzero wall-clock) is what the replay validator checks
-//!   to decide "this is fully deleted, skip."
-//! - Step 3 finally unchains the inode and stamps a real `i_dtime`. At
-//!   this point the mount-replay walker would observe
-//!   `i_dtime != 0 && i_links_count == 0` — the canonical "fully
-//!   deleted" state — and would not re-enlist the inode.
+//! - Step 2 unchains the inode and stamps a real `i_dtime`. The bitmap
+//!   bit is still set at this point, so the ino is not reusable; if we
+//!   crash between step 2 and step 3, mount-replay (#564) observes
+//!   `i_links_count == 0 && i_dtime != 0` — the canonical "fully
+//!   deleted" state — and skips it. The orphan chain has already been
+//!   patched, so the inode is no longer on any orphan-list walk.
+//! - Step 3 (`free_inode`) tolerates a second call only if the bitmap
+//!   bit is still set. A crash between the tombstone and this step
+//!   leaves the bit set; mount-replay re-runs `free_inode` (the ino is
+//!   not on the chain anymore, so replay finds it via a separate scan
+//!   of the bitmap or via userspace `fsck`). The double-free is
+//!   avoided because step 2's `i_dtime` stamp (a nonzero wall-clock)
+//!   is what the replay validator checks to decide "this is fully
+//!   deleted, skip."
 //! - Step 4 is in-memory only; a crash here costs nothing beyond the
 //!   pin until the next mount.
 //!
@@ -135,6 +144,20 @@ pub fn finalize(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
         cache.get(&ino).and_then(|w| w.upgrade()).ok_or(EIO)?
     };
 
+    // Guard: the on-disk slot must still be in the orphan state —
+    // `i_links_count == 0`. A racing relink (currently rejected by the
+    // driver, but defense in depth) would leave a positive link count;
+    // freeing the inode underneath a live dirent would silently corrupt
+    // the filesystem. Read-only check, no lock held across it; the
+    // orphan-list pin (cloned above) keeps the ino from being concurrently
+    // finalized elsewhere.
+    {
+        let (disk, _, _) = read_disk_inode(super_ref, ino)?;
+        if disk.i_links_count != 0 {
+            return Err(EIO);
+        }
+    }
+
     let _kind = pinned.kind;
     // `free_inode`'s `was_dir` flag drives a `bg_used_dirs_count`
     // decrement. The unlink path (#569) already decrements that counter
@@ -154,19 +177,20 @@ pub fn finalize(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
     //    all zero) — mount-replay (#564) will then re-run steps 2-4.
     truncate_inode_to_zero(super_ref, &ext2_inode)?;
 
-    // 2. Free the inode number in the inode bitmap and bump
+    // 2. Remove this ino from the on-disk orphan chain and stamp the
+    //    deletion tombstone. This **must** happen before step 3: once
+    //    the inode bitmap bit is cleared, a concurrent `create(2)` can
+    //    re-allocate this ino. Doing unchain-then-stamp first keeps the
+    //    ino off the orphan chain and durably tombstoned while the bit
+    //    is still set, so there's no window where `s_last_orphan` or a
+    //    predecessor's `i_dtime` could transiently point at a reallocated,
+    //    non-orphan inode.
+    unchain_orphan(super_ref, ino)?;
+
+    // 3. Free the inode number in the inode bitmap and bump
     //    `s_free_inodes_count`. `was_dir` decrements
     //    `bg_used_dirs_count` for the owning group.
     super::ialloc::free_inode(super_ref, ino, was_dir)?;
-
-    // 3. Remove this ino from the on-disk orphan chain: patch the
-    //    predecessor (either `s_last_orphan` or another orphan's
-    //    `i_dtime`) to point at our `i_dtime` (next-pointer), then
-    //    stamp *our* `i_dtime` with the current wall-clock seconds so
-    //    a subsequent mount-time walker sees us as fully deleted
-    //    (`i_links_count == 0 && i_dtime != 0 && i_dtime < some-chain-head`
-    //    — the linkage is dead and only the dtime-tombstone remains).
-    unchain_orphan(super_ref, ino)?;
 
     // 4. Drop the in-memory Arc<Inode> pin. After this the inode cache's
     //    Weak<Inode> will no longer upgrade; a racing `iget` that
@@ -217,7 +241,7 @@ fn truncate_inode_to_zero(
     // RMW the on-disk inode slot so a later mount-replay sees a
     // consistent zero-length orphan. We preserve `i_links_count` (must
     // stay 0 — the orphan invariant) and `i_dtime` (still the orphan-
-    // chain next-pointer at this point; step 3 will overwrite it).
+    // chain next-pointer at this point; step 2 will overwrite it).
     let (block_in_dev, offset_in_block) = locate_inode_slot(super_ref, ext2_inode.ino)?;
     let bh = super_ref
         .cache
@@ -246,7 +270,8 @@ fn truncate_inode_to_zero(
     Ok(())
 }
 
-/// Step 3: remove `ino` from the on-disk orphan chain.
+/// Step 2: remove `ino` from the on-disk orphan chain and stamp its
+/// `i_dtime` tombstone.
 ///
 /// The chain is a singly-linked list threaded through on-disk
 /// `i_dtime` fields, with the head in `s_last_orphan`. To remove
@@ -320,9 +345,11 @@ fn unchain_orphan(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(), i64> {
 
     // Finally, stamp `ino`'s own i_dtime with the wall-clock. The
     // on-disk inode slot was previously zeroed of its data pointers in
-    // step 1 and of its bitmap bit in step 2 — this write is the last
-    // on-disk mutation for this inode and marks it as fully deleted to
-    // any subsequent mount-replay walker.
+    // step 1 — this write converts the orphan-chain next-pointer into
+    // a real deletion timestamp. Step 3 (`free_inode`) runs after this
+    // to release the bitmap bit; at that point mount-replay sees
+    // `i_links_count == 0 && i_dtime != 0` and knows the inode is
+    // fully deleted.
     let now = crate::fs::vfs::Timespec::now().sec as u32;
     // `now == 0` would look like "still on orphan list" to the
     // mount-replay walker. Defend against a clock-at-epoch situation

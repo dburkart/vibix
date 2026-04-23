@@ -178,6 +178,28 @@ fn mount_ro() -> (Arc<SuperBlock>, Arc<Ext2Fs>, Arc<Ext2Super>, Arc<RamDisk>) {
 // Tests
 // ---------------------------------------------------------------------------
 
+// On-disk offsets for the tombstone-state assertion. Duplicated from
+// the ext2_orphan_chain test — the offsets are pinned against the real
+// mkfs.ext2 layout rather than consuming crate-private constants.
+const BGDT_BYTE_OFFSET_1K: usize = 2048;
+const BGD_OFF_INODE_TABLE: usize = 8;
+const INODE_SIZE: usize = 128;
+const INODE_OFF_DTIME: usize = 20;
+const INODE_OFF_LINKS_COUNT: usize = 26;
+const BLOCK_SIZE_BYTES: usize = 1024;
+
+fn u32_le(image: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(image[off..off + 4].try_into().unwrap())
+}
+fn u16_le(image: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(image[off..off + 2].try_into().unwrap())
+}
+fn inode_slot_offset(image: &[u8], ino: u32) -> usize {
+    let itab_block = u32_le(image, BGDT_BYTE_OFFSET_1K + BGD_OFF_INODE_TABLE) as usize;
+    let slot_in_table = (ino as usize) - 1;
+    itab_block * BLOCK_SIZE_BYTES + slot_in_table * INODE_SIZE
+}
+
 fn finalize_rmdir_orphan_frees_blocks_and_chain_head() {
     let (sb, _fs, super_arc, _disk) = mount_rw();
 
@@ -259,6 +281,26 @@ fn finalize_rmdir_orphan_frees_blocks_and_chain_head() {
         free_blocks_after > free_blocks_before,
         "finalize must free lost+found's dir data block back to the allocator (before={free_blocks_before}, after={free_blocks_after})",
     );
+    // 6. Tombstone state. The on-disk inode slot for ino 11 must show
+    //    `i_links_count == 0 && i_dtime != 0` — the canonical "fully
+    //    deleted" signature mount-replay (#564) uses to distinguish
+    //    finalized inodes from still-orphan ones. Read the block
+    //    directly off the RamDisk storage so we bypass any in-memory
+    //    cache of the Ext2Inode.
+    {
+        let storage = _disk.storage.lock();
+        let slot_off = inode_slot_offset(&storage, 11);
+        let links = u16_le(&storage, slot_off + INODE_OFF_LINKS_COUNT);
+        let dtime = u32_le(&storage, slot_off + INODE_OFF_DTIME);
+        assert_eq!(
+            links, 0,
+            "finalize must leave i_links_count == 0 (orphan invariant preserved)"
+        );
+        assert_ne!(
+            dtime, 0,
+            "finalize must stamp a nonzero i_dtime — mount-replay uses i_dtime != 0 as the 'fully deleted' marker"
+        );
+    }
 
     sb.ops.unmount();
     drop(super_arc);
