@@ -381,6 +381,14 @@ mod block_backed {
 
         let block_count = size.div_ceil(block_size as u64);
         for logical in 0..block_count {
+            // Cap record parsing to the directory's logical size. The
+            // on-disk block extent is always `block_size`, but `i_size`
+            // can fall short of a full block boundary on the final
+            // block — records past `i_size` are not live and must not
+            // be exposed by `lookup` (RFC 0004 §Security).
+            let logical_off = logical * block_size as u64;
+            let logical_len =
+                core::cmp::min(size.saturating_sub(logical_off), block_size as u64) as usize;
             let logical_u32: u32 = match logical.try_into() {
                 Ok(v) => v,
                 Err(_) => return Err(EIO),
@@ -411,7 +419,7 @@ mod block_backed {
                 .bread(super_ref.device_id, abs as u64)
                 .map_err(|_| EIO)?;
             let data = bh.data.read();
-            let end = core::cmp::min(data.len(), block_size as usize);
+            let end = core::cmp::min(data.len(), logical_len);
             for rec in DirEntryIter::new(&data[..end], filetype_valid) {
                 match rec {
                     Err(DirError::Corrupt) | Err(DirError::Io) => return Err(EIO),
@@ -476,6 +484,11 @@ mod block_backed {
         // block's iteration, not the whole call.
         let mut block_buf: Vec<u8> = vec![0u8; block_size as usize];
         for logical in 0..block_count {
+            // Same i_size cap as `lookup` — see note there. A short
+            // final block must not leak records past `i_size`.
+            let logical_off = logical * block_size as u64;
+            let logical_len =
+                core::cmp::min(size.saturating_sub(logical_off), block_size as u64) as usize;
             let logical_u32: u32 = match logical.try_into() {
                 Ok(v) => v,
                 Err(_) => return Err(EIO),
@@ -501,21 +514,12 @@ mod block_backed {
                 .cache
                 .bread(super_ref.device_id, abs as u64)
                 .map_err(|_| EIO)?;
-            {
+            let valid_end = {
                 let data = bh.data.read();
-                let end = core::cmp::min(data.len(), block_size as usize);
+                let end = core::cmp::min(data.len(), logical_len);
                 block_buf[..end].copy_from_slice(&data[..end]);
-                if end < block_buf.len() {
-                    // Anything past the disk block's extent is zeros;
-                    // the iterator will stop once rec_len overruns
-                    // the valid prefix.
-                    for b in &mut block_buf[end..] {
-                        *b = 0;
-                    }
-                }
-            }
-
-            let valid_end = core::cmp::min(block_buf.len(), block_size as usize);
+                end
+            };
             for rec in DirEntryIter::new(&block_buf[..valid_end], filetype_valid) {
                 let view = match rec {
                     Err(DirError::Corrupt) | Err(DirError::Io) => return Err(EIO),

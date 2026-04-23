@@ -48,6 +48,7 @@ pub const SECTOR_SIZE: usize = 512;
 /// | `NotInitialized`| `ENODEV` |
 /// | `Timeout`       | `EIO`    |
 /// | `OutOfRange`    | `EINVAL` |
+/// | `ReadOnly`      | `EROFS`  |
 /// | `NoMemory`      | `ENOMEM` |
 ///
 /// Kept deliberately small — the cache and ext2 driver only need to
