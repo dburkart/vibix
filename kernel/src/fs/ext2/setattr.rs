@@ -298,7 +298,7 @@ pub fn setattr(ext2_inode: &Ext2Inode, inode: &Inode, attr: &SetAttr) -> Result<
 /// Compute the (absolute block, offset-in-block) location of the
 /// inode-table slot for `ino`. Mirrors the arithmetic in
 /// [`super::inode::iget`].
-fn locate_inode_slot(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(u64, usize), i64> {
+pub(super) fn locate_inode_slot(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(u64, usize), i64> {
     if ino == 0 {
         return Err(EINVAL);
     }
@@ -340,7 +340,7 @@ fn locate_inode_slot(super_ref: &Arc<Ext2Super>, ino: u32) -> Result<(u64, usize
 /// The walk is reverse-logical: highest logical block first, so a
 /// crash mid-walk leaves a prefix of the file intact and no "past
 /// EOF" block pointer still reachable from the inode.
-fn truncate_free(
+pub(super) fn truncate_free(
     super_ref: &Arc<Ext2Super>,
     cur_i_block: &[u32; EXT2_N_BLOCKS],
     new_size: u64,

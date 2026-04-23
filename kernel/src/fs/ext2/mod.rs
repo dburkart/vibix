@@ -140,3 +140,13 @@ pub mod link;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use link::{link, symlink};
+
+// Orphan-list final-close sequence (#573). Runs the four-step
+// truncate → free_inode → unchain → unpin pipeline for an unlinked-
+// but-closed inode. Same feature gate as the rest of the write-path
+// modules; the integration test lives in `kernel/tests/ext2_orphan_finalize.rs`.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod orphan_finalize;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use orphan_finalize::finalize as finalize_orphan;
