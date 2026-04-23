@@ -16,6 +16,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::Ordering;
 
 use crate::sync::{BlockingRwLock, Semaphore};
 
@@ -136,6 +137,88 @@ impl Dentry {
     /// `true` if `inode` is currently populated (positive dentry).
     pub fn is_positive(&self) -> bool {
         self.inode.read().is_some()
+    }
+}
+
+/// RAII wrapper around an `Arc<Dentry>` that increments the dentry's
+/// owning [`SuperBlock::dentry_pin_count`] on construction and
+/// decrements it on drop. Used by long-lived dentry storage sites
+/// (`Task::cwd`, [`super::OpenFile`]) to keep the SB's busy counter
+/// honest so `umount2`'s default `EBUSY` check and the `MNT_DETACH`
+/// finalize-gate see every live pin — not just the transient
+/// [`super::SbActiveGuard`] scopes.
+///
+/// The pin is anchored to the dentry's inode's super-block via the
+/// inode's [`alloc::sync::Weak`]. If the SB has already been dropped
+/// (dentries outliving their SB is only possible for negative/orphan
+/// dentries during teardown), the counter bump is a no-op; the Drop
+/// side then naturally also skips.
+///
+/// Holders that are not themselves pinning an SB (e.g. a dentry
+/// constructed outside any mount in a unit test) get a no-op pin.
+pub struct PinnedDentry {
+    dentry: Arc<Dentry>,
+    sb: Option<Arc<SuperBlock>>,
+}
+
+impl PinnedDentry {
+    /// Pin `dentry`: bump its SB's `dentry_pin_count`. The pin is
+    /// released when the returned value is dropped.
+    pub fn new(dentry: Arc<Dentry>) -> Self {
+        let sb = dentry
+            .inode
+            .read()
+            .as_ref()
+            .and_then(|ino| ino.sb.upgrade());
+        if let Some(sb) = sb.as_ref() {
+            sb.dentry_pin_count.fetch_add(1, Ordering::SeqCst);
+        }
+        Self { dentry, sb }
+    }
+
+    /// Access the underlying dentry.
+    pub fn dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
+    }
+
+    /// Clone the underlying `Arc<Dentry>` without affecting the pin
+    /// count. Callers that need a short-lived reference (a path walk's
+    /// `cwd` seed, for instance) should prefer this over taking a new
+    /// `PinnedDentry`.
+    pub fn clone_arc(&self) -> Arc<Dentry> {
+        self.dentry.clone()
+    }
+}
+
+impl Clone for PinnedDentry {
+    /// Cloning a `PinnedDentry` yields a second pin on the same SB —
+    /// `fork(2)` cloning a parent's cwd into the child is the canonical
+    /// use case.
+    fn clone(&self) -> Self {
+        if let Some(sb) = self.sb.as_ref() {
+            sb.dentry_pin_count.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            dentry: self.dentry.clone(),
+            sb: self.sb.clone(),
+        }
+    }
+}
+
+impl Drop for PinnedDentry {
+    fn drop(&mut self) {
+        if let Some(sb) = self.sb.as_ref() {
+            let old = sb.dentry_pin_count.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(old > 0, "dentry_pin_count underflow");
+            if old == 1 {
+                // Last dentry pin released: a lazily-detached mount
+                // whose finalize-gate was waiting on `dentry_pin_count`
+                // may now be runnable. `finalize_pending_detach` is a
+                // no-op for SBs without a pending detach entry, so
+                // calling it unconditionally is safe.
+                super::mount_table::finalize_pending_detach(sb);
+            }
+        }
     }
 }
 

@@ -61,7 +61,7 @@ pub mod super_block;
 pub mod tarfs;
 
 pub use backend::VfsBackend;
-pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags};
+pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags, PinnedDentry};
 pub use devfs::DevFs;
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use init::{init, root};

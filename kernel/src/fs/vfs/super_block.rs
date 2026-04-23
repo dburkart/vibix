@@ -61,6 +61,18 @@ pub struct SuperBlock {
     /// `sys_umount` Phase A sets `draining = true` then spins on
     /// `sb_active == 0`.
     pub sb_active: AtomicUsize,
+    /// Long-lived `Arc<Dentry>` pin count. Bumped for every dentry that
+    /// outlives a syscall's [`SbActiveGuard`] — e.g. stored in
+    /// `Task::cwd`, held inside an `OpenFile`, or (future) cached in a
+    /// `getcwd` path-cache. `sys_umount`'s default busy-check refuses
+    /// `EBUSY` unless this is zero *in addition to* `sb_active`; the
+    /// `MNT_DETACH` finalize-gate likewise consults both.
+    ///
+    /// Distinct from `sb_active`: `sb_active` is a short-lived
+    /// in-flight-syscall count; `dentry_pin_count` is what keeps a
+    /// filesystem "busy" from a user-observable standpoint (a process
+    /// whose cwd lives on the mount, an open fd, etc.).
+    pub dentry_pin_count: AtomicUsize,
     pub draining: AtomicBool,
 }
 
@@ -81,6 +93,7 @@ impl SuperBlock {
             flags,
             rename_mutex: BlockingMutex::new(()),
             sb_active: AtomicUsize::new(0),
+            dentry_pin_count: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
         }
     }

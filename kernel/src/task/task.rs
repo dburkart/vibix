@@ -143,7 +143,13 @@ pub(super) struct Task {
     /// spawned before `vfs::init()` runs. `chdir` sets this to the
     /// resolved dentry; `fork` copies it from the parent; `exec` preserves
     /// it unchanged.
-    pub cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
+    ///
+    /// Wrapped in [`crate::fs::vfs::PinnedDentry`] so its lifetime bumps
+    /// the owning SB's `dentry_pin_count`. That counter is what makes
+    /// `umount2`'s default busy-check refuse `EBUSY` when a task's cwd
+    /// still lives on the mount, and what makes the `MNT_DETACH`
+    /// finalize-gate wait for the chdir to be released.
+    pub cwd: Option<crate::fs::vfs::PinnedDentry>,
 
     /// Per-task POSIX credentials (uid/euid/suid + gid/egid/sgid +
     /// supplementary groups). Stored as `Arc<Credential>` behind a
@@ -356,7 +362,7 @@ impl Task {
         child_address_space: alloc::sync::Arc<spin::RwLock<AddressSpace>>,
         child_cr3: PhysFrame<Size4KiB>,
         child_fd_table: alloc::sync::Arc<Mutex<crate::fs::FileDescTable>>,
-        child_cwd: Option<alloc::sync::Arc<crate::fs::vfs::Dentry>>,
+        child_cwd: Option<crate::fs::vfs::PinnedDentry>,
         child_credentials: Arc<Credential>,
     ) -> Result<Self, crate::mem::addrspace::ForkError> {
         crate::fork_trace!(
