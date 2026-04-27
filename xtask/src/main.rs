@@ -120,6 +120,13 @@ const SMOKE_MARKERS: &[&str] = &[
     // `ring3-first-fault:` diagnostic line emitted by the IDT fault
     // handlers in that case).
     "ring3-iretq: rip=",
+    // #647: kernel emits `irq-pre-ring3: ticks=N` immediately before the
+    // very first IRETQ to ring-3 and `irq-post-ring3: ticks=… delta=…`
+    // on the first SYSCALL back from ring-3. The delta is the number of
+    // timer ticks the kernel observed while userspace was first
+    // executing — the #478 starvation signature has delta near zero.
+    "irq-pre-ring3: ticks=",
+    "irq-post-ring3: ticks=",
     // #478 diagnostic: emitted by userspace init on fd=2 as the very first
     // userspace action, immediately after ring-3 entry and before the first
     // `write(1, HELLO_MSG)`. Three-marker localization:
@@ -139,6 +146,15 @@ const SMOKE_MARKERS: &[&str] = &[
     // SYSRET / user-context restore after the first write is broken.
     "init: post-write marker",
 ];
+
+// Note: an earlier draft of #647 added a delta floor parsed out of
+// the `irq-post-ring3` marker. In practice the gap between IRETQ and
+// the first SYSCALL is microseconds (well below one 10 ms tick) on
+// real hardware, so a delta floor would flake. The marker's *presence*
+// is the gate: when the #478 starvation hits, userspace never reaches
+// its first SYSCALL and `irq-post-ring3:` simply never appears, which
+// the existing missing-markers check catches. Soak detection lives
+// kernel-side via `process::CURRENT_PID_SOAK_THRESHOLD`.
 
 /// Markers for the fork+exec+wait flow. These are flakey under un-accelerated
 /// CI QEMU — the child sometimes doesn't finish before HARD_CAP even though

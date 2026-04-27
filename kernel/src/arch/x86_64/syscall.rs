@@ -159,6 +159,20 @@ pub static SYSCALL_SCRATCH_RSP: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static SYSCALL_RESTART_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// `time::ticks()` snapshot taken right before the very first IRETQ to
+/// ring-3. Read again on the first SYSCALL from ring-3 to compute how
+/// many timer interrupts fired during the userspace-spawn window — the
+/// #478 starvation signature has this delta near zero. Set once by
+/// [`jump_to_ring3`]; consumed once by [`syscall_dispatch`] via
+/// `INIT_IRQ_POST_FIRED`.
+pub static INIT_IRQ_PRE_RING3_TICKS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// One-shot flag: `false` until the first SYSCALL from ring-3 has
+/// emitted the matching `irq-post-ring3:` marker. Avoids spamming the
+/// counter on every subsequent syscall.
+pub static INIT_IRQ_POST_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Enable SYSCALL/SYSRET and point LSTAR at the entry trampoline.
 /// Must be called after GDT is live.
 pub fn init() {
@@ -226,6 +240,13 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
         USER_DATA_SELECTOR,
         0x202u64,
     );
+    // #647: snapshot the timer-tick counter immediately before the
+    // ring-0→ring-3 transition. xtask smoke compares this against the
+    // matching `irq-post-ring3` snapshot taken on the first SYSCALL
+    // from userspace and fails when too few timer interrupts fire in
+    // between (the #478 starvation signature).
+    INIT_IRQ_PRE_RING3_TICKS.store(crate::time::ticks(), core::sync::atomic::Ordering::Release);
+    crate::serial_println!("irq-pre-ring3: ticks={}", crate::time::ticks());
     // #478 diagnostic step 1: emit a single-byte marker on the QEMU debug
     // console (port 0xe9) *immediately* before the iretq, and a second
     // byte in the same asm block *after* the iretq frame is pushed but
@@ -295,6 +316,33 @@ pub unsafe extern "C" fn syscall_dispatch(
     a4: u64,
     a5: u64,
 ) -> i64 {
+    // #478 fix: SYSCALL entry clears RFLAGS.IF via SFMASK, so we land
+    // here with interrupts disabled. The dispatch path takes plain
+    // (non-IRQ-masking) spin locks like `process::TABLE`; spinning on
+    // those with IF=0 starves the timer ISR and wedges the kernel
+    // when the holder needs preemption to release (the #478 trace
+    // signature: `current_pid` `pause` loop, 24 timer interrupts /
+    // 120 s). Re-enable IRQs here, before any locks are touched.
+    //
+    // Safety: kernel-mode code running at this point uses its own
+    // per-task SYSCALL stack (`SYSCALL_KERNEL_RSP` / `arm_ring3_syscall_stack`)
+    // and the user GS base hasn't been touched, so a timer ISR
+    // preempting us is no different from a timer ISR preempting any
+    // other task-context kernel code.
+    unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)) };
+
+    // #647: emit the `irq-post-ring3` marker on the very first SYSCALL
+    // from ring-3 so xtask smoke can verify the timer ISR fired enough
+    // times during the userspace-spawn window. Done before any other
+    // syscall handling — if userspace never observably runs (the #478
+    // signature) this branch is never taken and smoke fails on the
+    // missing marker.
+    if !INIT_IRQ_POST_FIRED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let pre = INIT_IRQ_PRE_RING3_TICKS.load(core::sync::atomic::Ordering::Acquire);
+        let now = crate::time::ticks();
+        let delta = now.saturating_sub(pre);
+        crate::serial_println!("irq-post-ring3: ticks={} pre={} delta={}", now, pre, delta);
+    }
     use syscall_nr::*;
     match nr {
         // read(fd, buf, len) — non-blocking; returns -EAGAIN if no data.
