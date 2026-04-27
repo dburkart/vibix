@@ -29,7 +29,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
 use vibix::block::BlockDevice;
 use vibix::fs::ext2::dir;
