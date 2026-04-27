@@ -1442,6 +1442,17 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let _ = reader_handle.join();
     let _ = child.wait();
 
+    // Drain any serial lines the reader thread queued after the main
+    // loop exited (marker-completion path) but before the pipe closed.
+    // Without this, a late residual signature like
+    // `ring3-first-fault: #PF` printed in the final ms of the boot
+    // can be silently dropped from `accumulated` and miss the
+    // VIBIX_SMOKE_SERIAL_LOG persisted file (#648 nightly-soak relies
+    // on every emitted line being inspectable).
+    while let Ok(line) = rx.try_recv() {
+        accumulated.push_str(&line);
+    }
+
     // Optional always-on serial capture for the nightly soak (#648).
     // When `VIBIX_SMOKE_SERIAL_LOG` is set, persist the accumulated
     // serial output to that path on every exit (success and failure)

@@ -367,6 +367,27 @@ jobs:
             pass_rate=0
           fi
 
+          # Treat missing shard counters as a hard failure: if a shard
+          # crashed before writing its `shard-N-counters.env`, its
+          # results are absent and silently aggregating fewer-than-
+          # expected shards would understate residual hits and let a
+          # red night slip through as green. Page the gate before
+          # publishing the (incomplete) aggregate metrics.
+          if [ "${shards_seen}" -lt "${SHARD_COUNT}" ] || [ "${total}" -lt "${TOTAL_RUNS_EXPECTED}" ]; then
+            {
+              echo ""
+              echo "## ❌ incomplete shard reporting"
+              echo ""
+              echo "- shards reporting: ${shards_seen}/${SHARD_COUNT}"
+              echo "- runs aggregated: ${total}/${TOTAL_RUNS_EXPECTED}"
+              echo ""
+              echo "One or more shards did not produce a counters file. Aggregate"
+              echo "results below are incomplete; treating this as a workflow failure."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::nightly-soak aggregate: only ${shards_seen}/${SHARD_COUNT} shards reported (${total}/${TOTAL_RUNS_EXPECTED} runs); failing the gate"
+            exit 1
+          fi
+
           {
             echo "# nightly-soak aggregate (${SHARD_COUNT} shards, expected ${TOTAL_RUNS_EXPECTED} runs)"
             echo ""
@@ -461,35 +482,40 @@ jobs:
             --json number,title \
             --jq '.[0].number // empty')
 
-          body=$(cat <<EOF
-\`nightly-soak\` has failed three consecutive scheduled runs. This
-typically means a residual signature from the #501 quality sprint
-(or a new bug class) is recurring at sufficient density to trip the
-1000× gate every night.
-
-## Latest run
-
-- $RUN_URL — residual hits: ring3=${SIG_RING3}, stall=${SIG_STALL}, leak=${SIG_LEAK}
-
-## Prior reds
-
-- $prev1_url
-- $prev2_url
-
-## Next steps
-
-1. Download the \`nightly-soak-logs-shard-*\` artifacts from the latest run.
-2. \`grep\` per-run \`*.serial\` files for \`ring3-first-fault: #PF\`,
-   \`init: iretq to ring-3\` followed by missing \`init: hello from pid 1\`,
-   and \`tasks: reaped task ... (stack VA slot ... leaked)\`.
-3. Bisect against the merge base of the most recent green run vs.
-   today's red run.
-4. If the regression is genuinely intermittent and not bisectable to a
-   commit, escalate to the #501 epic.
-
-Auto-filed by \`.github/workflows/nightly-soak.yml\` per #648.
-EOF
-)
+          # Build the issue body. Heredocs whose body is at column 0
+          # would terminate the surrounding YAML `run: |` block scalar;
+          # use a printf-fed `printf` chain instead so every line stays
+          # within the YAML block's indent.
+          body_file="$(mktemp)"
+          {
+            printf '%s\n' '`nightly-soak` has failed three consecutive scheduled runs. This'
+            printf '%s\n' 'typically means a residual signature from the #501 quality sprint'
+            printf '%s\n' '(or a new bug class) is recurring at sufficient density to trip the'
+            printf '%s\n' '1000× gate every night.'
+            printf '\n'
+            printf '%s\n' '## Latest run'
+            printf '\n'
+            printf -- '- %s — residual hits: ring3=%s, stall=%s, leak=%s\n' \
+              "${RUN_URL}" "${SIG_RING3}" "${SIG_STALL}" "${SIG_LEAK}"
+            printf '\n'
+            printf '%s\n' '## Prior reds'
+            printf '\n'
+            printf -- '- %s\n' "${prev1_url}"
+            printf -- '- %s\n' "${prev2_url}"
+            printf '\n'
+            printf '%s\n' '## Next steps'
+            printf '\n'
+            printf '%s\n' '1. Download the `nightly-soak-logs-shard-*` artifacts from the latest run.'
+            printf '%s\n' '2. `grep` per-run `*.serial` files for `ring3-first-fault: #PF`,'
+            printf '%s\n' '   `init: iretq to ring-3` followed by missing `init: hello from pid 1`,'
+            printf '%s\n' '   and `tasks: reaped task ... (stack VA slot ... leaked)`.'
+            printf '%s\n' '3. Bisect against the merge base of the most recent green run vs.'
+            printf '%s\n' "   today's red run."
+            printf '%s\n' '4. If the regression is genuinely intermittent and not bisectable to a'
+            printf '%s\n' '   commit, escalate to the #501 epic.'
+            printf '\n'
+            printf '%s\n' 'Auto-filed by `.github/workflows/nightly-soak.yml` per #648.'
+          } > "${body_file}"
 
           if [ -n "${existing}" ]; then
             echo "Existing tracking issue #${existing} is open — appending a streak-update comment."
@@ -502,5 +528,5 @@ EOF
               --repo "${OWNER}/${REPO}" \
               --title "${title}" \
               --label "priority:P1,area:debug" \
-              --body "${body}"
+              --body-file "${body_file}"
           fi
