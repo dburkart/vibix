@@ -535,8 +535,12 @@ pub fn rename(
     //     blocks. The victim's dirent is already gone by step 5.
     if let Some(ino) = victim_hit_zero {
         if let Some((v_arc, v_ext2)) = victim_arcs.as_ref() {
-            v_ext2.unlinked.store(true, Ordering::SeqCst);
+            // Push-then-mark ordering: see the matching note in
+            // `unlink::unlink_common` step 8 — the open-fd-close
+            // finalize trigger (#638) reads `unlinked` then expects
+            // the orphan_list pin to already be there.
             push_on_orphan_list(&super_, ino, v_arc)?;
+            v_ext2.unlinked.store(true, Ordering::SeqCst);
         }
     }
 
