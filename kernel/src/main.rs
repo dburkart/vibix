@@ -63,7 +63,14 @@ pub extern "C" fn _start() -> ! {
     // BOOTLOADER_RECLAIMABLE memory through the first VFS mount, so
     // reading it here before `mem::reclaim_bootloader_memory` runs
     // is safe.
-    if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
+    // Parse root=<source> + rootflags=<csv> per RFC 0004 Workstream F
+    // (#577) and writeback knobs from the Limine cmdline. The parsed
+    // RootArgs is threaded down past block::init() and consumed by
+    // `vfs::init::init_with` so a `root=/dev/vda` boot actually mounts
+    // ext2 instead of falling back to the auto-probe (issue #631).
+    // Defaults to `RootArgs::auto()` when no cmdline is delivered, which
+    // preserves the pre-#577 behaviour of "try ext2 → tarfs → ramfs".
+    let root_args = if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
         let bytes = cmdline_resp.cmdline().to_bytes();
         if !bytes.is_empty() {
             serial_println!(
@@ -71,13 +78,6 @@ pub extern "C" fn _start() -> ! {
                 core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
             );
         }
-        // Parse root=<source> + rootflags=<csv> per RFC 0004 Workstream F
-        // (#577). The result is logged unconditionally; the VFS mount
-        // path consumes it via `vfs::init::init_with` (host tests and
-        // any future prod caller). Today the prod boot path does not
-        // itself call `vfs::init::init_with`, so this is a pure
-        // observability hop — the cmdline is surfaced in the serial log
-        // so operators can confirm Limine delivered what they set.
         let root_args = vibix::boot_cmdline::parse(bytes);
         serial_println!(
             "rootfs: source={:?} flags={:#x} explicit_ro={:?}",
@@ -102,9 +102,12 @@ pub extern "C" fn _start() -> ! {
                 vibix::block::writeback::DEFAULT_INTERVAL_SECS,
             );
         }
+
+        root_args
     } else {
         serial_println!("cmdline: not provided by bootloader");
-    }
+        vibix::boot_cmdline::RootArgs::auto()
+    };
 
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     match vibix::hpet::init() {
@@ -146,6 +149,17 @@ pub extern "C" fn _start() -> ! {
             Err(e) => serial_println!("block: write failed: {:?}", e),
         }
     }
+
+    // VFS init consumes the parsed `RootArgs` and brings up the namespace
+    // root (`/`), `/dev`, and `/tmp`. Must run after `block::init()` so
+    // ext2 can see the virtio-blk registry entry; runs before the userspace
+    // module summary + `task::init()` so PID 1 launches against a live
+    // namespace. Issue #631 wired this in — before the wiring, `_start`
+    // logged the parsed RootArgs but never called `init_with`, so the
+    // boot effectively ignored `root=/dev/vda` even though tests covered
+    // the path.
+    vibix::fs::vfs::init::init_with(root_args);
+    serial_println!("vfs: init_with consumed cmdline RootArgs");
 
     // Console init must come after mem::init() — the character grid and
     // scrollback buffer are heap-allocated inside Console::new().
