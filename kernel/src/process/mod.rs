@@ -9,6 +9,20 @@
 //! cross-lock path is `mark_zombie` → `CHILD_WAIT.notify_all()` →
 //! `task::wake(id)` → `SCHED`, which is safe because `TABLE` is dropped
 //! before the notify call.
+//!
+//! The session/pgrp syscalls (`sys_getsid`, `sys_getpgid`) sample
+//! `task::current_id()` **before** taking `TABLE` so the forbidden order
+//! is mechanically impossible — see #478 diagnostic
+//! (https://github.com/dburkart/vibix/pull/595#issuecomment-4302346400).
+//!
+//! ## IF-discipline (#647)
+//!
+//! [`current_pid`] must be called with interrupts enabled. It spins on
+//! a plain `spin::Mutex`; with `IF=0` a stuck holder cannot be
+//! preempted and the kernel wedges (the failure shape traced to #478).
+//! Debug builds assert `RFLAGS.IF=1` on entry and panic if the soak
+//! threshold is reached. Callers in interrupt-disabled regions must
+//! cache the pid before disabling IRQs.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -169,9 +183,86 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
 
 /// Return the PID of the currently-running task, or `0` if the running
 /// task has no process table entry (e.g. the bootstrap kernel task).
+///
+/// ## Invariants enforced (#647)
+///
+/// - Must be called with interrupts enabled (IF=1). Spinning here with
+///   IF=0 starves the timer ISR, which is the failure signature traced
+///   to #478. Debug builds panic on violation; release builds skip the
+///   check (no atomic read on the hot syscall path).
+/// - The TABLE acquire uses an instrumented `try_lock` loop. If the
+///   spin reaches [`CURRENT_PID_SOAK_THRESHOLD`] without progress, the
+///   kernel panics in debug builds with a captured backtrace so the
+///   regression is loud rather than silent.
 pub fn current_pid() -> u32 {
     let task_id = crate::task::current_id();
-    TABLE.lock().pid_of.get(&task_id).copied().unwrap_or(0)
+    debug_assert!(
+        is_if_set(),
+        "current_pid() called with interrupts disabled — \
+         spinning on TABLE with IF=0 starves the timer ISR (#478/#647)"
+    );
+    let table = lock_table_with_soak_check("current_pid");
+    table.pid_of.get(&task_id).copied().unwrap_or(0)
+}
+
+/// Soak-loop ceiling for `try_lock` retries on TABLE before declaring
+/// "stuck spinning". Tuned high enough that ordinary contention (a few
+/// hundred ns of holder work) never trips, low enough that a wedged
+/// holder is caught within seconds even on slow QEMU. Each pause is
+/// ~1 cycle; ~1e8 iterations is ~30 ms on real hardware, multiple
+/// seconds on un-accelerated QEMU.
+pub const CURRENT_PID_SOAK_THRESHOLD: u64 = 100_000_000;
+
+/// Acquire TABLE with an instrumented `try_lock` spin. Panics in debug
+/// builds when the spin count exceeds [`CURRENT_PID_SOAK_THRESHOLD`] —
+/// loud failure for the #478-class hang. Release builds use the plain
+/// blocking `lock()` to keep the hot path branchless.
+#[inline]
+fn lock_table_with_soak_check(caller: &'static str) -> spin::MutexGuard<'static, Table> {
+    #[cfg(debug_assertions)]
+    {
+        let mut spins: u64 = 0;
+        loop {
+            if let Some(g) = TABLE.try_lock() {
+                return g;
+            }
+            spins += 1;
+            if spins == CURRENT_PID_SOAK_THRESHOLD {
+                panic!(
+                    "process::TABLE: {caller}() spin exceeded soak threshold \
+                     ({CURRENT_PID_SOAK_THRESHOLD} iters) — holder appears wedged \
+                     (likely lock-ordering violation; see #478/#647)"
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = caller;
+        TABLE.lock()
+    }
+}
+
+/// Cheap check for "interrupts currently enabled". Inline so the
+/// debug-only assertion in [`current_pid`] doesn't add a function-call
+/// cost when `debug_assertions` is off (the `debug_assert!` macro
+/// elides the call entirely in release).
+#[cfg(target_os = "none")]
+#[inline]
+fn is_if_set() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+}
+
+/// Host-build stub: unit tests for this module run on the host where
+/// real RFLAGS isn't meaningful. The IrqLock host harness models IF
+/// state via an AtomicBool, but `current_pid` is exercised through
+/// session-syscall tests that don't go through `task::current_id`, so
+/// we report `true` here and let those tests focus on TABLE semantics.
+#[cfg(not(target_os = "none"))]
+#[inline]
+fn is_if_set() -> bool {
+    true
 }
 
 /// Mark `pid` as a zombie with `exit_status`, then wake any parents
@@ -491,31 +582,22 @@ pub fn sys_setsid() -> i64 {
     setsid_for(current_pid())
 }
 
-/// `getsid(pid)` — return the session id of `pid`, or of the caller if
-/// `pid == 0`. Returns ESRCH for unknown pids.
-pub fn sys_getsid(pid: u32) -> i64 {
-    let t = TABLE.lock();
-    let target = if pid == 0 {
-        let self_pid = *t.pid_of.get(&crate::task::current_id()).unwrap_or(&0);
-        if self_pid == 0 {
-            return ESRCH;
-        }
-        self_pid
-    } else {
-        pid
-    };
-    match t.by_pid.get(&target) {
-        Some(e) => e.session_id as i64,
-        None => ESRCH,
-    }
-}
-
 /// `getpgid(pid)` — return the pgrp id of `pid`, or of the caller if
 /// `pid == 0`. Returns ESRCH for unknown pids.
+///
+/// `task::current_id()` is sampled *before* TABLE is acquired (and
+/// only when `pid == 0`, where the caller's own id is needed) —
+/// otherwise the call would invert the documented `TABLE → SCHED`
+/// forbidden order (see module docs / #478 diagnostic).
 pub fn sys_getpgid(pid: u32) -> i64 {
+    let caller_task_id = if pid == 0 {
+        Some(crate::task::current_id())
+    } else {
+        None
+    };
     let t = TABLE.lock();
-    let target = if pid == 0 {
-        let self_pid = *t.pid_of.get(&crate::task::current_id()).unwrap_or(&0);
+    let target = if let Some(tid) = caller_task_id {
+        let self_pid = *t.pid_of.get(&tid).unwrap_or(&0);
         if self_pid == 0 {
             return ESRCH;
         }
@@ -525,6 +607,32 @@ pub fn sys_getpgid(pid: u32) -> i64 {
     };
     match t.by_pid.get(&target) {
         Some(e) => e.pgrp_id as i64,
+        None => ESRCH,
+    }
+}
+
+/// `getsid(pid)` — return the session id of `pid`, or of the caller if
+/// `pid == 0`. Returns ESRCH for unknown pids.
+///
+/// See [`sys_getpgid`] for the lock-ordering rationale.
+pub fn sys_getsid(pid: u32) -> i64 {
+    let caller_task_id = if pid == 0 {
+        Some(crate::task::current_id())
+    } else {
+        None
+    };
+    let t = TABLE.lock();
+    let target = if let Some(tid) = caller_task_id {
+        let self_pid = *t.pid_of.get(&tid).unwrap_or(&0);
+        if self_pid == 0 {
+            return ESRCH;
+        }
+        self_pid
+    } else {
+        pid
+    };
+    match t.by_pid.get(&target) {
+        Some(e) => e.session_id as i64,
         None => ESRCH,
     }
 }
