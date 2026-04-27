@@ -60,6 +60,27 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 /// value (RFC 0002 §flags).
 pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
 
+/// `AT_EACCESS` — flag to `faccessat(2)` that asks the kernel to use
+/// the *effective* uid/gid for the permission check instead of the
+/// POSIX-default *real* uid/gid. Linux value 0x200; shares its bit
+/// pattern with `AT_REMOVEDIR` (the `unlinkat(2)` flag) — the two
+/// belong to disjoint syscall flag namespaces and the value collision
+/// is harmless in practice.
+pub const AT_EACCESS: u32 = 0x200;
+
+/// `F_OK` — `access(2)` mode meaning "test for existence only" (no
+/// permission bit checked). When `mode == F_OK` (i.e. `0`), a
+/// successful path resolve is itself the answer; no `permission()`
+/// callback is invoked.
+pub const F_OK: u32 = 0;
+/// `R_OK` — `access(2)` mode bit asking "is read permission granted?"
+pub const R_OK: u32 = 4;
+/// `W_OK` — `access(2)` mode bit asking "is write permission granted?"
+pub const W_OK: u32 = 2;
+/// `X_OK` — `access(2)` mode bit asking "is execute (or search, on a
+/// directory) permission granted?"
+pub const X_OK: u32 = 1;
+
 /// `S_ISVTX` — the POSIX "sticky bit" in `InodeMeta.mode`. When set on
 /// a directory, `unlink`/`rename` require the caller to own either the
 /// target file or the directory (or be root). Linux value 0o1000.
@@ -1418,6 +1439,183 @@ pub unsafe fn sys_lchown_impl(path_uva: u64, uid: u64, gid: u64) -> i64 {
 /// `fchownat(dfd, path, uid, gid, flags)` — `*at` form of chown.
 pub unsafe fn sys_fchownat_impl(dfd: i32, path_uva: u64, uid: u64, gid: u64, flags: u32) -> i64 {
     chownat_impl(dfd, path_uva, uid as u32, gid as u32, flags)
+}
+
+// ---------------------------------------------------------------------------
+// access / faccessat / faccessat2 (issue #545, RFC 0004 Workstream A wave 1)
+//
+// `access(2)` lets a caller probe whether they would be permitted to
+// open/read/write/execute `path` without actually doing so. The
+// distinguishing feature vs. the normal permission path is the use of
+// the **real** uid/gid (not effective) — historically intended for
+// setuid binaries asking "what could the real user have done?".
+//
+// `faccessat(dirfd, path, mode, flags)` is the *at form. `AT_EACCESS`
+// flips the check back to the effective uid/gid; `AT_SYMLINK_NOFOLLOW`
+// stops on a trailing symlink (in which case the resolution naturally
+// fails on most callers' use cases — kept for POSIX completeness).
+//
+// `faccessat2(dirfd, path, mode, flags)` is the Linux extension that
+// validates flag bits strictly (rejecting unknown bits with `EINVAL`
+// rather than silently masking them). Both implementations here reject
+// unknown bits — the codebase's other `*at` syscalls (`fchmodat`,
+// `fchownat`, `unlinkat`) follow the same explicit-whitelist
+// convention, and matching it keeps a future flag addition from
+// silently being a no-op.
+// ---------------------------------------------------------------------------
+
+/// Build the credential snapshot the access-check should consult.
+///
+/// POSIX `access(2)` (and `faccessat(.., 0)`) checks against the
+/// caller's **real** uid/gid, not effective. We model that by cloning
+/// the per-task credential and overriding the effective IDs — including
+/// `euid` and `egid`, which is what `default_permission` actually
+/// reads — to mirror the real IDs. The `AT_EACCESS` flag short-circuits
+/// this and returns the snapshot unchanged so the effective IDs apply.
+///
+/// `suid`/`sgid` are intentionally left at their original values: they
+/// don't participate in `default_permission` and POSIX never asks the
+/// access check to consult them.
+fn access_check_credential(cur: &Credential, use_effective: bool) -> Credential {
+    if use_effective {
+        cur.clone()
+    } else {
+        Credential::from_task_ids(
+            cur.uid,
+            cur.uid,
+            cur.suid,
+            cur.gid,
+            cur.gid,
+            cur.sgid,
+            cur.groups.clone(),
+        )
+    }
+}
+
+/// Translate an `access(2)` mode bitmask into [`Access`] flags.
+///
+/// Returns `Access::NONE` for `F_OK` (0) — the caller treats that as
+/// "skip the permission callback, the path resolve was sufficient".
+fn access_mode_to_access(mode: u32) -> Access {
+    let mut a = Access::NONE;
+    if mode & R_OK != 0 {
+        a = a | Access::READ;
+    }
+    if mode & W_OK != 0 {
+        a = a | Access::WRITE;
+    }
+    if mode & X_OK != 0 {
+        a = a | Access::EXECUTE;
+    }
+    a
+}
+
+/// Shared body for `access`, `faccessat`, and `faccessat2`. Returns 0
+/// on permitted, negative errno otherwise. Both `faccessat` and
+/// `faccessat2` reject unknown flag bits (see module-level comment),
+/// so a single body suffices.
+fn faccessat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
+    // Mode validation: only the low three bits are valid, plus F_OK==0.
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return EINVAL;
+    }
+    // Flag validation: only AT_EACCESS, AT_SYMLINK_NOFOLLOW, and
+    // AT_EMPTY_PATH are recognised. Any other bit is rejected so a
+    // future addition is whitelisted explicitly.
+    let allowed = AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if flags & !allowed != 0 {
+        return EINVAL;
+    }
+
+    let buf = match copy_user_path(path_uva) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let path = buf.as_slice();
+
+    let is_absolute = path.first() == Some(&b'/');
+    if dfd != AT_FDCWD && !is_absolute {
+        // Per-fd dfd resolution is tracked under #239; until then, only
+        // AT_FDCWD or absolute paths reach the inode.
+        return EINVAL;
+    }
+
+    let cur = crate::task::current_credentials();
+    let use_effective = flags & AT_EACCESS != 0;
+    let check_cred = access_check_credential(&cur, use_effective);
+
+    // The path walk must run under the same credential that will later
+    // gate the permission check, so an unsearchable ancestor returns
+    // `EACCES` (real ID's view) rather than silently resolving as the
+    // effective ID and then failing the leaf check with the wrong
+    // errno. `AT_SYMLINK_NOFOLLOW` selects the lstat-style walk — on a
+    // terminal symlink the resolved inode *is* the symlink, and
+    // `default_permission` against link bits (typically 0o777) makes
+    // the answer almost always "yes"; that mirrors Linux.
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (inode, _nd) = match resolve_inode_as(path, follow, check_cred.clone()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // F_OK: existence is the answer. Skip the permission callback.
+    let access = access_mode_to_access(mode);
+    if access == Access::NONE {
+        return 0;
+    }
+
+    // EROFS short-circuit for W_OK on a read-only mount. Linux does
+    // this even when the file's mode bits would grant write — the
+    // syscall reports the answer the *next* write would actually get,
+    // which is EROFS, not EACCES. Matches `do_faccessat` in the Linux
+    // kernel.
+    if access.contains(Access::WRITE) {
+        if let Some(sb) = inode.sb.upgrade() {
+            if sb.flags.contains(crate::fs::vfs::SbFlags::RDONLY) {
+                // Per Linux: only block writes to regular files /
+                // directories — character devices on a RO mount are
+                // still writeable through the device backend, so
+                // `access(W_OK)` should not lie about that. RamFs
+                // doesn't yet model writable devices on a RO SB so
+                // this branch is conservative; revisit if a driver
+                // ever needs the carve-out.
+                match inode.kind {
+                    InodeKind::Reg | InodeKind::Dir | InodeKind::Link => return EROFS,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    match inode.ops.permission(&inode, &check_cred, access) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `access(path, mode)` — POSIX.1-2017 §access. Equivalent to
+/// `faccessat(AT_FDCWD, path, mode, 0)`. The check uses the caller's
+/// **real** uid/gid (not effective).
+pub unsafe fn sys_access_impl(path_uva: u64, mode: u64) -> i64 {
+    faccessat_impl(AT_FDCWD, path_uva, mode as u32, 0)
+}
+
+/// `faccessat(dirfd, path, mode, flags)` — POSIX.1-2017 §faccessat.
+///
+/// `flags` honors `AT_EACCESS` (use effective IDs),
+/// `AT_SYMLINK_NOFOLLOW`, and `AT_EMPTY_PATH`. Unknown bits are
+/// rejected with `EINVAL`.
+pub unsafe fn sys_faccessat_impl(dfd: i32, path_uva: u64, mode: u64, flags: u32) -> i64 {
+    faccessat_impl(dfd, path_uva, mode as u32, flags)
+}
+
+/// `faccessat2(dirfd, path, mode, flags)` — Linux extension that adds
+/// strict flag-bit validation on top of `faccessat`. Our `faccessat`
+/// already rejects unknown flag bits (see module-level comment), so
+/// the bodies are identical — the separate entry point exists to give
+/// `glibc`'s `faccessat2` shim a stable syscall number.
+pub unsafe fn sys_faccessat2_impl(dfd: i32, path_uva: u64, mode: u64, flags: u32) -> i64 {
+    faccessat_impl(dfd, path_uva, mode as u32, flags)
 }
 
 // ---------------------------------------------------------------------------

@@ -337,6 +337,10 @@ name = "syscall_utimensat"
 harness = false
 
 [[test]]
+name = "syscall_faccessat"
+harness = false
+
+[[test]]
 name = "ntty_sigint_flush"
 harness = false
 
