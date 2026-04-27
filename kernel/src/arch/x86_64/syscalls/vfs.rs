@@ -113,7 +113,14 @@ fn copy_user_path(path_uva: u64) -> Result<Vec<u8>, i64> {
 /// `NameIdata`'s `edges` vector so the caller's `Arc<SuperBlock>`
 /// references keep the SB alive for the duration of the `getattr` call.
 fn resolve_inode(path: &[u8], follow: bool) -> Result<(Arc<Inode>, NameIdata), i64> {
-    resolve_inode_as(path, follow, Credential::kernel())
+    // RFC 0004 Workstream B: every userspace-driven VFS path walk runs
+    // under the caller's per-task credential snapshot. The previous
+    // `Credential::kernel()` fallback existed only while the syscall
+    // arms were feature-gated off; with `vfs_creds` flipped on, every
+    // dispatch arm reaches the impl with a real task in `current`, so
+    // `current_credentials()` is the right (and only) source.
+    let cred = (*crate::task::current_credentials()).clone();
+    resolve_inode_as(path, follow, cred)
 }
 
 /// Like [`resolve_inode`] but walks the path using `cred` for
@@ -868,10 +875,10 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
     // DAC check: POSIX `mkdir(2)` requires write + search (execute bit
     // on a directory) on the parent. Goes through `InodeOps::permission`
     // so ACL-style overrides can take effect once an FS driver implements
-    // them. Until Workstream B plumbs per-task credentials, the caller
-    // is always `Credential::kernel()` (root) — the dispatch arm is
-    // feature-gated so this placeholder is never reachable from ring-3.
-    let cred = Credential::kernel();
+    // them. RFC 0004 Workstream B: caller's per-task credential snapshot
+    // drives the check — root bypass falls out of `default_permission`
+    // when `cred.euid == 0`.
+    let cred = (*crate::task::current_credentials()).clone();
     let access = Access::WRITE | Access::EXECUTE;
     if let Err(e) = parent_inode.ops.permission(&parent_inode, &cred, access) {
         return e;
@@ -921,8 +928,8 @@ pub unsafe fn sys_mkdirat_impl(dfd: i32, path_uva: u64, mode: u64) -> i64 {
 ///   can tell "current directory" from "parent of".
 /// - Parent not a directory → `-ENOTDIR`.
 ///
-/// Credential is `Credential::kernel()` until Workstream B (#546)
-/// lands per-task credentials.
+/// Credential is the caller's per-task snapshot via
+/// [`crate::task::current_credentials`] (RFC 0004 Workstream B, #550).
 pub unsafe fn sys_rmdir_impl(path_uva: u64) -> i64 {
     let buf = match copy_user_path(path_uva) {
         Ok(b) => b,
@@ -1107,14 +1114,14 @@ fn unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
 
     // Sticky-bit check. When S_ISVTX is set on the parent, POSIX
     // requires the caller to own either the parent or the target
-    // file, or be the super-user. Uses `Credential::kernel()` as a
-    // placeholder — replaced by the per-task credential when
-    // Workstream B flips `vfs_creds` on (#546).
-    let cred = Credential::kernel();
+    // file, or be the super-user. RFC 0004 Workstream B: driven by
+    // the caller's per-task credential snapshot. Effective uid is the
+    // identity POSIX consults for DAC ownership comparisons.
+    let cred = crate::task::current_credentials();
     let parent_meta = parent_inode.meta.read();
-    if parent_meta.mode & S_ISVTX != 0 && cred.uid != 0 {
+    if parent_meta.mode & S_ISVTX != 0 && cred.euid != 0 {
         let leaf_uid = leaf_inode.meta.read().uid;
-        if cred.uid != parent_meta.uid && cred.uid != leaf_uid {
+        if cred.euid != parent_meta.uid && cred.euid != leaf_uid {
             return EPERM;
         }
     }
@@ -2182,7 +2189,8 @@ fn linkat_impl(
             crate::task::current_cwd().unwrap_or_else(|| root.clone())
         };
         let flags = LookupFlags::default();
-        let mut nd = match NameIdata::new(root, cwd, Credential::kernel(), flags) {
+        let cred = (*crate::task::current_credentials()).clone();
+        let mut nd = match NameIdata::new(root, cwd, cred, flags) {
             Ok(n) => n,
             Err(e) => return e,
         };
@@ -2231,10 +2239,9 @@ fn linkat_impl(
     }
 
     // DAC check: writer needs W|X on the new parent directory.
-    // Credential is `kernel()` until Workstream B (#546) plumbs the
-    // per-task credential through — the dispatch arm is feature-gated
-    // so this placeholder is never reachable from ring-3.
-    let cred = Credential::kernel();
+    // RFC 0004 Workstream B: caller's per-task credential snapshot
+    // drives the check.
+    let cred = (*crate::task::current_credentials()).clone();
     if let Err(e) = new_parent
         .ops
         .permission(&new_parent, &cred, Access::WRITE | Access::EXECUTE)
@@ -2323,8 +2330,9 @@ fn symlinkat_impl(target_uva: u64, new_dfd: i32, link_path_uva: u64) -> i64 {
         return ENOTDIR;
     }
 
-    // DAC: writer needs W|X on the new parent directory.
-    let cred = Credential::kernel();
+    // DAC: writer needs W|X on the new parent directory. Caller's
+    // per-task credential snapshot drives the check (RFC 0004 §B).
+    let cred = (*crate::task::current_credentials()).clone();
     if let Err(e) = parent
         .ops
         .permission(&parent, &cred, Access::WRITE | Access::EXECUTE)
@@ -2409,7 +2417,7 @@ fn readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
     } else {
         crate::task::current_cwd().unwrap_or_else(|| root.clone())
     };
-    let cred = Credential::kernel();
+    let cred = (*crate::task::current_credentials()).clone();
     let flags = LookupFlags::default();
     let mut nd = match NameIdata::new(root, cwd, cred, flags) {
         Ok(n) => n,

@@ -24,7 +24,7 @@ pic8259 = "0.11"
 pc-keyboard = "0.8"
 
 [features]
-default = []
+default = ["vfs_creds"]
 # Enable to trigger a UD2 after init; verifies the invalid-opcode handler path.
 fault-test = []
 # Enable to fire a deliberate `panic!()` after init; useful for eyeballing
@@ -49,13 +49,15 @@ bench = []
 # never ship it. Enable with `cargo xtask run --features fork-trace` (or
 # `--features fork-trace` on any xtask subcommand).
 fork-trace = []
-# Workstream A ↔ B gate (RFC 0004). When off, POSIX write-side VFS
-# syscalls added by Workstream A (mkdir/mkdirat today; rmdir/unlink/…
-# in sibling PRs) compile to `-ENOSYS`. Workstream B flips this on in
-# the same PR that lands `Task::credentials`, so per-task credentials
-# are always available at every DAC-sensitive call site. Keeps a
-# partially-landed Workstream A from exposing an unauthenticated
-# DAC-bypass window.
+# Workstream A ↔ B gate (RFC 0004). On by default as of #550 — every
+# VFS syscall entry now reads the caller's per-task credential
+# snapshot via `crate::task::current_credentials()` (no more
+# `Credential::kernel()` fallback at any userspace-driven call site).
+# Disable explicitly with `--no-default-features` to compile the
+# Workstream A write-side syscalls back out to `-ENOSYS`; this is
+# only useful for re-running the dispatch-gate regression tests in
+# the `kernel/tests/syscall_*.rs` files that assert the off-branch
+# behaviour. Production builds always run with the feature on.
 vfs_creds = []
 # RFC 0004 Workstream D/E feature gate. When off, the ext2 on-disk
 # types (`fs::ext2::disk`) still compile (they're pure data, host unit
