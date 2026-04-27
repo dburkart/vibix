@@ -68,9 +68,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use spin::{Mutex, Once, RwLock};
+use spin::{Once, RwLock};
 
 use super::{BlockDevice, BlockError};
+use crate::debug_lockdep::{assert_no_spinlocks_held, SpinLock};
 
 /// Valid bit — the in-memory slab reflects the on-disk block as of its
 /// most recent read-back.
@@ -216,7 +217,7 @@ pub struct BlockCache {
     /// Cache body + CLOCK-Pro metadata. Guarded together so the
     /// eviction sweep sees a consistent view of residency + classes +
     /// hand.
-    inner: Mutex<CacheInner>,
+    inner: SpinLock<CacheInner>,
     /// Dirty-set mirror used by the writeback daemon (populated by
     /// `mark_dirty`, cleared by `sync_dirty_buffer`). Stored as keys,
     /// not `Weak` handles — the daemon re-looks-up the `Arc` out of
@@ -224,7 +225,7 @@ pub struct BlockCache {
     /// still flushes correctly. A separate mutex so the writeback
     /// daemon (future) can snapshot the dirty set without contending
     /// on the CLOCK-Pro critical section.
-    dirty: Mutex<BTreeSet<(DeviceId, u64)>>,
+    dirty: SpinLock<BTreeSet<(DeviceId, u64)>>,
     /// Cap beyond which eviction must start reclaiming. Observed by
     /// `bread` when deciding whether to run a CLOCK-Pro sweep.
     max_buffers: usize,
@@ -260,13 +261,13 @@ impl BlockCache {
             device,
             next_device_id: AtomicU32::new(0),
             block_size,
-            inner: Mutex::new(CacheInner {
+            inner: SpinLock::new(CacheInner {
                 entries: BTreeMap::new(),
                 classes: BTreeMap::new(),
                 non_resident: VecDeque::new(),
                 clock_hand: None,
             }),
-            dirty: Mutex::new(BTreeSet::new()),
+            dirty: SpinLock::new(BTreeSet::new()),
             max_buffers,
         })
     }
@@ -470,6 +471,13 @@ impl BlockCache {
             let offset = blk
                 .checked_mul(self.block_size as u64)
                 .ok_or(BlockError::OutOfRange)?;
+            // RFC 0004 §Buffer cache normative invariant: no spin
+            // lock may be held across a block-I/O wait. The cache
+            // dropped its `inner` SpinLock above (the eviction
+            // sweep block ended at L459); this assertion is the
+            // tripwire that fires loudly if a future caller layer
+            // re-enters `bread` while still holding one.
+            assert_no_spinlocks_held("BlockCache::bread \u{2192} device.read_at");
             self.device.read_at(offset, &mut data[..])?;
         }
         fresh.state.store(STATE_VALID, Ordering::Release);
@@ -648,6 +656,14 @@ impl BlockCache {
                     return Err(BlockError::OutOfRange);
                 }
             };
+            // RFC 0004 §Buffer cache normative invariant: the
+            // `BufferHead.data` RwLock was released above (snapshot
+            // was taken inside its own scope at L631-L636) and the
+            // cache `inner` / `dirty` SpinLocks were released after
+            // the residency lookup at L619-L625. Trip loudly if a
+            // future caller layer re-enters `sync_dirty_buffer`
+            // while still holding any spinlock.
+            assert_no_spinlocks_held("BlockCache::sync_dirty_buffer \u{2192} device.write_at");
             self.device.write_at(offset, &snapshot)
         } else {
             // Not resident and we don't know the block number. This
@@ -963,6 +979,7 @@ mod tests {
     use crate::block::{BlockError, SECTOR_SIZE};
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicU32, AtomicUsize};
+    use spin::Mutex;
 
     /// In-memory stand-in for a real `BlockDevice`. Only the bits the
     /// cache skeleton's trivial tests consult (`block_size`, `capacity`)
