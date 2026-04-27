@@ -1511,11 +1511,9 @@ fn access_mode_to_access(mode: u32) -> Access {
 }
 
 /// Shared body for `access`, `faccessat`, and `faccessat2`. Returns 0
-/// on permitted, negative errno otherwise.
-///
-/// `accept_unknown_flag_bits` is `false` for both `faccessat` and
-/// `faccessat2` here (see module-level comment). The parameter is kept
-/// to make the policy explicit at the call site.
+/// on permitted, negative errno otherwise. Both `faccessat` and
+/// `faccessat2` reject unknown flag bits (see module-level comment),
+/// so a single body suffices.
 fn faccessat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
     // Mode validation: only the low three bits are valid, plus F_OK==0.
     if mode & !(R_OK | W_OK | X_OK) != 0 {
