@@ -248,19 +248,35 @@ pub use spinlock::{SpinLock, SpinLockGuard};
 mod tests {
     use super::*;
 
-    /// Ensure the counter starts at zero for each test. Tests run
-    /// serially in their own threads under `cargo test`; sharing the
-    /// global counter would cause cross-test interference. Reset
-    /// explicitly at the top of each test.
+    /// Serialise tests that touch the shared `HELD_SPINLOCKS` static.
+    /// libtest runs `#[test]`s in parallel by default (one per worker
+    /// thread); without this lock two tests would interleave their
+    /// `lock` / `drop` / `assert_no_spinlocks_held` calls on the
+    /// shared counter and one would observe the other's intermediate
+    /// state. Same pattern as `kernel/src/fs/vfs/gc_queue.rs`. Use
+    /// `std::sync::Mutex` so a panicking test poisons the lock
+    /// rather than deadlocking the suite — `into_inner` recovers.
     #[cfg(debug_assertions)]
-    fn reset_counter() {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the test lock and reset the counter. Returned guard
+    /// holds the `TEST_LOCK` for the lifetime of the test scope —
+    /// keep it alive (e.g. `let _guard = test_guard();`) so other
+    /// tests block until this one finishes.
+    #[cfg(debug_assertions)]
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Reset under the lock so a previous test that paniced
+        // mid-acquire (leaving the counter > 0) doesn't poison
+        // the next test's invariant.
         HELD_SPINLOCKS.store(0, Ordering::Relaxed);
+        g
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn counter_increments_on_lock_decrements_on_drop() {
-        reset_counter();
+        let _t = test_guard();
         let m = SpinLock::new(0u32);
         assert_eq!(held_spinlocks(), 0);
         {
@@ -273,7 +289,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn counter_tracks_nested_locks() {
-        reset_counter();
+        let _t = test_guard();
         let a = SpinLock::new(1u8);
         let b = SpinLock::new(2u8);
         let _ga = a.lock();
@@ -284,7 +300,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn try_lock_increments_only_on_success() {
-        reset_counter();
+        let _t = test_guard();
         let m = SpinLock::new(7u8);
         let _g = m.lock();
         assert_eq!(held_spinlocks(), 1);
@@ -297,7 +313,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn assert_passes_with_no_locks_held() {
-        reset_counter();
+        let _t = test_guard();
         // Should not panic.
         assert_no_spinlocks_held("test:no-lock-site");
     }
@@ -306,7 +322,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "debug_lockdep: invariant violated at test:violation-site")]
     fn assert_panics_when_lock_held() {
-        reset_counter();
+        // `should_panic` test still needs the lock to keep the
+        // counter free of interference from a sibling test until
+        // the panic fires. The `Mutex` poisoning recovers in
+        // `test_guard`'s `unwrap_or_else`.
+        let _t = test_guard();
         let m = SpinLock::new(0u8);
         let _g = m.lock();
         // Holding `_g` across this call MUST panic.
@@ -316,7 +336,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn guard_deref_and_mutate() {
-        reset_counter();
+        let _t = test_guard();
         let m = SpinLock::new(0u32);
         {
             let mut g = m.lock();
