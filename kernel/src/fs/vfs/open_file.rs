@@ -89,14 +89,20 @@ impl OpenFile {
             // list.
             finalize_pending_detach(&sb);
         }
-        Arc::new(Self {
+        let of = Arc::new(Self {
             dentry,
             inode,
             offset: BlockingMutex::new(0),
             flags: AtomicU32::new(flags),
             ops,
             sb,
-        })
+        });
+        // Fire the driver `open` hook now that the `OpenFile` is fully
+        // constructed and the SB pin has been migrated to
+        // `dentry_pin_count`. Drivers (ext2) use this to bump a
+        // per-open refcount that pairs with the `release` hook below.
+        of.ops.open(&of);
+        of
     }
 }
 
@@ -105,6 +111,13 @@ impl OpenFile {
 /// -detached SB waiting on the pin has its finalizer fire here.
 impl Drop for OpenFile {
     fn drop(&mut self) {
+        // Driver `release` hook runs BEFORE the SB pin release. ext2's
+        // orphan-finalize trigger needs the inode + super still
+        // structurally pinned so it can call `finalize_orphan` (which
+        // touches the buffer cache, sb_disk, BGDT) without racing the
+        // mount teardown. The hook is infallible by trait contract.
+        self.ops.release(self);
+
         let old = self.sb.dentry_pin_count.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(old > 0, "OpenFile::drop: dentry_pin_count underflow");
         if old == 1 {

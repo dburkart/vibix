@@ -312,6 +312,32 @@ pub trait FileOps: Send + Sync {
     fn fsync(&self, _f: &OpenFile, _data_only: bool) -> Result<(), i64> {
         Ok(())
     }
+
+    /// Driver hook fired exactly once per [`OpenFile`] right after the
+    /// `OpenFile` is fully constructed (after `OpenFile::new` has handed
+    /// the `SbActiveGuard` pin off to `dentry_pin_count`). The `OpenFile`
+    /// reference is stable for the duration of the call.
+    ///
+    /// Default: no-op. Drivers that need a per-open refcount (ext2's
+    /// orphan-finalize trigger, RFC 0004 §Final-close sequence) bump it
+    /// here. Failure surfacing isn't supported — the open has already
+    /// pinned the SB and the syscall layer has no rollback path; if a
+    /// driver hook needs to fail, it must do so earlier (e.g. inside
+    /// `InodeOps::lookup` / `InodeOps::create`).
+    fn open(&self, _f: &OpenFile) {}
+
+    /// Driver hook fired exactly once per [`OpenFile`] from
+    /// [`OpenFile::Drop`], **before** the SB pin is released. The
+    /// `OpenFile` reference is stable for the duration of the call.
+    ///
+    /// Default: no-op. Drivers that need a per-open refcount (ext2's
+    /// orphan-finalize trigger) decrement it here and may run terminal
+    /// finalize work synchronously (e.g. truncate-to-zero + free_inode
+    /// for an unlinked-but-open inode whose count just hit zero). The
+    /// hook is infallible — drop paths can't propagate errors to the
+    /// caller; drivers should `kwarn!` and absorb any I/O failure (the
+    /// next mount-time replay path will retry).
+    fn release(&self, _f: &OpenFile) {}
 }
 
 /// Default POSIX permission check: owner / group / other bits in
