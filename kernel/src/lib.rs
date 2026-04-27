@@ -17,6 +17,7 @@ pub mod abi;
 pub mod block;
 pub mod build_info;
 pub mod cpu;
+pub mod debug_lockdep;
 #[cfg(any(test, target_os = "none"))]
 pub mod fork_abi;
 #[cfg(any(test, target_os = "none"))]

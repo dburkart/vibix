@@ -67,6 +67,12 @@ impl<T: ?Sized> IrqLock<T> {
     pub fn lock(&self) -> IrqLockGuard<'_, T> {
         let prev_if = arch_if::save_and_disable();
         let guard = self.inner.lock();
+        // Count the IRQ-masking spinlock toward the held-spinlock
+        // invariant (RFC 0004 §Buffer cache, no-spin-across-I/O).
+        // A held `IrqLock` is the *worst* lock to hold across a
+        // block-I/O wait — it disables IRQs, so the wait can't
+        // even progress on tick.
+        crate::debug_lockdep::inc_held_spinlocks();
         IrqLockGuard {
             guard: Some(guard),
             prev_if,
@@ -79,10 +85,13 @@ impl<T: ?Sized> IrqLock<T> {
     pub fn try_lock(&self) -> Option<IrqLockGuard<'_, T>> {
         let prev_if = arch_if::save_and_disable();
         match self.inner.try_lock() {
-            Some(guard) => Some(IrqLockGuard {
-                guard: Some(guard),
-                prev_if,
-            }),
+            Some(guard) => {
+                crate::debug_lockdep::inc_held_spinlocks();
+                Some(IrqLockGuard {
+                    guard: Some(guard),
+                    prev_if,
+                })
+            }
             None => {
                 arch_if::restore(prev_if);
                 None
@@ -116,6 +125,11 @@ impl<T: ?Sized> Drop for IrqLockGuard<'_, T> {
         // let a pending IRQ observe the data under the (still held)
         // lock semantics and deadlock-via-reentry.
         self.guard = None;
+        // Decrement after the underlying spin release so the
+        // counter reflects "no longer holding the lock" by the
+        // time IF is restored and any IRQ that fires can run an
+        // `assert_no_spinlocks_held`.
+        crate::debug_lockdep::dec_held_spinlocks();
         arch_if::restore(self.prev_if);
     }
 }
