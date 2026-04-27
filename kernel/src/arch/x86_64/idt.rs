@@ -14,16 +14,24 @@ use crate::arch::x86_64::interrupts::{
 };
 use crate::serial_println;
 
-/// #478 diagnostic latch: the first CPL=3 fault of the session logs a
-/// `ring3-first-fault:` line with full frame state before the handler
-/// runs its normal path. Subsequent ring-3 faults are common (SIGSEGV
-/// delivery etc.) and must not flood the log. One-shot by design.
+/// #478 diagnostic latch: the first *unrecoverable* CPL=3 fault of the
+/// session logs a `ring3-first-fault:` line with full frame state.
+/// Subsequent ring-3 faults are common (SIGSEGV delivery etc.) and
+/// must not flood the log. One-shot by design.
+///
+/// For #PF specifically, the caller MUST wait until the resolution
+/// attempt has either succeeded (and returned) or fallen through to a
+/// terminal path (panic / hang / SIGSEGV) before invoking this helper:
+/// a routine first-touch CoW write fault on a forked user-stack page
+/// would otherwise trip the latch on every healthy boot, defeating the
+/// nightly-soak gate added for #527 / #646.
 static FIRST_RING3_FAULT_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Emit one `ring3-first-fault:` line on the first CPL=3 fault ever
-/// observed. `extra` is vector-specific trailer (e.g. `code=0x0` for #GP,
-/// `cr2=0x400000 code=PROTECTION` for #PF) — no user memory is touched
-/// while formatting, only scalars copied out of the hardware frame.
+/// Emit one `ring3-first-fault:` line on the first unrecoverable CPL=3
+/// fault ever observed. `extra` is vector-specific trailer (e.g.
+/// `code=0x0` for #GP, `cr2=0x400000 code=PROTECTION` for #PF) — no user
+/// memory is touched while formatting, only scalars copied out of the
+/// hardware frame.
 fn log_first_ring3_fault(vector: &str, frame: &InterruptStackFrame, extra: core::fmt::Arguments) {
     if (frame.code_segment.0 & 0b11) == 0 {
         return;
@@ -136,11 +144,13 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     }
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
-    log_first_ring3_fault(
-        "#PF",
-        &frame,
-        format_args!("cr2={:#x} code={:?}", addr_u64, code),
-    );
+    // Defer `log_first_ring3_fault` to the terminal paths below. A
+    // first-touch CoW write fault on a forked user-stack page is a
+    // routine, fully-resolved event and must not trip the diagnostic
+    // latch — otherwise every nightly-soak run trips #527's gate on a
+    // healthy boot. Fire the latch only when the fault genuinely could
+    // not be resolved (SMAP / RSVD panic, unrecoverable user-mode
+    // access violation, or hang fall-through).
 
     if let Some(expected) = crate::test_hook::take_page_fault_expectation() {
         use crate::test_harness::{exit_qemu, QemuExitCode};
@@ -178,6 +188,11 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // explicit no-op — the comment documents the RFC's step 2.
 
     if crate::mem::pf::is_rsvd_fault(err_raw) {
+        log_first_ring3_fault(
+            "#PF",
+            &frame,
+            format_args!("cr2={:#x} code={:?}", addr_u64, code),
+        );
         panic_rsvd_corruption(addr_u64);
     }
 
@@ -186,6 +201,11 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // region) is a SIGSEGV/MAPERR; we don't have signal delivery yet
     // so log and hang with the RFC-mandated marker.
     if cpl != 0 && !crate::mem::pf::is_user_va(addr_u64) {
+        log_first_ring3_fault(
+            "#PF",
+            &frame,
+            format_args!("cr2={:#x} code={:?}", addr_u64, code),
+        );
         serial_println!(
             "EXCEPTION: #PF user addr={:#x} outside USER_VA_END (MAPERR) code={:?}",
             addr_u64,
@@ -308,10 +328,15 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
 
     // Check whether the fault address lands inside a kernel task's guard
     // page — if so, this is a stack overflow, not a generic fault.
-    if let Some(task_id) = crate::task::find_stack_overflow(addr_u64 as usize) {
+    if let Some(slot_idx) = crate::task::find_stack_overflow(addr_u64 as usize) {
+        log_first_ring3_fault(
+            "#PF",
+            &frame,
+            format_args!("cr2={:#x} code={:?}", addr_u64, code),
+        );
         serial_println!(
-            "EXCEPTION: #PF task {} stack overflow addr={:#x} code={:?}\n{:#?}",
-            task_id,
+            "EXCEPTION: #PF stack overflow slot={} addr={:#x} code={:?}\n{:#?}",
+            slot_idx,
             addr_u64,
             code,
             frame
@@ -327,6 +352,11 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // with DefaultAction::Terminate. The helper calls `task::exit()`, so
     // IRETQ never runs; the scheduler context-switches to the next task.
     if cpl != 0 {
+        log_first_ring3_fault(
+            "#PF",
+            &frame,
+            format_args!("cr2={:#x} code={:?}", addr_u64, code),
+        );
         serial_println!(
             "#PF ring-3 access violation addr={:#x} code={:?}",
             addr_u64,
@@ -344,6 +374,11 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
         return; // handler path: IRETQ fires the signal handler
     }
 
+    log_first_ring3_fault(
+        "#PF",
+        &frame,
+        format_args!("cr2={:#x} code={:?}", addr_u64, code),
+    );
     serial_println!(
         "EXCEPTION: #PF addr={:#x} code={:?}\n{:#?}",
         addr_u64,
@@ -359,10 +394,10 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u64) -
     // unmapped), so it escalates to #DF. The #DF frame's stack_pointer
     // holds the faulted RSP — check it before the generic diagnostic.
     let faulted_rsp = frame.stack_pointer.as_u64() as usize;
-    if let Some(task_id) = crate::task::find_stack_overflow(faulted_rsp) {
+    if let Some(slot_idx) = crate::task::find_stack_overflow(faulted_rsp) {
         serial_println!(
-            "EXCEPTION: #DF task {} stack overflow rsp={:#x}\n{:#?}",
-            task_id,
+            "EXCEPTION: #DF stack overflow slot={} rsp={:#x}\n{:#?}",
+            slot_idx,
             faulted_rsp,
             frame
         );

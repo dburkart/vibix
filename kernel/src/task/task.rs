@@ -19,6 +19,7 @@
 //! function.
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -64,9 +65,60 @@ pub(super) const TASK_SLOT_SIZE: usize = GUARD_SIZE + STACK_SIZE;
 /// and below the kernel image at `0xFFFF_FFFF_8000_0000`.
 pub(super) const TASK_STACKS_VA_BASE: usize = 0xFFFF_D000_0000_0000;
 
-/// Bump allocator for task-stack VA slots. Monotonically increments;
-/// task stacks are never freed (tasks don't exit yet).
+/// Bump allocator for task-stack VA slots. Monotonically increases; the
+/// only path that consumes from this is [`alloc_stack_slot`] when the
+/// free list is empty.
 pub(super) static NEXT_STACK_VA: AtomicUsize = AtomicUsize::new(TASK_STACKS_VA_BASE);
+
+/// Free list of task-stack VA slots returned by the reaper. Populated
+/// by [`free_stack_slot`] when a task is reaped; drained by
+/// [`alloc_stack_slot`] before falling back to the bump allocator.
+///
+/// A slot reaching this list is fully unmapped — the reaper has called
+/// `unmap_and_free_in_pml4` on every stack page, and the guard page
+/// was never mapped to begin with. The next allocator can therefore
+/// re-`map_range` the stack pages without colliding with stale leaf
+/// PTEs in the shared upper-half L3 subtree.
+///
+/// `Mutex` (not `BlockingMutex`) so the allocator paths in
+/// [`Task::new_with_priority`] / [`Task::new_forked`] (which run inside
+/// the fork syscall, with kernel-level locks already held) and the
+/// reaper's [`free_stack_slot`] (which runs in task context with IRQs
+/// enabled) can both reach it without an IRQ-context audit. Contention
+/// is only meaningful at fork+reap rates, far below the 1-2 cycles
+/// where a spin-only mutex hurts.
+static FREE_STACK_SLOTS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+
+/// Reserve a task-stack VA slot. Pops the most-recently-freed slot
+/// from [`FREE_STACK_SLOTS`] when one is available (recycling keeps the
+/// working set small under fork-heavy workloads), otherwise bumps
+/// [`NEXT_STACK_VA`].
+///
+/// Returns the guard-page base (low end of the 20 KiB slot). The slot
+/// is still unmapped — callers must `paging::map_range` the stack
+/// pages before priming.
+pub(super) fn alloc_stack_slot() -> usize {
+    if let Some(slot) = FREE_STACK_SLOTS.lock().pop_front() {
+        return slot;
+    }
+    NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed)
+}
+
+/// Return a task-stack VA slot to the free list. Caller must have
+/// already unmapped the slot's stack pages (the guard page was never
+/// mapped). #646: closes the per-cycle leak that the reaper used to
+/// log as `tasks: reaped task N (stack VA slot ... leaked)`.
+pub(super) fn free_stack_slot(guard_base: usize) {
+    debug_assert!(
+        guard_base >= TASK_STACKS_VA_BASE,
+        "free_stack_slot: VA below TASK_STACKS_VA_BASE"
+    );
+    debug_assert!(
+        (guard_base - TASK_STACKS_VA_BASE) % TASK_SLOT_SIZE == 0,
+        "free_stack_slot: VA not slot-aligned"
+    );
+    FREE_STACK_SLOTS.lock().push_front(guard_base);
+}
 
 /// Sequential task IDs. 0 is reserved for the bootstrap task.
 static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(1);
@@ -239,8 +291,9 @@ impl Task {
     ///   ^ saved rsp (initial)
     /// ```
     pub fn new_with_priority(entry: fn() -> !, priority: u8) -> Self {
-        // Bump-allocate a fresh VA slot.
-        let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
+        // Reserve a fresh VA slot — recycles a freed slot if one is
+        // available, otherwise bumps `NEXT_STACK_VA`.
+        let slot_va = alloc_stack_slot();
         let guard_base = slot_va;
         let stack_base = slot_va + GUARD_SIZE;
 
@@ -370,8 +423,9 @@ impl Task {
             user_rip,
             user_rsp
         );
-        // Allocate a fresh guard+stack slot.
-        let slot_va = NEXT_STACK_VA.fetch_add(TASK_SLOT_SIZE, Ordering::Relaxed);
+        // Reserve a fresh guard+stack slot. Recycles a freed slot if
+        // one is available, otherwise bumps `NEXT_STACK_VA` (#646).
+        let slot_va = alloc_stack_slot();
         let guard_base = slot_va;
         let stack_base = slot_va + GUARD_SIZE;
         crate::fork_trace!(
@@ -471,5 +525,51 @@ impl Task {
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.
             syscall_stack_top: (stack_base + STACK_SIZE) as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod stack_slot_tests {
+    use super::*;
+
+    /// Single test covers both #646 invariants: freed slots are
+    /// recycled in LIFO order before the bump allocator advances, and
+    /// the bump fallback produces monotonically increasing,
+    /// slot-aligned bases when the free list is empty.
+    ///
+    /// Combined into one test on purpose — `NEXT_STACK_VA` and
+    /// `FREE_STACK_SLOTS` are process-global, so two `#[test]` fns
+    /// running in parallel would race on the same allocator state and
+    /// flake intermittently.
+    #[test]
+    fn free_list_recycle_then_bump_fallback() {
+        // Drain anything that earlier `Task::new_*` calls might have
+        // queued so the assertions below don't trip on stale state.
+        while FREE_STACK_SLOTS.lock().pop_front().is_some() {}
+
+        // Free list path: a slot we just freed must come straight back
+        // out of `alloc_stack_slot`, ahead of any bump.
+        let probe = TASK_STACKS_VA_BASE + TASK_SLOT_SIZE * 1_000_000;
+        free_stack_slot(probe);
+        let recycled = alloc_stack_slot();
+        assert_eq!(
+            recycled, probe,
+            "free list LIFO: freed slot must come back first"
+        );
+
+        // Bump path: free list now empty, so two consecutive allocs
+        // must be one slot apart and slot-aligned.
+        let a = alloc_stack_slot();
+        let b = alloc_stack_slot();
+        assert_eq!(
+            b - a,
+            TASK_SLOT_SIZE,
+            "consecutive bump allocs must be one slot apart"
+        );
+        assert_eq!(
+            (a - TASK_STACKS_VA_BASE) % TASK_SLOT_SIZE,
+            0,
+            "bump-allocated slot must be slot-aligned"
+        );
     }
 }

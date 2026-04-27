@@ -703,13 +703,19 @@ pub fn for_each_task(mut f: impl FnMut(TaskInfo)) {
     }
 }
 
-/// Check whether `addr` falls within any live kernel task's guard page.
-/// Returns the task ID of the overflowing task, or `None` if no guard
-/// page was hit.
+/// Check whether `addr` falls within any kernel-task guard page in
+/// the task-stack VA window. Returns the slot index of the overflowing
+/// stack, or `None` if no guard page was hit.
 ///
 /// Fully lock-free: derives the answer from the fixed VA layout of the
 /// task stack window, so it is always safe to call from any exception
 /// context — even when the scheduler lock is already held on this CPU.
+///
+/// The returned value is the *slot index*, not a task ID. Pre-#646
+/// every slot was bump-allocated and never reused, so the slot index
+/// happened to equal `task.id - 1`. With slot recycling that
+/// equivalence no longer holds; callers that need a stable identifier
+/// for the overflowing task must walk the live task list themselves.
 pub fn find_stack_overflow(addr: usize) -> Option<usize> {
     use core::sync::atomic::Ordering;
     use task::{GUARD_SIZE, NEXT_STACK_VA, TASK_SLOT_SIZE, TASK_STACKS_VA_BASE};
@@ -721,9 +727,8 @@ pub fn find_stack_overflow(addr: usize) -> Option<usize> {
     let slot_idx = (addr - TASK_STACKS_VA_BASE) / TASK_SLOT_SIZE;
     let slot_guard_base = TASK_STACKS_VA_BASE + slot_idx * TASK_SLOT_SIZE;
     // Guard page occupies [slot_guard_base, slot_guard_base + GUARD_SIZE).
-    // Task IDs start at 1, so slot 0 → task 1.
     if addr < slot_guard_base + GUARD_SIZE {
-        Some(slot_idx + 1)
+        Some(slot_idx)
     } else {
         None
     }
@@ -980,9 +985,11 @@ pub fn current_growsdown_lookup(
 /// ISR. The exiting task is queued in [`REAPER_VICTIMS`] and the
 /// reaper is notified before we context-switch away.
 ///
-/// The stack VA slot (`NEXT_STACK_VA`'s bump-allocated range) is *not*
-/// reclaimed — that would require a free-list on `NEXT_STACK_VA`
-/// which is out of scope for this pass. The VA is logged as leaked.
+/// The stack VA slot (`NEXT_STACK_VA`'s bump-allocated range) is
+/// returned to the slot free-list via [`task::free_stack_slot`] so a
+/// subsequent fork can recycle it (#646). Without this, every
+/// fork+exec+wait cycle permanently consumed a 20 KiB slot and
+/// long-running soak runs eventually exhausted the arena.
 ///
 /// # Panics
 /// - No other ready task exists (exiting the last runnable task would
@@ -1091,9 +1098,13 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
             let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
         }
 
-        // Log the leaked stack VA slot for diagnostics.
+        // Return the now-fully-unmapped stack VA slot to the free list
+        // so a subsequent fork can recycle it (#646). The guard page
+        // was never mapped; the loop above has just released every
+        // mapped stack page via `unmap_and_free_in_pml4`.
+        task::free_stack_slot(victim.guard_base);
         serial_println!(
-            "tasks: reaped task {} (stack VA slot {:#x}..{:#x} leaked)",
+            "tasks: reaped task {} (stack VA slot {:#x}..{:#x} returned)",
             victim.id,
             victim.guard_base,
             victim.guard_base + task::TASK_SLOT_SIZE
