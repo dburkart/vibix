@@ -464,6 +464,7 @@ impl FileSystem for Ext2Fs {
             sb_disk: spin::Mutex::new(sb_after_stamp),
             bgdt: spin::Mutex::new(bgdt),
             ext2_flags,
+            force_ro_latch: AtomicBool::new(false),
             owner: self.self_ref.clone(),
             inode_cache: super::inode::new_inode_cache(),
             ext2_inode_cache: super::inode::new_ext2_inode_cache(),
@@ -562,6 +563,12 @@ pub struct Ext2Super {
     pub bgdt: spin::Mutex<Vec<Ext2GroupDesc>>,
     /// Driver-level mount flags — atime skip, forced-RO, NOSUID, etc.
     pub ext2_flags: Ext2MountFlags,
+    /// Runtime force-RO latch. Set by write paths that detect on-disk
+    /// inconsistency (RFC 0004 §Security: e.g. block-bitmap double-free
+    /// → EIO + force-RO). Once `true`, [`Self::is_writable`] returns
+    /// `false` so subsequent writes refuse with [`EROFS`]. The latch is
+    /// a one-way set; clearing requires re-mount.
+    pub force_ro_latch: AtomicBool,
     /// Back-reference to the owning factory so `unmount` can clear the
     /// single-mount latch. `Weak` breaks the `Ext2Fs → SuperBlock →
     /// Ext2Super → Ext2Fs` cycle.
@@ -597,6 +604,31 @@ pub struct Ext2Super {
     /// a strong `Arc<Ext2Super>` without the caller threading one in.
     /// Filled in by [`Arc::new_cyclic`] at mount time.
     self_ref: Weak<Ext2Super>,
+}
+
+impl Ext2Super {
+    /// `true` iff the mount currently accepts writes — i.e. neither the
+    /// caller-requested [`Ext2MountFlags::RDONLY`] nor the synthetic
+    /// [`Ext2MountFlags::FORCED_RDONLY`] is set, *and* the runtime
+    /// `force_ro_latch` has not been tripped by an inconsistency
+    /// detector (see [`Self::force_ro`]).
+    pub fn is_writable(&self) -> bool {
+        if self.ext2_flags.contains(Ext2MountFlags::RDONLY)
+            || self.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
+        {
+            return false;
+        }
+        !self.force_ro_latch.load(Ordering::Acquire)
+    }
+
+    /// Trip the runtime force-RO latch. Subsequent calls to
+    /// [`Self::is_writable`] return `false`. One-way: there is no
+    /// `clear_force_ro` — once an inconsistency is observed, the only
+    /// recovery is `umount` + `e2fsck`. RFC 0004 §Security ("double-free
+    /// → EIO + force RO") and CodeRabbit follow-up #617 item 3.
+    pub fn force_ro(&self) {
+        self.force_ro_latch.store(true, Ordering::Release);
+    }
 }
 
 impl SuperOps for Ext2Super {

@@ -92,6 +92,11 @@ fn run_tests() {
             "free_rejects_out_of_range",
             &(free_rejects_out_of_range as fn()),
         ),
+        (
+            "free_rejects_backup_sb_and_bgdt",
+            &(free_rejects_backup_sb_and_bgdt as fn()),
+        ),
+        ("double_free_forces_ro", &(double_free_forces_ro as fn())),
         ("ro_mount_refuses_alloc", &(ro_mount_refuses_alloc as fn())),
         (
             "alloc_exhaustion_returns_enospc",
@@ -309,18 +314,17 @@ fn free_rejects_superblock_block() {
 }
 
 fn free_rejects_block_bitmap_block() {
-    let (_sb, _fs, super_arc, _disk) = mount_rw();
-    let before_sb = sb_free(&super_arc);
-    // Block 3 is group 0's block bitmap (per dumpe2fs on the fixture).
-    let r = free_block(&super_arc, 3);
-    assert_eq!(r, Err(EIO), "free_block(block bitmap) must be EIO");
-    // Block 4 is group 0's inode bitmap.
-    let r = free_block(&super_arc, 4);
-    assert_eq!(r, Err(EIO), "free_block(inode bitmap) must be EIO");
-    // Block 5 is group 0's first inode-table block.
-    let r = free_block(&super_arc, 5);
-    assert_eq!(r, Err(EIO), "free_block(inode table) must be EIO");
-    assert_eq!(sb_free(&super_arc), before_sb);
+    // A metadata-free attempt now trips the runtime force-RO latch
+    // (#617 item 3), so each metadata block needs its own mount —
+    // otherwise the second call returns EROFS instead of EIO.
+    for &meta in &[3u32, 4, 5] {
+        let (_sb, _fs, super_arc, _disk) = mount_rw();
+        let before_sb = sb_free(&super_arc);
+        let r = free_block(&super_arc, meta);
+        assert_eq!(r, Err(EIO), "free_block(metadata block {meta}) must be EIO");
+        // Counters unchanged.
+        assert_eq!(sb_free(&super_arc), before_sb);
+    }
 }
 
 fn free_rejects_out_of_range() {
@@ -330,6 +334,44 @@ fn free_rejects_out_of_range() {
     // Past end of fs.
     assert_eq!(free_block(&super_arc, FIXTURE_BLOCKS_COUNT), Err(EIO));
     assert_eq!(free_block(&super_arc, u32::MAX), Err(EIO));
+}
+
+fn free_rejects_backup_sb_and_bgdt() {
+    // #617 item 1: backup SB at block 257, backup BGDT at 258 in the
+    // 2-group balloc fixture. Both must be rejected with EIO.
+    for &meta in &[257u32, 258] {
+        let (_sb, _fs, super_arc, _disk) = mount_rw();
+        let r = free_block(&super_arc, meta);
+        assert_eq!(
+            r,
+            Err(EIO),
+            "free_block(backup metadata {meta}) must be EIO"
+        );
+    }
+}
+
+fn double_free_forces_ro() {
+    // #617 item 3: a double-free trips the runtime force-RO latch so
+    // subsequent allocator calls refuse with EROFS.
+    let (_sb, _fs, super_arc, _disk) = mount_rw();
+    // Allocate then free: legit round trip.
+    let b = alloc_block(&super_arc, Some(0)).expect("first alloc must succeed");
+    free_block(&super_arc, b).expect("first free must succeed");
+    // Second free of the same block: double-free → EIO + force-RO.
+    assert_eq!(
+        free_block(&super_arc, b),
+        Err(EIO),
+        "double-free must return EIO"
+    );
+    // Subsequent alloc must now refuse with EROFS because the latch is
+    // set even though the mount flags didn't change.
+    assert_eq!(
+        alloc_block(&super_arc, None),
+        Err(EROFS),
+        "post-double-free alloc must refuse with EROFS"
+    );
+    // free_block also refuses.
+    assert_eq!(free_block(&super_arc, 27), Err(EROFS));
 }
 
 fn ro_mount_refuses_alloc() {
