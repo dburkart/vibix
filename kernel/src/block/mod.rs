@@ -176,9 +176,22 @@ pub fn default_device() -> Option<Arc<dyn BlockDevice>> {
 /// that a second call simply replaces the slot; there is currently no
 /// buffer cache attached that would need to be torn down first. Intended
 /// for the boot probe path and for tests that inject a ramdisk.
+///
+/// Also publishes the device into devfs under the canonical name `vda`
+/// so it appears as `/dev/vda` and the `mount(2)` path resolver can
+/// hand it to filesystem factories. Tests that don't bring up devfs
+/// won't observe the registration — `register_block_device` is a pure
+/// in-memory map insert with no other side effects.
 #[cfg(any(test, target_os = "none"))]
 pub fn set_default_device(dev: Arc<dyn BlockDevice>) {
-    *DEFAULT_DEVICE.lock() = Some(dev);
+    *DEFAULT_DEVICE.lock() = Some(dev.clone());
+    // Devfs is only compiled for target_os="none" — host unit tests
+    // exercise `set_default_device` for the registry round-trip and
+    // can't reach the VFS, so the publish is target-only.
+    #[cfg(target_os = "none")]
+    crate::fs::vfs::devfs::register_block_device("vda", dev);
+    #[cfg(not(target_os = "none"))]
+    let _ = dev;
 }
 
 /// Probe PCI and bring up the first supported block device. Called once
