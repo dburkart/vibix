@@ -420,9 +420,19 @@ fn register_builtin_filesystems() {
     #[cfg(feature = "ext2")]
     register_filesystem(
         "ext2",
-        Box::new(|_src| match crate::block::default_device() {
-            Some(dev) => Ok(crate::fs::ext2::Ext2Fs::new_with_device(dev) as Arc<dyn FileSystem>),
-            None => Err(crate::fs::ENODEV),
+        Box::new(|src| {
+            // Per issue #625: when the caller supplies a `/dev/...`
+            // path as the mount source, walk it through the namespace
+            // to find the backing block device. With no source path
+            // (or an empty one) fall back to the boot-time default
+            // device — preserves the pre-#625 behaviour for the boot
+            // path that mounts ext2 via `init_with(VirtioBlk)` without
+            // going through `mount(2)`.
+            let dev = match src {
+                MountSource::Path(p) if !p.is_empty() => crate::fs::vfs::resolve_block_device(p)?,
+                _ => crate::block::default_device().ok_or(crate::fs::ENODEV)?,
+            };
+            Ok(crate::fs::ext2::Ext2Fs::new_with_device(dev) as Arc<dyn FileSystem>)
         }),
     );
 }

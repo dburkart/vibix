@@ -362,6 +362,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "mount_dev_resolve"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "block_writeback"
 harness = false
 

@@ -272,6 +272,18 @@ pub trait InodeOps: Send + Sync {
     fn fifo_pipe(&self) -> Option<Arc<crate::ipc::pipe::Pipe>> {
         None
     }
+
+    /// If this inode represents a block device (`InodeKind::Blk`),
+    /// return the underlying [`BlockDevice`] handle. Used by the
+    /// `mount(2)` resolver to turn a `/dev/<name>` source path into the
+    /// concrete backing device handed to filesystem factories like
+    /// ext2.
+    ///
+    /// Default: `None`. Only devfs (and any future block-device-bearing
+    /// FS) needs to override this.
+    fn block_device(&self) -> Option<Arc<dyn crate::block::BlockDevice>> {
+        None
+    }
 }
 
 /// Per-open-file operations. Regular-file I/O, directory reading,

@@ -33,7 +33,10 @@
 //! delegated to the serial singleton which manages its own lock, so
 //! devfs carries no per-inode locks beyond what `Inode` itself provides.
 
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::inode::{Inode, InodeKind, InodeMeta};
@@ -45,7 +48,9 @@ use super::ops::{
 use super::super_block::{SbFlags, SuperBlock};
 use super::MountFlags;
 
+use crate::block::BlockDevice;
 use crate::fs::{EAGAIN, EISDIR, ENOENT};
+use spin::RwLock;
 
 // DEVFS_MAGIC — not in the Linux set but chosen to be distinct.
 const DEVFS_MAGIC: u64 = 0x1373;
@@ -70,6 +75,52 @@ fn alloc_ino_base() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Block-device registry
+// ---------------------------------------------------------------------------
+//
+// Live block devices are registered here at boot (or by tests) by name —
+// e.g. "vda", "sda1". Devfs root lookup consults the registry so that
+// `/dev/<name>` resolves to a block-kind inode whose `InodeOps::block_device`
+// returns the underlying [`BlockDevice`] handle. This is the bridge that
+// `mount(2)` walks through when a `MountSource::Path("/dev/vda")` arrives
+// and the ext2 factory needs the concrete backing device.
+
+static BLOCK_DEV_REGISTRY: RwLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
+    RwLock::new(BTreeMap::new());
+
+/// Register `dev` under `name` (without the leading `/dev/`). A second
+/// registration with the same name replaces the previous entry — matches
+/// the rest of the device-driver layer's idempotent registration style.
+///
+/// Visible in every devfs mount immediately; existing mounts pick the
+/// new device up the next time their root inode does a lookup of `name`.
+pub fn register_block_device(name: &str, dev: Arc<dyn BlockDevice>) {
+    BLOCK_DEV_REGISTRY.write().insert(name.to_string(), dev);
+}
+
+/// Test-only: clear every registered block device. Integration tests
+/// install their own registry state per test run.
+#[cfg(test)]
+pub(crate) fn reset_block_device_registry_for_tests() {
+    BLOCK_DEV_REGISTRY.write().clear();
+}
+
+/// Look up a registered block device by name. Public so the mount(2)
+/// resolver can short-circuit a path walk in tests; the production
+/// resolver always goes through `path_walk` + `InodeOps::block_device`.
+pub fn lookup_block_device(name: &str) -> Option<Arc<dyn BlockDevice>> {
+    BLOCK_DEV_REGISTRY.read().get(name).cloned()
+}
+
+fn registered_block_devices() -> Vec<(String, Arc<dyn BlockDevice>)> {
+    BLOCK_DEV_REGISTRY
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Device kind tag
 // ---------------------------------------------------------------------------
 
@@ -85,14 +136,77 @@ enum DevKind {
 // Root-directory inode ops
 // ---------------------------------------------------------------------------
 
-/// `InodeOps` for the `/dev` directory.  The child set is fixed; we
-/// store the four device `Arc<Inode>` values directly.
+/// `InodeOps` for the `/dev` directory.  The four character devices are
+/// fixed at mount time; block devices are resolved dynamically through
+/// the global [`BLOCK_DEV_REGISTRY`] (so devices registered post-mount
+/// — e.g. the boot-time virtio-blk probe in `block::init` — become
+/// visible without re-mounting devfs).
+///
+/// Block-device inodes are cached per-mount in [`Self::block_inodes`]
+/// so repeated `lookup` calls return the same `Arc<Inode>` and `st_ino`
+/// stays stable across syscalls.
 struct DevfsDirOps {
     null: Arc<Inode>,
     zero: Arc<Inode>,
     console: Arc<Inode>,
     tty: Arc<Inode>,
     sb: Weak<SuperBlock>,
+    /// Per-mount block-device inode cache. Keyed by registered name
+    /// (e.g. "vda"). Inodes are minted lazily on first lookup; the
+    /// allocator hands out ino values >= the per-mount block-base.
+    block_inodes: RwLock<BTreeMap<String, Arc<Inode>>>,
+    /// Next available inode number for newly-discovered block devices
+    /// in this mount. Initialised to `ino_base + BLOCK_INO_OFFSET` so
+    /// block-device inos never collide with the four char devices'
+    /// `ino_base+1..=ino_base+4` slots.
+    next_block_ino: AtomicU64,
+}
+
+/// Offset added to a mount's `ino_base` to get the first block-device
+/// ino slot. Leaves room for the four built-in char devices.
+const BLOCK_INO_OFFSET: u64 = 5;
+
+impl DevfsDirOps {
+    /// Look up a block-device child by registered name. On a cache miss
+    /// the registry is consulted; on a hit a fresh `Arc<Inode>` is
+    /// minted and cached so subsequent lookups return the same object.
+    fn lookup_block(&self, name: &[u8]) -> Result<Arc<Inode>, i64> {
+        let name_str = core::str::from_utf8(name).map_err(|_| ENOENT)?;
+
+        if let Some(inode) = self.block_inodes.read().get(name_str).cloned() {
+            return Ok(inode);
+        }
+
+        let dev = lookup_block_device(name_str).ok_or(ENOENT)?;
+        let mut cache = self.block_inodes.write();
+        // Re-check under the write lock — another thread may have
+        // raced ahead and inserted the same entry.
+        if let Some(inode) = cache.get(name_str).cloned() {
+            return Ok(inode);
+        }
+
+        let ino = self.next_block_ino.fetch_add(1, Ordering::Relaxed);
+        let ops = Arc::new(DevfsBlockOps {
+            sb: self.sb.clone(),
+            dev: dev.clone(),
+        });
+        let meta = InodeMeta {
+            mode: 0o660,
+            nlink: 1,
+            blksize: dev.block_size(),
+            ..Default::default()
+        };
+        let inode = Arc::new(Inode::new(
+            ino,
+            self.sb.clone(),
+            ops.clone() as Arc<dyn InodeOps>,
+            ops as Arc<dyn FileOps>,
+            InodeKind::Blk,
+            meta,
+        ));
+        cache.insert(name_str.to_string(), inode.clone());
+        Ok(inode)
+    }
 }
 
 impl InodeOps for DevfsDirOps {
@@ -102,7 +216,7 @@ impl InodeOps for DevfsDirOps {
             b"zero" => Ok(self.zero.clone()),
             b"console" => Ok(self.console.clone()),
             b"tty" => Ok(self.tty.clone()),
-            _ => Err(ENOENT),
+            _ => self.lookup_block(name),
         }
     }
 
@@ -114,13 +228,50 @@ impl InodeOps for DevfsDirOps {
     }
 }
 
-/// `FileOps` for the `/dev` directory — emits `.`, `..`, and the four
-/// device entries via the `linux_dirent64` wire format.
+/// `InodeOps` + `FileOps` for a single block-device inode in `/dev`.
+/// `block_device()` returns the registered handle so the `mount(2)`
+/// resolver can hand it to filesystem factories that need a backing
+/// device (e.g. ext2). Read/write through the inode are intentionally
+/// not implemented here — userspace block-device IO is a future
+/// follow-up; today the only consumer is the mount path.
+struct DevfsBlockOps {
+    sb: Weak<SuperBlock>,
+    dev: Arc<dyn BlockDevice>,
+}
+
+impl InodeOps for DevfsBlockOps {
+    fn getattr(&self, inode: &Inode, out: &mut Stat) -> Result<(), i64> {
+        let sb = self.sb.upgrade().ok_or(ENOENT)?;
+        let meta = inode.meta.read();
+        meta_into_stat(&meta, inode.kind, sb.fs_id.0, inode.ino, out);
+        Ok(())
+    }
+
+    fn block_device(&self) -> Option<Arc<dyn BlockDevice>> {
+        Some(self.dev.clone())
+    }
+}
+
+impl FileOps for DevfsBlockOps {}
+
+/// `FileOps` for the `/dev` directory — emits `.`, `..`, the four
+/// built-in char devices, and every currently-registered block device
+/// via the `linux_dirent64` wire format.
+///
+/// The block-device tail is snapshotted from [`BLOCK_DEV_REGISTRY`] at
+/// the start of the call and is materialised through the parent
+/// [`DevfsDirOps`] so the per-mount block-inode cache stays the source
+/// of truth for `st_ino`.
 struct DevfsDirFileOps {
     null_ino: u64,
     zero_ino: u64,
     console_ino: u64,
     tty_ino: u64,
+    /// Back-reference to the dir ops so getdents can mint / look up
+    /// block-device inodes through the same per-mount cache that
+    /// `lookup` uses. `Weak` to avoid an SB → DirOps → DirFileOps →
+    /// DirOps cycle.
+    dir_ops: Weak<DevfsDirOps>,
 }
 
 impl FileOps for DevfsDirFileOps {
@@ -132,12 +283,12 @@ impl FileOps for DevfsDirFileOps {
     fn getdents(&self, f: &OpenFile, buf: &mut [u8], cookie: &mut u64) -> Result<usize, i64> {
         // cookie = count of virtual entries already consumed.
         // Absolute positions: 0 = ".",  1 = "..",  2 = null,  3 = zero,
-        //                     4 = console,  5 = tty.
+        //                     4 = console,  5 = tty,
+        //                     6.. = registered block devices (snapshot).
         let dir_ino = f.inode.ino;
         let mut written = 0usize;
         let start = *cookie;
 
-        // Emit entry at absolute position `pos` if it hasn't been consumed yet.
         let mut pos: u64 = 0;
 
         macro_rules! maybe_emit {
@@ -160,6 +311,20 @@ impl FileOps for DevfsDirFileOps {
         maybe_emit!(self.zero_ino, 2 /* DT_CHR */, b"zero");
         maybe_emit!(self.console_ino, 2 /* DT_CHR */, b"console");
         maybe_emit!(self.tty_ino, 2 /* DT_CHR */, b"tty");
+
+        // Block-device tail. Snapshot the registry so a concurrent
+        // `register_block_device` can't perturb the iteration order
+        // mid-call. Materialise each device through `lookup_block` so
+        // ino assignment goes through the per-mount cache.
+        if let Some(dir_ops) = self.dir_ops.upgrade() {
+            for (name, _) in registered_block_devices() {
+                let ino = match dir_ops.lookup_block(name.as_bytes()) {
+                    Ok(inode) => inode.ino,
+                    Err(_) => continue,
+                };
+                maybe_emit!(ino, 6 /* DT_BLK */, name.as_bytes());
+            }
+        }
 
         Ok(written)
     }
@@ -303,12 +468,15 @@ impl FileSystem for DevFs {
                 console: console_inode.clone(),
                 tty: tty_inode.clone(),
                 sb: weak_sb.clone(),
+                block_inodes: RwLock::new(BTreeMap::new()),
+                next_block_ino: AtomicU64::new(ino_base + BLOCK_INO_OFFSET),
             });
             let root_file_ops = Arc::new(DevfsDirFileOps {
                 null_ino: null_inode.ino,
                 zero_ino: zero_inode.ino,
                 console_ino: console_inode.ino,
                 tty_ino: tty_inode.ino,
+                dir_ops: Arc::downgrade(&root_dir_ops),
             });
             let root_meta = InodeMeta {
                 mode: 0o555,

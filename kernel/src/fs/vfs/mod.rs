@@ -51,6 +51,7 @@ pub mod devfs;
 pub mod gc_queue;
 pub mod init;
 pub mod inode;
+pub mod mount_resolve;
 pub mod mount_table;
 pub mod open_file;
 pub mod ops;
@@ -66,6 +67,7 @@ pub use devfs::DevFs;
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
 pub use init::{init, root};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
+pub use mount_resolve::resolve_block_device;
 pub use mount_table::{alloc_fs_id, mount, unmount, GlobalMountResolver, UmountFlags, MOUNT_TABLE};
 pub use open_file::OpenFile;
 pub use ops::{
