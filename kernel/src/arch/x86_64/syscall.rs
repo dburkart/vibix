@@ -1031,6 +1031,17 @@ pub unsafe extern "C" fn syscall_dispatch(
         // setresuid.
         SETRESGID => super::syscalls::creds::sys_setresgid(a0 as u32, a1 as u32, a2 as u32),
 
+        // getgroups(size, list[]) — POSIX.1-2017 §getgroups. Issue #549.
+        // size==0 returns the count without touching the buffer; size>0
+        // copies up to `size` u32 group IDs to user. EINVAL if size is
+        // non-zero and smaller than the count.
+        GETGROUPS => super::syscalls::creds::sys_getgroups(a0 as i32, a1),
+
+        // setgroups(size, list[]) — POSIX.1-2017 §setgroups. Issue #549.
+        // Root-only this epic (CAP_SETGID is out of scope per RFC 0004
+        // Workstream B wave 1); list bounded at NGROUPS_MAX=32.
+        SETGROUPS => super::syscalls::creds::sys_setgroups(a0 as i32, a1),
+
         _ => -38i64, // ENOSYS
     }
 }
@@ -1671,6 +1682,8 @@ pub mod syscall_nr {
     pub const SETREGID: u64 = 114;
     pub const SETRESUID: u64 = 117;
     pub const SETRESGID: u64 = 119;
+    pub const GETGROUPS: u64 = 115;
+    pub const SETGROUPS: u64 = 116;
 }
 
 #[cfg(test)]
@@ -1748,6 +1761,10 @@ mod tests {
         assert_eq!(syscall_nr::SETREGID, 114, "SYS_setregid must be 114");
         assert_eq!(syscall_nr::SETRESUID, 117, "SYS_setresuid must be 117");
         assert_eq!(syscall_nr::SETRESGID, 119, "SYS_setresgid must be 119");
+
+        // Supplementary group syscalls (issue #549, RFC 0004 Workstream B)
+        assert_eq!(syscall_nr::GETGROUPS, 115, "SYS_getgroups must be 115");
+        assert_eq!(syscall_nr::SETGROUPS, 116, "SYS_setgroups must be 116");
 
         // IPC / FIFO
         assert_eq!(syscall_nr::PIPE, 22, "SYS_pipe must be 22");

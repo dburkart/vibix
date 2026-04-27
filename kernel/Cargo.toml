@@ -325,6 +325,10 @@ name = "syscall_setuid_family"
 harness = false
 
 [[test]]
+name = "syscall_setgroups_family"
+harness = false
+
+[[test]]
 name = "syscall_truncate"
 harness = false
 

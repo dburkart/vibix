@@ -48,8 +48,18 @@
 //! "privileged" predicate is still `euid == 0` (POSIX.1: only the
 //! effective *user* ID determines privilege for the `setgid` family too).
 
+use alloc::vec::Vec;
+
+use crate::arch::x86_64::uaccess;
 use crate::fs::vfs::Credential;
-use crate::fs::{EINVAL, EPERM};
+use crate::fs::{EFAULT, EINVAL, EPERM};
+
+/// Maximum number of supplementary groups a single task may carry. Issue #549
+/// pins this at 32 — the smallest value RFC 0004 §Open Questions calls out as
+/// reasonable for a hobby kernel and the lower bound POSIX.1-2017 permits.
+/// Linux uses 65536; 32 is intentionally tight and revisitable when a
+/// real-world workload bumps into it.
+pub const NGROUPS_MAX: usize = 32;
 
 // `u32::MAX` is the C `(uid_t)-1` sentinel. Named at module scope so
 // the intent is obvious at every use site and a future switch to a
@@ -329,6 +339,117 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> i64 {
         sgid
     };
     let new_cred = with_gids(&cur, new_rgid, new_egid, new_sgid);
+    crate::task::replace_current_credentials(new_cred);
+    0
+}
+
+/// Helper for [`sys_setgroups`]: build a fresh `Credential` cloned from
+/// `cur` with `groups` replacing the supplementary group list.
+fn with_groups(cur: &Credential, groups: Vec<u32>) -> Credential {
+    Credential::from_task_ids(
+        cur.uid, cur.euid, cur.suid, cur.gid, cur.egid, cur.sgid, groups,
+    )
+}
+
+/// `getgroups(size, list)` — POSIX.1-2017 §getgroups.
+///
+/// Returns the count of supplementary group IDs on the calling task.
+///
+/// - If `size == 0`, the call is a query: return the count without
+///   touching `list_uva` (POSIX-mandated; `list_uva` may legally be
+///   `NULL` on this path and we must not fault on it).
+/// - Otherwise, copy up to `size` group IDs out to `list_uva` (a
+///   `gid_t[]`, `gid_t = u32` on this ABI) and return the actual count
+///   copied.
+/// - If `size > 0` and `size < count`, return `EINVAL` (POSIX: "If the
+///   size argument is non-zero and less than the number of group IDs,
+///   `getgroups()` shall fail" with `EINVAL`).
+/// - If the user buffer is invalid, return `EFAULT`.
+///
+/// Uses the wait-free Arc-snapshot read model — the group list is
+/// cloned out from under a short read-lock before any user copy.
+pub fn sys_getgroups(size: i32, list_uva: u64) -> i64 {
+    let cred = crate::task::current_credentials();
+    let count = cred.groups.len();
+    if size == 0 {
+        // Query form: report the count, do not touch the buffer.
+        return count as i64;
+    }
+    if size < 0 {
+        return EINVAL;
+    }
+    let size = size as usize;
+    if size < count {
+        return EINVAL;
+    }
+    // Copy the live group list out as native-endian u32s. gid_t is u32
+    // on this ABI; userspace and kernel share endianness so to_ne_bytes
+    // matches the C-side `gid_t` layout exactly.
+    if count > 0 {
+        let bytes_len = count
+            .checked_mul(core::mem::size_of::<u32>())
+            .expect("getgroups: NGROUPS_MAX bound prevents this overflow");
+        // Stage to a kernel buffer first so we hold the user-copy bracket
+        // for the minimum window.
+        let mut staging: Vec<u8> = Vec::with_capacity(bytes_len);
+        for gid in cred.groups.iter() {
+            staging.extend_from_slice(&gid.to_ne_bytes());
+        }
+        match unsafe { uaccess::copy_to_user(list_uva as usize, &staging) } {
+            Ok(()) => {}
+            Err(_) => return EFAULT,
+        }
+    }
+    count as i64
+}
+
+/// `setgroups(size, list)` — POSIX.1-2017 §setgroups (BSD/Linux extension
+/// in POSIX.1-2017 spirit).
+///
+/// Replaces the calling task's supplementary group list with the
+/// `size`-element vector at `list_uva`. Per RFC 0004 Workstream B wave 1,
+/// `setgroups` is **root-only** — non-root callers receive `EPERM`.
+/// `CAP_SETGID` is out of scope for this epic.
+///
+/// - `size > NGROUPS_MAX` (32): `EINVAL`. RFC 0004 §Open Questions pins
+///   the bound; POSIX permits any value ≥ `_POSIX_NGROUPS_MAX` (=8).
+/// - `size < 0`: `EINVAL`.
+/// - `euid != 0`: `EPERM` (this epic).
+/// - `list_uva` invalid for `size * sizeof(gid_t)` bytes: `EFAULT`.
+///
+/// On success returns 0. The list is replaced wholesale — POSIX makes no
+/// promises about deduping or sorting; we preserve insertion order so
+/// `getgroups` round-trips a `setgroups(g)` exactly.
+pub fn sys_setgroups(size: i32, list_uva: u64) -> i64 {
+    if size < 0 {
+        return EINVAL;
+    }
+    let size = size as usize;
+    if size > NGROUPS_MAX {
+        return EINVAL;
+    }
+    let cur = crate::task::current_credentials();
+    if cur.euid != 0 {
+        return EPERM;
+    }
+    let groups = if size == 0 {
+        Vec::new()
+    } else {
+        let bytes_len = size
+            .checked_mul(core::mem::size_of::<u32>())
+            .expect("setgroups: NGROUPS_MAX bound prevents this overflow");
+        let mut staging = alloc::vec![0u8; bytes_len];
+        match unsafe { uaccess::copy_from_user(&mut staging, list_uva as usize) } {
+            Ok(()) => {}
+            Err(_) => return EFAULT,
+        }
+        let mut out = Vec::with_capacity(size);
+        for chunk in staging.chunks_exact(core::mem::size_of::<u32>()) {
+            out.push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        out
+    };
+    let new_cred = with_groups(&cur, groups);
     crate::task::replace_current_credentials(new_cred);
     0
 }
