@@ -64,30 +64,30 @@
 //! - Step 4 is in-memory only; a crash here costs nothing beyond the
 //!   pin until the next mount.
 //!
-//! # Out of scope
+//! # Production triggers
 //!
-//! - The production trigger (wiring the last-fd-close event to this
-//!   finalize call). In the current ext2 driver, the orphan list holds
-//!   `Arc<Inode>` strong refs — the last `OpenFile` drop doesn't cause
-//!   the `Inode` to hit zero while an orphan-list entry exists.
-//!   [`Ext2Super::evict_inode`](super::fs::Ext2Super) is the hook site
-//!   the VFS `gc_queue` drives, but it only fires when the VFS drops
-//!   the last `Arc<Inode>` it holds, which only happens after the
-//!   orphan-list pin is explicitly released. Until the production
-//!   trigger is wired (follow-up issue; see "Wiring the production
-//!   trigger" below), callers invoke [`finalize`] directly — this is
-//!   sufficient for the mount-time replay path (#564) and for the
-//!   integration tests that exercise the sequence end-to-end.
+//! Three call sites drive [`finalize`] in the live driver:
 //!
-//! # Wiring the production trigger
-//!
-//! The RFC 0004 design envisions a per-`OpenFile` drop that, after
-//! decrementing a driver-side refcount, calls this module's [`finalize`]
-//! when the count hits zero for an unlinked inode. That refcount hook
-//! doesn't exist yet on `OpenFile`; adding it is a separate VFS surface
-//! change and will be handled in a follow-up. Until then, mount-time
-//! replay (#564) and explicit calls (from tests, or a future background
-//! orphan-sweep) are the two callers.
+//! 1. **Last-fd-close** (issue #638): the per-`Ext2Inode`
+//!    `open_count` atomic is bumped by [`FileOps::open`](crate::fs::vfs::ops::FileOps::open)
+//!    and decremented by [`FileOps::release`](crate::fs::vfs::ops::FileOps::release)
+//!    on every successful `OpenFile` construction / drop. When the
+//!    count transitions one→zero on an inode whose `unlinked` flag is
+//!    set, the `release` hook calls [`finalize`] directly — bypassing
+//!    the VFS `gc_queue` / `evict_inode` indirection that would
+//!    otherwise be blocked by the orphan-list `Arc<Inode>` pin
+//!    (chicken-and-egg: the pin is held by `orphan_list` and only
+//!    released **inside** `finalize`, so `Inode::Drop` for an orphan
+//!    can never fire to enqueue eviction).
+//! 2. **Mount-time orphan-chain replay** (#564): inodes left on
+//!    `s_last_orphan` from a previous mount are walked and finalized
+//!    before the SB becomes visible to userspace.
+//! 3. **VFS eviction passthrough** (#573): if a non-fd path manages to
+//!    drop the last `Arc<Inode>` for an orphan (e.g. a future
+//!    background orphan-sweep), [`Ext2Super::evict_inode`](super::fs::Ext2Super)
+//!    routes through here as a defence-in-depth fallback. In normal
+//!    operation the per-open trigger above runs first and the eviction
+//!    path becomes a no-op (orphan_list entry already gone).
 
 use alloc::sync::Arc;
 

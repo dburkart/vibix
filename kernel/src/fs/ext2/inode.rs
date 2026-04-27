@@ -63,7 +63,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use spin::Mutex;
 
@@ -174,6 +174,20 @@ pub struct Ext2Inode {
     /// the surface exists so the unlink path and mount-time orphan
     /// replay (#564) have a well-known place to set it.
     pub unlinked: AtomicBool,
+    /// Driver-side outstanding-opens refcount. Bumped by
+    /// [`FileOps::open`] (one per successful `OpenFile::new`) and
+    /// decremented by [`FileOps::release`] (one per `OpenFile::Drop`).
+    /// When [`unlinked`](Self::unlinked) is set and this count
+    /// transitions from one to zero, the `release` hook calls
+    /// [`super::orphan_finalize::finalize`] directly to drive the
+    /// RFC 0004 §Final-close sequence — bypassing the VFS
+    /// `gc_queue`/`evict_inode` indirection that would otherwise be
+    /// blocked by the orphan-list `Arc<Inode>` pin (chicken-and-egg:
+    /// the pin is held by `orphan_list` and only released **inside**
+    /// `finalize`, so `Inode::Drop` for an orphan can never fire to
+    /// trigger eviction). See issue #638 / RFC 0004 §Wiring the
+    /// production trigger.
+    pub open_count: AtomicU32,
 }
 
 impl Ext2Inode {
@@ -184,6 +198,7 @@ impl Ext2Inode {
             meta: BlockingRwLock::new(meta),
             block_map: BlockingRwLock::new(None),
             unlinked: AtomicBool::new(false),
+            open_count: AtomicU32::new(0),
         }
     }
 }
@@ -396,6 +411,67 @@ impl FileOps for Ext2Inode {
     /// ordering rules (RFC 0004 §Write extend + §Write Ordering).
     fn write(&self, f: &OpenFile, buf: &[u8], off: u64) -> Result<usize, i64> {
         super::file::write_file_at(&f.inode, self, buf, off)
+    }
+
+    /// Bump the driver-side outstanding-opens refcount. Paired with
+    /// [`Self::release`]. Issue #638 / RFC 0004 §Wiring the production
+    /// trigger.
+    fn open(&self, _f: &OpenFile) {
+        self.open_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrement the outstanding-opens refcount. If the count
+    /// transitions from one to zero AND the inode is unlinked
+    /// (i.e. on the per-mount [`OrphanList`]), drive the RFC 0004
+    /// §Final-close sequence synchronously via
+    /// [`super::orphan_finalize::finalize`].
+    ///
+    /// This is the in-kernel production trigger for orphan-finalize
+    /// (issue #638). The VFS `gc_queue` / `evict_inode` indirection
+    /// can't drive it because the orphan-list `Arc<Inode>` pin keeps
+    /// `Inode::Drop` from ever firing on an orphan — the pin is only
+    /// released **inside** `finalize`, which is the chicken/egg the
+    /// per-open refcount unwinds.
+    ///
+    /// On a non-orphan close: the decrement is the only side effect;
+    /// the VFS cache eventually evicts the inode through its normal
+    /// `Weak<Inode>` upgrade-failure path (no driver work needed —
+    /// ext2 has no dirty-inode writeback yet; that lives behind the
+    /// future `sync` path).
+    ///
+    /// Errors from `finalize` are absorbed with a `kwarn!`: the drop
+    /// path can't propagate, and leaving the orphan-list pin in place
+    /// means the next mount-time replay (#564) will rediscover the
+    /// inode and retry the sequence.
+    fn release(&self, _f: &OpenFile) {
+        let prev = self.open_count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "Ext2Inode::release: open_count underflow");
+        if prev != 1 {
+            return;
+        }
+        // Last close. If the inode is unlinked, run finalize. The
+        // `unlinked` atomic is set by `unlink::push_on_orphan_list`'s
+        // caller before the orphan-list pin is installed, so reading
+        // `true` here is sufficient evidence that the orphan_list
+        // entry exists (or will be observed by `finalize`'s ENOENT
+        // path otherwise — idempotent).
+        if !self.unlinked.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(super_arc) = self.super_ref.upgrade() else {
+            // Mount is mid-teardown; the orphan-list pin will be
+            // released when the per-super state drops, and any leaked
+            // on-disk state is recovered by mount-replay on the next
+            // boot.
+            return;
+        };
+        if let Err(e) = super::orphan_finalize::finalize(&super_arc, self.ino) {
+            crate::kwarn!(
+                "ext2: open_count→0 finalize ino {}: errno={}, leaving pin for replay",
+                self.ino,
+                e,
+            );
+        }
     }
 }
 

@@ -599,10 +599,17 @@ fn unlink_common(
         decrement_used_dirs(&super_, loc.child_ino)?;
     }
 
-    // 8. On hit-zero: mark unlinked, push on orphan list.
+    // 8. On hit-zero: push on orphan list, then mark unlinked. The
+    //    push-then-mark ordering matters for the open-fd-close finalize
+    //    trigger (#638): a concurrent `OpenFile::Drop` reads
+    //    `unlinked == true` and immediately calls `finalize_orphan`,
+    //    which expects the orphan_list pin to already be installed.
+    //    Setting `unlinked` last guarantees the releaser observes
+    //    "unlinked && pin present" rather than racing into a finalize
+    //    that returns `ENOENT` and silently leaks the orphan inode.
     if new_links == 0 {
-        child_ext2.unlinked.store(true, Ordering::SeqCst);
         push_on_orphan_list(&super_, loc.child_ino, &child_arc)?;
+        child_ext2.unlinked.store(true, Ordering::SeqCst);
     }
 
     Ok(())
