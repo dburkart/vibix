@@ -145,6 +145,15 @@ const SMOKE_MARKERS: &[&str] = &[
     // Missing this while `init: hello from pid 1` fires is a signal that the
     // SYSRET / user-context restore after the first write is broken.
     "init: post-write marker",
+    // Promoted back to required after #478 (PR #655 SYSCALL `sti`),
+    // #527 (PR #662 latch placement), and #646 (PR #662 stack VA
+    // free-list) closed the fork+exec flake era. The earlier demotion
+    // to soft markers (PR #419) was a temporary measure while those
+    // root causes were under investigation; they fire deterministically
+    // now and missing them indicates a real regression in the fork /
+    // exec / wait path. HARD_CAP is owned by #511 and tuned separately.
+    "hello: hello from execed child",
+    "init: fork+exec+wait ok",
 ];
 
 // Note: an earlier draft of #647 added a delta floor parsed out of
@@ -156,11 +165,12 @@ const SMOKE_MARKERS: &[&str] = &[
 // the existing missing-markers check catches. Soak detection lives
 // kernel-side via `process::CURRENT_PID_SOAK_THRESHOLD`.
 
-/// Markers for the fork+exec+wait flow. These are flakey under un-accelerated
-/// CI QEMU — the child sometimes doesn't finish before HARD_CAP even though
-/// the kernel path is healthy. Missing soft markers warn but don't fail the
-/// suite; a kernel panic is still fatal via the PANIC_MARKER check.
-const SMOKE_SOFT_MARKERS: &[&str] = &["hello: hello from execed child", "init: fork+exec+wait ok"];
+/// Soft markers — present but non-fatal if missing. Currently empty:
+/// the previous fork+exec+wait soft markers were re-promoted to
+/// `SMOKE_MARKERS` after #478/#527/#646 closed the flake era (#420).
+/// The plumbing stays so a future flakey-but-diagnostic marker can be
+/// added without re-introducing the `soft_remaining` machinery.
+const SMOKE_SOFT_MARKERS: &[&str] = &[];
 
 fn main() -> R<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
