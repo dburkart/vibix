@@ -1442,6 +1442,22 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let _ = reader_handle.join();
     let _ = child.wait();
 
+    // Optional always-on serial capture for the nightly soak (#648).
+    // When `VIBIX_SMOKE_SERIAL_LOG` is set, persist the accumulated
+    // serial output to that path on every exit (success and failure)
+    // so the soak driver can pattern-match each run for residual
+    // bug-class signatures (#478, #527, #646) without re-routing
+    // QEMU's stdio. Best-effort: a write failure is logged to stderr
+    // but does not change smoke's pass/fail outcome.
+    if let Some(path) = env::var_os("VIBIX_SMOKE_SERIAL_LOG") {
+        if let Err(e) = fs::write(&path, &accumulated) {
+            eprintln!(
+                "warning: failed to write VIBIX_SMOKE_SERIAL_LOG={}: {e}",
+                Path::new(&path).display()
+            );
+        }
+    }
+
     // Helper to dump the debugcon log (#478 diagnostic step 1) on any
     // failure path so CI log lines and uploaded artifacts both show it.
     let dump_debugcon = |log_path: &Path| match fs::read(log_path) {

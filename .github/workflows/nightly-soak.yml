@@ -1,0 +1,506 @@
+name: nightly-soak
+
+# Standing nightly 1000× smoke soak gating on residual flake markers
+# from the #501 quality sprint — see issue #648.
+#
+# Runs `cargo xtask smoke` 1000 times under unaccelerated TCG and fails
+# the workflow on any of these residual signatures appearing in the
+# captured serial of any single run:
+#
+#   - `ring3-first-fault: #PF`             — #527 user-stack-top fault.
+#   - `init: iretq to ring-3` followed by
+#     no `init: hello from pid 1`          — #478 silent stall.
+#   - `tasks: reaped task ... (stack VA
+#     slot ... leaked)`                    — #646 stack-VA-slot leak.
+#
+# All three signatures are diagnostic markers added in PR #595. The
+# soak runs as a *standing gate*: any future regression that revives
+# the bug class is caught within ≤ 24 h instead of leaking to manual
+# QA.
+#
+# Sharding: 1000 runs at ~30-60 s each under TCG would be ~8-16 h on a
+# single GitHub-hosted runner, blowing past the 6 h job cap. Split into
+# `shard_count` parallel matrix shards so each shard stays well under
+# the cap. The post-shard `aggregate` job sums per-shard results into
+# one job summary.
+#
+# Auto-filing: if the workflow has failed three nights in a row at the
+# moment a new run completes red, the `aggregate` job opens a tracking
+# issue via `gh issue create` (project label `priority:P1`,
+# `area:debug`) so the on-call human is paged loudly. See the
+# `auto-file-followup` step.
+
+on:
+  schedule:
+    # 03:42 UTC nightly — staggered away from `smoke-soak.yml` (08:17),
+    # `ci.yml`, and other daily jobs in this repo.
+    - cron: '42 3 * * *'
+  workflow_dispatch:
+    inputs:
+      total_runs:
+        description: 'Total number of smoke runs to execute across all shards'
+        required: false
+        default: '1000'
+      shard_count:
+        description: 'Number of parallel shards (must evenly divide total_runs)'
+        required: false
+        default: '10'
+
+permissions:
+  contents: read
+  # Required for the auto-file-followup step (`gh issue create`) and
+  # for reading recent workflow runs to detect 3-nights-red streaks.
+  issues: write
+  actions: read
+
+concurrency:
+  # Distinct from the other smoke-soak workflow's group. Cancel an
+  # in-flight prior run only on workflow_dispatch retriggers — never
+  # on a fresh nightly schedule, where each run is a separate data
+  # point in the streak detector below.
+  group: nightly-soak-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      shard_ids: ${{ steps.compute.outputs.shard_ids }}
+      runs_per_shard: ${{ steps.compute.outputs.runs_per_shard }}
+      total_runs: ${{ steps.compute.outputs.total_runs }}
+      shard_count: ${{ steps.compute.outputs.shard_count }}
+    steps:
+      - name: Compute shard plan
+        id: compute
+        env:
+          TOTAL_RUNS: ${{ github.event.inputs.total_runs || '1000' }}
+          SHARD_COUNT: ${{ github.event.inputs.shard_count || '10' }}
+        run: |
+          set -u
+          case "${TOTAL_RUNS}" in
+            ''|*[!0-9]*) echo "::error::total_runs must be a positive integer"; exit 1 ;;
+          esac
+          case "${SHARD_COUNT}" in
+            ''|*[!0-9]*) echo "::error::shard_count must be a positive integer"; exit 1 ;;
+          esac
+          if [ "${TOTAL_RUNS}" -le 0 ] || [ "${SHARD_COUNT}" -le 0 ]; then
+            echo "::error::total_runs and shard_count must be > 0"; exit 1
+          fi
+          if [ $(( TOTAL_RUNS % SHARD_COUNT )) -ne 0 ]; then
+            echo "::error::shard_count (${SHARD_COUNT}) must evenly divide total_runs (${TOTAL_RUNS})"
+            exit 1
+          fi
+          per=$(( TOTAL_RUNS / SHARD_COUNT ))
+          ids='['
+          i=1
+          while [ "${i}" -le "${SHARD_COUNT}" ]; do
+            if [ "${i}" -gt 1 ]; then ids="${ids},"; fi
+            ids="${ids}${i}"
+            i=$(( i + 1 ))
+          done
+          ids="${ids}]"
+          echo "shard_ids=${ids}" >> "${GITHUB_OUTPUT}"
+          echo "runs_per_shard=${per}" >> "${GITHUB_OUTPUT}"
+          echo "total_runs=${TOTAL_RUNS}" >> "${GITHUB_OUTPUT}"
+          echo "shard_count=${SHARD_COUNT}" >> "${GITHUB_OUTPUT}"
+          echo "Plan: ${TOTAL_RUNS} runs across ${SHARD_COUNT} shards (${per} runs/shard)"
+
+  soak-shard:
+    name: soak shard ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # Each smoke boot finishes in ~30-60 s under unaccelerated TCG on a
+    # GitHub-hosted runner; 100 runs/shard at the slow end is ~100 min,
+    # leaving ample headroom under the 6 h job cap. Spike to 330 min
+    # (5.5 h) to absorb runner-load variance and a cold cargo build on
+    # the first miss.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shard_ids) }}
+    env:
+      RUNS_PER_SHARD: ${{ needs.plan.outputs.runs_per_shard }}
+      # Outer kill switch around `cargo xtask smoke`. The xtask itself
+      # has a 600 s `HARD_CAP` watchdog that kills QEMU and unwinds
+      # cleanly long before this; we only need belt-and-suspenders for
+      # a wedged cargo or a stuck pre-build step.
+      SMOKE_RUN_TIMEOUT_SECS: '720'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso build-essential coreutils
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          # Share the smoke-soak workflow's cache key so the kernel
+          # build is warm on the first run of each shard.
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
+
+      # Warm the smoke ISO once before the loop so per-iteration cost
+      # is just the QEMU boot — `cargo xtask build` covers the kernel
+      # build and ISO assembly. A failure here aborts the shard early
+      # rather than burning the whole 5 h timeout on a build issue.
+      - name: Pre-build smoke ISO
+        run: cargo xtask build
+        timeout-minutes: 20
+
+      - name: Run nightly soak shard
+        id: soak
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          mkdir -p soak-logs
+          count="${RUNS_PER_SHARD}"
+          per_run_timeout="${SMOKE_RUN_TIMEOUT_SECS}"
+
+          # Residual signature patterns. Each is a Perl-compatible regex
+          # passed to `grep -E`. Listed here (not embedded in the loop)
+          # so a future signature can be added without restructuring
+          # the per-run scoring logic.
+          #
+          # The #478 stall pattern is composite ("iretq to ring-3"
+          # without a following "init: hello from pid 1"); it is
+          # detected separately because grep alone cannot express
+          # negative lookaheads across lines.
+          PAT_RING3_FAULT='ring3-first-fault: #PF'
+          PAT_STACK_LEAK='tasks: reaped task .* \(stack VA slot .* leaked\)'
+          MARK_IRETQ='init: iretq to ring-3'
+          MARK_HELLO='init: hello from pid 1'
+
+          echo "== nightly-soak shard ${SHARD}: count=${count} per_run_timeout=${per_run_timeout}s =="
+
+          passes=0
+          fails=0
+          timeouts=0
+          sig_ring3=0
+          sig_stall=0
+          sig_leak=0
+          printf 'run\tresult\tduration_s\tsignatures\n' > "soak-logs/shard-${SHARD}-summary.tsv"
+
+          for i in $(seq 1 "${count}"); do
+            log="soak-logs/shard-${SHARD}-run-$(printf '%04d' "${i}").log"
+            serial="soak-logs/shard-${SHARD}-run-$(printf '%04d' "${i}").serial"
+            export VIBIX_SMOKE_SERIAL_LOG="${serial}"
+            start_ns=$(date +%s%N)
+            if timeout --kill-after=30s "${per_run_timeout}s" \
+                 cargo xtask smoke > "${log}" 2>&1; then
+              status="pass"
+              passes=$((passes + 1))
+            else
+              rc=$?
+              if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
+                status="timeout"
+                timeouts=$((timeouts + 1))
+              else
+                status="fail"
+              fi
+              fails=$((fails + 1))
+            fi
+            end_ns=$(date +%s%N)
+            dur_ms=$(( (end_ns - start_ns) / 1000000 ))
+            dur_s=$(awk "BEGIN { printf \"%.1f\", ${dur_ms} / 1000.0 }")
+
+            # Residual-signature scan over the captured serial. Falls
+            # back to the cargo log if the serial file is missing
+            # (e.g. xtask crashed before writing it) so a
+            # pre-marker-emission regression still gets pattern-matched.
+            scan="${serial}"
+            if [ ! -s "${scan}" ]; then scan="${log}"; fi
+            sigs=""
+            if grep -E -q "${PAT_RING3_FAULT}" "${scan}" 2>/dev/null; then
+              sigs="${sigs}ring3_fault,"
+              sig_ring3=$((sig_ring3 + 1))
+            fi
+            if grep -E -q "${PAT_STACK_LEAK}" "${scan}" 2>/dev/null; then
+              sigs="${sigs}stack_leak,"
+              sig_leak=$((sig_leak + 1))
+            fi
+            if grep -F -q "${MARK_IRETQ}" "${scan}" 2>/dev/null \
+               && ! grep -F -q "${MARK_HELLO}" "${scan}" 2>/dev/null; then
+              sigs="${sigs}init_stall,"
+              sig_stall=$((sig_stall + 1))
+            fi
+            sigs="${sigs%,}"
+            if [ -z "${sigs}" ]; then sigs="-"; fi
+
+            printf '%s\t%s\t%s\t%s\n' "${i}" "${status}" "${dur_s}" "${sigs}" \
+              >> "soak-logs/shard-${SHARD}-summary.tsv"
+            echo "[shard ${SHARD} run ${i}/${count}] ${status} (${dur_s}s) sigs=${sigs}"
+          done
+
+          total=$((passes + fails))
+          pass_rate=$(( passes * 100 / total ))
+          residual_total=$(( sig_ring3 + sig_stall + sig_leak ))
+
+          # Per-shard summary block; the aggregate job sums these.
+          {
+            echo "## nightly-soak shard ${SHARD}"
+            echo ""
+            echo "- runs: ${total}"
+            echo "- passed: ${passes}"
+            echo "- failed: ${fails} (timeouts: ${timeouts})"
+            echo "- pass rate: ${pass_rate}%"
+            echo ""
+            echo "### residual-signature hits"
+            echo ""
+            echo "- ring3-first-fault (#527): ${sig_ring3}"
+            echo "- init-stall (iretq w/o hello, #478): ${sig_stall}"
+            echo "- stack-VA-slot leak (#646): ${sig_leak}"
+            echo "- total residual hits: ${residual_total}"
+          } | tee "soak-logs/shard-${SHARD}-summary.md"
+
+          {
+            cat "soak-logs/shard-${SHARD}-summary.md"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # Persist scalar counters for the aggregate job to sum.
+          {
+            echo "passes=${passes}"
+            echo "fails=${fails}"
+            echo "timeouts=${timeouts}"
+            echo "total=${total}"
+            echo "sig_ring3=${sig_ring3}"
+            echo "sig_stall=${sig_stall}"
+            echo "sig_leak=${sig_leak}"
+            echo "residual_total=${residual_total}"
+          } > "soak-logs/shard-${SHARD}-counters.env"
+
+          # Fail the shard if any residual signature fired in any run.
+          # Pass-rate alone is intentionally NOT a gate here — a
+          # marker-less generic flake is tracked by smoke-soak.yml; this
+          # workflow gates on the *named* bug-class residuals only.
+          if [ "${residual_total}" -gt 0 ]; then
+            echo "::error::nightly-soak shard ${SHARD}: ${residual_total} residual-signature hit(s) — see counters above"
+            exit 1
+          fi
+
+      - name: Upload shard logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-soak-logs-shard-${{ matrix.shard }}
+          path: soak-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  aggregate:
+    name: aggregate + auto-file
+    needs: [plan, soak-shard]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download all shard logs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          path: all-logs
+          pattern: nightly-soak-logs-shard-*
+          merge-multiple: true
+
+      - name: Aggregate shard counters
+        id: agg
+        env:
+          TOTAL_RUNS_EXPECTED: ${{ needs.plan.outputs.total_runs }}
+          SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+        run: |
+          set -u
+          # Per-shard counter files use the same variable names, so
+          # `source`-ing them in a loop would overwrite previous values
+          # rather than summing them. Parse line-by-line instead.
+          passes=0
+          fails=0
+          timeouts=0
+          total=0
+          sig_ring3=0
+          sig_stall=0
+          sig_leak=0
+          shards_seen=0
+          for f in all-logs/shard-*-counters.env; do
+            [ -e "${f}" ] || continue
+            shards_seen=$(( shards_seen + 1 ))
+          done
+          for f in all-logs/shard-*-counters.env; do
+            [ -e "${f}" ] || continue
+            while IFS='=' read -r k v; do
+              case "${k}" in
+                passes)         passes=$(( passes + v )) ;;
+                fails)          fails=$(( fails + v )) ;;
+                timeouts)       timeouts=$(( timeouts + v )) ;;
+                total)          total=$(( total + v )) ;;
+                sig_ring3)      sig_ring3=$(( sig_ring3 + v )) ;;
+                sig_stall)      sig_stall=$(( sig_stall + v )) ;;
+                sig_leak)       sig_leak=$(( sig_leak + v )) ;;
+              esac
+            done < "${f}"
+          done
+
+          residual_total=$(( sig_ring3 + sig_stall + sig_leak ))
+          if [ "${total}" -gt 0 ]; then
+            pass_rate=$(( passes * 100 / total ))
+          else
+            pass_rate=0
+          fi
+
+          {
+            echo "# nightly-soak aggregate (${SHARD_COUNT} shards, expected ${TOTAL_RUNS_EXPECTED} runs)"
+            echo ""
+            echo "- shards reporting: ${shards_seen}/${SHARD_COUNT}"
+            echo "- runs: ${total}"
+            echo "- passed: ${passes}"
+            echo "- failed: ${fails} (timeouts: ${timeouts})"
+            echo "- pass rate: ${pass_rate}%"
+            echo ""
+            echo "## residual-signature hits"
+            echo ""
+            echo "| signature | issue | hits |"
+            echo "|-----------|-------|------|"
+            echo "| ring3-first-fault: #PF | #527 | ${sig_ring3} |"
+            echo "| init: iretq w/o hello | #478 | ${sig_stall} |"
+            echo "| stack VA slot leaked | #646 | ${sig_leak} |"
+            echo "| **total**             |      | **${residual_total}** |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "residual_total=${residual_total}" >> "${GITHUB_OUTPUT}"
+          echo "passes=${passes}" >> "${GITHUB_OUTPUT}"
+          echo "fails=${fails}" >> "${GITHUB_OUTPUT}"
+          echo "total=${total}" >> "${GITHUB_OUTPUT}"
+          echo "pass_rate=${pass_rate}" >> "${GITHUB_OUTPUT}"
+          echo "sig_ring3=${sig_ring3}" >> "${GITHUB_OUTPUT}"
+          echo "sig_stall=${sig_stall}" >> "${GITHUB_OUTPUT}"
+          echo "sig_leak=${sig_leak}" >> "${GITHUB_OUTPUT}"
+
+          # Aggregate gate: any residual signature in any run fails.
+          if [ "${residual_total}" -gt 0 ]; then
+            echo "::error::nightly-soak aggregate: ${residual_total} residual-signature hit(s) across all shards"
+            exit 1
+          fi
+
+      # Auto-file a tracking issue on a 3-nights-red streak. Runs only
+      # when the current workflow's overall conclusion is failure (any
+      # shard failed or this aggregate gate tripped). Counts the last
+      # 3 *completed* `nightly-soak` runs that were `schedule`-triggered
+      # — workflow_dispatch reruns are excluded so a human probing the
+      # gate doesn't conjure spurious "3 nights red" pages.
+      - name: Auto-file 3-nights-red follow-up
+        if: failure() || needs.soak-shard.result == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SIG_RING3: ${{ steps.agg.outputs.sig_ring3 }}
+          SIG_STALL: ${{ steps.agg.outputs.sig_stall }}
+          SIG_LEAK:  ${{ steps.agg.outputs.sig_leak }}
+        run: |
+          set -u
+          # Pull the last 4 completed schedule-triggered runs of THIS
+          # workflow (limit=4 so we have the current run plus the 3
+          # before it; we filter out in_progress entries below). The
+          # current run's conclusion is still null at this point in the
+          # job, so we rely on the failure() gate above: if we got
+          # here, today's run is red.
+          runs_json=$(gh api \
+            "repos/${OWNER}/${REPO}/actions/workflows/nightly-soak.yml/runs?event=schedule&per_page=10" \
+            --jq '[.workflow_runs[] | select(.status == "completed")] | .[0:3]')
+
+          # If fewer than 2 prior completed schedule runs exist, we
+          # cannot have a 3-nights streak yet (today's run + 2 prior
+          # reds). Skip silently.
+          prior_count=$(echo "${runs_json}" | jq 'length')
+          if [ "${prior_count}" -lt 2 ]; then
+            echo "Only ${prior_count} prior completed schedule run(s) found — no 3-nights streak possible yet."
+            exit 0
+          fi
+
+          # Streak detection: the two most recent completed schedule
+          # runs (excluding the current one, which is still in
+          # progress) must both have conclusion=failure. Combined with
+          # the failure() gate that put us here, that's 3 reds.
+          prior_failures=$(echo "${runs_json}" | jq '[.[0:2][] | select(.conclusion == "failure")] | length')
+          if [ "${prior_failures}" -lt 2 ]; then
+            echo "Prior 2 schedule runs had ${prior_failures} failures — not a 3-nights streak. No issue filed."
+            exit 0
+          fi
+
+          prev1_url=$(echo "${runs_json}" | jq -r '.[0].html_url')
+          prev2_url=$(echo "${runs_json}" | jq -r '.[1].html_url')
+
+          # De-dup: avoid filing a fresh issue every night during a
+          # protracted red streak. Search for an open issue with the
+          # canonical title prefix; if one exists, comment instead.
+          title="nightly-soak: 3 consecutive failures — residual flake regression"
+          existing=$(gh issue list \
+            --repo "${OWNER}/${REPO}" \
+            --search "in:title \"${title}\" state:open" \
+            --json number,title \
+            --jq '.[0].number // empty')
+
+          body=$(cat <<EOF
+\`nightly-soak\` has failed three consecutive scheduled runs. This
+typically means a residual signature from the #501 quality sprint
+(or a new bug class) is recurring at sufficient density to trip the
+1000× gate every night.
+
+## Latest run
+
+- $RUN_URL — residual hits: ring3=${SIG_RING3}, stall=${SIG_STALL}, leak=${SIG_LEAK}
+
+## Prior reds
+
+- $prev1_url
+- $prev2_url
+
+## Next steps
+
+1. Download the \`nightly-soak-logs-shard-*\` artifacts from the latest run.
+2. \`grep\` per-run \`*.serial\` files for \`ring3-first-fault: #PF\`,
+   \`init: iretq to ring-3\` followed by missing \`init: hello from pid 1\`,
+   and \`tasks: reaped task ... (stack VA slot ... leaked)\`.
+3. Bisect against the merge base of the most recent green run vs.
+   today's red run.
+4. If the regression is genuinely intermittent and not bisectable to a
+   commit, escalate to the #501 epic.
+
+Auto-filed by \`.github/workflows/nightly-soak.yml\` per #648.
+EOF
+)
+
+          if [ -n "${existing}" ]; then
+            echo "Existing tracking issue #${existing} is open — appending a streak-update comment."
+            gh issue comment "${existing}" \
+              --repo "${OWNER}/${REPO}" \
+              --body "Streak continues. Latest red: ${RUN_URL} (residual hits: ring3=${SIG_RING3}, stall=${SIG_STALL}, leak=${SIG_LEAK})."
+          else
+            echo "Filing new tracking issue."
+            gh issue create \
+              --repo "${OWNER}/${REPO}" \
+              --title "${title}" \
+              --label "priority:P1,area:debug" \
+              --body "${body}"
+          fi
