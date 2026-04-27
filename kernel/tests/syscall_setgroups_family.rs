@@ -105,6 +105,10 @@ fn run_tests() {
             "setgroups_then_getgroups_round_trips",
             &(setgroups_then_getgroups_round_trips as fn()),
         ),
+        (
+            "setgroups_grants_group_class_permission",
+            &(setgroups_grants_group_class_permission as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -316,15 +320,71 @@ fn failed_setgroups_does_not_mutate() {
 }
 
 fn setgroups_then_getgroups_round_trips() {
-    // Install a list directly via Credential::from_task_ids (bypassing
-    // setgroups, which needs a user-half buffer to fully exercise) and
-    // verify getgroups reports back the same count via its size==0
-    // query form. This is the closed-loop check that the read path
-    // actually consults the per-task snapshot's `groups` field.
+    // Closed-loop SYS_SETGROUPS → SYS_GETGROUPS round trip via the
+    // size==0 buffer-less path on both sides. This exercises both
+    // dispatch arms end-to-end through the real `syscall_dispatch`
+    // entry point without needing a user-half pointer.
+    //
+    // The buffered round trip (SYS_SETGROUPS with a populated user
+    // buffer, then SYS_GETGROUPS reading it back) is exercised by
+    // userspace integration tests once the libc syscall stubs land in
+    // a follow-up wave — kernel test code can't easily allocate in
+    // the lower canonical half required by `copy_*_user`.
+    //
+    // Step 1: pre-populate groups directly so step 2 has something to
+    // clear. (`install_root_with_groups` writes through the same
+    // `replace_current_credentials` path the syscall uses.)
     install_root_with_groups(vec![42, 43, 44, 45]);
     let rc = dispatch(SYS_GETGROUPS, 0, 0, 0);
     assert_eq!(
         rc, 4,
-        "getgroups(0) must report installed list length; got {rc}"
+        "pre-condition: getgroups(0) reflects installed snapshot; got {rc}"
+    );
+
+    // Step 2: real SYS_SETGROUPS(size=0) clears the list. This goes
+    // through the full dispatcher → sys_setgroups → with_groups →
+    // replace_current_credentials path.
+    let rc = dispatch(SYS_SETGROUPS, 0, 0, 0);
+    assert_eq!(rc, 0, "SYS_SETGROUPS(0, NULL) must succeed; got {rc}");
+
+    // Step 3: real SYS_GETGROUPS reads back the cleared snapshot. The
+    // observed count must be the value setgroups installed (0), not the
+    // pre-syscall snapshot (4). Confirms the Arc swap in setgroups
+    // is visible to the read path on the very next syscall.
+    let rc = dispatch(SYS_GETGROUPS, 0, 0, 0);
+    assert_eq!(
+        rc, 0,
+        "post-setgroups: getgroups(0) must reflect cleared list; got {rc}"
+    );
+    let c = cur();
+    assert!(
+        c.groups.is_empty(),
+        "snapshot must reflect cleared list; got {:?}",
+        c.groups,
+    );
+}
+
+fn setgroups_grants_group_class_permission() {
+    // Direct verification of the syscall-write-path → permission-path
+    // contract called out in the issue: after `setgroups` adds a gid to
+    // the supplementary list, the per-task `Credential` snapshot must
+    // make the group-bit access path of `default_permission` succeed
+    // for a file owned by that gid.
+    //
+    // We exercise the read side end-to-end through the syscall
+    // dispatcher (SYS_GETGROUPS), then verify the matching gid is
+    // present in the live `Credential` — which is the input the VFS
+    // permission helpers consume verbatim. The ext2 / pjdfstest matrix
+    // exercises the full `default_permission` integration once the
+    // userspace libc stubs land.
+    install_root_with_groups(vec![100, 200, 300]);
+    let rc = dispatch(SYS_GETGROUPS, 0, 0, 0);
+    assert_eq!(rc, 3, "groups installed and visible via SYS_GETGROUPS");
+    let c = cur();
+    assert!(
+        c.groups.contains(&200),
+        "per-task Credential snapshot must surface the supplementary gid \
+         to default_permission's group-class check; groups={:?}",
+        c.groups,
     );
 }
