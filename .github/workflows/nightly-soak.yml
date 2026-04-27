@@ -55,11 +55,14 @@ permissions:
 
 concurrency:
   # Distinct from the other smoke-soak workflow's group. Cancel an
-  # in-flight prior run only on workflow_dispatch retriggers — never
-  # on a fresh nightly schedule, where each run is a separate data
-  # point in the streak detector below.
+  # in-flight prior run on workflow_dispatch retriggers (a human
+  # rerunning means the prior soak's data is no longer the desired
+  # one) but never on schedule — each scheduled night is a separate
+  # data point in the streak detector below, and cancelling one would
+  # corrupt the 3-nights-red signal. The group key is partitioned by
+  # event so scheduled and dispatch runs never share a slot.
   group: nightly-soak-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   plan:
@@ -206,8 +209,14 @@ jobs:
             serial="soak-logs/shard-${SHARD}-run-$(printf '%04d' "${i}").serial"
             export VIBIX_SMOKE_SERIAL_LOG="${serial}"
             start_ns=$(date +%s%N)
+            # `setsid` puts cargo (and the QEMU child it spawns) into
+            # its own process group so `timeout`'s kill reaches the
+            # whole tree. Without this, an outer-timeout fire only
+            # SIGTERMs cargo and orphaned QEMU instances pile up
+            # across iterations, eating runner memory and masking
+            # subsequent failures.
             if timeout --kill-after=30s "${per_run_timeout}s" \
-                 cargo xtask smoke > "${log}" 2>&1; then
+                 setsid cargo xtask smoke > "${log}" 2>&1; then
               status="pass"
               passes=$((passes + 1))
             else
@@ -275,6 +284,20 @@ jobs:
 
           {
             cat "soak-logs/shard-${SHARD}-summary.md"
+            # Per-run density table — collapsed by default so a 100+
+            # row table doesn't dominate the job summary, but expands
+            # to the full pass/fail/duration/signatures grid for the
+            # operator chasing a flake. This is the per-run
+            # visibility called out in #648.
+            echo ""
+            echo "<details><summary>per-run table (shard ${SHARD})</summary>"
+            echo ""
+            echo "| run | result | duration_s | signatures |"
+            echo "|-----|--------|------------|------------|"
+            tail -n +2 "soak-logs/shard-${SHARD}-summary.tsv" \
+              | awk -F'\t' '{ printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }'
+            echo ""
+            echo "</details>"
           } >> "${GITHUB_STEP_SUMMARY}"
 
           # Persist scalar counters for the aggregate job to sum.
@@ -439,7 +462,14 @@ jobs:
           SIG_STALL: ${{ steps.agg.outputs.sig_stall }}
           SIG_LEAK:  ${{ steps.agg.outputs.sig_leak }}
         run: |
-          set -u
+          # `-e` halts on any unexpected failure (e.g. transient gh API
+          # errors that would otherwise let the script continue with
+          # empty `runs_json` and silently skip filing the
+          # 3-nights-red issue). `-o pipefail` propagates errors
+          # through `gh ... | jq ...`. `-u` catches typo'd env-var
+          # references. `if`-gated commands still tolerate non-zero
+          # exits via shell-builtin semantics.
+          set -euo pipefail
           # Pull the last 4 completed schedule-triggered runs of THIS
           # workflow (limit=4 so we have the current run plus the 3
           # before it; we filter out in_progress entries below). The
