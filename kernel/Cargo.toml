@@ -438,6 +438,10 @@ name = "umount2_flags"
 harness = false
 
 [[test]]
+name = "umount2_canonicalize"
+harness = false
+
+[[test]]
 name = "dentry_pin_unmount"
 harness = false
 

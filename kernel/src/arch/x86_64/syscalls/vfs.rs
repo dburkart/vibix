@@ -2727,6 +2727,50 @@ const MNT_SUPPORTED: u32 = MNT_FORCE | MNT_DETACH;
 /// The success path always detaches; Phase-B flush + driver
 /// teardown is synchronous for the default / FORCE cases and
 /// deferred for DETACH.
+/// Walk up parent links from `resolved` until a dentry with a covering
+/// mount edge is found, returning that edge's mountpoint dentry.
+///
+/// This mirrors Linux's `umount2(2)` behaviour where the target may be
+/// any path inside a mounted filesystem (e.g. `/mnt/sub/dir`) — the
+/// kernel canonicalizes it to the nearest enclosing mount root, then
+/// peels back one step via the mount edge to obtain the mountpoint
+/// dentry in the parent filesystem (which is what
+/// [`crate::fs::vfs::unmount`] needs).
+///
+/// Errors:
+/// - `EBUSY` if the walk reaches `ns_root` without finding a covering
+///   edge — that means the caller asked to unmount `/`. Linux mirrors
+///   this until `pivot_root` is implemented; vibix follows suit.
+/// - `EINVAL` if the covering edge's mountpoint weak-ref is dead
+///   (mount is racing a teardown on another thread).
+/// - `EINVAL` if a parent link cannot be upgraded, or if a self-parenting
+///   non-namespace dentry is reached without a covering edge — neither
+///   is reachable in normal operation but both are guarded so the loop
+///   cannot spin.
+pub fn canonicalize_umount_target(
+    resolved: Arc<Dentry>,
+    ns_root: &Arc<Dentry>,
+    resolver: &dyn MountResolver,
+) -> Result<Arc<Dentry>, i64> {
+    let mut cur = resolved;
+    loop {
+        if let Some(edge) = resolver.mount_above(&cur) {
+            return edge.mountpoint.upgrade().ok_or(EINVAL);
+        }
+        if Arc::ptr_eq(&cur, ns_root) {
+            return Err(EBUSY);
+        }
+        let parent = cur.parent.upgrade().ok_or(EINVAL)?;
+        if Arc::ptr_eq(&parent, &cur) {
+            // Self-parenting dentry that is not `ns_root` — disconnected
+            // root with no covering mount edge. Surface as EINVAL rather
+            // than looping.
+            return Err(EINVAL);
+        }
+        cur = parent;
+    }
+}
+
 pub unsafe fn sys_umount2_impl(target_uva: u64, flags: u32) -> i64 {
     // 1. Superuser-only. Mirrors Linux's CAP_SYS_ADMIN gate at the
     //    entry of `path_umount`.
@@ -2787,19 +2831,15 @@ pub unsafe fn sys_umount2_impl(target_uva: u64, flags: u32) -> i64 {
         return e;
     }
     let resolved = nd.path.dentry.clone();
+    let ns_root = nd.root.clone();
 
-    // 5. If the resolved dentry is itself the root of a mounted
-    //    filesystem (path walk crossed the mount for us), walk
-    //    back up to the mountpoint dentry — that's what
-    //    `mount_table::unmount` expects.
-    let target_dentry = match GlobalMountResolver.mount_above(&resolved) {
-        Some(edge) => match edge.mountpoint.upgrade() {
-            Some(mp) => mp,
-            // Mountpoint weak ref is dead — the mount is already
-            // being torn down on another thread; treat as EINVAL.
-            None => return EINVAL,
-        },
-        None => resolved,
+    // 5. Canonicalize the resolved dentry to the dentry that owns the
+    //    covering mount edge (issue #636). Pulled into a helper so
+    //    host unit tests can exercise the walk without staging a full
+    //    `path_walk` + mount table.
+    let target_dentry = match canonicalize_umount_target(resolved, &ns_root, &GlobalMountResolver) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
 
     // 6. Translate MNT_* to UmountFlags and hand off to the VFS.
