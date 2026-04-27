@@ -85,6 +85,15 @@ const SMOKE_MARKERS: &[&str] = &[
     "block: virtio-blk ready",
     "block: lba0[0..16]=[56, 49, 42, 49, 58, 42, 4c, 4b, 30",
     "block: write+readback ok at lba 2047",
+    // VFS init in `_start` (issue #631) consumes the cmdline-parsed
+    // RootArgs and brings up `/`, `/dev`, `/tmp`. The init_with
+    // confirmation line proves `_start` actually invoked it; the per-
+    // mount lines below prove the namespace is populated. Without #631,
+    // none of these would fire on the prod boot path.
+    "vfs: mounted",
+    "vfs: mounted devfs at /dev",
+    "vfs: mounted ramfs at /tmp",
+    "vfs: init_with consumed cmdline RootArgs",
     "vibix online.",
     "interrupts enabled",
     "tasks: scheduler online",
