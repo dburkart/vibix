@@ -1091,24 +1091,41 @@ fn reap_pending(victim: alloc::boxed::Box<Task>) {
     // regardless of what locks the victim happened to be holding.
     let stack_base = victim.stack_base();
     if stack_base != 0 {
+        let mut all_unmapped = true;
         for i in 0..victim.stack_page_count() {
             let va = stack_base + i * 4096;
             let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(va as u64))
                 .expect("stack page VA aligned by construction");
-            let _ = paging::unmap_and_free_in_pml4(victim.cr3, page);
+            if let Err(e) = paging::unmap_and_free_in_pml4(victim.cr3, page) {
+                serial_println!(
+                    "tasks: reap task {} unmap stack page {:#x} failed: {:?} — \
+                     leaking VA slot {:#x}..{:#x} to avoid stale-PTE recycle",
+                    victim.id,
+                    va,
+                    e,
+                    victim.guard_base,
+                    victim.guard_base + task::TASK_SLOT_SIZE
+                );
+                all_unmapped = false;
+            }
         }
 
-        // Return the now-fully-unmapped stack VA slot to the free list
-        // so a subsequent fork can recycle it (#646). The guard page
-        // was never mapped; the loop above has just released every
-        // mapped stack page via `unmap_and_free_in_pml4`.
-        task::free_stack_slot(victim.guard_base);
-        serial_println!(
-            "tasks: reaped task {} (stack VA slot {:#x}..{:#x} returned)",
-            victim.id,
-            victim.guard_base,
-            victim.guard_base + task::TASK_SLOT_SIZE
-        );
+        if all_unmapped {
+            // Return the now-fully-unmapped stack VA slot to the free list
+            // so a subsequent fork can recycle it (#646). The guard page
+            // was never mapped; the loop above has just released every
+            // mapped stack page via `unmap_and_free_in_pml4`. If any unmap
+            // failed we deliberately leak the slot — recycling a slot with
+            // stale upper-half PTEs would resurrect exactly the class of
+            // bug this PR fixes.
+            task::free_stack_slot(victim.guard_base);
+            serial_println!(
+                "tasks: reaped task {} (stack VA slot {:#x}..{:#x} returned)",
+                victim.id,
+                victim.guard_base,
+                victim.guard_base + task::TASK_SLOT_SIZE
+            );
+        }
     }
 
     // Drop the Box<Task>. The Arc<RwLock<AddressSpace>> goes with it;

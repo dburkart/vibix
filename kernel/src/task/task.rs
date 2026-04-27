@@ -457,7 +457,14 @@ impl Task {
             "fork-trace: [Task::new_forked] ← map_range ok={}",
             map_result.is_ok()
         );
-        map_result.map_err(|_| crate::mem::addrspace::ForkError::OutOfMemory)?;
+        if map_result.is_err() {
+            // map_range failed (typically frame-allocator exhaustion).
+            // Return the just-reserved slot to the free list so a
+            // subsequent fork can recycle it; otherwise OOM under fork
+            // pressure would leak the very VA slots #646 fixes.
+            free_stack_slot(guard_base);
+            return Err(crate::mem::addrspace::ForkError::OutOfMemory);
+        }
 
         let top = stack_base + STACK_SIZE;
 

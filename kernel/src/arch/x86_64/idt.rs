@@ -352,11 +352,12 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // with DefaultAction::Terminate. The helper calls `task::exit()`, so
     // IRETQ never runs; the scheduler context-switches to the next task.
     if cpl != 0 {
-        log_first_ring3_fault(
-            "#PF",
-            &frame,
-            format_args!("cr2={:#x} code={:?}", addr_u64, code),
-        );
+        // Do NOT call `log_first_ring3_fault` here: if the task has installed
+        // a SIGSEGV handler, `deliver_fault_signal_iret` rewrites IRETQ to
+        // the handler and the fault is *recoverable* — latching this site
+        // would re-fire the diagnostic on every signal-handled fault. The
+        // unrecoverable `Default`/`Ignore` path inside the signal layer
+        // logs its own `signal: terminate` line before calling `exit()`.
         serial_println!(
             "#PF ring-3 access violation addr={:#x} code={:?}",
             addr_u64,
@@ -374,11 +375,10 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
         return; // handler path: IRETQ fires the signal handler
     }
 
-    log_first_ring3_fault(
-        "#PF",
-        &frame,
-        format_args!("cr2={:#x} code={:?}", addr_u64, code),
-    );
+    // Kernel-mode (CPL=0) #PF that fell through every recovery path is a
+    // genuine kernel bug. The `log_first_ring3_fault` helper is ring-3-only
+    // (it short-circuits on CPL=0), so don't bother calling it here — the
+    // EXCEPTION line below is the diagnostic of record.
     serial_println!(
         "EXCEPTION: #PF addr={:#x} code={:?}\n{:#?}",
         addr_u64,
