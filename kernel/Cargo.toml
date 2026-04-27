@@ -447,6 +447,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_orphan_open_close"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "ext2_rename"
 harness = false
 required-features = ["ext2"]
