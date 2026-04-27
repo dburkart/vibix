@@ -944,6 +944,20 @@ pub unsafe extern "C" fn syscall_dispatch(
         #[cfg(feature = "vfs_creds")]
         UTIMENSAT => super::syscalls::vfs::sys_utimensat_impl(a0 as i32, a1, a2, a3 as u32),
 
+        // access / faccessat / faccessat2 (issue #545, RFC 0004
+        // Workstream A wave 1). Same A↔B gate as the other VFS arms —
+        // these syscalls make DAC decisions against the caller's
+        // credentials, so until Workstream B flips `vfs_creds` on they
+        // must remain unreachable from ring-3 (the dispatcher's
+        // default returns `-ENOSYS`). Integration tests call
+        // `sys_*_impl` directly regardless of feature state.
+        #[cfg(feature = "vfs_creds")]
+        ACCESS => super::syscalls::vfs::sys_access_impl(a0, a1),
+        #[cfg(feature = "vfs_creds")]
+        FACCESSAT => super::syscalls::vfs::sys_faccessat_impl(a0 as i32, a1, a2, a3 as u32),
+        #[cfg(feature = "vfs_creds")]
+        FACCESSAT2 => super::syscalls::vfs::sys_faccessat2_impl(a0 as i32, a1, a2, a3 as u32),
+
         // mount(source, target, fstype, flags, data) — RFC 0004 §Mount API.
         // Superuser-only; rejects unknown flag bits; resolves fstype by name
         // against the fstype registry populated by `vfs::init`. See issue #575.
@@ -1651,6 +1665,9 @@ pub mod syscall_nr {
     pub const FCHOWNAT: u64 = 260;
     pub const FCHMODAT: u64 = 268;
     pub const UTIMENSAT: u64 = 280;
+    pub const ACCESS: u64 = 21;
+    pub const FACCESSAT: u64 = 269;
+    pub const FACCESSAT2: u64 = 439;
     pub const MOUNT: u64 = 165;
     pub const UMOUNT2: u64 = 166;
     pub const POLL: u64 = 7;
@@ -1785,6 +1802,11 @@ mod tests {
 
         // utimensat (issue #544)
         assert_eq!(syscall_nr::UTIMENSAT, 280, "SYS_utimensat must be 280");
+
+        // access / faccessat / faccessat2 (issue #545)
+        assert_eq!(syscall_nr::ACCESS, 21, "SYS_access must be 21");
+        assert_eq!(syscall_nr::FACCESSAT, 269, "SYS_faccessat must be 269");
+        assert_eq!(syscall_nr::FACCESSAT2, 439, "SYS_faccessat2 must be 439");
 
         // Mount plumbing (issue #575, RFC 0004 Workstream F)
         assert_eq!(syscall_nr::MOUNT, 165, "SYS_mount must be 165");
