@@ -20,7 +20,9 @@ through (once caller migration lands) instead of reaching directly into
 `crate::time::*` and `crate::arch::*`:
 
 - `Clock` — monotonic time + one-shot future-tick wakeups.
-- `IrqSource` — preemption-relevant IRQ acknowledgement.
+- `TimerIrq` — preemption-driving timer IRQ acknowledgement. (Renamed
+  from `IrqSource` per #670 — broader IRQ routing is explicitly Phase 2;
+  the old name overpromised.)
 
 Production wires both to the existing PIT/LAPIC/`time::WAKEUPS`
 machinery via zero-sized adapters. Tests and the future host-side
@@ -34,7 +36,7 @@ site.
 
 | Path | Status | Contents |
 |---|---|---|
-| `kernel/src/task/env.rs` | landed (#672) | `Tick`, `Clock`, `IrqSource`, `TaskId` |
+| `kernel/src/task/env.rs` | landed (#672) | `Tick`, `Clock`, `TimerIrq`, `TaskId` |
 | `kernel/src/task/mod.rs` | landed (#672, `pub mod env;` only) | will host `HwClock`, `HwIrq`, `env()` (#666) |
 | `kernel/src/time.rs` | unchanged today | will drop to `pub(crate)` after caller migration (#667) |
 
@@ -58,7 +60,7 @@ pub trait Clock: Sync {
     fn enqueue_wakeup(&self, deadline: Tick, id: TaskId);
 }
 
-pub trait IrqSource: Sync {
+pub trait TimerIrq: Sync {
     fn ack_timer(&self);
 }
 ```
@@ -76,7 +78,7 @@ underlying type in one place without breaking impls.
 
 ### IRQ-context safety
 
-All `Clock` and `IrqSource` methods MUST be safe to call from both task
+All `Clock` and `TimerIrq` methods MUST be safe to call from both task
 context and interrupt context. Implementors that hold internal state
 across methods MUST mask IRQs while held (the existing `time::WAKEUPS`
 already uses `crate::sync::IrqLock`). A non-IRQ-safe impl is a soundness
@@ -103,7 +105,7 @@ correctness bug, not a performance one.
 
 ### `env()` accessor (not yet landed — issue #666)
 
-`task::env()` returns `(&'static dyn Clock, &'static dyn IrqSource)`.
+`task::env()` returns `(&'static dyn Clock, &'static dyn TimerIrq)`.
 The production accessor body MUST contain no `Once`, no `Mutex`, no
 atomic load other than the `&'static` reference materialization — see
 the equivalence property below for why. Test/sim builds may swap the
@@ -152,7 +154,7 @@ Explicitly out of scope for Phase 1, by RFC §"Alternatives Considered":
 
 ## The discipline
 
-> **A `Clock` or `IrqSource` trait method is added only when a second
+> **A `Clock` or `TimerIrq` trait method is added only when a second
 > implementation actually needs it.**
 
 Speculative methods ("we'll probably want this when…") are rejected.
@@ -175,7 +177,7 @@ each one lands.
 
 The Phase-2 simulator RFC will need the scheduler's
 externally-observable behavior to be expressible as a labeled
-transition system over `(Clock-event, IrqSource-event) → state
+transition system over `(Clock-event, TimerIrq-event) → state
 transition`. The seam shape here is *necessary* for this but may not
 be *sufficient* — softirq ordering (above) is the known suspect. The
 Phase-2 RFC must validate sufficiency before relying on the v1 trait

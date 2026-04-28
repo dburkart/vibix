@@ -68,7 +68,7 @@ pub mod sync;
 // touches `arch`, `sync`, and `x86_64` which are all `target_os =
 // "none"`. The exception is the `task::env` submodule (RFC 0005
 // scheduler / IRQ seam), whose trait definitions and `MockClock` /
-// `MockIrqSource` impls (gated behind `feature = "sched-mock"`) are
+// `MockTimerIrq` impls (gated behind `feature = "sched-mock"`) are
 // host-buildable so the seam has CI-runnable host unit tests. Hence
 // the wider gate here; the body of `task/mod.rs` stays gated to
 // `target_os = "none"` internally.

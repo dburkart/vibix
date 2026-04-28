@@ -38,7 +38,7 @@ pub mod env;
 // and `crate::time` features that don't compile on the host, so they
 // are gated to bare-metal builds. Host builds reach `task::env` only
 // (RFC 0005 seam) so the `sched-mock` test path can compile and
-// exercise `MockClock` / `MockIrqSource` without dragging the real
+// exercise `MockClock` / `MockTimerIrq` without dragging the real
 // scheduler in.
 #[cfg(target_os = "none")]
 pub mod priority;

@@ -7,6 +7,16 @@ created: 2026-04-27
 
 # RFC 0005: Scheduler / IRQ Seam for Deterministic Simulation Testing
 
+> **Post-acceptance rename (#670):** the `IrqSource` trait described
+> throughout this RFC was renamed to `TimerIrq` (and `MockIrqSource` to
+> `MockTimerIrq`) before any Phase 2 work depends on the name, per
+> roadmap item 6 / OS-engineer advisory A1. Broader IRQ routing is
+> explicitly Phase 2; the old name overpromised. The RFC text below
+> retains the historical name to preserve the proposal record — the
+> design note at [`docs/design/scheduler-seam.md`](../design/scheduler-seam.md)
+> describes the as-shipped names. Where the two disagree, the design
+> note wins.
+
 ## Abstract
 
 Extract the scheduler core in `kernel/src/task/` from its direct dependence on
@@ -578,10 +588,9 @@ in a half-migrated state.
       fails if any `MockClock` or `MockIrqSource` symbol is present.
       This makes the "physically excluded from production" claim
       enforced rather than asserted.
-- [ ] Rename `IrqSource` → `TimerIrq` (or `PreemptionIrq`) before any
-      Phase-2 simulator work depends on the name (per OS-engineer
-      advisory A1). Mechanical rename, one PR, deferred to last so the
-      earlier PRs don't churn it twice.
+- [x] Rename `IrqSource` → `TimerIrq` (#670). Mechanical rename, one
+      PR, landed before any Phase-2 simulator work depends on the name
+      (per OS-engineer advisory A1).
 - [x] Document the seam in [`docs/design/scheduler-seam.md`](../design/scheduler-seam.md)
       (one-page; links here) including: trait shape, IRQ-context contract,
       init-order contract, equivalence property, the
