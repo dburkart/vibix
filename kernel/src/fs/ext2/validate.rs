@@ -137,14 +137,13 @@ pub fn validate_bgdt(
         }
 
         // ---- inode bitmap ----
-        let ib_clear = match read_and_count_clear_bits(
-            cache,
-            device_id,
-            bg.bg_inode_bitmap as u64,
-            inodes_in_this_group,
-        ) {
-            Some(n) => n,
-            None => {
+        // Read the inode bitmap block once and reuse the buffer for both
+        // the clear-bit count and the group-0 reserved-inode walk below,
+        // so an I/O failure on a re-read can't silently downgrade to "all
+        // reserved bits set" via `Option::None` (CodeRabbit #694).
+        let ib_bh = match cache.bread(device_id, bg.bg_inode_bitmap as u64) {
+            Ok(bh) => bh,
+            Err(_) => {
                 kwarn!(
                     "ext2: validate_bgdt: group {}: unreadable inode bitmap at block {}, forcing RO",
                     group,
@@ -153,6 +152,8 @@ pub fn validate_bgdt(
                 return ForceRo::Yes;
             }
         };
+        let ib_data = ib_bh.data.read();
+        let ib_clear = count_clear_bits(&ib_data, inodes_in_this_group);
         if ib_clear != bg.bg_free_inodes_count as u32 {
             kwarn!(
                 "ext2: validate_bgdt: group {}: inode bitmap has {} clear bits, BGDT says bg_free_inodes_count={}; forcing RO",
@@ -168,9 +169,7 @@ pub fn validate_bgdt(
         // They map to bits `0..first_ino-1` of group 0's inode bitmap;
         // every one of those bits MUST be set.
         if group == 0 {
-            if let Some(ino) =
-                first_clear_reserved_ino(cache, device_id, bg.bg_inode_bitmap as u64, first_ino)
-            {
+            if let Some(ino) = first_clear_reserved_ino(&ib_data, first_ino) {
                 kwarn!(
                     "ext2: validate_bgdt: group 0: reserved inode {} is unallocated in inode bitmap, forcing RO",
                     ino,
@@ -272,8 +271,12 @@ pub(crate) fn count_clear_bits(bitmap: &[u8], bit_limit: u32) -> u32 {
 }
 
 /// Return the first reserved-inode number (1-based, in
-/// `1..first_ino`) whose bit in `inode_bitmap_block` is *clear* —
-/// i.e. the bitmap claims it's free, which is a corruption.
+/// `1..first_ino`) whose bit in `data` is *clear* — i.e. the bitmap
+/// claims it's free, which is a corruption.
+///
+/// Takes the already-loaded inode-bitmap block bytes so the caller's
+/// `bread` failure can't be confused with "no clear reserved inode";
+/// I/O failures must be handled at the call site (forcing RO).
 ///
 /// Returns `None` if every reserved bit is set (the healthy case).
 ///
@@ -281,14 +284,7 @@ pub(crate) fn count_clear_bits(bitmap: &[u8], bit_limit: u32) -> u32 {
 /// rev-1 image sets `s_first_ino` to `0`, `1`, or `2` — losing the root
 /// inode is a corruption regardless of what the superblock claims about
 /// the reserved range.
-fn first_clear_reserved_ino(
-    cache: &BlockCache,
-    device_id: DeviceId,
-    inode_bitmap_block: u64,
-    first_ino: u32,
-) -> Option<u32> {
-    let bh = cache.bread(device_id, inode_bitmap_block).ok()?;
-    let data = bh.data.read();
+fn first_clear_reserved_ino(data: &[u8], first_ino: u32) -> Option<u32> {
     // Inos are 1-based; bit `i` in the bitmap corresponds to ino `i+1`.
     // Validate `1..s_first_ino` plus `EXT2_ROOT_INO` (= 2) unconditionally,
     // so a malformed superblock that lies about `s_first_ino` can't smuggle
