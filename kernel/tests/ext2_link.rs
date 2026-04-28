@@ -20,13 +20,10 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
-use spin::Mutex;
-
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::fs::ext2::symlink::{is_fast_symlink, is_symlink, read_symlink, EXT2_FAST_SYMLINK_MAX};
 use vibix::fs::ext2::{
     create_dir, create_file, dir, iget, link as ext2_link, symlink as ext2_symlink, Ext2Fs,
@@ -113,79 +110,11 @@ fn run_tests() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RamDisk — identical shape to ext2_create.rs / ext2_unlink.rs.
-// ---------------------------------------------------------------------------
-
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-    writes: AtomicU32,
-    read_only: AtomicBool,
-}
-
-impl RamDisk {
-    fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
-        assert!(bytes.len() % block_size as usize == 0);
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(bytes.to_vec()),
-            writes: AtomicU32::new(0),
-            read_only: AtomicBool::new(false),
-        })
-    }
-    fn set_read_only(&self, ro: bool) {
-        self.read_only.store(ro, Ordering::Relaxed);
-    }
-    fn writes(&self) -> u32 {
-        self.writes.load(Ordering::Relaxed)
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(BlockError::ReadOnly);
-        }
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 fn mount_golden_rw() -> (
     Arc<vibix::fs::vfs::super_block::SuperBlock>,

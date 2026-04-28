@@ -38,13 +38,9 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, Ordering};
 
-use spin::Mutex;
-
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::fs::ext2::{alloc_block, alloc_inode, iget, Ext2Fs, Ext2Super};
 use vibix::fs::vfs::dentry::Dentry;
 use vibix::fs::vfs::inode::Inode;
@@ -105,68 +101,11 @@ fn run_tests() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RamDisk — mirrors the copy in the other ext2 integration tests.
-// ---------------------------------------------------------------------------
-
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-    writes: AtomicU32,
-}
-
-impl RamDisk {
-    fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
-        assert!(bytes.len() % block_size as usize == 0);
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(bytes.to_vec()),
-            writes: AtomicU32::new(0),
-        })
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 fn mount_rw() -> (Arc<SuperBlock>, Arc<Ext2Fs>, Arc<Ext2Super>) {
     let disk = RamDisk::from_image(BALLOC_IMG.as_slice(), 512);
