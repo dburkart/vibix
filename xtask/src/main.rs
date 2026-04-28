@@ -20,6 +20,11 @@
 //!                    and assert `SHELL_PIPELINE_OK: 4` on serial (issue #462)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
+//!   nm-check      — RFC 0005 Phase 1 (#669): build the release kernel + ISO
+//!                   and fail if any `sched-mock`-gated symbol
+//!                   (`MockClock`, `MockClockState`, `MockIrqSource`,
+//!                   `MockIrqState`, `MockTimerIrq`) leaks past the
+//!                   `#[cfg(feature = "sched-mock")]` gate
 //!   fuzz          — bounded-iteration host fuzz of an FS layer (#677)
 //!                   `cargo xtask fuzz ext2 [--iters=N]` (defaults to 2000)
 //!   clean         — remove build artifacts
@@ -227,6 +232,64 @@ fn main() -> R<()> {
         "shell-pipeline" => shell_pipeline(&opts)?,
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
+        "nm-check" => {
+            // RFC 0005 Phase 1 hardening (#669). Build the release
+            // kernel first, then run the static guard. Reject any
+            // trailing positional arg up front: `nm-check` takes no
+            // arguments, and silently dropping unknown ones (e.g. a
+            // typo'd `nm-check release` instead of `--release`)
+            // would let an unintended invocation pass for the wrong
+            // reason — exactly the kind of fail-open behaviour this
+            // gate exists to prevent.
+            if !rest.is_empty() {
+                return Err(format!(
+                    "nm-check: unexpected positional arg(s): {:?}; nm-check takes only build flags before the subcommand",
+                    rest,
+                )
+                .into());
+            }
+            // We force `--release` regardless of `--release` on the CLI: this
+            // subcommand's whole purpose is to verify the release
+            // build, and a debug-build pass would silently
+            // misrepresent the answer. We also pin every diagnostic
+            // feature off (`fault-test`, `panic-test`, `bench`,
+            // `fork-trace`) — those toggles are for hand-driven
+            // debugging only and would have the gate validating a
+            // non-production variant. A caller passing them gets a
+            // hard error rather than silent acceptance.
+            if opts.fault_test || opts.panic_test || opts.bench || opts.fork_trace {
+                return Err("nm-check: --fault-test / --panic-test / --bench / --fork-trace are incompatible with the production-build guard; rerun with no diagnostic features".into());
+            }
+            let release_opts = BuildOpts {
+                release: true,
+                fault_test: false,
+                panic_test: false,
+                bench: false,
+                fork_trace: false,
+            };
+            let kernel = build(&release_opts)?;
+            nm_check_no_mocks(&kernel)?;
+
+            // Defense-in-depth: also re-check the ISO-staged ELF.
+            // `make_iso` copies the kernel into
+            // `build/<staging>/boot/vibix`, and that staged file — not
+            // the workspace `target/.../release/vibix` — is what
+            // actually ships inside the ISO. Scanning the staged copy
+            // catches a hypothetical future ISO post-processing step
+            // (compression, signing, relink) that mutates the bundled
+            // ELF away from the original.
+            //
+            // We call `make_iso` directly with the already-built
+            // `kernel` rather than `iso(&release_opts)` to avoid a
+            // second cargo-build of the same release ELF (it's the
+            // same bytes both times — `iso()` would re-invoke
+            // `build()`).
+            let iso_path = workspace_root().join("target").join("vibix.iso");
+            make_iso(&kernel, &iso_path, "iso_root")?;
+            println!("→ nm-check: iso built at {}", iso_path.display());
+            let staged_kernel = workspace_root().join("build/iso_root/boot/vibix");
+            nm_check_no_mocks(&staged_kernel)?;
+        }
         "initrd" => {
             let path = ensure_initrd()?;
             println!("→ initrd: {}", path.display());
@@ -314,7 +377,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -558,6 +621,12 @@ fn strip_debug(kernel: &Path) -> R<()> {
 /// component.  Returns `None` if `rustc` is not on PATH or the binary is not
 /// found (caller falls back to system `objcopy`).
 fn find_llvm_objcopy() -> Option<std::ffi::OsString> {
+    find_llvm_tool("llvm-objcopy")
+}
+
+/// Locate a binary from the active rustup toolchain's `llvm-tools` component.
+/// Returns `None` if `rustc` is not on PATH or the binary is not found.
+fn find_llvm_tool(name: &str) -> Option<std::ffi::OsString> {
     // Ask rustc for its sysroot (e.g.
     // ~/.rustup/toolchains/nightly-aarch64-unknown-linux-gnu).
     let output = Command::new("rustc")
@@ -569,17 +638,101 @@ fn find_llvm_objcopy() -> Option<std::ffi::OsString> {
     }
     let sysroot = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
     // llvm-tools are installed under
-    // <sysroot>/lib/rustlib/<host-triple>/bin/llvm-objcopy.
+    // <sysroot>/lib/rustlib/<host-triple>/bin/<name>.
     // Use a glob-style search so we don't need to hard-code the host triple.
     let bin_glob = sysroot.join("lib").join("rustlib");
     for entry in fs::read_dir(&bin_glob).ok()? {
         let entry = entry.ok()?;
-        let candidate = entry.path().join("bin").join("llvm-objcopy");
+        let candidate = entry.path().join("bin").join(name);
         if candidate.exists() {
             return Some(candidate.into_os_string());
         }
     }
     None
+}
+
+/// RFC 0005 Phase 1 hardening (#669). Statically verify that no
+/// `sched-mock`-gated symbols (`MockClock`, `MockIrqSource`, plus
+/// `MockClockState` / `MockIrqState` interior types) leak into the
+/// release-built kernel ELF. Belt-and-suspenders behind the
+/// `#[cfg(feature = "sched-mock")]` source-level gate from #668: if
+/// someone accidentally enables the feature in a release pipeline, or
+/// adds a non-gated `pub use` that re-exports a mock type, this guard
+/// fires before the binary ships.
+///
+/// Runs `llvm-nm` (preferred — bundled with the rustup `llvm-tools`
+/// component, host-architecture agnostic) over the freshly-built
+/// release kernel ELF and fails on any symbol whose demangled name
+/// contains a forbidden mock substring. Falls back to system `nm` if
+/// `llvm-nm` is not on PATH.
+/// Forbidden symbol substrings — must stay in lockstep with the
+/// `#[cfg(feature = "sched-mock")]`-gated public types in
+/// `kernel/src/task/env.rs`. Substring (not exact) match so we catch
+/// monomorphized impl symbols (`<…MockClock as Clock>::now`), Drop
+/// glue, and `MockClockState` / `MockIrqState` interior types.
+///
+/// Per #670, `MockIrqSource` may rename to `MockTimerIrq`; add the
+/// new name here when that lands so the gate keeps biting.
+const NM_CHECK_FORBIDDEN: &[&str] = &[
+    "MockClock",
+    "MockClockState",
+    "MockIrqSource",
+    "MockIrqState",
+    "MockTimerIrq",
+];
+
+/// Pure scan over `nm --demangle` stdout: returns the lines that name a
+/// forbidden mock symbol. Pulled out as a free function so the host
+/// unit-test suite can exercise the matcher against a synthetic
+/// nm-output fixture without needing a real release ELF.
+fn scan_nm_output_for_mocks<'a>(stdout: &'a str, forbidden: &[&str]) -> Vec<&'a str> {
+    let mut hits: Vec<&'a str> = Vec::new();
+    for line in stdout.lines() {
+        if forbidden.iter().any(|needle| line.contains(needle)) {
+            hits.push(line);
+        }
+    }
+    hits
+}
+
+fn nm_check_no_mocks(kernel: &Path) -> R<()> {
+    let tool = find_llvm_tool("llvm-nm").unwrap_or_else(|| std::ffi::OsString::from("nm"));
+    let output = Command::new(&tool).arg("--demangle").arg(kernel).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "nm-check: {} {} failed: {}",
+            std::path::Path::new(&tool).display(),
+            kernel.display(),
+            String::from_utf8_lossy(&output.stderr),
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hits = scan_nm_output_for_mocks(&stdout, NM_CHECK_FORBIDDEN);
+    if !hits.is_empty() {
+        eprintln!(
+            "nm-check: forbidden sched-mock symbol(s) found in {} ({} match(es)):",
+            kernel.display(),
+            hits.len(),
+        );
+        for line in &hits {
+            eprintln!("  {line}");
+        }
+        eprintln!(
+            "RFC 0005 Phase 1 (#669): release kernels must not contain sched-mock symbols ({}).",
+            NM_CHECK_FORBIDDEN.join(", "),
+        );
+        eprintln!(
+            "If you intentionally enabled `sched-mock` for a non-release pipeline, run nm-check against a default-features build."
+        );
+        return Err("nm-check: forbidden sched-mock symbol present in release ELF".into());
+    }
+    println!(
+        "→ nm-check: no sched-mock symbols ({}) in {}",
+        NM_CHECK_FORBIDDEN.join(", "),
+        kernel.display(),
+    );
+    Ok(())
 }
 
 /// Post-link step: read the freshly-linked ELF's own symbol table and
@@ -2328,6 +2481,69 @@ serial: yes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 0005 nm-check (#669): a nm-output fixture with no forbidden
+    /// substrings must yield zero hits.
+    #[test]
+    fn nm_check_clean_output_has_no_hits() {
+        let stdout = "\
+ffffffff80001000 T _start
+ffffffff80002000 t vibix::task::env::HwClock::now
+ffffffff80003000 T main
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert!(hits.is_empty(), "unexpected hits: {hits:?}");
+    }
+
+    /// RFC 0005 nm-check (#669): the matcher must catch monomorphized
+    /// trait-impl symbols — the form the linker actually emits if a
+    /// release build accidentally references a `MockClock`.
+    #[test]
+    fn nm_check_catches_monomorphized_mock_impl() {
+        let stdout = "\
+ffffffff80001110 t core::ptr::drop_in_place::<vibix::task::env::MockClock>
+ffffffff8007e510 t <vibix::task::env::MockClock as vibix::task::env::Clock>::drain_expired
+ffffffff8007f4d0 t <vibix::task::env::MockClock as vibix::task::env::Clock>::enqueue_wakeup
+ffffffff80080300 t <vibix::task::env::MockClock as vibix::task::env::Clock>::now
+ffffffff80002000 T _start
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(hits.len(), 4, "every MockClock line must match: {hits:?}");
+    }
+
+    /// RFC 0005 nm-check (#669): both `MockIrqSource` (today) and
+    /// `MockTimerIrq` (post-#670 rename) must be caught — the rename is
+    /// pre-authorized in the spawn prompt for #669.
+    #[test]
+    fn nm_check_catches_both_irq_mock_names() {
+        let stdout = "\
+ffffffff80010000 t <vibix::task::env::MockIrqSource as vibix::task::env::IrqSource>::ack_timer
+ffffffff80010100 t <vibix::task::env::MockTimerIrq as vibix::task::env::IrqSource>::ack_timer
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(hits.len(), 2, "both irq mock names must match: {hits:?}");
+    }
+
+    /// RFC 0005 nm-check (#669): the interior `MockClockState` and
+    /// `MockIrqState` types are listed in `NM_CHECK_FORBIDDEN` even
+    /// though substring matching catches them transitively today via
+    /// Drop glue and field paths. Pin both names with explicit
+    /// fixtures so a refactor that splits them into a free-standing
+    /// module path (no longer transitively named through `MockClock`/
+    /// `MockIrqSource`) keeps biting.
+    #[test]
+    fn nm_check_catches_interior_state_types() {
+        let stdout = "\
+ffffffff80020000 t core::ptr::drop_in_place::<vibix::task::env::MockClockState>
+ffffffff80020100 t core::ptr::drop_in_place::<vibix::task::env::MockIrqState>
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(
+            hits.len(),
+            2,
+            "both interior state types must match: {hits:?}"
+        );
+    }
 
     #[test]
     fn ustar_dir_block_checksum_valid() {

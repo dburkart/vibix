@@ -85,6 +85,22 @@ yet, so the runner boots as a placeholder. The CI gate still earns its keep by f
 on harness regressions (kernel panic, QEMU watchdog timeout, ext2 image builder
 break). Real conformance signal arrives when #642 ports the runner to vibix userspace.
 
+## Layer 5 - RFC 0005 nm-check (release-symbol guard)
+
+`cargo xtask nm-check --release` builds the release kernel and ISO and runs
+`llvm-nm` over the resulting ELF, failing if any `MockClock` / `MockIrqSource`
+symbol (or any other `sched-mock`-gated type) appears. This is the static guard
+that the `#[cfg(feature = "sched-mock")]` source-level gate around the mocks in
+`kernel/src/task/env.rs` actually holds — even if a future PR accidentally
+flips `sched-mock` on by default, or a non-gated `pub use` re-exports a mock
+type, this step fails the release pipeline before the binary ships.
+
+CI runs this in the `fmt + build (release)` job (`.github/workflows/ci.yml`).
+Do not disable or weaken the check without an RFC update — it is the
+"physically excluded from production" evidence Security review B1 asked for.
+When the mocks rename (e.g. #670: `MockIrqSource` → `MockTimerIrq`), update the
+`NM_CHECK_FORBIDDEN` list in `xtask/src/main.rs` in the same PR.
+
 ## Gotchas
 
 - Do not add `-no-shutdown` to the `test_runner` QEMU args. It breaks the
