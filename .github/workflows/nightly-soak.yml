@@ -1,20 +1,31 @@
 name: nightly-soak
 
-# Standing nightly 1000× smoke soak gating on residual flake markers
-# from the #501 quality sprint — see issue #648.
+# Standing nightly 1000× smoke soak gating on smoke-run pass/fail —
+# see issues #648 (originating gate) and #711 (this gate's fix).
 #
-# Runs `cargo xtask smoke` 1000 times under unaccelerated TCG and fails
-# the workflow on any of these residual signatures appearing in the
-# captured serial of any single run:
+# Runs `cargo xtask smoke` 1000 times under unaccelerated TCG. The
+# binary gate is `fails == 0` across every shard: any non-zero
+# `cargo xtask smoke` exit, anywhere, fails the workflow. The known
+# residual-signature greps from the #501 quality sprint are kept as
+# *categorization* (so the operator can see at a glance which bug
+# class dominated) but are no longer the gate — that hole let new
+# failure modes walk silently through a 150/1000-failed run as
+# `success` (run 25032340134, fixed by #711).
+#
+# Categorized signatures (advisory, in the step summary):
 #
 #   - `ring3-first-fault: #PF`             — #527 user-stack-top fault.
 #   - `init: iretq to ring-3` followed by
 #     no `init: hello from pid 1`          — #478 silent stall.
 #   - `tasks: reaped task ... (stack VA
 #     slot ... leaked)`                    — #646 stack-VA-slot leak.
+#   - missing `init: fork+exec+wait ok`
+#     only (exec hello present)            — #710 post-wait4 stall (Mode A).
+#   - missing both `hello: hello from
+#     execed child` AND
+#     `init: fork+exec+wait ok`            — #709 post-fork stall  (Mode B).
 #
-# All three signatures are diagnostic markers added in PR #595. The
-# soak runs as a *standing gate*: any future regression that revives
+# The soak runs as a *standing gate*: any future regression that revives
 # the bug class is caught within ≤ 24 h instead of leaking to manual
 # QA.
 #
@@ -193,6 +204,14 @@ jobs:
           PAT_STACK_LEAK='tasks: reaped task .* \(stack VA slot .* leaked\)'
           MARK_IRETQ='init: iretq to ring-3'
           MARK_HELLO='init: hello from pid 1'
+          # Categorization markers for the new failure modes (#709,
+          # #710). The grep set is *advisory only* — the binary gate
+          # below is now `fails == 0`, so a failure that matches none
+          # of these signatures still fails the workflow. These exist
+          # purely to bucket failures in the step summary so the
+          # operator can see at a glance which mode dominated.
+          MARK_EXEC_HELLO='hello: hello from execed child'
+          MARK_FORK_WAIT_OK='init: fork+exec+wait ok'
 
           echo "== nightly-soak shard ${SHARD}: count=${count} per_run_timeout=${per_run_timeout}s =="
 
@@ -202,6 +221,8 @@ jobs:
           sig_ring3=0
           sig_stall=0
           sig_leak=0
+          sig_post_wait_stall=0
+          sig_post_fork_stall=0
           printf 'run\tresult\tduration_s\tsignatures\n' > "soak-logs/shard-${SHARD}-summary.tsv"
 
           for i in $(seq 1 "${count}"); do
@@ -253,6 +274,30 @@ jobs:
               sigs="${sigs}init_stall,"
               sig_stall=$((sig_stall + 1))
             fi
+            # Mode-A vs Mode-B fork+exec+wait stall categorization. We
+            # only score these on actual failures (status != pass) to
+            # avoid false-positive bucket inflation for runs whose
+            # serial was truncated by an early-boot crash, etc. The
+            # buckets are mutually exclusive: Mode-B (no exec hello)
+            # implies Mode-A (no wait4 ok), so we pick the more
+            # specific bucket first.
+            if [ "${status}" != "pass" ]; then
+              has_exec_hello=0
+              has_wait_ok=0
+              if grep -F -q "${MARK_EXEC_HELLO}" "${scan}" 2>/dev/null; then
+                has_exec_hello=1
+              fi
+              if grep -F -q "${MARK_FORK_WAIT_OK}" "${scan}" 2>/dev/null; then
+                has_wait_ok=1
+              fi
+              if [ "${has_exec_hello}" -eq 0 ] && [ "${has_wait_ok}" -eq 0 ]; then
+                sigs="${sigs}post_fork_stall,"
+                sig_post_fork_stall=$((sig_post_fork_stall + 1))
+              elif [ "${has_exec_hello}" -eq 1 ] && [ "${has_wait_ok}" -eq 0 ]; then
+                sigs="${sigs}post_wait_stall,"
+                sig_post_wait_stall=$((sig_post_wait_stall + 1))
+              fi
+            fi
             sigs="${sigs%,}"
             if [ -z "${sigs}" ]; then sigs="-"; fi
 
@@ -280,6 +325,11 @@ jobs:
             echo "- init-stall (iretq w/o hello, #478): ${sig_stall}"
             echo "- stack-VA-slot leak (#646): ${sig_leak}"
             echo "- total residual hits: ${residual_total}"
+            echo ""
+            echo "### new failure-mode categories"
+            echo ""
+            echo "- post-wait4 stall (Mode A, #710): ${sig_post_wait_stall}"
+            echo "- post-fork child stall (Mode B, #709): ${sig_post_fork_stall}"
           } | tee "soak-logs/shard-${SHARD}-summary.md"
 
           {
@@ -309,15 +359,20 @@ jobs:
             echo "sig_ring3=${sig_ring3}"
             echo "sig_stall=${sig_stall}"
             echo "sig_leak=${sig_leak}"
+            echo "sig_post_wait_stall=${sig_post_wait_stall}"
+            echo "sig_post_fork_stall=${sig_post_fork_stall}"
             echo "residual_total=${residual_total}"
           } > "soak-logs/shard-${SHARD}-counters.env"
 
-          # Fail the shard if any residual signature fired in any run.
-          # Pass-rate alone is intentionally NOT a gate here — a
-          # marker-less generic flake is tracked by smoke-soak.yml; this
-          # workflow gates on the *named* bug-class residuals only.
-          if [ "${residual_total}" -gt 0 ]; then
-            echo "::error::nightly-soak shard ${SHARD}: ${residual_total} residual-signature hit(s) — see counters above"
+          # Fail the shard if *any* run failed, regardless of whether
+          # the failure tripped a known residual-signature grep. The
+          # earlier residual-only gate (#711) silently absorbed new
+          # failure modes (post-fork / post-wait4 stalls) — any run
+          # that the xtask itself called "failed" is a real failure
+          # and must fail the gate. The signature breakdown above is
+          # kept in the step summary for forensics.
+          if [ "${fails}" -gt 0 ]; then
+            echo "::error::nightly-soak shard ${SHARD}: ${fails}/${total} runs failed (residual hits: ring3=${sig_ring3} stall=${sig_stall} leak=${sig_leak} post_wait=${sig_post_wait_stall} post_fork=${sig_post_fork_stall})"
             exit 1
           fi
 
@@ -363,6 +418,8 @@ jobs:
           sig_ring3=0
           sig_stall=0
           sig_leak=0
+          sig_post_wait_stall=0
+          sig_post_fork_stall=0
           shards_seen=0
           for f in all-logs/shard-*-counters.env; do
             [ -e "${f}" ] || continue
@@ -379,6 +436,8 @@ jobs:
                 sig_ring3)      sig_ring3=$(( sig_ring3 + v )) ;;
                 sig_stall)      sig_stall=$(( sig_stall + v )) ;;
                 sig_leak)       sig_leak=$(( sig_leak + v )) ;;
+                sig_post_wait_stall) sig_post_wait_stall=$(( sig_post_wait_stall + v )) ;;
+                sig_post_fork_stall) sig_post_fork_stall=$(( sig_post_fork_stall + v )) ;;
               esac
             done < "${f}"
           done
@@ -428,6 +487,13 @@ jobs:
             echo "| init: iretq w/o hello | #478 | ${sig_stall} |"
             echo "| stack VA slot leaked | #646 | ${sig_leak} |"
             echo "| **total**             |      | **${residual_total}** |"
+            echo ""
+            echo "## new failure-mode categories"
+            echo ""
+            echo "| signature | issue | hits |"
+            echo "|-----------|-------|------|"
+            echo "| post-wait4 stall (Mode A) | #710 | ${sig_post_wait_stall} |"
+            echo "| post-fork child stall (Mode B) | #709 | ${sig_post_fork_stall} |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
           echo "residual_total=${residual_total}" >> "${GITHUB_OUTPUT}"
@@ -438,10 +504,17 @@ jobs:
           echo "sig_ring3=${sig_ring3}" >> "${GITHUB_OUTPUT}"
           echo "sig_stall=${sig_stall}" >> "${GITHUB_OUTPUT}"
           echo "sig_leak=${sig_leak}" >> "${GITHUB_OUTPUT}"
+          echo "sig_post_wait_stall=${sig_post_wait_stall}" >> "${GITHUB_OUTPUT}"
+          echo "sig_post_fork_stall=${sig_post_fork_stall}" >> "${GITHUB_OUTPUT}"
 
-          # Aggregate gate: any residual signature in any run fails.
-          if [ "${residual_total}" -gt 0 ]; then
-            echo "::error::nightly-soak aggregate: ${residual_total} residual-signature hit(s) across all shards"
+          # Aggregate gate: fail the workflow if *any* run failed
+          # across all shards, regardless of which signature (if any)
+          # the failure tripped. Per #711, the previous
+          # residual-only gate let new failure modes walk through
+          # silently — `fails != 0` is the binary truth signal from
+          # the xtask, and is what we now key on.
+          if [ "${fails}" -gt 0 ]; then
+            echo "::error::nightly-soak aggregate: ${fails}/${total} runs failed (residual hits: ring3=${sig_ring3} stall=${sig_stall} leak=${sig_leak} post_wait=${sig_post_wait_stall} post_fork=${sig_post_fork_stall})"
             exit 1
           fi
 
@@ -461,6 +534,10 @@ jobs:
           SIG_RING3: ${{ steps.agg.outputs.sig_ring3 }}
           SIG_STALL: ${{ steps.agg.outputs.sig_stall }}
           SIG_LEAK:  ${{ steps.agg.outputs.sig_leak }}
+          SIG_POST_WAIT: ${{ steps.agg.outputs.sig_post_wait_stall }}
+          SIG_POST_FORK: ${{ steps.agg.outputs.sig_post_fork_stall }}
+          AGG_FAILS: ${{ steps.agg.outputs.fails }}
+          AGG_TOTAL: ${{ steps.agg.outputs.total }}
         run: |
           # `-e` halts on any unexpected failure (e.g. transient gh API
           # errors that would otherwise let the script continue with
@@ -525,8 +602,10 @@ jobs:
             printf '\n'
             printf '%s\n' '## Latest run'
             printf '\n'
-            printf -- '- %s — residual hits: ring3=%s, stall=%s, leak=%s\n' \
-              "${RUN_URL}" "${SIG_RING3}" "${SIG_STALL}" "${SIG_LEAK}"
+            printf -- '- %s — fails: %s/%s; residual hits: ring3=%s, stall=%s, leak=%s; new modes: post_wait=%s, post_fork=%s\n' \
+              "${RUN_URL}" "${AGG_FAILS}" "${AGG_TOTAL}" \
+              "${SIG_RING3}" "${SIG_STALL}" "${SIG_LEAK}" \
+              "${SIG_POST_WAIT}" "${SIG_POST_FORK}"
             printf '\n'
             printf '%s\n' '## Prior reds'
             printf '\n'
@@ -551,7 +630,7 @@ jobs:
             echo "Existing tracking issue #${existing} is open — appending a streak-update comment."
             gh issue comment "${existing}" \
               --repo "${OWNER}/${REPO}" \
-              --body "Streak continues. Latest red: ${RUN_URL} (residual hits: ring3=${SIG_RING3}, stall=${SIG_STALL}, leak=${SIG_LEAK})."
+              --body "Streak continues. Latest red: ${RUN_URL} (fails: ${AGG_FAILS}/${AGG_TOTAL}; residual hits: ring3=${SIG_RING3}, stall=${SIG_STALL}, leak=${SIG_LEAK}; new modes: post_wait=${SIG_POST_WAIT}, post_fork=${SIG_POST_FORK})."
           else
             echo "Filing new tracking issue."
             gh issue create \
