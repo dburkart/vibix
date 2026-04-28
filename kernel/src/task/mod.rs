@@ -88,21 +88,17 @@ static REAPER_WQ: WaitQueue = WaitQueue::new();
 pub fn init() {
     // Confirm the production seam wire-up is reachable before any
     // scheduler dispatch (RFC 0005 §Security A1). `env()` must hand
-    // back the `HwClock` / `HwIrq` singletons — the same `&'static`
-    // addresses as `&env::HW_CLOCK` / `&env::HW_IRQ`. Pointer-equality
-    // on the trait-object data pointers catches any accidental rewire
-    // to a different impl. Cheap enough to keep in non-debug too, but
-    // `debug_assert!` matches the rest of `task::init`'s invariant
-    // checks.
+    // back the `HwClock` / `HwIrq` singletons. We compare the trait
+    // object references directly — `core::ptr::eq` on `&dyn Trait`
+    // compares both the data pointer and the vtable pointer, so two
+    // ZST adapters that happened to share a data address but had
+    // different impls would still fail. Casting through `*const ()`
+    // would silently lose the vtable half of the identity check.
     debug_assert!({
         let (clock, irq) = env::env();
-        core::ptr::eq(
-            clock as *const _ as *const (),
-            &env::HW_CLOCK as *const _ as *const (),
-        ) && core::ptr::eq(
-            irq as *const _ as *const (),
-            &env::HW_IRQ as *const _ as *const (),
-        )
+        let hw_clock: &dyn env::Clock = &env::HW_CLOCK;
+        let hw_irq: &dyn env::IrqSource = &env::HW_IRQ;
+        core::ptr::eq(clock, hw_clock) && core::ptr::eq(irq, hw_irq)
     });
 
     let mut sched = SCHED.lock();

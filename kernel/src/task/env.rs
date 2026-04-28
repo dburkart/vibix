@@ -183,7 +183,7 @@ pub struct HwIrq;
 #[cfg(target_os = "none")]
 impl IrqSource for HwIrq {
     fn ack_timer(&self) {
-        crate::arch::x86_64::apic::lapic_eoi();
+        crate::arch::ack_timer_irq();
     }
 }
 
