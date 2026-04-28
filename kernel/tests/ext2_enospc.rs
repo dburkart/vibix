@@ -44,7 +44,7 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use vibix::block::BlockDevice;
-use vibix::fs::ext2::{alloc_block, finalize_orphan, iget, Ext2Fs, Ext2Super};
+use vibix::fs::ext2::{alloc_block, finalize_orphan, free_block, iget, Ext2Fs, Ext2Super};
 use vibix::fs::vfs::dentry::Dentry;
 use vibix::fs::vfs::inode::Inode;
 use vibix::fs::vfs::open_file::OpenFile;
@@ -173,15 +173,15 @@ fn block_exhaustion_then_unlink_recovers() {
     // body's primary contract is "the FS reports ENOSPC at the
     // syscall boundary and recovers", not "the writer must trigger the
     // exhaustion via FileOps::write specifically").
-    let mut drained: u32 = 0;
+    let mut drained_bnos: Vec<u32> = Vec::new();
     loop {
         match alloc_block(&super_arc, None) {
-            Ok(_) => drained += 1,
+            Ok(bno) => drained_bnos.push(bno),
             Err(ENOSPC) => break,
             Err(e) => panic!("unexpected balloc error mid-drain: {e}"),
         }
     }
-    assert!(drained > 0, "must drain at least one block");
+    assert!(!drained_bnos.is_empty(), "must drain at least one block");
     assert_eq!(
         super_arc.sb_disk.lock().s_free_blocks_count,
         0,
@@ -264,6 +264,23 @@ fn block_exhaustion_then_unlink_recovers() {
         free_blocks_after_finalize > free_blocks_at_full,
         "finalize must release blocks back to the allocator \
          (after_full={free_blocks_at_full}, after_finalize={free_blocks_after_finalize})",
+    );
+
+    // Release the blocks the test itself drained from the bitmap to
+    // force ENOSPC. Without this, `s_free_blocks_count` only reflects
+    // `big`'s blocks coming back — a regression where the drained
+    // blocks themselves never recover would slip past. After freeing
+    // them, the counter must match the pre-test initial value (modulo
+    // the directory blocks that `/` may have grown to host the
+    // dirent for `big`/`small`; allow `<=` to absorb that).
+    for bno in drained_bnos.iter().copied() {
+        free_block(&super_arc, bno).expect("free_block on drained bno");
+    }
+    let free_blocks_full_recovery = super_arc.sb_disk.lock().s_free_blocks_count;
+    assert!(
+        free_blocks_full_recovery + 4 >= free_blocks_initial,
+        "after freeing drained blocks the counter must rebound to ~initial \
+         (initial={free_blocks_initial}, recovered={free_blocks_full_recovery})",
     );
 
     // Recovery: a fresh create + small write must succeed.
@@ -395,21 +412,26 @@ fn inode_exhaustion_then_unlink_half_recovers() {
          (after_full={free_after_full}, after_finalize={free_after_finalize})",
     );
 
-    // Step 3: re-create. Subsequent `create` calls must succeed until
-    // we run out again (we only freed `half` inodes). At least one
-    // fresh create is the recovery checkpoint.
+    // Step 3: re-create. We freed exactly `half` inodes back to the
+    // allocator; every one of those `half` slots must accept a fresh
+    // create. A "passes if at least one succeeds" check would mask a
+    // partial-reclamation bug where some of the freed bits never made
+    // it back into rotation, so iterate the full `half` and require
+    // every recreate to land.
     let mut recovered = 0usize;
     for i in 0..half {
         let name = format!("r{i:02}");
         match root_vfs.ops.create(&root_vfs, name.as_bytes(), 0o644) {
             Ok(_) => recovered += 1,
-            Err(ENOSPC) => break,
-            Err(e) => panic!("unexpected post-finalize create error: {e}"),
+            Err(e) => panic!(
+                "post-finalize create {name} must succeed, got {e} \
+                 (recovered so far = {recovered}, target = {half})"
+            ),
         }
     }
-    assert!(
-        recovered >= 1,
-        "post-finalize FS must accept at least one new create (got {recovered})"
+    assert_eq!(
+        recovered, half,
+        "post-finalize FS must accept all {half} freed-up create slots (got {recovered})"
     );
 
     drop(root_vfs);
