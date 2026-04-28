@@ -86,6 +86,21 @@ static REAPER_WQ: WaitQueue = WaitQueue::new();
 /// Install the bootstrap task wrapping the currently-running thread.
 /// Must be called exactly once, before any [`spawn`].
 pub fn init() {
+    // Confirm the production seam wire-up is reachable before any
+    // scheduler dispatch (RFC 0005 §Security A1). `env()` must hand
+    // back the `HwClock` / `HwIrq` singletons. We compare the trait
+    // object references directly — `core::ptr::eq` on `&dyn Trait`
+    // compares both the data pointer and the vtable pointer, so two
+    // ZST adapters that happened to share a data address but had
+    // different impls would still fail. Casting through `*const ()`
+    // would silently lose the vtable half of the identity check.
+    debug_assert!({
+        let (clock, irq) = env::env();
+        let hw_clock: &dyn env::Clock = &env::HW_CLOCK;
+        let hw_irq: &dyn env::IrqSource = &env::HW_IRQ;
+        core::ptr::eq(clock, hw_clock) && core::ptr::eq(irq, hw_irq)
+    });
+
     let mut sched = SCHED.lock();
     assert!(sched.current.is_none(), "task::init called twice");
     sched.current = Some(Box::new(Task::bootstrap()));
