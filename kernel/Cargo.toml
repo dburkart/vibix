@@ -427,6 +427,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_enospc"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "ext2_ialloc"
 harness = false
 required-features = ["ext2"]
