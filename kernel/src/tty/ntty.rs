@@ -36,7 +36,7 @@ pub trait OutSink {
 /// `target_os = "none"` and unavailable to host unit tests. Production
 /// code wires [`KernelSignalDispatch`] (defined only for
 /// `target_os = "none"`); tests supply their own.
-pub trait SignalDispatch {
+pub trait SignalDispatch: Send + Sync {
     /// True when the pgrp has no live members. When this returns true,
     /// the ISIG path delivers `SIGHUP` + `SIGCONT` via [`Self::send_to_pgrp`]
     /// instead of the originally-requested signal — mirrors Linux's
@@ -418,6 +418,98 @@ impl Default for NTty {
     }
 }
 
+/// `LineDiscipline` adapter that wires the [`NTty`] state machine into a
+/// [`Tty`] (#474). On each rx byte:
+///
+/// 1. Snapshot `Termios` and `JobControl` off the tty.
+/// 2. Run [`NTty::receive_signal_or_byte`] — ISIG control chars (VINTR /
+///    VQUIT / VSUSP) are consumed and dispatched to the foreground pgrp;
+///    other bytes pass through `c_iflag` transforms.
+/// 3. Surviving bytes are pushed into [`NTty::canon_input`], which routes
+///    them through the line editor (canonical mode) or straight into the
+///    raw ring (raw mode), waking `tty.read_wait` on each commit.
+///
+/// The dispatcher is injected at construction so production builds wire
+/// [`KernelSignalDispatch`] while host unit tests can supply a capturing
+/// double. The ldisc holds no other reference to the tty — every
+/// `receive_byte` call gets the live `Tty` via the trait parameter, so
+/// termios changes through `tcsetattr` take effect immediately without
+/// any cache-invalidation dance.
+pub struct NTtyLdisc {
+    ntty: NTty,
+    dispatch: alloc::sync::Arc<dyn SignalDispatch>,
+}
+
+impl NTtyLdisc {
+    pub fn new(dispatch: alloc::sync::Arc<dyn SignalDispatch>) -> Self {
+        Self {
+            ntty: NTty::new(),
+            dispatch,
+        }
+    }
+
+    /// Borrow the underlying [`NTty`] for tests/asserts (`reader_len`,
+    /// raw ring inspection).
+    pub fn ntty(&self) -> &NTty {
+        &self.ntty
+    }
+}
+
+/// Wake adapter that drives a [`crate::poll::WaitQueue`] from the
+/// [`ReaderWake`] trait. Used by [`NTtyLdisc`] to wake `tty.read_wait`
+/// on each canonical-mode commit. Defined here (not in `mod.rs`) so the
+/// `ReaderWake` impl stays adjacent to its only consumer.
+#[cfg(any(test, target_os = "none"))]
+struct WaitQueueWake<'a>(&'a alloc::sync::Arc<crate::poll::WaitQueue>);
+
+#[cfg(any(test, target_os = "none"))]
+impl<'a> ReaderWake for WaitQueueWake<'a> {
+    fn wake(&self) {
+        self.0.wake_poll_then_one();
+    }
+}
+
+impl super::LineDiscipline for NTtyLdisc {
+    fn receive_byte(&self, tty: &super::Tty, byte: u8) {
+        // Snapshot termios + jobctl while holding their locks only for
+        // the read; the `NTty` calls below take their own internal lock
+        // and must not run with these held.
+        let termios = *tty.termios.lock();
+        let ctrl_snapshot = {
+            let ctrl = tty.ctrl.lock();
+            // Build a thin JobControl carrying only what
+            // `receive_signal_or_byte` reads — the lock-free pgrp
+            // snapshot. Session/pgrp themselves aren't read by NTty.
+            let jc = JobControl::new();
+            jc.pgrp_snapshot.store(ctrl.pgrp_snapshot.load());
+            jc
+        };
+        let surviving = self.ntty.receive_signal_or_byte(
+            &termios,
+            &ctrl_snapshot,
+            self.dispatch.as_ref(),
+            byte,
+        );
+        if let Some(b) = surviving {
+            #[cfg(any(test, target_os = "none"))]
+            {
+                let wake = WaitQueueWake(&tty.read_wait);
+                self.ntty.canon_input(&termios, b, &wake);
+            }
+            #[cfg(not(any(test, target_os = "none")))]
+            {
+                self.ntty.canon_input(&termios, b, &NullWake);
+            }
+        }
+    }
+
+    fn open(&self, _tty: &super::Tty) -> Result<(), i64> {
+        Ok(())
+    }
+
+    fn close(&self, _tty: &super::Tty) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,24 +722,26 @@ mod tests {
     // ── ISIG tests (#431) ────────────────────────────────────────────
 
     use crate::tty::JobControl;
-    use core::cell::RefCell;
 
     /// Test dispatcher: records every (pgid, sig) call and answers
-    /// `is_orphaned` from a pre-seeded set.
+    /// `is_orphaned` from a pre-seeded set. Uses [`spin::Mutex`] rather
+    /// than `RefCell` so the dispatcher can satisfy the
+    /// `SignalDispatch: Send + Sync` bound (the bound is needed so the
+    /// production [`NTtyLdisc`] can hold an `Arc<dyn SignalDispatch>`).
     struct CapturingDispatch {
         orphaned_pgrps: &'static [u32],
-        captures: RefCell<Vec<(u32, u8)>>,
+        captures: spin::Mutex<Vec<(u32, u8)>>,
     }
 
     impl CapturingDispatch {
         fn new(orphaned: &'static [u32]) -> Self {
             Self {
                 orphaned_pgrps: orphaned,
-                captures: RefCell::new(Vec::new()),
+                captures: spin::Mutex::new(Vec::new()),
             }
         }
         fn captures(&self) -> Vec<(u32, u8)> {
-            self.captures.borrow().clone()
+            self.captures.lock().clone()
         }
     }
 
@@ -656,7 +750,7 @@ mod tests {
             self.orphaned_pgrps.contains(&pgid)
         }
         fn send_to_pgrp(&self, pgid: u32, sig: u8) {
-            self.captures.borrow_mut().push((pgid, sig));
+            self.captures.lock().push((pgid, sig));
         }
     }
 
