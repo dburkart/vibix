@@ -173,11 +173,11 @@ pub extern "C" fn _start() -> ! {
     if fork_ret > 0 {
         let child_pid = fork_ret as u64;
         let mut wstatus: i32 = 0;
-        let _waited: i64;
+        let waited: i64;
         unsafe {
             core::arch::asm!(
                 "syscall",
-                inlateout("rax") 61u64 => _waited,                         // wait4
+                inlateout("rax") 61u64 => waited,                          // wait4
                 inlateout("rdi") child_pid => _,                            // pid
                 inlateout("rsi") &mut wstatus as *mut i32 as u64 => _,      // *wstatus
                 inlateout("rdx") 0u64 => _,                                 // options
@@ -190,14 +190,24 @@ pub extern "C" fn _start() -> ! {
             );
         }
         // #710 localizing marker: emitted IMMEDIATELY after `wait4`
-        // returns to the parent. If the soak fails with this marker
-        // present but `init: fork+exec+wait ok` missing, the stall is
-        // strictly between the two `write()` syscalls below — i.e.
-        // wait4 returned but the *next* userspace instruction never
-        // ran. If this marker is also missing, wait4 itself never
-        // returned (parent never woke from the condvar park).
-        write(1, WAIT4_RETURN_MSG);
-        write(1, DONE_MSG);
+        // returns to the parent — but only on a successful reap of the
+        // expected child. Gating on `waited == child_pid && wstatus == 0`
+        // means a negative errno or an exec-failed child (wstatus != 0)
+        // can't masquerade as a healthy wait path; the soak then fails
+        // for the right reason instead of papering over the bug.
+        //
+        // If the soak fails with this marker present but `init:
+        // fork+exec+wait ok` missing, the stall is strictly between the
+        // two `write()` syscalls below — i.e. wait4 returned, the reap
+        // succeeded, but the *next* userspace instruction never ran. If
+        // this marker is missing, either wait4 itself never returned
+        // (parent never woke from the condvar park) or the reap result
+        // was unexpected (errno or non-zero wstatus).
+        let exit_code = (wstatus >> 8) & 0xFF;
+        if waited == child_pid as i64 && exit_code == 0 {
+            write(1, WAIT4_RETURN_MSG);
+            write(1, DONE_MSG);
+        }
     }
 
     // Loop forever.
