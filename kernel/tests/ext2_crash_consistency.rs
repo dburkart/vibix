@@ -592,6 +592,7 @@ where
 /// silently accepted — that's not a consistency violation, it's the
 /// mount path correctly rejecting a torn image.
 fn replay_all(pre_op: &[u8], log: &[(u64, Vec<u8>)], op_name: &str) {
+    let mut validated = 0usize;
     for k in 0..=log.len() {
         let mut img = pre_op.to_vec();
         for (off, payload) in log.iter().take(k) {
@@ -612,9 +613,22 @@ fn replay_all(pre_op: &[u8], log: &[(u64, Vec<u8>)], op_name: &str) {
         use core::fmt::Write as _;
         let _ = write!(&mut label, "{op_name} k={k}");
         assert_consistent(&post_mount, &super_arc, &label);
+        validated += 1;
         sb.ops.unmount();
         drop(super_arc);
     }
+    // Guard against a vacuous run: if every k refused to mount, the
+    // harness would silently pass without ever exercising the
+    // consistency assertion. The recording window is supposed to
+    // contain at least the steady-state mount (k=0 always replays
+    // the pre-op image, which is by construction mountable), so a
+    // 0 here means something went badly wrong with the recording or
+    // the mount path.
+    assert!(
+        validated > 0,
+        "[{op_name}] replay produced 0 validated crash-points (log has {} writes) — harness is vacuous",
+        log.len(),
+    );
 }
 
 // ---------------------------------------------------------------------------
