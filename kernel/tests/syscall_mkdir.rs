@@ -12,9 +12,10 @@
 //! - `mkdir(".")` / `mkdir("..")` / `mkdir("")` return `-ENOENT`
 //!   (the leaf-normalizer rejects them).
 //! - `mkdirat(AT_FDCWD, path, mode)` creates a directory.
-//! - `mkdirat(some_fd, "rel/path", mode)` returns `-EINVAL` — relative
-//!   paths against a real fd aren't supported until per-fd walks land
-//!   (issue #239).
+//! - `mkdirat(real_dirfd, "child", mode)` resolves `child` inside the
+//!   directory referenced by `real_dirfd` (issue #588).
+//! - `mkdirat(non_dir_fd, "rel/path", mode)` returns `-ENOTDIR`.
+//! - `mkdirat(closed_fd, "rel/path", mode)` returns `-EBADF`.
 //!
 //! The test calls `sys_mkdir_impl` / `sys_mkdirat_impl` directly rather
 //! than through `syscall_dispatch`, because the dispatch arm is gated
@@ -33,7 +34,7 @@ use core::ptr;
 
 use vibix::arch::x86_64::syscalls::vfs::{sys_mkdir_impl, sys_mkdirat_impl, AT_FDCWD};
 use vibix::fs::vfs::ops::Stat;
-use vibix::fs::{EEXIST, EINVAL, ENOENT, ENOTDIR};
+use vibix::fs::{EBADF, EEXIST, ENOENT, ENOTDIR};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
 use vibix::{
@@ -95,8 +96,16 @@ fn run_tests() {
             &(mkdirat_at_fdcwd_creates_directory as fn()),
         ),
         (
-            "mkdirat_real_fd_relative_path_einval",
-            &(mkdirat_real_fd_relative_path_einval as fn()),
+            "mkdirat_real_dirfd_creates_child",
+            &(mkdirat_real_dirfd_creates_child as fn()),
+        ),
+        (
+            "mkdirat_non_dir_fd_is_enotdir",
+            &(mkdirat_non_dir_fd_is_enotdir as fn()),
+        ),
+        (
+            "mkdirat_closed_fd_is_ebadf",
+            &(mkdirat_closed_fd_is_ebadf as fn()),
         ),
         (
             "mkdir_strips_non_permission_bits",
@@ -288,15 +297,86 @@ fn mkdirat_at_fdcwd_creates_directory() {
     assert_eq!(st.st_mode & S_IFMT, S_IFDIR);
 }
 
-fn mkdirat_real_fd_relative_path_einval() {
-    // Per-fd walks don't exist yet (#239) — a real fd + relative path
-    // must bounce with -EINVAL, not silently walk from somewhere else.
-    let r = mkdirat(3, b"rel/child", 0o755);
+// ---- helpers for *at(real-dirfd) tests ------------------------------
+
+const SYS_OPEN: u64 = 2;
+const SYS_CLOSE: u64 = 3;
+const O_RDONLY: u64 = 0;
+const O_DIRECTORY: u64 = 0o200_000;
+
+fn open_dir(path: &[u8]) -> i64 {
+    let uva = stage(path);
+    unsafe {
+        syscall_dispatch(
+            core::ptr::null_mut(),
+            SYS_OPEN,
+            uva,
+            O_RDONLY | O_DIRECTORY,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+fn open_file(path: &[u8]) -> i64 {
+    let uva = stage(path);
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPEN, uva, O_RDONLY, 0, 0, 0, 0) }
+}
+
+fn close_fd(fd: u32) -> i64 {
+    unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0) }
+}
+
+fn mkdirat_real_dirfd_creates_child() {
+    // Set up a parent directory, open it, then mkdirat a child name
+    // through that fd. The child must end up inside the opened parent.
+    let r = mkdir(b"/tmp/mkdirat-dirfd-parent", 0o755);
+    assert_eq!(r, 0, "parent mkdir must succeed, got {}", r);
+    let dfd = open_dir(b"/tmp/mkdirat-dirfd-parent");
+    assert!(
+        dfd >= 0,
+        "open(parent, O_RDONLY|O_DIRECTORY) failed: {}",
+        dfd
+    );
+
+    let r = mkdirat(dfd as i32, b"child", 0o755);
     assert_eq!(
-        r, EINVAL,
-        "mkdirat(real_fd, relative) must EINVAL, got {}",
+        r, 0,
+        "mkdirat(real_dirfd, \"child\") must succeed, got {}",
         r
     );
+
+    // The child must be visible at the parent's absolute path. If the
+    // walk had silently rooted at "/" instead of `dfd`, this stat would
+    // miss because the child would be at /child, not /tmp/.../child.
+    let r = stat(b"/tmp/mkdirat-dirfd-parent/child");
+    assert_eq!(
+        r, 0,
+        "child must be visible inside the dirfd's directory, got {}",
+        r
+    );
+    let st = read_stat();
+    assert_eq!(st.st_mode & S_IFMT, S_IFDIR);
+    let _ = close_fd(dfd as u32);
+}
+
+fn mkdirat_non_dir_fd_is_enotdir() {
+    // A real fd whose backing inode is not a directory must yield ENOTDIR.
+    let r = mknod_reg(b"/tmp/mkdirat-not-dir-file");
+    assert_eq!(r, 0);
+    let fd = open_file(b"/tmp/mkdirat-not-dir-file");
+    assert!(fd >= 0, "open(file) failed: {}", fd);
+    let r = mkdirat(fd as i32, b"child", 0o755);
+    assert_eq!(r, ENOTDIR, "mkdirat(file_fd, ...) must ENOTDIR, got {}", r);
+    let _ = close_fd(fd as u32);
+}
+
+fn mkdirat_closed_fd_is_ebadf() {
+    // A high fd that was never opened (or is closed) must yield EBADF.
+    let r = mkdirat(999, b"child", 0o755);
+    assert_eq!(r, EBADF, "mkdirat(closed_fd, ...) must EBADF, got {}", r);
 }
 
 fn mkdir_strips_non_permission_bits() {

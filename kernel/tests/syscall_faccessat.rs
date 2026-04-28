@@ -16,8 +16,8 @@
 //!   AT_EACCESS)` (effective ID) — the central distinguishing feature.
 //! - Unknown flag bits → `EINVAL`.
 //! - Mode bits outside `R_OK | W_OK | X_OK` → `EINVAL`.
-//! - Relative path with `dfd != AT_FDCWD` → `EINVAL` (per-fd dirfd
-//!   resolution is tracked under #239).
+//! - Relative path with a closed/invalid `dfd` → `EBADF` (per-fd dirfd
+//!   resolution landed in #588).
 //! - `faccessat2` returns the same answer as `faccessat` for
 //!   well-formed inputs.
 //! - Dispatch arms return `-ENOSYS` until `vfs_creds` flips on.
@@ -36,7 +36,7 @@ use vibix::arch::x86_64::syscalls::vfs::{
     AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, F_OK, R_OK, W_OK, X_OK,
 };
 use vibix::fs::vfs::Credential;
-use vibix::fs::{EACCES, EINVAL, ENOENT};
+use vibix::fs::{EACCES, EBADF, EINVAL, ENOENT};
 use vibix::mem::vmatree::{Share, Vma};
 use vibix::mem::vmobject::AnonObject;
 use vibix::{
@@ -104,8 +104,8 @@ fn run_tests() {
             &(faccessat_invalid_mode_einval as fn()),
         ),
         (
-            "faccessat_relative_with_dfd_einval",
-            &(faccessat_relative_with_dfd_einval as fn()),
+            "faccessat_relative_with_closed_dfd_ebadf",
+            &(faccessat_relative_with_closed_dfd_ebadf as fn()),
         ),
         (
             "faccessat2_matches_faccessat",
@@ -395,15 +395,16 @@ fn faccessat_invalid_mode_einval() {
     );
 }
 
-fn faccessat_relative_with_dfd_einval() {
+fn faccessat_relative_with_closed_dfd_ebadf() {
     set_root_creds();
-    // Per-fd dirfd resolution is #239; relative path + non-AT_FDCWD
-    // is rejected up front rather than silently resolving against
-    // the namespace root.
+    // Per-fd dirfd resolution landed in #588. A relative path with a
+    // dfd that is not AT_FDCWD and not currently open in the fd table
+    // must surface as EBADF, not silently resolve against the
+    // namespace root.
     let r = faccessat(7, b"relative/path", F_OK, 0);
     assert_eq!(
-        r, EINVAL,
-        "relative path with dfd != AT_FDCWD must be EINVAL, got {}",
+        r, EBADF,
+        "relative path with closed dfd must be EBADF, got {}",
         r
     );
 }
