@@ -101,6 +101,24 @@ pub extern "C" fn _start() -> ! {
     // line for log triage.
     write_all(STDOUT, b"shell_pipeline: starting echo|cat|wc-c\n");
 
+    // ── #690 regression: callee-saved GPR roundtrip across sys_fork().
+    //
+    // SysV AMD64 treats rbx, rbp, r12-r15 as callee-saved across function
+    // calls; sys_fork()'s asm here doesn't list them as clobbers (only
+    // the caller-saved set), so the compiler will happily hold a userspace
+    // local in one of them across the syscall in both parent and child.
+    // Pre-#690 fix, the kernel restored only rcx/r11/rsp on SYSRETQ from
+    // the child path, leaving rbx/rbp/r12-r15 with whatever the kernel
+    // last wrote — silently corrupting the local in the child.
+    //
+    // We force the compiler's hand with `core::hint::black_box` on a
+    // sentinel value so it has to be live across `sys_fork()`. If the
+    // child reads back the same sentinel we set in the parent, the full
+    // user-GPR snapshot survived. We also wait4() the child here so this
+    // probe runs to completion before the pipeline below — failure is
+    // a fast, isolated marker.
+    callee_saved_fork_probe();
+
     // Diagnostic preflight: confirm fd 0/1/2 are open in the supervisor
     // before any pipe2/fork — if any of these are closed at PID-1 entry
     // we'd see write_all to STDERR silently fail downstream.
@@ -513,6 +531,72 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> i64 {
         );
     }
     ret
+}
+
+/// #690 regression probe.
+///
+/// Holds a sentinel value across `sys_fork()` and asserts that the
+/// child reads it back unchanged. `core::hint::black_box` on either
+/// side prevents the optimizer from dead-store-eliminating the local
+/// or replacing the post-fork load with the pre-fork constant — both
+/// of which would silently mask the bug.
+///
+/// On success, the parent emits `SHELL_PIPELINE_CALLEE_SAVED_OK`.
+/// On failure (parent value `!=` child value, modulo any nonzero diff),
+/// the child emits `SHELL_PIPELINE_FAIL: callee_saved=<observed>` and
+/// exits non-zero so the parent's `wait_zero` trips.
+fn callee_saved_fork_probe() {
+    const SENTINEL: u64 = 0xDEAD_C0DE_F00D_BABEu64;
+
+    // Anchor the local in scope across the syscall. The asm in
+    // sys_fork() does not list rbx/rbp/r12-r15 as clobbers, so the
+    // compiler can (and at -O does) keep `local` in one of those across
+    // the call. black_box makes this required, not optional.
+    let mut local: u64 = SENTINEL;
+    local = core::hint::black_box(local);
+
+    let pid = sys_fork();
+    if pid < 0 {
+        write_all(STDERR, b"SHELL_PIPELINE_FAIL: callee_saved fork\n");
+        sys_exit(2);
+    }
+
+    if pid == 0 {
+        // Child: black_box again so the load isn't constant-folded back
+        // to SENTINEL after the syscall.
+        let observed = core::hint::black_box(local);
+        if observed == SENTINEL {
+            // Parent will wait_zero on this. exit(0) on match.
+            sys_exit(0);
+        }
+        // Mismatch — emit a marker carrying the observed value, then
+        // exit non-zero.
+        write_all(STDOUT, b"SHELL_PIPELINE_FAIL: callee_saved=");
+        write_u64_to(STDOUT, observed);
+        write_all(STDOUT, b"\n");
+        sys_exit(41);
+    }
+
+    // Parent: wait for the probe child and require status 0.
+    if !wait_zero(
+        pid as u64,
+        b"SHELL_PIPELINE_FAIL: callee_saved wait\n",
+        b"SHELL_PIPELINE_FAIL: callee_saved nonzero\n",
+    ) {
+        sys_exit(3);
+    }
+    // Use `local` *after* wait4 so it is live across both fork() and
+    // wait4(); the parent path also exercises the callee-saved
+    // restore on the parent's SYSRETQ (which #690's fix makes uniform
+    // across the two paths).
+    let parent_observed = core::hint::black_box(local);
+    if parent_observed != SENTINEL {
+        write_all(STDOUT, b"SHELL_PIPELINE_FAIL: callee_saved parent=");
+        write_u64_to(STDOUT, parent_observed);
+        write_all(STDOUT, b"\n");
+        sys_exit(42);
+    }
+    write_all(STDOUT, b"SHELL_PIPELINE_CALLEE_SAVED_OK\n");
 }
 
 fn sys_fork() -> i64 {
