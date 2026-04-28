@@ -127,9 +127,12 @@ pub extern "C" fn _start() -> ! {
     }
     if pid_echo == 0 {
         // Child: stdout → p1w, then close every pipe fd we still hold.
-        if sys_dup2(p1w, STDOUT) < 0 {
+        let r = sys_dup2(p1w, STDOUT);
+        if r < 0 {
+            write_all(STDERR, b"shell_pipeline[echo-child]: dup2 stdout failed\n");
             sys_exit(11);
         }
+        write_all(STDERR, b"shell_pipeline[echo-child]: dup2 stdout ok\n");
         sys_close(p1r);
         sys_close(p1w);
         sys_close(p2r);
@@ -145,11 +148,15 @@ pub extern "C" fn _start() -> ! {
     }
     if pid_cat == 0 {
         if sys_dup2(p1r, STDIN) < 0 {
+            write_all(STDERR, b"shell_pipeline[cat-child]: dup2 stdin failed\n");
             sys_exit(12);
         }
+        write_all(STDERR, b"shell_pipeline[cat-child]: dup2 stdin ok\n");
         if sys_dup2(p2w, STDOUT) < 0 {
+            write_all(STDERR, b"shell_pipeline[cat-child]: dup2 stdout failed\n");
             sys_exit(13);
         }
+        write_all(STDERR, b"shell_pipeline[cat-child]: dup2 stdout ok\n");
         sys_close(p1r);
         sys_close(p1w);
         sys_close(p2r);
@@ -165,8 +172,10 @@ pub extern "C" fn _start() -> ! {
     }
     if pid_wc == 0 {
         if sys_dup2(p2r, STDIN) < 0 {
+            write_all(STDERR, b"shell_pipeline[wc-child]: dup2 stdin failed\n");
             sys_exit(14);
         }
+        write_all(STDERR, b"shell_pipeline[wc-child]: dup2 stdin ok\n");
         sys_close(p1r);
         sys_close(p1w);
         sys_close(p2r);
@@ -200,27 +209,35 @@ pub extern "C" fn _start() -> ! {
 
 /// echo: write the payload, exit 0.
 fn stage_echo() -> ! {
+    write_all(STDERR, b"shell_pipeline[echo]: enter\n");
     if write_all(STDOUT, ECHO_PAYLOAD) {
+        write_all(STDERR, b"shell_pipeline[echo]: wrote ok, exit 0\n");
         sys_exit(0);
     }
+    write_all(STDERR, b"shell_pipeline[echo]: write failed, exit 21\n");
     sys_exit(21);
 }
 
 /// cat: copy stdin → stdout until EOF, exit 0.
 fn stage_cat() -> ! {
+    write_all(STDERR, b"shell_pipeline[cat]: enter\n");
     let mut buf = [0u8; 64];
     loop {
         let n = sys_read(STDIN, buf.as_mut_ptr(), buf.len() as u64);
         if n == 0 {
+            write_all(STDERR, b"shell_pipeline[cat]: EOF, exit 0\n");
             sys_exit(0);
         }
         if n < 0 {
+            write_all(STDERR, b"shell_pipeline[cat]: read err, exit 22\n");
             sys_exit(22);
         }
         let n = n as usize;
         if !write_all(STDOUT, &buf[..n]) {
+            write_all(STDERR, b"shell_pipeline[cat]: write err, exit 23\n");
             sys_exit(23);
         }
+        write_all(STDERR, b"shell_pipeline[cat]: relayed chunk\n");
     }
 }
 
@@ -228,6 +245,7 @@ fn stage_cat() -> ! {
 /// fd 1 if the count matches the expected value, otherwise emit a
 /// failure line.
 fn stage_wc() -> ! {
+    write_all(STDERR, b"shell_pipeline[wc]: enter\n");
     let mut buf = [0u8; 64];
     let mut count: u32 = 0;
     loop {
@@ -236,6 +254,7 @@ fn stage_wc() -> ! {
             break;
         }
         if n < 0 {
+            write_all(STDERR, b"shell_pipeline[wc]: read err, exit 31\n");
             sys_exit(31);
         }
         // u32 is plenty — pipeline payload is 4 bytes.
