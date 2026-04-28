@@ -112,7 +112,7 @@ accessor to a thread-local `OnceCell` of boxed impls.
 ## Equivalence property and verification
 
 The production wire-up is observationally equivalent to the pre-RFC
-direct calls iff:
+direct calls if and only if:
 
 1. **Pure forwarding.** Every `HwClock` / `HwIrq` method body is a
    single call into the existing global, no added state, no
