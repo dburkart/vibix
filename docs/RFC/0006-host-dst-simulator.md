@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Host-Side Deterministic Simulator (DST Phase 2)
-status: In Review
+status: Accepted
 created: 2026-04-27
 ---
 
@@ -1104,6 +1104,27 @@ randomized harness.
 
 All open questions are deferred to implementation per the resolutions
 recorded below. None block RFC acceptance.
+
+Post-defense advisory items absorbed (defense cycle 1):
+
+- *VIBIX_SIM_SEED= panic-hook string is a stable interface* (Sec-A1
+  re-review) — call out explicitly in the implementation that this
+  string is greppable forever; document in §"Reproducibility envelope"
+  and `docs/design/simulator.md`.
+- *`preempt_tick` re-entrancy guard should be active under all
+  `sched-mock` builds, not just `cfg(debug_assertions)`* (OS-A1
+  re-review) — implementation uses `cfg(any(debug_assertions, all(test,
+  feature = "sched-mock")))` (or simpler: always-on when `sched-mock`).
+- *`--explain` agent-stable output format* (UserSpace-A1 re-review) —
+  ship `--explain=table|json|tsv` with `tsv` as the agent-stable form.
+- *Custom `Ord` impls in `simulator/` and sched-mock-gated kernel code
+  must be reviewed for determinism* (Academic-A1 re-review) — add to
+  the `docs/design/simulator.md` checklist.
+- *Nightly suite path filter should include `simulator/**`*
+  (Testing-A1 re-review) — extend the filter in Roadmap item 9.
+
+These are implementation conveniences, not design changes; they ride
+the relevant Roadmap items.
 
 - **Pinning a specific nightly date.** The Reproducibility Envelope
   requires it. *Lean: pin in Roadmap item 1 to whatever nightly is
