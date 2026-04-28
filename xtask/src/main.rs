@@ -247,15 +247,18 @@ fn main() -> R<()> {
             let kernel = build(&release_opts)?;
             nm_check_no_mocks(&kernel)?;
 
-            // Defense-in-depth: also re-check after the ISO bundling
-            // step has run, in case any future ISO post-processing
-            // (e.g. compression or relink) ever changes symbol
-            // visibility. The ISO itself is a CD9660 image — we
-            // re-check the kernel ELF that gets embedded, which is the
-            // same path `make_iso` consumes.
+            // Defense-in-depth: also re-check the ISO-staged ELF.
+            // `make_iso` copies the kernel into
+            // `build/<staging>/boot/vibix`, and that staged file — not
+            // the workspace `target/.../release/vibix` — is what
+            // actually ships inside the ISO. Scanning the staged copy
+            // catches a hypothetical future ISO post-processing step
+            // (compression, signing, relink) that mutates the bundled
+            // ELF away from the original.
             let iso_path = iso(&release_opts)?;
             println!("→ nm-check: iso built at {}", iso_path.display());
-            nm_check_no_mocks(&kernel)?;
+            let staged_kernel = workspace_root().join("build/iso_root/boot/vibix");
+            nm_check_no_mocks(&staged_kernel)?;
         }
         "initrd" => {
             let path = ensure_initrd()?;
@@ -2487,6 +2490,27 @@ ffffffff80010100 t <vibix::task::env::MockTimerIrq as vibix::task::env::IrqSourc
 ";
         let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
         assert_eq!(hits.len(), 2, "both irq mock names must match: {hits:?}");
+    }
+
+    /// RFC 0005 nm-check (#669): the interior `MockClockState` and
+    /// `MockIrqState` types are listed in `NM_CHECK_FORBIDDEN` even
+    /// though substring matching catches them transitively today via
+    /// Drop glue and field paths. Pin both names with explicit
+    /// fixtures so a refactor that splits them into a free-standing
+    /// module path (no longer transitively named through `MockClock`/
+    /// `MockIrqSource`) keeps biting.
+    #[test]
+    fn nm_check_catches_interior_state_types() {
+        let stdout = "\
+ffffffff80020000 t core::ptr::drop_in_place::<vibix::task::env::MockClockState>
+ffffffff80020100 t core::ptr::drop_in_place::<vibix::task::env::MockIrqState>
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(
+            hits.len(),
+            2,
+            "both interior state types must match: {hits:?}"
+        );
     }
 
     #[test]
