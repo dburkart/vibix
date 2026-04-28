@@ -10,11 +10,11 @@
 //! adapters, no `env()` accessor, no callers migrated. Issue #666
 //! lands the `HwClock` / `HwIrq` adapters and the `env()` accessor;
 //! issue #667 migrates `preempt_tick` / `sleep_ms` / signal callers
-//! through the seam; issue #668 lands `MockClock` / `MockIrqSource`.
+//! through the seam; issue #668 lands `MockClock` / `MockTimerIrq`.
 //!
 //! ## Discipline (RFC 0005, "Discipline" section)
 //!
-//! > A `Clock` or `IrqSource` trait method is added only when a
+//! > A `Clock` or `TimerIrq` trait method is added only when a
 //! > second implementation actually needs it.
 //!
 //! Speculative methods are rejected. The first new method that
@@ -125,15 +125,16 @@ pub trait Clock: Sync {
     fn enqueue_wakeup(&self, deadline: Tick, id: TaskId);
 }
 
-/// Source of preemption-relevant interrupts for the scheduler.
+/// Source of the preemption-driving timer IRQ for the scheduler.
 ///
-/// Scoped to the *scheduler's* view of IRQs only: device drivers
-/// continue to ack their own IRQs through `crate::arch::*` directly.
-/// One-shot IDT install, IOAPIC redirection programming, and IPI
-/// send are **not** part of this trait (RFC 0005 §"Alternatives
-/// Considered" — wider trait surface rejected for v1). Despite the
-/// generic-sounding name, today this means a single method.
-pub trait IrqSource: Sync {
+/// Scoped to the *scheduler's* timer IRQ only: device drivers continue
+/// to ack their own IRQs through `crate::arch::*` directly. Broader IRQ
+/// routing — one-shot IDT install, IOAPIC redirection programming, IPI
+/// send — is **not** part of this trait (RFC 0005 §"Alternatives
+/// Considered" — wider trait surface rejected for v1, and explicitly
+/// Phase 2). The name reflects what the trait abstracts today: the
+/// single ack-timer method that `preempt_tick` invokes.
+pub trait TimerIrq: Sync {
     /// Acknowledge the timer IRQ that drove the current
     /// `preempt_tick` call. Today: LAPIC EOI write; on legacy PIC:
     /// PIC EOI. Called from the timer ISR — must be IRQ-safe.
@@ -154,7 +155,7 @@ pub trait IrqSource: Sync {
 //
 // `HwIrq` and `env()` depend on `crate::arch::*` and so are gated to
 // `target_os = "none"` builds; the trait definitions above stay
-// host-buildable for the future `MockClock` / `MockIrqSource`
+// host-buildable for the future `MockClock` / `MockTimerIrq`
 // (issue #668).
 // ---------------------------------------------------------------------------
 
@@ -176,12 +177,12 @@ impl Clock for HwClock {
     }
 }
 
-/// Production `IrqSource` over the LAPIC end-of-interrupt path.
+/// Production `TimerIrq` over the LAPIC end-of-interrupt path.
 #[cfg(target_os = "none")]
 pub struct HwIrq;
 
 #[cfg(target_os = "none")]
-impl IrqSource for HwIrq {
+impl TimerIrq for HwIrq {
     fn ack_timer(&self) {
         crate::arch::ack_timer_irq();
     }
@@ -196,14 +197,14 @@ pub static HW_IRQ: HwIrq = HwIrq;
 
 /// Production wire-up of the scheduler / IRQ seam.
 ///
-/// Returns the singleton `Clock` + `IrqSource` pair that the scheduler
+/// Returns the singleton `Clock` + `TimerIrq` pair that the scheduler
 /// and the timer ISR will route through once issue #667 migrates the
 /// callers. Body is intentionally a single tuple of two `&'static`
 /// references — no `Once`, no `Mutex`, no atomic load — so that the
 /// production path adds zero synchronization vs. the pre-seam direct
 /// calls (RFC 0005 Equivalence condition 2).
 #[cfg(target_os = "none")]
-pub fn env() -> (&'static dyn Clock, &'static dyn IrqSource) {
+pub fn env() -> (&'static dyn Clock, &'static dyn TimerIrq) {
     (&HW_CLOCK, &HW_IRQ)
 }
 
@@ -225,15 +226,15 @@ pub fn env() -> (&'static dyn Clock, &'static dyn IrqSource) {
 pub fn assert_production_env() -> bool {
     let (clock, irq) = env();
     let hw_clock: &dyn Clock = &HW_CLOCK;
-    let hw_irq: &dyn IrqSource = &HW_IRQ;
+    let hw_irq: &dyn TimerIrq = &HW_IRQ;
     core::ptr::eq(clock, hw_clock) && core::ptr::eq(irq, hw_irq)
 }
 
 // ---------------------------------------------------------------------------
 // Mock impls (Phase 1 wave 3, issue #668).
 //
-// `MockClock` and `MockIrqSource` are non-production `Clock` /
-// `IrqSource` implementations used by host-side unit tests, future
+// `MockClock` and `MockTimerIrq` are non-production `Clock` /
+// `TimerIrq` implementations used by host-side unit tests, future
 // in-kernel `sched-mock`-gated integration tests, and (eventually) the
 // Phase 2 host-side simulator. They are gated by the `sched-mock`
 // Cargo feature *only* (no `target_os` exception) so a release kernel
@@ -339,16 +340,16 @@ impl Clock for MockClock {
     }
 }
 
-/// Mock `IrqSource` for deterministic scheduler tests.
+/// Mock `TimerIrq` for deterministic scheduler tests.
 ///
 /// `ack_timer` is a no-op on the wire (there is no LAPIC / PIC behind
 /// the mock to acknowledge), but the call is recorded for assertions and
-/// a separate [`MockIrqSource::inject_timer`] entry point lets tests
+/// a separate [`MockTimerIrq::inject_timer`] entry point lets tests
 /// simulate a timer IRQ landing — for the v1 trait surface that just
 /// records an inject; future trait methods (post-Phase 2) may grow
 /// observable side effects.
 #[cfg(feature = "sched-mock")]
-pub struct MockIrqSource {
+pub struct MockTimerIrq {
     inner: spin::Mutex<MockIrqState>,
 }
 
@@ -360,7 +361,7 @@ struct MockIrqState {
 }
 
 #[cfg(feature = "sched-mock")]
-impl MockIrqSource {
+impl MockTimerIrq {
     /// Construct a fresh mock IRQ source with both counters at zero.
     pub const fn new() -> Self {
         Self {
@@ -379,12 +380,12 @@ impl MockIrqSource {
         self.inner.lock().pending_timer_injects += 1;
     }
 
-    /// Number of times [`IrqSource::ack_timer`] has been called.
+    /// Number of times [`TimerIrq::ack_timer`] has been called.
     pub fn ack_count(&self) -> u64 {
         self.inner.lock().ack_calls
     }
 
-    /// Number of timer IRQs injected by [`MockIrqSource::inject_timer`]
+    /// Number of timer IRQs injected by [`MockTimerIrq::inject_timer`]
     /// minus the number acknowledged. Should drop to zero after the
     /// scheduler processes every injected tick.
     pub fn pending_timers(&self) -> u64 {
@@ -394,14 +395,14 @@ impl MockIrqSource {
 }
 
 #[cfg(feature = "sched-mock")]
-impl Default for MockIrqSource {
+impl Default for MockTimerIrq {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[cfg(feature = "sched-mock")]
-impl IrqSource for MockIrqSource {
+impl TimerIrq for MockTimerIrq {
     fn ack_timer(&self) {
         self.inner.lock().ack_calls += 1;
     }
@@ -469,7 +470,7 @@ mod mock_tests {
 
     #[test]
     fn mock_irq_records_ack_and_inject() {
-        let irq = MockIrqSource::new();
+        let irq = MockTimerIrq::new();
         assert_eq!(irq.ack_count(), 0);
         assert_eq!(irq.pending_timers(), 0);
 
@@ -491,7 +492,7 @@ mod mock_tests {
     #[test]
     fn end_to_end_advance_inject_observe_wakeup() {
         let clock = MockClock::new(0);
-        let irq = MockIrqSource::new();
+        let irq = MockTimerIrq::new();
 
         // A task arms a wakeup three ticks out.
         let task_id: TaskId = 42;
