@@ -259,6 +259,7 @@ fn mount_rw_on(
 // ---------------------------------------------------------------------------
 
 const SB_BYTE_OFFSET: usize = 1024;
+const SB_OFF_INODES_COUNT: usize = 0;
 const BGDT_BYTE_OFFSET_1K: usize = 2048;
 const BGD_OFF_INODE_BITMAP: usize = 4;
 const BGD_OFF_INODE_TABLE: usize = 8;
@@ -268,6 +269,21 @@ const INODE_OFF_LINKS_COUNT: usize = 26;
 const INODE_OFF_I_BLOCK: usize = 40;
 const BLOCK_SIZE_BYTES: usize = 1024;
 const EXT2_ROOT_INO: u32 = 2;
+
+/// Returns true iff `ino` is in `[1, s_inodes_count]` for `image`.
+/// CodeRabbit #702: replay images are intentionally torn, so a dirent
+/// can carry a garbage `inode` that would index past the end of the
+/// inode table or bitmap if we trusted it. Every helper that reads
+/// per-ino bytes goes through this gate so a corrupt record can't
+/// cause the harness itself to panic or read unrelated bytes as
+/// inode-table data.
+fn inode_in_range(image: &[u8], ino: u32) -> bool {
+    if ino == 0 {
+        return false;
+    }
+    let max = u32_le(image, SB_BYTE_OFFSET + SB_OFF_INODES_COUNT);
+    ino <= max
+}
 
 fn u16_le(bytes: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap())
@@ -289,6 +305,11 @@ fn inode_bitmap_block(image: &[u8]) -> usize {
 
 fn read_inode_bitmap_bit(image: &[u8], ino: u32) -> bool {
     // ext2 inode numbers start at 1; bitmap bit (ino-1) tracks slot ino.
+    // Out-of-range ino (a torn dirent's garbage inode field) is
+    // treated as "free" — there is no corresponding bitmap bit.
+    if !inode_in_range(image, ino) {
+        return false;
+    }
     let bm = inode_bitmap_block(image) * BLOCK_SIZE_BYTES;
     let idx = (ino - 1) as usize;
     let byte = image[bm + idx / 8];
@@ -296,16 +317,25 @@ fn read_inode_bitmap_bit(image: &[u8], ino: u32) -> bool {
 }
 
 fn read_inode_mode(image: &[u8], ino: u32) -> u16 {
+    if !inode_in_range(image, ino) {
+        return 0;
+    }
     let slot = inode_slot_offset(image, ino);
     u16_le(image, slot + INODE_OFF_MODE)
 }
 
 fn read_inode_links_count(image: &[u8], ino: u32) -> u16 {
+    if !inode_in_range(image, ino) {
+        return 0;
+    }
     let slot = inode_slot_offset(image, ino);
     u16_le(image, slot + INODE_OFF_LINKS_COUNT)
 }
 
 fn read_inode_i_block0(image: &[u8], ino: u32) -> u32 {
+    if !inode_in_range(image, ino) {
+        return 0;
+    }
     let slot = inode_slot_offset(image, ino);
     u32_le(image, slot + INODE_OFF_I_BLOCK)
 }
@@ -346,6 +376,14 @@ fn walk_dir_block(block: &[u8]) -> Vec<(Vec<u8>, u32)> {
         let rec_len = u16_le(block, cursor + 4) as usize;
         let name_len = block[cursor + 6] as usize;
         if rec_len < EXT2_DIR_REC_HEADER_LEN || rec_len % 4 != 0 || cursor + rec_len > block.len() {
+            break;
+        }
+        // name_len must fit inside the record's name slot. A torn
+        // write can leave a record whose name_len byte is garbage
+        // larger than `rec_len - header`; trusting it would let us
+        // copy bytes from the next record (or past the block) into
+        // the returned name.
+        if name_len > rec_len - EXT2_DIR_REC_HEADER_LEN {
             break;
         }
         if cursor + EXT2_DIR_REC_HEADER_LEN + name_len > block.len() {
@@ -395,6 +433,13 @@ fn walk_tree(image: &[u8]) -> (Vec<(u32, Vec<u8>, u32)>, Vec<u32>) {
         }
         let block = &image[block_start..block_start + BLOCK_SIZE_BYTES];
         for (name, child_ino) in walk_dir_block(block) {
+            // Skip dirents whose `inode` field is out-of-range —
+            // a torn write can leave garbage in the inode slot, and
+            // we'd rather drop the edge than chase it into unrelated
+            // bytes of the image.
+            if !inode_in_range(image, child_ino) {
+                continue;
+            }
             if name == b"." || name == b".." {
                 // Self / parent backref — recorded as an edge for the
                 // links_count accounting (each subdir's `..` is a real
