@@ -50,13 +50,25 @@ impl SplitMix64 {
 }
 
 fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
+    // Accept both `--flag=value` (used by `cargo xtask fuzz ext2`) and
+    // `--flag value` (the form documented in the binary's usage line —
+    // out-of-band invocations fall back to this).
     let prefix = format!("{flag}=");
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
         if let Some(rest) = a.strip_prefix(&prefix) {
             if let Ok(v) = rest.parse::<T>() {
                 return Some(v);
             }
+        } else if a == flag {
+            if let Some(next) = args.get(i + 1) {
+                if let Ok(v) = next.parse::<T>() {
+                    return Some(v);
+                }
+            }
         }
+        i += 1;
     }
     None
 }
