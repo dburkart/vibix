@@ -35,7 +35,9 @@ use x86_64::instructions::port::Port;
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, PassthroughLdisc, Tty};
+use crate::tty::ntty::{KernelSignalDispatch, NTtyLdisc, SignalDispatch};
+#[cfg(target_os = "none")]
+use crate::tty::{LineDiscipline, Tty};
 #[cfg(target_os = "none")]
 use spin::Lazy;
 
@@ -78,9 +80,10 @@ impl TtyDriver for SerialDriver {
 
 #[cfg(target_os = "none")]
 static SERIAL_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
+    let dispatch: Arc<dyn SignalDispatch> = Arc::new(KernelSignalDispatch);
     Arc::new(Tty::with_driver(
         Arc::new(SerialDriver),
-        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+        Arc::new(NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
     ))
 });
 

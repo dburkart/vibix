@@ -347,6 +347,10 @@ name = "ntty_sigint_flush"
 harness = false
 
 [[test]]
+name = "ntty_ldisc_wiring"
+harness = false
+
+[[test]]
 name = "gdbstub_loop"
 harness = false
 

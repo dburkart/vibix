@@ -27,7 +27,9 @@ use crate::tty::TtyDriver;
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, PassthroughLdisc, Tty};
+use crate::tty::ntty::{KernelSignalDispatch, NTtyLdisc, SignalDispatch};
+#[cfg(target_os = "none")]
+use crate::tty::{LineDiscipline, Tty};
 #[cfg(target_os = "none")]
 use alloc::sync::Arc;
 #[cfg(target_os = "none")]
@@ -55,9 +57,10 @@ impl TtyDriver for Ps2Driver {
 
 #[cfg(target_os = "none")]
 static PS2_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
+    let dispatch: Arc<dyn SignalDispatch> = Arc::new(KernelSignalDispatch);
     Arc::new(Tty::with_driver(
         Arc::new(Ps2Driver),
-        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+        Arc::new(NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
     ))
 });
 
