@@ -1,0 +1,10 @@
+[package]
+name = "userspace_shell_pipeline"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "userspace_shell_pipeline"
+path = "src/main.rs"

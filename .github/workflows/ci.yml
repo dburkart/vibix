@@ -275,6 +275,46 @@ jobs:
           path: target/debugcon.log
           if-no-files-found: ignore
 
+  # Issue #462: end-to-end shell-pipeline integration test. Boots the
+  # `userspace_shell_pipeline` binary as PID 1 and asserts the
+  # `SHELL_PIPELINE_OK: 4` marker on serial. Exercises pipe2 + fork +
+  # dup2 + close + read/write + wait4 against RFC 0003.
+  shell-pipeline:
+    name: shell-pipeline integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo + limine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/limine
+          key: ${{ runner.os }}-cargo-shell-pipeline-${{ hashFiles('**/Cargo.lock', 'xtask/src/main.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-shell-pipeline-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo xtask shell-pipeline
+        run: cargo xtask shell-pipeline
+
   # RFC 0004 Workstream G P2 (#582): run the vendored pjdfstest harness
   # (#580 + #581) and fail if the emitted
   # `target/pjdfstest-results.json` diverges from the committed baseline
