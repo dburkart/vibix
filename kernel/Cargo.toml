@@ -418,6 +418,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_malformed_dir"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "ext2_ialloc"
 harness = false
 required-features = ["ext2"]
