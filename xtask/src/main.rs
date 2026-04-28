@@ -236,13 +236,21 @@ fn main() -> R<()> {
             // `--release` regardless of `--release` on the CLI: this
             // subcommand's whole purpose is to verify the release
             // build, and a debug-build pass would silently
-            // misrepresent the answer.
+            // misrepresent the answer. We also pin every diagnostic
+            // feature off (`fault-test`, `panic-test`, `bench`,
+            // `fork-trace`) — those toggles are for hand-driven
+            // debugging only and would have the gate validating a
+            // non-production variant. A caller passing them gets a
+            // hard error rather than silent acceptance.
+            if opts.fault_test || opts.panic_test || opts.bench || opts.fork_trace {
+                return Err("nm-check: --fault-test / --panic-test / --bench / --fork-trace are incompatible with the production-build guard; rerun with no diagnostic features".into());
+            }
             let release_opts = BuildOpts {
                 release: true,
-                fault_test: opts.fault_test,
-                panic_test: opts.panic_test,
-                bench: opts.bench,
-                fork_trace: opts.fork_trace,
+                fault_test: false,
+                panic_test: false,
+                bench: false,
+                fork_trace: false,
             };
             let kernel = build(&release_opts)?;
             nm_check_no_mocks(&kernel)?;
@@ -689,7 +697,8 @@ fn nm_check_no_mocks(kernel: &Path) -> R<()> {
             eprintln!("  {line}");
         }
         eprintln!(
-            "RFC 0005 Phase 1 (#669): release kernels must not contain MockClock/MockIrqSource."
+            "RFC 0005 Phase 1 (#669): release kernels must not contain sched-mock symbols ({}).",
+            NM_CHECK_FORBIDDEN.join(", "),
         );
         eprintln!(
             "If you intentionally enabled `sched-mock` for a non-release pipeline, run nm-check against a default-features build."
@@ -697,8 +706,9 @@ fn nm_check_no_mocks(kernel: &Path) -> R<()> {
         return Err("nm-check: forbidden sched-mock symbol present in release ELF".into());
     }
     println!(
-        "→ nm-check: no MockClock/MockIrqSource symbols in {}",
-        kernel.display()
+        "→ nm-check: no sched-mock symbols ({}) in {}",
+        NM_CHECK_FORBIDDEN.join(", "),
+        kernel.display(),
     );
     Ok(())
 }
