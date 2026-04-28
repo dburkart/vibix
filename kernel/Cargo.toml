@@ -49,6 +49,14 @@ bench = []
 # never ship it. Enable with `cargo xtask run --features fork-trace` (or
 # `--features fork-trace` on any xtask subcommand).
 fork-trace = []
+# RFC 0005 Phase 1 wave 3 (#668). Enables `MockClock` /
+# `MockIrqSource` in `task::env` for deterministic scheduler tests and
+# the future host-side simulator (Phase 2). Off by default; the
+# nm-check guard (#669) statically verifies the symbols don't appear
+# in a release-built kernel ELF — keep this strictly opt-in so that
+# guard stays meaningful. No `target_os` exception: the mocks must be
+# unreachable on a real boot, not just "not normally built".
+sched-mock = []
 # Workstream A ↔ B gate (RFC 0004). On by default as of #550 — every
 # VFS syscall entry now reads the caller's per-task credential
 # snapshot via `crate::task::current_credentials()` (no more
