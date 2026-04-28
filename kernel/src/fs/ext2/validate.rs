@@ -275,22 +275,26 @@ pub(crate) fn count_clear_bits(bitmap: &[u8], bit_limit: u32) -> u32 {
 /// `1..first_ino`) whose bit in `inode_bitmap_block` is *clear* —
 /// i.e. the bitmap claims it's free, which is a corruption.
 ///
-/// Returns `None` if every reserved bit is set (the healthy case) or
-/// if `first_ino <= 1` (no reserved range, which a mount-path geometry
-/// check should already have rejected).
+/// Returns `None` if every reserved bit is set (the healthy case).
+///
+/// `EXT2_ROOT_INO` (= 2) is **always** validated, even if a malformed
+/// rev-1 image sets `s_first_ino` to `0`, `1`, or `2` — losing the root
+/// inode is a corruption regardless of what the superblock claims about
+/// the reserved range.
 fn first_clear_reserved_ino(
     cache: &BlockCache,
     device_id: DeviceId,
     inode_bitmap_block: u64,
     first_ino: u32,
 ) -> Option<u32> {
-    if first_ino <= 1 {
-        return None;
-    }
     let bh = cache.bread(device_id, inode_bitmap_block).ok()?;
     let data = bh.data.read();
     // Inos are 1-based; bit `i` in the bitmap corresponds to ino `i+1`.
-    let bits_to_check = (first_ino - 1) as usize;
+    // Validate `1..s_first_ino` plus `EXT2_ROOT_INO` (= 2) unconditionally,
+    // so a malformed superblock that lies about `s_first_ino` can't smuggle
+    // a cleared root-inode bit past us.
+    let bits_to_check =
+        core::cmp::max(first_ino.saturating_sub(1), super::disk::EXT2_ROOT_INO) as usize;
     for bit in 0..bits_to_check {
         let byte = bit / 8;
         let mask = 1u8 << (bit % 8);
@@ -374,9 +378,12 @@ mod tests {
     fn count_clear_bits_respects_limit() {
         // Whole byte is clear, but limit only covers the low 3 bits.
         assert_eq!(count_clear_bits(&[0x00], 3), 3);
-        // Limit straddles a byte boundary: low byte is 0xff, high byte
-        // bit 0 is clear (rest don't matter past limit=9).
-        assert_eq!(count_clear_bits(&[0xff, 0xfe], 9), 0);
+        // Limit straddles a byte boundary. Low byte is 0xff (no clear
+        // bits). High byte 0xfe = 0b1111_1110 — LSB-first, so bit 0 is
+        // clear and bits 1..=7 are set. With limit=9 we examine bits
+        // 0..=8 (i.e. all of byte 0 plus bit 0 of byte 1) → 1 clear
+        // bit. With limit=10 we add bit 1 of byte 1 (set), so still 1.
+        assert_eq!(count_clear_bits(&[0xff, 0xfe], 9), 1);
         assert_eq!(count_clear_bits(&[0xff, 0xfe], 10), 1);
     }
 
