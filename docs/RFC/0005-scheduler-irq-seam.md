@@ -582,8 +582,8 @@ in a half-migrated state.
       Phase-2 simulator work depends on the name (per OS-engineer
       advisory A1). Mechanical rename, one PR, deferred to last so the
       earlier PRs don't churn it twice.
-- [ ] Document the seam in `docs/design/scheduler-seam.md` (one-page;
-      links here) including: trait shape, IRQ-context contract,
+- [x] Document the seam in [`docs/design/scheduler-seam.md`](../design/scheduler-seam.md)
+      (one-page; links here) including: trait shape, IRQ-context contract,
       init-order contract, equivalence property, the
       "add-a-method-only-when-a-second-impl-needs-it" discipline, and
       the LTS-equivalence flag for Phase 2.
