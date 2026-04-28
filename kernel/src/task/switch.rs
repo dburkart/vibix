@@ -40,11 +40,16 @@ unsafe extern "C" {
     pub fn task_entry_trampoline();
 
     /// First-entry trampoline for a fork child. Called by `context_switch`
-    /// when the child task is first scheduled. Callee-saved registers are
-    /// primed by `Task::new_forked` with the user-space context:
-    ///   r12 = user RIP  (→ rcx for SYSRETQ)
-    ///   rbp = user RSP  (→ rsp before SYSRETQ)
-    ///   rbx = user RFLAGS (→ r11 for SYSRETQ)
+    /// when the child task is first scheduled.
+    ///
+    /// Stack layout primed by `Task::new_forked` (see
+    /// `crate::fork_abi::prime_fork_child_stack`): on entry the
+    /// `context_switch` `ret` has already loaded the SysV callee-saved
+    /// registers (`rbx`, `rbp`, `r12`–`r15`) directly from the prime
+    /// frame, so they already hold the parent's user values. The
+    /// remaining 9 user GPRs (rip, rflags, rsp, rdi/rsi/rdx/r10/r8/r9)
+    /// sit at `[rsp]..[rsp+0x40]` and this trampoline pops/reads them
+    /// before issuing SYSRETQ.
     ///
     /// Returns to ring-3 with rax=0 so the child sees 0 from fork().
     pub fn fork_child_sysret();
@@ -120,11 +125,21 @@ fork_child_sysret:
     pop rdi
     pop rdx
     pop rax
-    // Standard fork-child SYSRETQ tail:
-    mov rcx, r12
-    mov r11, rbx
-    xor eax, eax
-    mov rsp, rbp
+    // Standard fork-child SYSRETQ tail (#690): pop the 9 user GPRs
+    // primed below the context_switch frame, then SYSRETQ. rbx/rbp/r12-r15
+    // already hold their user values from the context_switch pop sequence.
+    pop rcx              // user RIP   → rcx
+    pop r11              // user RFLAGS → r11
+    // rsp now points at user_rsp slot. Load arg regs via [rsp+N] before
+    // we abandon the kernel stack with `pop rsp`.
+    mov rdi, [rsp + 8]   // user rdi
+    mov rsi, [rsp + 16]  // user rsi
+    mov rdx, [rsp + 24]  // user rdx
+    mov r10, [rsp + 32]  // user r10
+    mov r8,  [rsp + 40]  // user r8
+    mov r9,  [rsp + 48]  // user r9
+    pop rsp              // user RSP   (last, switches to user stack)
+    xor eax, eax         // child fork() return value
     sysretq
 "#
 );
@@ -175,23 +190,42 @@ fork_child_sysret:
     // Called as the first instruction of a fork child after context_switch
     // loads its primed kernel stack.
     //
-    // Register state set by Task::new_forked priming:
-    //   r12 = user RIP   → loaded into rcx for SYSRETQ
-    //   rbp = user RSP   → loaded into rsp before SYSRETQ
-    //   rbx = user RFLAGS → loaded into r11 for SYSRETQ
+    // On entry, context_switch's pop sequence has already loaded the
+    // SysV callee-saved registers (rbx, rbp, r12-r15) directly with
+    // their final user values from the prime frame. The remaining 9
+    // user GPRs are stacked below us at [rsp]..[rsp+0x40] in this order:
+    //
+    //   [rsp+0x00] user RIP    → rcx (SYSRETQ jumps to rcx)
+    //   [rsp+0x08] user RFLAGS → r11 (SYSRETQ restores RFLAGS from r11)
+    //   [rsp+0x10] user RSP    → rsp (popped last to keep kernel stack
+    //                                  reachable while we load the rest)
+    //   [rsp+0x18] user rdi
+    //   [rsp+0x20] user rsi
+    //   [rsp+0x28] user rdx
+    //   [rsp+0x30] user r10
+    //   [rsp+0x38] user r8
+    //   [rsp+0x40] user r9
     //
     // SYSRETQ: rcx → RIP, r11 → RFLAGS, CS/SS switched to ring-3 selectors.
     //
-    // Do NOT sti here: rbx already holds the parent's saved RFLAGS which
+    // Do NOT sti here: r11 will hold the parent's saved RFLAGS which
     // includes IF=1 (user mode runs with interrupts enabled). SYSRETQ
     // restores RFLAGS from r11, so IF is re-enabled atomically when the CPU
     // transitions to ring-3. An explicit sti before the RSP switch would
     // allow an IRQ to fire with a kernel-mode CS but a user-mode RSP,
     // corrupting the user stack.
-    mov rcx, r12      // user RIP
-    mov r11, rbx      // user RFLAGS (IF=1 → interrupts re-enabled by SYSRETQ)
-    xor eax, eax      // return 0 — fork() child path
-    mov rsp, rbp      // restore user RSP (switch stack before SYSRETQ)
+    pop rcx              // user RIP
+    pop r11              // user RFLAGS (IF=1 → re-enabled by SYSRETQ)
+    // rsp now at user_rsp slot; load remaining args via [rsp+N] before
+    // pop rsp abandons the kernel stack.
+    mov rdi, [rsp + 8]
+    mov rsi, [rsp + 16]
+    mov rdx, [rsp + 24]
+    mov r10, [rsp + 32]
+    mov r8,  [rsp + 40]
+    mov r9,  [rsp + 48]
+    pop rsp              // user RSP — switches to user stack
+    xor eax, eax         // child fork() return value
     sysretq
 "#
 );

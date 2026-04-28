@@ -114,21 +114,22 @@ pub fn spawn_and_get_id(entry: fn() -> !) -> usize {
 /// allocate a new kernel stack, push the child onto the ready queue, and
 /// return the child's task ID.
 ///
-/// `user_rip`, `user_rflags`, `user_rsp` are the ring-3 register state
-/// saved by the SYSCALL entry before invoking `syscall_dispatch`.
+/// `regs` carries the ring-3 register state saved by the SYSCALL entry
+/// before invoking `syscall_dispatch` — full GPR set so the child sees
+/// the same callee-saved (rbx/rbp/r12-r15) and syscall-arg
+/// (rdi/rsi/rdx/r10/r8/r9) registers as the parent at the SYSRETQ point
+/// (#690).
 pub fn fork_current_task(
-    user_rip: u64,
-    user_rflags: u64,
-    user_rsp: u64,
+    regs: &crate::fork_abi::ForkUserRegs,
 ) -> Result<usize, crate::mem::addrspace::ForkError> {
     use alloc::sync::Arc;
     use spin::{Mutex, RwLock};
 
     crate::fork_trace!(
         "fork-trace: [fork_current_task enter] user_rip={:#x} user_rflags={:#x} user_rsp={:#x}",
-        user_rip,
-        user_rflags,
-        user_rsp
+        regs.user_rip,
+        regs.user_rflags,
+        regs.user_rsp
     );
 
     // Snapshot everything needed from the current task while holding
@@ -213,9 +214,7 @@ pub fn fork_current_task(
     crate::fork_trace!("fork-trace: [fork_current_task] → Task::new_forked()");
     let child = unsafe {
         Task::new_forked(
-            user_rip,
-            user_rflags,
-            user_rsp,
+            regs,
             parent_priority,
             parent_affinity,
             parent_fpu_ptr,

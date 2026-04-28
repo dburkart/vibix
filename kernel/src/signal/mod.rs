@@ -545,7 +545,23 @@ fn deliver_fault_terminate(sig: u8) -> ! {
 ///   `[rsp+56]`  = user RIP   (rcx at entry)
 ///   `[rsp+64]`  = user RFLAGS (r11 at entry)
 ///   `[rsp+72]`  = user RSP
+///   `[rsp+80]`  = saved user `rbx`  (callee-saved, #690)
+///   `[rsp+88]`  = saved user `rbp`  (callee-saved, #690)
+///   `[rsp+96]`  = saved user `r12`  (callee-saved, #690)
+///   `[rsp+104]` = saved user `r13`  (callee-saved, #690)
+///   `[rsp+112]` = saved user `r14`  (callee-saved, #690)
+///   `[rsp+120]` = saved user `r15`  (callee-saved, #690)
+///
+/// The six callee-saved slots (`rbx`, `rbp`, `r12`–`r15`) were added in
+/// #690 so the FORK syscall can publish the parent's full SysV
+/// callee-saved set into the forked child's user register state.
+/// Without these slots, `fork_child_sysret` only restored `rcx/r11/rsp`
+/// before SYSRETQ and the child resumed ring-3 with whatever the kernel
+/// happened to leave in `rbx/rbp/r12-r15` — silently corrupting any
+/// userspace local the compiler was holding in a callee-saved register
+/// across `sys_fork()`.
 #[repr(C)]
+#[derive(Default)]
 pub struct SyscallReturnContext {
     pub user_rax: u64,
     pub user_rdi: u64,
@@ -557,6 +573,12 @@ pub struct SyscallReturnContext {
     pub user_rip: u64,
     pub user_rflags: u64,
     pub user_rsp: u64,
+    pub user_rbx: u64,
+    pub user_rbp: u64,
+    pub user_r12: u64,
+    pub user_r13: u64,
+    pub user_r14: u64,
+    pub user_r15: u64,
 }
 
 /// Length of the `SYSCALL` opcode (0x0F 0x05) in bytes. Rewinding

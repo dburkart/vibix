@@ -638,10 +638,26 @@ pub unsafe extern "C" fn syscall_dispatch(
             // own SyscallReturnContext on the kernel stack. Per-task by
             // construction: no cross-task races vs. the old FORK_USER_*
             // globals (issue #504).
-            let user_rip = (*ctx).user_rip;
-            let user_rflags = (*ctx).user_rflags;
-            let user_rsp = (*ctx).user_rsp;
-
+            //
+            // The full GPR set (including SysV callee-saved rbx/rbp/r12-r15)
+            // is published into the child via ForkUserRegs — see #690.
+            let regs = crate::fork_abi::ForkUserRegs {
+                user_rip: (*ctx).user_rip,
+                user_rflags: (*ctx).user_rflags,
+                user_rsp: (*ctx).user_rsp,
+                user_rdi: (*ctx).user_rdi,
+                user_rsi: (*ctx).user_rsi,
+                user_rdx: (*ctx).user_rdx,
+                user_r10: (*ctx).user_r10,
+                user_r8: (*ctx).user_r8,
+                user_r9: (*ctx).user_r9,
+                user_rbx: (*ctx).user_rbx,
+                user_rbp: (*ctx).user_rbp,
+                user_r12: (*ctx).user_r12,
+                user_r13: (*ctx).user_r13,
+                user_r14: (*ctx).user_r14,
+                user_r15: (*ctx).user_r15,
+            };
             // #502 probe: dump the current RFLAGS at fork-dispatch entry.
             // Expected: IF (bit 9) = 0, masked by MSR_FMASK's IF bit on
             // SYSCALL entry. If IF is ever observed = 1 here, FMASK
@@ -654,9 +670,9 @@ pub unsafe extern "C" fn syscall_dispatch(
                     "fork-trace: [syscall:FORK enter] parent_task={} user_rip={:#x} \
                      user_rflags={:#x} user_rsp={:#x} kernel_rflags={:#x} IF={}",
                     crate::task::current_id(),
-                    user_rip,
-                    user_rflags,
-                    user_rsp,
+                    regs.user_rip,
+                    regs.user_rflags,
+                    regs.user_rsp,
                     rflags_now,
                     (rflags_now >> 9) & 1,
                 );
@@ -673,22 +689,21 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
 
             crate::fork_trace!("fork-trace: [syscall:FORK] → fork_current_task()");
-            let child_task_id =
-                match crate::task::fork_current_task(user_rip, user_rflags, user_rsp) {
-                    Ok(id) => {
-                        crate::fork_trace!(
-                            "fork-trace: [syscall:FORK] ← fork_current_task() child_task_id={}",
-                            id
-                        );
+            let child_task_id = match crate::task::fork_current_task(&regs) {
+                Ok(id) => {
+                    crate::fork_trace!(
+                        "fork-trace: [syscall:FORK] ← fork_current_task() child_task_id={}",
                         id
-                    }
-                    Err(_) => {
-                        crate::fork_trace!(
-                            "fork-trace: [syscall:FORK] ← fork_current_task() ERR=ENOMEM"
-                        );
-                        return -12; // ENOMEM
-                    }
-                };
+                    );
+                    id
+                }
+                Err(_) => {
+                    crate::fork_trace!(
+                        "fork-trace: [syscall:FORK] ← fork_current_task() ERR=ENOMEM"
+                    );
+                    return -12; // ENOMEM
+                }
+            };
             crate::fork_trace!(
                 "fork-trace: [syscall:FORK] → process::register(task_id={}, parent_pid={})",
                 child_task_id,
@@ -1552,6 +1567,24 @@ syscall_entry:
     // 3. Save return-to-user context on the kernel stack (high→low
     //    address so the struct at rsp is laid out as in
     //    `SyscallReturnContext`).
+    //
+    //    Callee-saved set first (highest addresses of the struct): #690
+    //    requires we publish the parent's full SysV callee-saved GPRs
+    //    through to the fork child. Saving them here (rather than only
+    //    in the FORK arm) keeps SyscallReturnContext a uniform snapshot
+    //    of "what user registers were live at SYSCALL entry" — useful
+    //    for any future syscall that needs to mint a thread/coroutine
+    //    starting from the caller's full register file (e.g. clone()).
+    //    Cost is 6 extra pushes per syscall on the hottest path; SysV
+    //    treats these as caller-preserved at function-call boundaries
+    //    so dispatch's C code already neither reads nor depends on
+    //    their preserved values across the call into syscall_dispatch.
+    push r15
+    push r14
+    push r13
+    push r12
+    push rbp
+    push rbx
     push [rip + {syscall_scratch_rsp}]  // user RSP (stashed above)
     push r11                             // user RFLAGS (SYSRETQ restores from r11)
     push rcx                             // user RIP    (SYSRETQ jumps to rcx)
@@ -1563,6 +1596,8 @@ syscall_entry:
     //       [rsp+0]=rax [+8]=rdi [+16]=rsi [+24]=rdx
     //       [+32]=r10 [+40]=r8 [+48]=r9
     //       [+56]=user_rip [+64]=user_rflags [+72]=user_rsp
+    //       [+80]=user_rbx [+88]=user_rbp
+    //       [+96]=user_r12 [+104]=user_r13 [+112]=user_r14 [+120]=user_r15
     //     These slots are adjacent to the rip/rflags/rsp frame above so a
     //     single pointer (rsp) addresses the whole `SyscallReturnContext`.
     //     The FORK and SIGRETURN handlers read/write their own saved
@@ -1594,8 +1629,8 @@ syscall_entry:
     //      a5:  r9        → [rsp+8] (arg7)   — spilled before clobber
     //
     //    SysV requires rsp to be 16-byte aligned immediately before the
-    //    CALL instruction. The 3+7 preceding pushes leave rsp at
-    //    (top-80) — already 0 mod 16. Reserving two 8-byte slots for
+    //    CALL instruction. The 6+3+7 preceding pushes leave rsp at
+    //    (top-128) — already 0 mod 16. Reserving two 8-byte slots for
     //    arg6 and arg7 keeps rsp 0 mod 16 when the CALL executes.
     //
     //    ctx-pointer capture: the SyscallReturnContext is at the *current*
@@ -1626,8 +1661,8 @@ syscall_entry:
     //     rewritten) return value in rax, which becomes the value
     //     SYSRETQ delivers.
     //
-    //     Stack is at top-80 (3+7 = 10 pushes), already 0 mod 16 — no
-    //     extra alignment is needed for this CALL.
+    //     Stack is at top-128 (6+3+7 = 16 pushes), already 0 mod 16 —
+    //     no extra alignment is needed for this CALL.
     mov rdi, rsp        // ctx → arg0
     mov rsi, rax        // rv → arg1
     call check_and_deliver_signals
@@ -1658,6 +1693,16 @@ syscall_entry:
 3:
     pop rcx           // user RIP  → rcx  (for SYSRETQ)
     pop r11           // user RFLAGS → r11 (for SYSRETQ)
+    // rsp now points at the user_rsp slot. The 6 callee-saved slots
+    // (rbx, rbp, r12-r15) sit immediately above it. Load them via mov
+    // rather than pop so we can defer abandoning the kernel stack
+    // until the very last instruction before SYSRETQ.
+    mov rbx, [rsp + 8]   // user rbx
+    mov rbp, [rsp + 16]  // user rbp
+    mov r12, [rsp + 24]  // user r12
+    mov r13, [rsp + 32]  // user r13
+    mov r14, [rsp + 40]  // user r14
+    mov r15, [rsp + 48]  // user r15
     pop rsp           // user RSP  → rsp  (return to user stack)
 
     // 7. Return to ring-3.

@@ -305,6 +305,7 @@ fn sigreturn_dispatch_writes_ctx_and_asserts_restart() {
         user_rip: SENTINEL,
         user_rflags: SENTINEL,
         user_rsp: new_rsp,
+        ..SyscallReturnContext::default()
     };
 
     SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
@@ -401,6 +402,7 @@ fn sigreturn_dispatch_leaves_ctx_alone_when_not_restart() {
         user_rip: 0,
         user_rflags: 0,
         user_rsp: new_rsp,
+        ..SyscallReturnContext::default()
     };
 
     SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
