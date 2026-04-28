@@ -1,0 +1,58 @@
+[package]
+name = "vibix-ext2-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Host-side fuzz harness for the vibix ext2 driver (#677)."
+
+# `kernel/fuzz` is excluded from the parent workspace (see top-level
+# `Cargo.toml`). Declaring an empty `[workspace]` here makes this a
+# standalone workspace so cargo-fuzz tooling and a plain `cargo build`
+# both work without dragging the parent workspace's `-Z build-std` flags
+# or `x86_64-unknown-none` target into the host build.
+[workspace]
+
+[lib]
+name = "vibix_ext2_fuzz"
+path = "src/lib.rs"
+
+# Smoke-level corpus runner. Drives `fuzz_one` over the seed corpus plus
+# a bounded set of byte-flip mutations. This is what `cargo xtask fuzz
+# ext2` invokes — it does NOT need cargo-fuzz / libfuzzer installed, so
+# CI can run it on every PR.
+[[bin]]
+name = "ext2_fuzz_runner"
+path = "src/bin/ext2_fuzz_runner.rs"
+
+[dependencies]
+
+[features]
+# Enables the libFuzzer-style harness under `fuzz_targets/`. Off by
+# default so a plain `cargo build -p vibix-ext2-fuzz` does not try to
+# link against `libfuzzer-sys`. Long-form fuzzing locally:
+#   cd kernel/fuzz && cargo +nightly fuzz run ext2_mount
+default = []
+libfuzzer = ["dep:libfuzzer-sys"]
+# `dir.rs` has gated `mod block_backed` blocks keyed off `feature = "ext2"`
+# in the kernel crate. The fuzz crate re-includes that file via `#[path]`
+# but never enables this feature; declare it here only so the unused-cfg
+# check doesn't fire on every build.
+ext2 = []
+
+[dependencies.libfuzzer-sys]
+version = "0.4"
+optional = true
+
+# Each cargo-fuzz target is its own binary with its own `[[bin]]` entry,
+# gated on the `libfuzzer` feature.
+[[bin]]
+name = "ext2_mount"
+path = "fuzz_targets/ext2_mount.rs"
+required-features = ["libfuzzer"]
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

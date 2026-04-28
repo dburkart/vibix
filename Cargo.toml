@@ -11,7 +11,14 @@ members = [
 # is intentionally kept outside the workspace until #581 wires it into xtask —
 # its nightly target, dep versions, and unstable features must not leak into
 # the kernel build graph.
-exclude = ["tests/pjdfstest"]
+#
+# kernel/fuzz is the host-side fuzz harness for the ext2 driver (#677). It is
+# excluded from the main workspace because it builds for the host
+# (x86_64-unknown-linux-gnu) and depends on `vibix` with the non-default
+# `host-fuzz` feature; pulling it into the workspace would force the host
+# feature surface on the kernel-target build graph. `cargo xtask fuzz ext2`
+# drives it directly.
+exclude = ["tests/pjdfstest", "kernel/fuzz"]
 resolver = "2"
 
 [workspace.package]
