@@ -303,6 +303,10 @@ name = "shell_help"
 harness = false
 
 [[test]]
+name = "shell_files"
+harness = false
+
+[[test]]
 name = "syscall_mkfifo"
 harness = false
 

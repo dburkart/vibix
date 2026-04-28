@@ -12,6 +12,8 @@
 pub mod ansi;
 pub mod banner;
 pub mod line_editor;
+#[cfg(target_os = "none")]
+pub mod vfs_helpers;
 
 #[cfg(target_os = "none")]
 mod kernel_side {
@@ -190,12 +192,39 @@ mod kernel_side {
     /// a host-side unit test.
     const BUILTINS: &[Builtin] = &[
         Builtin {
+            name: "cat",
+            run: cmd_cat,
+            help: BuiltinHelp {
+                summary: "concatenate file contents to stdout",
+                usage: "cat <path>...",
+                examples: &["cat /etc/motd", "cat /dev/zero"],
+            },
+        },
+        Builtin {
+            name: "cd",
+            run: cmd_cd,
+            help: BuiltinHelp {
+                summary: "change the shell's working directory",
+                usage: "cd <path>",
+                examples: &["cd /tmp", "cd ..", "cd /"],
+            },
+        },
+        Builtin {
             name: "clear",
             run: cmd_clear_wrap,
             help: BuiltinHelp {
                 summary: "clear the screen (VT100)",
                 usage: "clear",
                 examples: &["clear"],
+            },
+        },
+        Builtin {
+            name: "cp",
+            run: cmd_cp,
+            help: BuiltinHelp {
+                summary: "copy a file (naive read-loop, no flags)",
+                usage: "cp <src> <dst>",
+                examples: &["cp /etc/motd /tmp/motd.bak"],
             },
         },
         Builtin {
@@ -214,6 +243,33 @@ mod kernel_side {
                 summary: "echo the rest of the line",
                 usage: "echo <args...>",
                 examples: &["echo hello world"],
+            },
+        },
+        Builtin {
+            name: "ls",
+            run: cmd_ls,
+            help: BuiltinHelp {
+                summary: "list directory entries (one per line)",
+                usage: "ls [path]",
+                examples: &["ls", "ls /dev"],
+            },
+        },
+        Builtin {
+            name: "mkdir",
+            run: cmd_mkdir,
+            help: BuiltinHelp {
+                summary: "create a directory (single-level only, no -p)",
+                usage: "mkdir <path>",
+                examples: &["mkdir /tmp/work"],
+            },
+        },
+        Builtin {
+            name: "mv",
+            run: cmd_mv,
+            help: BuiltinHelp {
+                summary: "rename or move a file (rename, falls back to link+unlink)",
+                usage: "mv <src> <dst>",
+                examples: &["mv /tmp/a /tmp/b"],
             },
         },
         Builtin {
@@ -253,6 +309,42 @@ mod kernel_side {
             },
         },
         Builtin {
+            name: "pwd",
+            run: cmd_pwd,
+            help: BuiltinHelp {
+                summary: "print the shell's working directory",
+                usage: "pwd",
+                examples: &["pwd"],
+            },
+        },
+        Builtin {
+            name: "rm",
+            run: cmd_rm,
+            help: BuiltinHelp {
+                summary: "remove a file (no -r in v1)",
+                usage: "rm <path>",
+                examples: &["rm /tmp/a"],
+            },
+        },
+        Builtin {
+            name: "rmdir",
+            run: cmd_rmdir,
+            help: BuiltinHelp {
+                summary: "remove an empty directory",
+                usage: "rmdir <path>",
+                examples: &["rmdir /tmp/work"],
+            },
+        },
+        Builtin {
+            name: "stat",
+            run: cmd_stat,
+            help: BuiltinHelp {
+                summary: "print stat(2) fields for a path",
+                usage: "stat <path>",
+                examples: &["stat /dev", "stat /tmp"],
+            },
+        },
+        Builtin {
             name: "tasks",
             run: cmd_tasks_wrap,
             help: BuiltinHelp {
@@ -268,6 +360,15 @@ mod kernel_side {
                 summary: "seconds since boot, ms precision",
                 usage: "time",
                 examples: &["time"],
+            },
+        },
+        Builtin {
+            name: "touch",
+            run: cmd_touch,
+            help: BuiltinHelp {
+                summary: "create an empty file if missing (no mtime update)",
+                usage: "touch <path>",
+                examples: &["touch /tmp/marker"],
             },
         },
         Builtin {
@@ -597,6 +698,420 @@ mod kernel_side {
                 t.nice,
             );
         });
+    }
+
+    // -- file-touching builtins (#395) ----------------------------------
+    //
+    // These builtins call straight into the in-kernel VFS via the
+    // `vfs_helpers` module. Errors come back as small negative `i64`
+    // errnos; `errno_msg` renders the common ones into a printable
+    // string. Anything unrecognised is shown as the raw number so the
+    // user can still triage.
+
+    use super::vfs_helpers;
+    use crate::fs::vfs::InodeKind;
+    use crate::fs::{
+        EACCES, EBUSY, EEXIST, EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+        EPERM, EROFS, EXDEV,
+    };
+
+    fn errno_msg(e: i64) -> alloc::string::String {
+        use alloc::format;
+        use alloc::string::ToString;
+        let s: &'static str = match e {
+            ENOENT => "no such file or directory",
+            ENOTDIR => "not a directory",
+            EISDIR => "is a directory",
+            EEXIST => "file exists",
+            EPERM => "operation not permitted",
+            EACCES => "permission denied",
+            EBUSY => "device or resource busy",
+            EINVAL => "invalid argument",
+            ENAMETOOLONG => "file name too long",
+            ENOTEMPTY => "directory not empty",
+            ENOSPC => "no space left on device",
+            EROFS => "read-only filesystem",
+            EXDEV => "cross-device link",
+            // Unknown / unmapped errno: keep the raw number visible so a
+            // VFS code path that returns something we don't have a string
+            // for is still debuggable.
+            _ => return format!("errno {}", e),
+        };
+        s.to_string()
+    }
+
+    /// Trim leading whitespace and split off the first whitespace-delimited
+    /// token. Returns `(token, rest_unparsed)`.
+    fn first_arg(args: &str) -> (&str, &str) {
+        let trimmed = args.trim_start();
+        match trimmed.find(char::is_whitespace) {
+            Some(i) => (&trimmed[..i], trimmed[i..].trim_start()),
+            None => (trimmed, ""),
+        }
+    }
+
+    fn cmd_pwd(args: &str) {
+        if !args.trim().is_empty() {
+            serial_println!("pwd: too many arguments");
+            return;
+        }
+        let cwd_dentry = task::current_cwd();
+        let path = match cwd_dentry {
+            Some(d) => vfs_helpers::dentry_path(&d),
+            None => alloc::string::String::from("/"),
+        };
+        serial_println!("{}", path);
+    }
+
+    fn cmd_cd(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("cd: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("cd: too many arguments");
+            return;
+        }
+        // Lexically normalize the input so `..` always means "drop the
+        // last component" — the kernel's `path_walk::step_dotdot` only
+        // crosses one mount edge per `..` and stops at the parent FS's
+        // mountpoint dentry without taking its parent, which would make
+        // `cd ..` from `/tmp` land back at `/tmp`. Resolving against an
+        // absolute, lexically-normalized path side-steps that.
+        let normalized = normalize_cd_path(path);
+        match vfs_helpers::resolve(normalized.as_bytes(), /* follow */ true) {
+            Ok(r) => {
+                if r.inode.kind != InodeKind::Dir {
+                    serial_println!("cd: {}: not a directory", path);
+                    return;
+                }
+                task::set_current_cwd(r.dentry.clone());
+            }
+            Err(e) => serial_println!("cd: {}: {}", path, errno_msg(e)),
+        }
+    }
+
+    /// Lexically resolve `path` to an absolute, normalized form using the
+    /// shell's CWD as the relative anchor. Strips `.` segments and pops
+    /// `..` segments at the string level. Always returns a path beginning
+    /// with `/`. Empty result collapses to `/`.
+    fn normalize_cd_path(path: &str) -> alloc::string::String {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        let mut buf: String = if path.starts_with('/') {
+            String::from(path)
+        } else {
+            let cwd_str = match task::current_cwd() {
+                Some(d) => vfs_helpers::dentry_path(&d),
+                None => String::from("/"),
+            };
+            let mut s = cwd_str;
+            if !s.ends_with('/') {
+                s.push('/');
+            }
+            s.push_str(path);
+            s
+        };
+        // Split, normalize, rejoin. Collect owned strings so we can
+        // safely clear and rebuild `buf`.
+        let mut stack: Vec<String> = Vec::new();
+        for comp in buf.split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    let _ = stack.pop();
+                }
+                other => stack.push(String::from(other)),
+            }
+        }
+        buf.clear();
+        if stack.is_empty() {
+            buf.push('/');
+        } else {
+            for c in &stack {
+                buf.push('/');
+                buf.push_str(c);
+            }
+        }
+        buf
+    }
+
+    fn cmd_ls(args: &str) {
+        let trimmed = args.trim();
+        let path: &str = if trimmed.is_empty() { "." } else { trimmed };
+        let r = match vfs_helpers::resolve(path.as_bytes(), /* follow */ true) {
+            Ok(r) => r,
+            Err(e) => {
+                serial_println!("ls: {}: {}", path, errno_msg(e));
+                return;
+            }
+        };
+        if r.inode.kind != InodeKind::Dir {
+            // For a non-dir path, `ls` of a single file just prints the
+            // basename — same as GNU coreutils minus the formatting.
+            serial_println!("{}", path);
+            return;
+        }
+        let mut had_err: Option<i64> = None;
+        let result = vfs_helpers::for_each_dirent(&r.inode, &r.dentry, |name, _kind| {
+            // Skip "." / ".." for a flag-free v1 to match GNU `ls`
+            // default behaviour.
+            if name == b"." || name == b".." {
+                return true;
+            }
+            match core::str::from_utf8(name) {
+                Ok(s) => serial_println!("{}", s),
+                Err(_) => serial_println!("?<non-utf8>"),
+            }
+            true
+        });
+        if let Err(e) = result {
+            had_err = Some(e);
+        }
+        if let Some(e) = had_err {
+            serial_println!("ls: {}: {}", path, errno_msg(e));
+        }
+    }
+
+    fn cmd_cat(args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            serial_println!("cat: missing path argument");
+            return;
+        }
+        for tok in trimmed.split_whitespace() {
+            // Defensively cap at 64 KiB per `cat` invocation. The shell
+            // task runs in kernel context and a runaway read against
+            // /dev/zero would otherwise OOM the kernel heap.
+            const CAT_LIMIT: usize = 64 * 1024;
+            let r = match vfs_helpers::resolve(tok.as_bytes(), /* follow */ true) {
+                Ok(r) => r,
+                Err(e) => {
+                    serial_println!("cat: {}: {}", tok, errno_msg(e));
+                    continue;
+                }
+            };
+            if r.inode.kind == InodeKind::Dir {
+                serial_println!("cat: {}: {}", tok, errno_msg(EISDIR));
+                continue;
+            }
+            let of = match vfs_helpers::open_inode(&r.inode, &r.dentry) {
+                Ok(of) => of,
+                Err(e) => {
+                    serial_println!("cat: {}: {}", tok, errno_msg(e));
+                    continue;
+                }
+            };
+            let mut chunk = [0u8; 256];
+            let mut off: u64 = 0;
+            let mut total: usize = 0;
+            loop {
+                if total >= CAT_LIMIT {
+                    serial_println!("\ncat: {}: output truncated at {} bytes", tok, CAT_LIMIT);
+                    break;
+                }
+                let n = match r.inode.file_ops.read(&of, &mut chunk, off) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        serial_println!("\ncat: {}: {}", tok, errno_msg(e));
+                        break;
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                // Best-effort UTF-8 print; non-utf8 bytes get a `?`
+                // placeholder so the serial console doesn't choke.
+                match core::str::from_utf8(&chunk[..n]) {
+                    Ok(s) => serial_print!("{}", s),
+                    Err(_) => {
+                        for &b in &chunk[..n] {
+                            if b.is_ascii() && (b == b'\n' || !b.is_ascii_control()) {
+                                serial_print!("{}", b as char);
+                            } else {
+                                serial_print!("?");
+                            }
+                        }
+                    }
+                }
+                off += n as u64;
+                total += n;
+            }
+        }
+    }
+
+    fn cmd_mkdir(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("mkdir: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("mkdir: too many arguments");
+            return;
+        }
+        if let Err(e) = vfs_helpers::mkdir(path.as_bytes(), 0o755) {
+            serial_println!("mkdir: {}: {}", path, errno_msg(e));
+        }
+    }
+
+    fn cmd_rmdir(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("rmdir: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("rmdir: too many arguments");
+            return;
+        }
+        if let Err(e) = vfs_helpers::rmdir(path.as_bytes()) {
+            serial_println!("rmdir: {}: {}", path, errno_msg(e));
+        }
+    }
+
+    fn cmd_rm(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("rm: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("rm: too many arguments (no -r in v1)");
+            return;
+        }
+        if let Err(e) = vfs_helpers::unlink(path.as_bytes()) {
+            serial_println!("rm: {}: {}", path, errno_msg(e));
+        }
+    }
+
+    fn cmd_touch(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("touch: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("touch: too many arguments");
+            return;
+        }
+        // If the path resolves, touch is a no-op (no mtime bump in v1).
+        // Otherwise create an empty regular file.
+        match vfs_helpers::resolve(path.as_bytes(), /* follow */ true) {
+            Ok(_) => {}
+            Err(e) if e == ENOENT => {
+                if let Err(e2) = vfs_helpers::create_file(path.as_bytes(), 0o644) {
+                    serial_println!("touch: {}: {}", path, errno_msg(e2));
+                }
+            }
+            Err(e) => serial_println!("touch: {}: {}", path, errno_msg(e)),
+        }
+    }
+
+    fn cmd_mv(args: &str) {
+        let (src, rest) = first_arg(args);
+        let (dst, extra) = first_arg(rest);
+        if src.is_empty() || dst.is_empty() {
+            serial_println!("mv: usage: mv <src> <dst>");
+            return;
+        }
+        if !extra.is_empty() {
+            serial_println!("mv: too many arguments");
+            return;
+        }
+        // Try a real rename first. Most in-kernel filesystems implement
+        // `InodeOps::rename`; the default trait body returns EPERM, which
+        // we use as the signal to fall back to link+unlink. The fallback
+        // is best-effort and only valid for non-directory inputs.
+        match vfs_helpers::rename(src.as_bytes(), dst.as_bytes()) {
+            Ok(()) => return,
+            Err(e) if e == EPERM => {
+                // Fall through to link+unlink below.
+                serial_println!("mv: rename unsupported by FS, falling back to link+unlink");
+            }
+            Err(e) => {
+                serial_println!("mv: {} -> {}: {}", src, dst, errno_msg(e));
+                return;
+            }
+        }
+        if let Err(e) = vfs_helpers::link(src.as_bytes(), dst.as_bytes()) {
+            serial_println!("mv: link {} -> {}: {}", src, dst, errno_msg(e));
+            return;
+        }
+        if let Err(e) = vfs_helpers::unlink(src.as_bytes()) {
+            serial_println!("mv: unlink {}: {}", src, errno_msg(e));
+        }
+    }
+
+    fn cmd_cp(args: &str) {
+        let (src, rest) = first_arg(args);
+        let (dst, extra) = first_arg(rest);
+        if src.is_empty() || dst.is_empty() {
+            serial_println!("cp: usage: cp <src> <dst>");
+            return;
+        }
+        if !extra.is_empty() {
+            serial_println!("cp: too many arguments");
+            return;
+        }
+        // Stream the copy in fixed-size chunks rather than slurping
+        // the whole source into the kernel heap. The 64 MiB cap keeps
+        // pathological inputs (e.g. `cp /dev/zero ...`) from wedging
+        // the box; a real coreutils-style `cp` would just keep going,
+        // but this is a kernel-resident debug shell.
+        const CP_LIMIT: u64 = 64 * 1024 * 1024;
+        if let Err(e) = vfs_helpers::stream_copy(src.as_bytes(), dst.as_bytes(), CP_LIMIT) {
+            serial_println!("cp: {} -> {}: {}", src, dst, errno_msg(e));
+        }
+    }
+
+    fn cmd_stat(args: &str) {
+        let (path, rest) = first_arg(args);
+        if path.is_empty() {
+            serial_println!("stat: missing path argument");
+            return;
+        }
+        if !rest.is_empty() {
+            serial_println!("stat: too many arguments");
+            return;
+        }
+        let (st, kind) = match vfs_helpers::stat(path.as_bytes()) {
+            Ok(v) => v,
+            Err(e) => {
+                serial_println!("stat: {}: {}", path, errno_msg(e));
+                return;
+            }
+        };
+        let kind_str = match kind {
+            InodeKind::Reg => "regular file",
+            InodeKind::Dir => "directory",
+            InodeKind::Link => "symbolic link",
+            InodeKind::Chr => "character device",
+            InodeKind::Blk => "block device",
+            InodeKind::Fifo => "fifo",
+            InodeKind::Sock => "socket",
+        };
+        serial_println!("  File: {}", path);
+        serial_println!(
+            "  Size: {:<12} Blocks: {:<10} IO Block: {:<6} {}",
+            st.st_size,
+            st.st_blocks,
+            st.st_blksize,
+            kind_str,
+        );
+        serial_println!(
+            "Device: {:#x}      Inode: {:<10} Links: {}",
+            st.st_dev,
+            st.st_ino,
+            st.st_nlink,
+        );
+        serial_println!(
+            "Access: ({:04o})  Uid: {:<5}  Gid: {}",
+            st.st_mode & 0o7777,
+            st.st_uid,
+            st.st_gid,
+        );
     }
 }
 
