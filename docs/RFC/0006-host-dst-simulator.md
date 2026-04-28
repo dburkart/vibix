@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Host-Side Deterministic Simulator (DST Phase 2)
-status: Draft
+status: In Review
 created: 2026-04-27
 ---
 
