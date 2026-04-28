@@ -206,3 +206,323 @@ pub static HW_IRQ: HwIrq = HwIrq;
 pub fn env() -> (&'static dyn Clock, &'static dyn IrqSource) {
     (&HW_CLOCK, &HW_IRQ)
 }
+
+/// Debug-only invariant: the references returned by [`env`] are the
+/// production singletons.
+///
+/// Lives here in `env.rs` rather than in the caller because
+/// `core::ptr::eq` on `&dyn Trait` compares both the data pointer
+/// **and** the vtable pointer, and the vtable for a given trait/type
+/// pair is materialized per-codegen-unit. A check that compares
+/// `env()`'s output against `&HW_CLOCK` from a different module would
+/// see two distinct vtable pointers (same `data` pointer, different
+/// `vtable`) and spuriously fire — which is exactly what bit the
+/// `task::init` call site after `sched_core` was extracted into its
+/// own module (RFC 0005 wave 3, #668). Keeping both materialization
+/// sites inside the same compilation unit (this function) sidesteps
+/// the issue while preserving the runtime check.
+#[cfg(target_os = "none")]
+pub fn assert_production_env() -> bool {
+    let (clock, irq) = env();
+    let hw_clock: &dyn Clock = &HW_CLOCK;
+    let hw_irq: &dyn IrqSource = &HW_IRQ;
+    core::ptr::eq(clock, hw_clock) && core::ptr::eq(irq, hw_irq)
+}
+
+// ---------------------------------------------------------------------------
+// Mock impls (Phase 1 wave 3, issue #668).
+//
+// `MockClock` and `MockIrqSource` are non-production `Clock` /
+// `IrqSource` implementations used by host-side unit tests, future
+// in-kernel `sched-mock`-gated integration tests, and (eventually) the
+// Phase 2 host-side simulator. They are gated by the `sched-mock`
+// Cargo feature *only* (no `target_os` exception) so a release kernel
+// build cannot pull them in: the nm-check guard (#669) statically
+// verifies the symbols don't appear in the release ELF.
+//
+// Discipline: the mocks own *all* their state internally and never
+// touch `crate::time::WAKEUPS` or `crate::arch::*`. That isolation is
+// what makes `with_mock_env`-driven tests deterministic — a test
+// advancing `MockClock` cannot accidentally race with the production
+// PIT tick handler updating `time::TICKS`.
+// ---------------------------------------------------------------------------
+
+/// Mock `Clock` for deterministic scheduler tests and the future host-side
+/// simulator.
+///
+/// Time advances only on explicit [`MockClock::tick`] / [`MockClock::advance`]
+/// calls — never spontaneously. `enqueue_wakeup` records `(deadline, id)`
+/// pairs in an internal table; `drain_expired` drains everything with
+/// `deadline <= now`. The implementation is independent of
+/// `crate::time::WAKEUPS` so a test driving a `MockClock` cannot collide
+/// with the production PIT tick path.
+///
+/// Uses `spin::Mutex` rather than [`crate::sync::IrqLock`] because the
+/// mock is not reachable on a real boot — there is no ISR that could
+/// re-enter it. On the host there is no IRQ context at all; under a
+/// future in-kernel sim test, the mock is the only `Clock` installed and
+/// the production timer ISR is not arming preempt ticks against it.
+#[cfg(feature = "sched-mock")]
+pub struct MockClock {
+    inner: spin::Mutex<MockClockState>,
+}
+
+#[cfg(feature = "sched-mock")]
+struct MockClockState {
+    now: u64,
+    /// Pending wakeups keyed by deadline. Mirrors the
+    /// `time::WAKEUPS` shape exactly so callers see identical
+    /// drain-order semantics.
+    wakeups: alloc::collections::BTreeMap<u64, Vec<TaskId>>,
+}
+
+#[cfg(feature = "sched-mock")]
+impl MockClock {
+    /// Construct a `MockClock` whose initial tick count is `seed`. The
+    /// wakeup table starts empty.
+    ///
+    /// `seed` is exposed so tests (and future seeded-replay simulator
+    /// runs) can start from a non-zero tick — e.g. to exercise overflow
+    /// edges of `Tick::checked_add` without spinning the clock forward
+    /// for billions of ticks first.
+    pub const fn new(seed: u64) -> Self {
+        Self {
+            inner: spin::Mutex::new(MockClockState {
+                now: seed,
+                wakeups: alloc::collections::BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Advance the clock by exactly one tick. Convenience wrapper over
+    /// [`MockClock::advance`] for tests that step in single-tick
+    /// increments.
+    pub fn tick(&self) {
+        self.advance(1);
+    }
+
+    /// Advance the clock by `ticks`, saturating at `u64::MAX`. Does not
+    /// drain wakeups — callers do that explicitly via the [`Clock`] trait
+    /// so tests can observe the pre-drain and post-drain state separately.
+    pub fn advance(&self, ticks: u64) {
+        let mut g = self.inner.lock();
+        g.now = g.now.saturating_add(ticks);
+    }
+
+    /// Number of pending wakeup entries. Test introspection only.
+    pub fn pending_wakeups(&self) -> usize {
+        self.inner.lock().wakeups.values().map(|v| v.len()).sum()
+    }
+}
+
+#[cfg(feature = "sched-mock")]
+impl Clock for MockClock {
+    fn now(&self) -> Tick {
+        Tick(self.inner.lock().now)
+    }
+
+    fn drain_expired(&self, now: Tick) -> Vec<TaskId> {
+        let mut g = self.inner.lock();
+        let mut out = Vec::new();
+        // Split off keys > now; the remainder is everything <= now.
+        let keep = g.wakeups.split_off(&(now.0 + 1));
+        let expired = core::mem::replace(&mut g.wakeups, keep);
+        for (_deadline, ids) in expired {
+            out.extend(ids);
+        }
+        out
+    }
+
+    fn enqueue_wakeup(&self, deadline: Tick, id: TaskId) {
+        let mut g = self.inner.lock();
+        g.wakeups.entry(deadline.0).or_default().push(id);
+    }
+}
+
+/// Mock `IrqSource` for deterministic scheduler tests.
+///
+/// `ack_timer` is a no-op on the wire (there is no LAPIC / PIC behind
+/// the mock to acknowledge), but the call is recorded for assertions and
+/// a separate [`MockIrqSource::inject_timer`] entry point lets tests
+/// simulate a timer IRQ landing — for the v1 trait surface that just
+/// records an inject; future trait methods (post-Phase 2) may grow
+/// observable side effects.
+#[cfg(feature = "sched-mock")]
+pub struct MockIrqSource {
+    inner: spin::Mutex<MockIrqState>,
+}
+
+#[cfg(feature = "sched-mock")]
+#[derive(Default)]
+struct MockIrqState {
+    ack_calls: u64,
+    pending_timer_injects: u64,
+}
+
+#[cfg(feature = "sched-mock")]
+impl MockIrqSource {
+    /// Construct a fresh mock IRQ source with both counters at zero.
+    pub const fn new() -> Self {
+        Self {
+            inner: spin::Mutex::new(MockIrqState {
+                ack_calls: 0,
+                pending_timer_injects: 0,
+            }),
+        }
+    }
+
+    /// Inject a virtual timer IRQ. Increments the pending-inject counter
+    /// so tests can observe how many IRQs have been queued versus
+    /// acknowledged. The simulator (Phase 2) will use this to drive
+    /// preempt ticks at chosen simulated-time points.
+    pub fn inject_timer(&self) {
+        self.inner.lock().pending_timer_injects += 1;
+    }
+
+    /// Number of times [`IrqSource::ack_timer`] has been called.
+    pub fn ack_count(&self) -> u64 {
+        self.inner.lock().ack_calls
+    }
+
+    /// Number of timer IRQs injected by [`MockIrqSource::inject_timer`]
+    /// minus the number acknowledged. Should drop to zero after the
+    /// scheduler processes every injected tick.
+    pub fn pending_timers(&self) -> u64 {
+        let g = self.inner.lock();
+        g.pending_timer_injects.saturating_sub(g.ack_calls)
+    }
+}
+
+#[cfg(feature = "sched-mock")]
+impl Default for MockIrqSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "sched-mock")]
+impl IrqSource for MockIrqSource {
+    fn ack_timer(&self) {
+        self.inner.lock().ack_calls += 1;
+    }
+}
+
+#[cfg(all(test, feature = "sched-mock"))]
+mod mock_tests {
+    use super::*;
+
+    #[test]
+    fn mock_clock_advances_only_on_explicit_tick() {
+        let c = MockClock::new(0);
+        assert_eq!(c.now().raw(), 0);
+        c.tick();
+        assert_eq!(c.now().raw(), 1);
+        c.advance(9);
+        assert_eq!(c.now().raw(), 10);
+    }
+
+    #[test]
+    fn mock_clock_seed_is_honored() {
+        let c = MockClock::new(1_000);
+        assert_eq!(c.now().raw(), 1_000);
+    }
+
+    #[test]
+    fn mock_clock_advance_saturates() {
+        let c = MockClock::new(u64::MAX - 1);
+        c.advance(10);
+        assert_eq!(c.now().raw(), u64::MAX);
+    }
+
+    #[test]
+    fn drain_returns_only_expired_ids_in_deadline_order() {
+        let c = MockClock::new(0);
+        c.enqueue_wakeup(Tick(5), 100);
+        c.enqueue_wakeup(Tick(3), 200);
+        c.enqueue_wakeup(Tick(10), 300);
+
+        // now=4 → drains deadline 3 only.
+        let drained = c.drain_expired(Tick(4));
+        assert_eq!(drained, alloc::vec![200]);
+        assert_eq!(c.pending_wakeups(), 2);
+
+        // now=5 → drains deadline 5 only.
+        let drained = c.drain_expired(Tick(5));
+        assert_eq!(drained, alloc::vec![100]);
+
+        // now=20 → drains the rest.
+        let drained = c.drain_expired(Tick(20));
+        assert_eq!(drained, alloc::vec![300]);
+        assert_eq!(c.pending_wakeups(), 0);
+    }
+
+    #[test]
+    fn multiple_ids_share_a_deadline() {
+        let c = MockClock::new(0);
+        c.enqueue_wakeup(Tick(7), 1);
+        c.enqueue_wakeup(Tick(7), 2);
+        c.enqueue_wakeup(Tick(7), 3);
+        let mut drained = c.drain_expired(Tick(7));
+        drained.sort_unstable();
+        assert_eq!(drained, alloc::vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn mock_irq_records_ack_and_inject() {
+        let irq = MockIrqSource::new();
+        assert_eq!(irq.ack_count(), 0);
+        assert_eq!(irq.pending_timers(), 0);
+
+        irq.inject_timer();
+        irq.inject_timer();
+        assert_eq!(irq.pending_timers(), 2);
+
+        irq.ack_timer();
+        assert_eq!(irq.ack_count(), 1);
+        assert_eq!(irq.pending_timers(), 1);
+
+        irq.ack_timer();
+        assert_eq!(irq.pending_timers(), 0);
+    }
+
+    /// End-to-end: advance the clock, inject a timer IRQ, observe a
+    /// wakeup. This is the proof-of-life flow the Phase 2 simulator and
+    /// future `with_mock_env`-driven scheduler tests will reuse.
+    #[test]
+    fn end_to_end_advance_inject_observe_wakeup() {
+        let clock = MockClock::new(0);
+        let irq = MockIrqSource::new();
+
+        // A task arms a wakeup three ticks out.
+        let task_id: TaskId = 42;
+        let now = clock.now();
+        let deadline = now.checked_add(3).expect("no overflow on small seed");
+        clock.enqueue_wakeup(deadline, task_id);
+        assert_eq!(clock.pending_wakeups(), 1);
+
+        // Two simulated timer ticks land — task is not yet due.
+        for _ in 0..2 {
+            irq.inject_timer();
+            clock.tick();
+            irq.ack_timer();
+            let drained = clock.drain_expired(clock.now());
+            assert!(
+                drained.is_empty(),
+                "task should not wake before deadline; drained={:?}",
+                drained
+            );
+        }
+        assert_eq!(irq.ack_count(), 2);
+        assert_eq!(irq.pending_timers(), 0);
+
+        // Third tick crosses the deadline → drain returns the task id.
+        irq.inject_timer();
+        clock.tick();
+        irq.ack_timer();
+        let drained = clock.drain_expired(clock.now());
+        assert_eq!(drained, alloc::vec![task_id]);
+        assert_eq!(clock.pending_wakeups(), 0);
+        assert_eq!(irq.ack_count(), 3);
+        assert_eq!(irq.pending_timers(), 0);
+    }
+}

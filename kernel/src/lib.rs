@@ -64,7 +64,15 @@ pub mod shell;
 pub mod signal;
 #[cfg(target_os = "none")]
 pub mod sync;
-#[cfg(target_os = "none")]
+// `pub mod task` is normally bare-metal-only — the scheduler core
+// touches `arch`, `sync`, and `x86_64` which are all `target_os =
+// "none"`. The exception is the `task::env` submodule (RFC 0005
+// scheduler / IRQ seam), whose trait definitions and `MockClock` /
+// `MockIrqSource` impls (gated behind `feature = "sched-mock"`) are
+// host-buildable so the seam has CI-runnable host unit tests. Hence
+// the wider gate here; the body of `task/mod.rs` stays gated to
+// `target_os = "none"` internally.
+#[cfg(any(target_os = "none", all(test, feature = "sched-mock")))]
 pub mod task;
 #[cfg(target_os = "none")]
 pub mod test_harness;
