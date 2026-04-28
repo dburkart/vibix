@@ -92,13 +92,20 @@ mod kernel_side {
     /// completion of an arrow escape, return the corresponding `Input`.
     /// Unrecognised finals and parameterised sequences with non-arrow
     /// finals drop silently.
+    ///
+    /// The modifier flags (per #336) are decoded but the line editor
+    /// doesn't yet have bindings for Ctrl/Shift/Alt + arrow, so the
+    /// initial routing keeps Up/Down → history regardless of modifier
+    /// state (preserving the #310 fix where Ctrl+Up didn't strand) and
+    /// drops Left/Right. Future PRs can add `Input` variants and route
+    /// modified arrows here without re-touching the state machine.
     fn serial_byte(b: u8, state: &mut ansi::State) -> Option<Input> {
         match ansi::step(state, b)? {
             Event::Byte(b) => byte_to_input(b),
-            Event::Csi(CsiFinal::Up) => Some(Input::HistoryPrev),
-            Event::Csi(CsiFinal::Down) => Some(Input::HistoryNext),
+            Event::Csi(CsiFinal::Up, _mods) => Some(Input::HistoryPrev),
+            Event::Csi(CsiFinal::Down, _mods) => Some(Input::HistoryNext),
             // Left/right and other finals: deferred per issue #112.
-            Event::Csi(_) => None,
+            Event::Csi(_, _) => None,
         }
     }
 
