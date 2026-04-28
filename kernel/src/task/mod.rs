@@ -32,6 +32,7 @@
 //! in [`crate::sync`] and are built on top of [`block_current`] and
 //! [`wake`] below.
 
+pub mod env;
 pub mod priority;
 mod scheduler;
 pub mod softirq;
