@@ -139,3 +139,70 @@ pub trait IrqSource: Sync {
     /// PIC EOI. Called from the timer ISR — must be IRQ-safe.
     fn ack_timer(&self);
 }
+
+// ---------------------------------------------------------------------------
+// Production adapters (Phase 1 wave 2, issue #666).
+//
+// Zero-sized wrappers over the existing `crate::time::*` and
+// `crate::arch::*` globals. Each method is a pure forwarding call so
+// the equivalence audit is mechanical: `HwClock::now()` is exactly
+// `crate::time::ticks()` boxed into a `Tick`, etc. No added
+// synchronization (no `Once`, `Mutex`, or atomic load) sits between a
+// caller and the underlying global — the `static` adapter values are
+// `'static` ZSTs and `env()` is a const-shaped function returning two
+// references.
+//
+// `HwIrq` and `env()` depend on `crate::arch::*` and so are gated to
+// `target_os = "none"` builds; the trait definitions above stay
+// host-buildable for the future `MockClock` / `MockIrqSource`
+// (issue #668).
+// ---------------------------------------------------------------------------
+
+/// Production `Clock` over the PIT tick counter and the
+/// `crate::time::WAKEUPS` deadline map.
+pub struct HwClock;
+
+impl Clock for HwClock {
+    fn now(&self) -> Tick {
+        Tick(crate::time::ticks())
+    }
+
+    fn drain_expired(&self, now: Tick) -> Vec<TaskId> {
+        crate::time::drain_expired(now.0)
+    }
+
+    fn enqueue_wakeup(&self, deadline: Tick, id: TaskId) {
+        crate::time::enqueue_wakeup(deadline.0, id);
+    }
+}
+
+/// Production `IrqSource` over the LAPIC end-of-interrupt path.
+#[cfg(target_os = "none")]
+pub struct HwIrq;
+
+#[cfg(target_os = "none")]
+impl IrqSource for HwIrq {
+    fn ack_timer(&self) {
+        crate::arch::x86_64::apic::lapic_eoi();
+    }
+}
+
+/// Singleton `HwClock` handed out by [`env`].
+pub static HW_CLOCK: HwClock = HwClock;
+
+/// Singleton `HwIrq` handed out by [`env`].
+#[cfg(target_os = "none")]
+pub static HW_IRQ: HwIrq = HwIrq;
+
+/// Production wire-up of the scheduler / IRQ seam.
+///
+/// Returns the singleton `Clock` + `IrqSource` pair that the scheduler
+/// and the timer ISR will route through once issue #667 migrates the
+/// callers. Body is intentionally a single tuple of two `&'static`
+/// references — no `Once`, no `Mutex`, no atomic load — so that the
+/// production path adds zero synchronization vs. the pre-seam direct
+/// calls (RFC 0005 Equivalence condition 2).
+#[cfg(target_os = "none")]
+pub fn env() -> (&'static dyn Clock, &'static dyn IrqSource) {
+    (&HW_CLOCK, &HW_IRQ)
+}
