@@ -1,7 +1,7 @@
 ---
 rfc: 0005
 title: Scheduler / IRQ Seam for Deterministic Simulation Testing
-status: Draft
+status: In Review
 created: 2026-04-27
 ---
 
