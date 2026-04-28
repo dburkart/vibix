@@ -43,7 +43,7 @@ pub mod bench;
 pub mod boot;
 pub mod boot_cmdline;
 pub mod fbview;
-#[cfg(target_os = "none")]
+#[cfg(any(test, target_os = "none"))]
 pub mod framebuffer;
 #[cfg(any(test, target_os = "none"))]
 pub mod hpet;
