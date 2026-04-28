@@ -252,11 +252,12 @@ fn openat_atfdcwd_absolute() {
 }
 
 fn openat_rejects_relative_without_atfdcwd() {
-    // dfd != AT_FDCWD and path is relative: no per-process cwd yet, so
-    // return EINVAL rather than silently treating dfd as ignored.
+    // dfd != AT_FDCWD with a relative path must consult the fd table
+    // (issue #588). When the dfd is not currently open, the resolver
+    // surfaces `EBADF` rather than silently treating the fd as ignored.
     let path = stage_path(b"relative/path");
     let r = unsafe { syscall_dispatch(core::ptr::null_mut(), SYS_OPENAT, 5u64, path, 0, 0, 0, 0) };
-    assert_eq!(r, EINVAL, "expected EINVAL, got {}", r);
+    assert_eq!(r, EBADF, "expected EBADF for closed dfd, got {}", r);
 }
 
 fn newfstatat_rejects_unknown_flag() {

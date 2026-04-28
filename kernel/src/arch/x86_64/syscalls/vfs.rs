@@ -161,6 +161,83 @@ fn resolve_inode_as(
     Ok((inode, nd))
 }
 
+/// Resolve a `*at` syscall's `dfd` argument to the directory dentry the
+/// walk should start from for relative paths.
+///
+/// Per POSIX `*at(2)`:
+/// - `AT_FDCWD` → the caller's per-process cwd is the walk root. We
+///   surface this as `Ok(None)` so callers can use their existing
+///   `current_cwd()` fallback (matches the behaviour of `resolve_inode`).
+/// - any other value → looked up in the current task's fd table. The
+///   referenced file must be a directory; non-directory backings return
+///   `-ENOTDIR`. Closed or out-of-range fds return `-EBADF`. Backends
+///   that don't expose a VFS dentry (e.g. `SerialBackend`) also yield
+///   `-ENOTDIR` because they have no directory inode to walk under.
+///
+/// The returned dentry is reference-counted (`Arc`), so it remains
+/// alive across the subsequent `path_walk` even if the fd is closed
+/// concurrently. Absolute paths ignore `dfd` entirely (per POSIX) — the
+/// helper is still safe to call on them, and callers that know the
+/// path is absolute may skip the call to save the fd-table round trip.
+fn resolve_dirfd(dfd: i32) -> Result<Option<Arc<Dentry>>, i64> {
+    if dfd == AT_FDCWD {
+        return Ok(None);
+    }
+    if dfd < 0 {
+        // Negative fds other than AT_FDCWD are never valid.
+        return Err(EBADF);
+    }
+    let fd = dfd as u32;
+    let tbl = crate::task::current_fd_table();
+    let backend = tbl.lock().get(fd).map_err(|_| EBADF)?;
+    let vfs = match backend.as_vfs() {
+        Some(v) => v,
+        // Non-VFS backends (e.g. SerialBackend before execve) don't
+        // refer to any directory in the namespace.
+        None => return Err(ENOTDIR),
+    };
+    if vfs.open_file.inode.kind != InodeKind::Dir {
+        return Err(ENOTDIR);
+    }
+    Ok(Some(vfs.open_file.dentry.clone()))
+}
+
+/// Like [`resolve_inode_as`] but seeds the path walk from `start` when
+/// the path is relative. `start = None` falls back to the caller's cwd
+/// (the `*at(AT_FDCWD)` and plain-path cases). Absolute paths reseat to
+/// the namespace root inside `path_walk` regardless of `start`.
+fn resolve_inode_at(
+    start: Option<Arc<Dentry>>,
+    path: &[u8],
+    follow: bool,
+    cred: Credential,
+) -> Result<(Arc<Inode>, NameIdata), i64> {
+    let root = vfs_root().ok_or(ENOENT)?;
+    let cwd = if path.first() == Some(&b'/') {
+        // Absolute path: cwd is irrelevant — `path_walk` reseats at
+        // root on the leading `/`. Pass root as the conventional
+        // sentinel.
+        root.clone()
+    } else if let Some(d) = start {
+        // Relative path with a real dirfd: walk from there.
+        d
+    } else {
+        // Relative path with AT_FDCWD (or plain non-`*at` syscall):
+        // walk from the caller's cwd.
+        crate::task::current_cwd().unwrap_or_else(|| root.clone())
+    };
+    let mut flags = LookupFlags::default();
+    if follow {
+        flags = flags | LookupFlags::FOLLOW;
+    } else {
+        flags = flags | LookupFlags::NOFOLLOW;
+    }
+    let mut nd = NameIdata::new(root, cwd, cred, flags)?;
+    path_walk(&mut nd, path, &GlobalMountResolver)?;
+    let inode = nd.path.inode.clone();
+    Ok((inode, nd))
+}
+
 /// Fill `out` from `inode.ops.getattr`, then copy out to user.
 fn stat_into_user(inode: &Arc<Inode>, user_statbuf: u64) -> i64 {
     if user_statbuf == 0 {
@@ -295,17 +372,20 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
         return r;
     }
 
-    // 3. `*at` preconditions. Non-AT_FDCWD dfd is out of scope for the
-    //    read-path subset; absolute paths ignore dfd entirely.
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    // 3. `*at` resolution. `AT_FDCWD` falls through to the caller's
+    //    cwd; a real dirfd seeds the walk from that directory. Absolute
+    //    paths ignore `dfd` per POSIX — `path_walk` reseats at root on
+    //    the leading `/` regardless of the start dentry.
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // 4. Walk. If O_CREAT is set and the leaf does not exist, try to
     //    create it in the parent directory, then re-walk.
     let follow = flags32 & oflags::O_NOFOLLOW == 0;
-    let (inode, nd) = match resolve_inode(path, follow) {
+    let cred = (*crate::task::current_credentials()).clone();
+    let (inode, nd) = match resolve_inode_at(start.clone(), path, follow, cred.clone()) {
         Ok(v) => {
             // File exists. With O_CREAT|O_EXCL this is an error.
             if flags32 & oflags::O_CREAT != 0 && flags32 & oflags::O_EXCL != 0 {
@@ -318,7 +398,12 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
+            let (parent_inode, _pnd) = match resolve_inode_at(
+                start.clone(),
+                parent_path,
+                /* follow */ true,
+                cred.clone(),
+            ) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -330,7 +415,7 @@ pub unsafe fn sys_openat_impl(dfd: i32, path_uva: u64, flags: u64, mode: u64) ->
                 return e;
             }
             // Re-resolve to pick up the freshly created dentry+inode.
-            match resolve_inode(path, follow) {
+            match resolve_inode_at(start.clone(), path, follow, cred.clone()) {
                 Ok(v) => v,
                 Err(e) => return e,
             }
@@ -579,13 +664,14 @@ pub unsafe fn sys_newfstatat_impl(dfd: i32, path_uva: u64, statbuf_uva: u64, fla
         return sys_fstat_impl(dfd as u64, statbuf_uva);
     }
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let (inode, _nd) = match resolve_inode(path, follow) {
+    let cred = (*crate::task::current_credentials()).clone();
+    let (inode, _nd) = match resolve_inode_at(start, path, follow, cred) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -740,10 +826,10 @@ fn mknod_impl(dfd: i32, path_uva: u64, mode: u32, _dev: u64) -> i64 {
     };
     let path = buf.as_slice();
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // mknod never names a directory — a trailing slash on the leaf is
     // invalid. split_parent strips it silently, so the check has to
@@ -752,9 +838,10 @@ fn mknod_impl(dfd: i32, path_uva: u64, mode: u32, _dev: u64) -> i64 {
         return ENOTDIR;
     }
 
+    let cred = (*crate::task::current_credentials()).clone();
     // Refuse if the target already exists. Matches Linux mknod semantics
     // (EEXIST on pre-existing path).
-    if resolve_inode(path, /* follow */ false).is_ok() {
+    if resolve_inode_at(start.clone(), path, /* follow */ false, cred.clone()).is_ok() {
         return EEXIST;
     }
 
@@ -762,10 +849,11 @@ fn mknod_impl(dfd: i32, path_uva: u64, mode: u32, _dev: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (parent_inode, _pnd) =
+        match resolve_inode_at(start, parent_path, /* follow */ true, cred) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if parent_inode.kind != InodeKind::Dir {
         return ENOTDIR;
     }
@@ -832,12 +920,11 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
     };
     let path = buf.as_slice();
 
-    // Per-process cwd / fd-rooted walks don't exist yet — accept only
-    // AT_FDCWD for relative paths (same precondition as openat/mknodat).
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    // `*at` resolution: AT_FDCWD → cwd, real fd → its dentry.
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // `split_parent` strips a trailing slash from the leaf. Directories
     // are the one kind of thing where a trailing slash on the path is
@@ -855,19 +942,21 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
         Err(e) => return e,
     };
 
+    let cred = (*crate::task::current_credentials()).clone();
     // Refuse if the target already exists. The pre-check races with a
     // concurrent creator, but the authoritative check is the FS driver's
     // own duplicate-insert path — RamFs returns EEXIST under the dir
     // rwsem (see `ramfs::InodeOps::mkdir`). The pre-walk just avoids
     // the more expensive permission-check + parent-resolution round-trip
     // when we already know the answer.
-    if resolve_inode(path, /* follow */ false).is_ok() {
+    if resolve_inode_at(start.clone(), path, /* follow */ false, cred.clone()).is_ok() {
         return EEXIST;
     }
-    let (parent_inode, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (parent_inode, _pnd) =
+        match resolve_inode_at(start, parent_path, /* follow */ true, cred.clone()) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if parent_inode.kind != InodeKind::Dir {
         return ENOTDIR;
     }
@@ -878,7 +967,6 @@ fn mkdir_impl(dfd: i32, path_uva: u64, mode: u32) -> i64 {
     // them. RFC 0004 Workstream B: caller's per-task credential snapshot
     // drives the check — root bypass falls out of `default_permission`
     // when `cred.euid == 0`.
-    let cred = (*crate::task::current_credentials()).clone();
     let access = Access::WRITE | Access::EXECUTE;
     if let Err(e) = parent_inode.ops.permission(&parent_inode, &cred, access) {
         return e;
@@ -1033,12 +1121,11 @@ fn unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
     };
     let path = buf.as_slice();
 
-    // `*at` preconditions mirror `openat`: non-AT_FDCWD dfd with a
-    // relative path is out of scope until per-fd cwd lands (#239).
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    // `*at` resolution: AT_FDCWD → cwd, real fd → its dentry.
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // Trailing-slash means the caller explicitly named a directory.
     // POSIX unlink(2) on a trailing-slash path returns EISDIR (or
@@ -1055,10 +1142,12 @@ fn unlinkat_impl(dfd: i32, path_uva: u64, flags: u32) -> i64 {
 
     // Resolve the parent (follow symlinks on every intermediate
     // component — standard POSIX behaviour).
-    let (parent_inode, pnd) = match resolve_inode(parent_path, /* follow */ true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let walk_cred = (*crate::task::current_credentials()).clone();
+    let (parent_inode, pnd) =
+        match resolve_inode_at(start, parent_path, /* follow */ true, walk_cred) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if parent_inode.kind != InodeKind::Dir {
         return ENOTDIR;
     }
@@ -1347,10 +1436,10 @@ fn chmodat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
     };
     let path = buf.as_slice();
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     let cred = crate::task::current_credentials();
     // chmod always resolves through a trailing symlink — the target
@@ -1358,7 +1447,7 @@ fn chmodat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
     // Linux returns EOPNOTSUPP; we accept-and-ignore it for simplicity
     // since the only sensible answer on an in-memory symlink is to
     // follow (there's nothing on a symlink inode to chmod).
-    let (inode, _nd) = match resolve_inode_as(path, /* follow */ true, (*cred).clone()) {
+    let (inode, _nd) = match resolve_inode_at(start, path, /* follow */ true, (*cred).clone()) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1401,14 +1490,14 @@ fn chownat_impl(dfd: i32, path_uva: u64, uid: u32, gid: u32, flags: u32) -> i64 
     };
     let path = buf.as_slice();
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     let cred = crate::task::current_credentials();
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let (inode, _nd) = match resolve_inode_as(path, follow, (*cred).clone()) {
+    let (inode, _nd) = match resolve_inode_at(start, path, follow, (*cred).clone()) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1540,12 +1629,10 @@ fn faccessat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
     };
     let path = buf.as_slice();
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        // Per-fd dfd resolution is tracked under #239; until then, only
-        // AT_FDCWD or absolute paths reach the inode.
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     let cur = crate::task::current_credentials();
     let use_effective = flags & AT_EACCESS != 0;
@@ -1560,7 +1647,7 @@ fn faccessat_impl(dfd: i32, path_uva: u64, mode: u32, flags: u32) -> i64 {
     // `default_permission` against link bits (typically 0o777) makes
     // the answer almost always "yes"; that mirrors Linux.
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let (inode, _nd) = match resolve_inode_as(path, follow, check_cred.clone()) {
+    let (inode, _nd) = match resolve_inode_at(start, path, follow, check_cred.clone()) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1991,12 +2078,12 @@ fn utimensat_impl(dfd: i32, path_uva: u64, times_uva: u64, flags: u32) -> i64 {
             Err(e) => return e,
         };
         let path = buf.as_slice();
-        let is_absolute = path.first() == Some(&b'/');
-        if dfd != AT_FDCWD && !is_absolute {
-            return EINVAL;
-        }
+        let start = match resolve_dirfd(dfd) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        let (i, _nd) = match resolve_inode_as(path, follow, (*cred).clone()) {
+        let (i, _nd) = match resolve_inode_at(start, path, follow, (*cred).clone()) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -2146,20 +2233,20 @@ fn linkat_impl(
     };
     let new_path = new_buf.as_slice();
 
-    // Per-process cwd / fd-rooted walks don't exist yet — accept only
-    // AT_FDCWD for relative paths. AT_EMPTY_PATH would need an fd-rooted
-    // walk, so reject with EINVAL until #239 lands.
+    // AT_EMPTY_PATH would need fd-as-source semantics that aren't wired
+    // here yet — reject with EINVAL until that path lands. Real dirfds
+    // for relative paths are now honoured via `resolve_dirfd`.
     if empty_path {
         return EINVAL;
     }
-    let old_abs = old_path.first() == Some(&b'/');
-    if old_dfd != AT_FDCWD && !old_abs {
-        return EINVAL;
-    }
-    let new_abs = new_path.first() == Some(&b'/');
-    if new_dfd != AT_FDCWD && !new_abs {
-        return EINVAL;
-    }
+    let old_start = match resolve_dirfd(old_dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let new_start = match resolve_dirfd(new_dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // Resolve the source. Hard-linking names the underlying inode, not
     // the link, so the default is NOT to follow a terminal symlink —
@@ -2169,8 +2256,14 @@ fn linkat_impl(
     // terminal symlink (correct for `O_NOFOLLOW`, wrong here), so we
     // walk with default flags when the caller asked for the default.
     // `AT_SYMLINK_FOLLOW` flips to POSIX-`link`-style following.
+    let walk_cred = (*crate::task::current_credentials()).clone();
     let src_inode = if follow_source {
-        match resolve_inode(old_path, /* follow */ true) {
+        match resolve_inode_at(
+            old_start.clone(),
+            old_path,
+            /* follow */ true,
+            walk_cred.clone(),
+        ) {
             Ok((i, _)) => i,
             Err(e) => return e,
         }
@@ -2185,12 +2278,13 @@ fn linkat_impl(
         };
         let cwd = if old_path.first() == Some(&b'/') {
             root.clone()
+        } else if let Some(d) = old_start.clone() {
+            d
         } else {
             crate::task::current_cwd().unwrap_or_else(|| root.clone())
         };
         let flags = LookupFlags::default();
-        let cred = (*crate::task::current_credentials()).clone();
-        let mut nd = match NameIdata::new(root, cwd, cred, flags) {
+        let mut nd = match NameIdata::new(root, cwd, walk_cred.clone(), flags) {
             Ok(n) => n,
             Err(e) => return e,
         };
@@ -2211,7 +2305,14 @@ fn linkat_impl(
     // and surfaces EEXIST on the losing side either way. Pre-checking
     // lets us skip the parent-resolve round-trip when the answer is
     // already known.
-    if resolve_inode(new_path, /* follow */ false).is_ok() {
+    if resolve_inode_at(
+        new_start.clone(),
+        new_path,
+        /* follow */ false,
+        walk_cred.clone(),
+    )
+    .is_ok()
+    {
         return EEXIST;
     }
 
@@ -2219,7 +2320,12 @@ fn linkat_impl(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (new_parent, _pnd) = match resolve_inode(new_parent_path, /* follow */ true) {
+    let (new_parent, _pnd) = match resolve_inode_at(
+        new_start,
+        new_parent_path,
+        /* follow */ true,
+        walk_cred.clone(),
+    ) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2309,12 +2415,20 @@ fn symlinkat_impl(target_uva: u64, new_dfd: i32, link_path_uva: u64) -> i64 {
     };
     let link_path = link_buf.as_slice();
 
-    let is_absolute = link_path.first() == Some(&b'/');
-    if new_dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(new_dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
-    if resolve_inode(link_path, /* follow */ false).is_ok() {
+    let walk_cred = (*crate::task::current_credentials()).clone();
+    if resolve_inode_at(
+        start.clone(),
+        link_path,
+        /* follow */ false,
+        walk_cred.clone(),
+    )
+    .is_ok()
+    {
         return EEXIST;
     }
 
@@ -2322,10 +2436,11 @@ fn symlinkat_impl(target_uva: u64, new_dfd: i32, link_path_uva: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (parent, _pnd) = match resolve_inode(parent_path, /* follow */ true) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (parent, _pnd) =
+        match resolve_inode_at(start, parent_path, /* follow */ true, walk_cred) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if parent.kind != InodeKind::Dir {
         return ENOTDIR;
     }
@@ -2394,10 +2509,10 @@ fn readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
     };
     let path = pbuf.as_slice();
 
-    let is_absolute = path.first() == Some(&b'/');
-    if dfd != AT_FDCWD && !is_absolute {
-        return EINVAL;
-    }
+    let start = match resolve_dirfd(dfd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
     // readlink(2) / readlinkat(2) operate on the symlink itself, so
     // the terminal component must NOT be followed. `resolve_inode`'s
@@ -2414,6 +2529,8 @@ fn readlinkat_impl(dfd: i32, path_uva: u64, buf_uva: u64, bufsize: u64) -> i64 {
     };
     let cwd = if path.first() == Some(&b'/') {
         root.clone()
+    } else if let Some(d) = start {
+        d
     } else {
         crate::task::current_cwd().unwrap_or_else(|| root.clone())
     };
