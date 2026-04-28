@@ -72,6 +72,25 @@ without going through real hardware.
 | S2.dev / Tokio test clock | Time advances on `sleep()` calls; clocks include a "schedule event for the future" method, not just `now()`. Validates `Clock::schedule_tick(deadline)` belongs in the trait. |
 | Polar Signals (state-machine DST) | A maximalist "everything is a state machine" approach has high cognitive overhead and slows engineers. Argues for *not* abstracting more than the harness needs. |
 | Hermit (Microsoft Research) | Time, RNG, scheduling, and syscalls are the four nondeterminism sources. Phase 1 covers time + scheduling; RNG and syscall-replay are deferred. |
+| Hyperkernel (Nelson et al., SOSP 2017) | Push-button verification of an OS kernel; the verified design factors time and IRQ exactly as proposed here so that the kernel can be symbolically executed without modeling hardware. The seam shape proposed here is a (probably-rediscovered) instance of their interface, which strengthens the claim that this factoring is a well-trodden primitive decomposition rather than an ad-hoc invention. |
+| Jitk (Wang et al., OSDI 2014) | Related discipline of separating policy from mechanism in kernel components — supports the "minimum surface, grow by demand" design rule below. |
+
+### Discipline (the rule we will enforce on later PRs)
+
+Polar Signals' DST writeup is a cautionary tale: their state-machine
+abstraction grew organically until it imposed real cognitive overhead on
+every contributor. To avoid the same failure mode, the rule is stated
+positively here so future PRs can be pushed back on with a citation:
+
+> **A `Clock` or `IrqSource` trait method is added only when a second
+> implementation actually needs it.** Speculative methods ("we'll
+> probably want this when…") are rejected. The first new method that
+> appears is the one the host-side simulator (Phase 2) needs first, and
+> that PR is where its semantics get debated.
+
+This mirrors loom's discipline (don't gate types you don't actually
+need to swap) and TigerBeetle's (the simulator surface is the
+*minimum* required to mock I/O, not a kitchen sink).
 
 ## Design
 
@@ -84,35 +103,91 @@ them to existing drivers via a single `static` per trait.
 ```rust
 // kernel/src/task/env.rs
 
-/// Monotonic tick count since boot. Opaque newtype so we can swap the
-/// underlying width or units without ABI churn.
+/// Typed task identifier — re-exported from `task::TaskId`. Used at the
+/// trait boundary instead of bare `usize` so a future generation-counted
+/// id refactor doesn't silently break `Clock` impls.
+pub use crate::task::TaskId;
+
+/// Monotonic tick count since boot. Opaque newtype with a private field;
+/// callers must use the methods on `Tick` rather than reaching into the
+/// `u64` directly. Field is `pub(crate)` so the production `HwClock`
+/// adapter can construct it without ceremony.
+///
+/// ## Unit invariant
+///
+/// `Tick` units must be uniform across all `Clock` impls within a single
+/// boot. Today every impl uses PIT ticks (10 ms). When the LAPIC-timer
+/// migration lands, every impl in that build switches together — there
+/// is no mixed-unit world. Violating this invariant breaks Liskov
+/// substitution and is a correctness bug, not a performance one.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub struct Tick(pub u64);
+pub struct Tick(pub(crate) u64);
+
+impl Tick {
+    pub fn checked_add(self, ticks: u64) -> Option<Self> {
+        self.0.checked_add(ticks).map(Tick)
+    }
+    pub fn saturating_add(self, ticks: u64) -> Self {
+        Tick(self.0.saturating_add(ticks))
+    }
+    pub fn raw(self) -> u64 { self.0 }
+}
 
 /// Source of monotonic time and one-shot future tick wakeups for the
 /// scheduler. The scheduler never reads a clock register or arms a timer
 /// directly — it goes through this trait.
+///
+/// ## IRQ-context contract
+///
+/// All three methods MUST be safe to call from both task context and
+/// interrupt context. Implementors that hold internal state across
+/// methods MUST mask IRQs while held (today: see `kernel/src/sync::IrqLock`,
+/// which `time::WAKEUPS` already uses). A non-IRQ-safe `Clock` impl is a
+/// soundness bug — `preempt_tick` will deadlock the first time the timer
+/// IRQ lands while a syscall holds the impl's internal lock.
+///
+/// ## Init-order contract
+///
+/// `Clock` impls MUST be safe to call any time after the global allocator
+/// is up — earlier than `task::init()`. Several boot-phase paths
+/// (TSC calibration, early `serial_println` timestamps) reach the clock
+/// before the scheduler exists. The production `HwClock` is zero-sized
+/// and trivially satisfies this; non-ZST impls (mocks, simulator) must
+/// either initialize lazily on first call or document their init-order
+/// requirement and have the boot sequence install them before that point.
 pub trait Clock: Sync {
-    /// Current monotonic tick count.
+    /// Current monotonic tick count. IRQ-safe.
     fn now(&self) -> Tick;
 
     /// Drain all wakeup ids whose deadline is `<= now`. The implementor
     /// owns the deadline structure (today: `time::WAKEUPS`); the
-    /// scheduler only consumes the drained ids.
-    fn drain_expired(&self, now: Tick) -> alloc::vec::Vec<usize>;
+    /// scheduler only consumes the drained ids. Called from the timer
+    /// ISR — must be IRQ-safe.
+    ///
+    /// Returns a `Vec<TaskId>` (allocation in IRQ-tail context). This
+    /// matches the existing `time::drain_expired` contract and is
+    /// preserved deliberately; replacing it with an iterator would
+    /// require pinning the lock across the iterator lifetime, which the
+    /// scheduler cannot promise. Any future change here is its own RFC.
+    fn drain_expired(&self, now: Tick) -> alloc::vec::Vec<TaskId>;
 
     /// Enqueue task `id` for a wakeup at `deadline`. Idempotent on
-    /// `(deadline, id)` pairs.
-    fn enqueue_wakeup(&self, deadline: Tick, id: usize);
+    /// `(deadline, id)` pairs. Called from task context (`sleep_ms`)
+    /// and potentially from IRQ context (future timeout-bearing
+    /// syscalls during signal-delivery wakeup) — must be IRQ-safe.
+    fn enqueue_wakeup(&self, deadline: Tick, id: TaskId);
 }
 
-/// Source of preemption interrupts for the scheduler. Only the
-/// per-tick-hot-path operations live here; one-shot IDT install,
-/// IOAPIC redirection, and IPI send are *not* part of this trait
-/// (see Alternatives Considered).
+/// Source of preemption-relevant interrupts for the scheduler. Scoped to
+/// the *scheduler's* view of IRQs only: device drivers continue to ack
+/// their own IRQs through `arch::*` directly. One-shot IDT install,
+/// IOAPIC redirection programming, and IPI send are *not* part of this
+/// trait (see Alternatives Considered). Despite the generic-sounding
+/// name, today this means a single method.
 pub trait IrqSource: Sync {
     /// Acknowledge the timer IRQ that drove the current `preempt_tick`
-    /// call. Today: LAPIC EOI write; on legacy PIC: PIC EOI.
+    /// call. Today: LAPIC EOI write; on legacy PIC: PIC EOI. Called
+    /// from the timer ISR — must be IRQ-safe.
     fn ack_timer(&self);
 }
 ```
@@ -205,14 +280,66 @@ pattern used by Linux's `clockevents_device` (struct of function pointers
 
 ### Test-time wiring
 
-In host (`cfg(not(target_os = "none"))`) and kernel-test
-(`cfg(test_harness)`) builds, `env()` resolves to a thread-local
-`OnceCell<(Box<dyn Clock>, Box<dyn IrqSource>)>` that tests install
-manually. A `MockClock` implementation (in `kernel/src/task/env.rs`
-behind `#[cfg(any(test, not(target_os = "none")))]`) advances on explicit
-`tick()` calls; `MockIrqSource::ack_timer` is a no-op. This alone improves
-in-kernel integration test isolation (today, several tests poke
-`time::TICKS` directly).
+In host (`cfg(test)`) and explicit `feature = "sched-mock"` builds,
+`env()` resolves to a thread-local `OnceCell<(Box<dyn Clock>, Box<dyn
+IrqSource>)>` that tests install manually. A `MockClock` implementation
+(in `kernel/src/task/env.rs`) is gated behind
+`#[cfg(any(test, feature = "sched-mock"))]` *only* — no `target_os`
+exception. The `sched-mock` feature is **not** enabled by the kernel
+target's default-features set, and `cargo xtask build --release` for
+the bare-metal target builds with default features only. CI gains a new
+step (added in roadmap item 6 below): after `cargo xtask build --release`
+produces the kernel ELF, run `nm` and fail the build if any symbol
+matching `MockClock|MockIrqSource` is present in the binary. This
+converts the "physically excluded from production" claim from an
+assertion into a verified invariant.
+
+`MockClock` advances on explicit `tick()` calls; `MockIrqSource::ack_timer`
+is a no-op. This alone improves in-kernel integration test isolation
+(today, several tests poke `time::TICKS` directly).
+
+### Equivalence (production wire-up correctness)
+
+The "no behavior change" claim is a property, not an assertion. Stated
+formally: *the composition `(HwClock, HwIrq)` routed through `env()`
+must be observationally equivalent to the pre-RFC direct calls into
+`time::*` and `arch::ack_timer_irq` for every externally visible
+sequence (test outputs, IRQ handler timing, scheduler decisions).*
+
+That property holds iff:
+
+1. **Pure forwarding.** Every `HwClock` / `HwIrq` method body is a
+   single call into the existing global, with no added state, no
+   transformation other than `Tick`/`u64` boxing, and no early return.
+   This is statically verifiable by reading the adapter source — the
+   adapters are < 20 lines.
+2. **No added synchronization.** The `env()` accessor returns
+   `&'static` references to two zero-sized statics; there is no lock,
+   no `Once::call_once`, no atomic load. A direct call and a routed
+   call execute the same machine instructions modulo one indirect
+   branch.
+3. **Identical IRQ-context safety.** `HwClock` inherits its
+   IRQ-context safety from the existing `time::*` functions (see
+   IRQ-context contract above). It cannot weaken the contract because
+   it does not own additional state.
+
+The implementing PR (roadmap item 3) MUST satisfy a verification
+checklist enforcing the above:
+
+- [ ] Adapter method bodies grep-checked to single-statement form.
+- [ ] `env()` body grep-checked to contain no `Once`, `Mutex`, atomic
+      load other than the `&'static` reference materialization.
+- [ ] The existing scheduler integration test suite (in
+      `kernel/tests/`) passes byte-identical output before and after
+      the migration commit (captured via QEMU serial log diff).
+
+This last item is the differential test the academic reviewer asked
+for: it is cheap (one CI run), strict (byte-identical diff), and
+catches any accidental behavior change in the `preempt_tick`
+sequencing. It is borrowed from Linux's `clocksource_verify_percpu`
+discipline (which catches clocksource impls that disagree with each
+other under load) — adapted here to compare the new code path against
+the old one rather than two co-existing impls.
 
 ### Key data structures
 
@@ -236,8 +363,16 @@ changes.
 
 ### Migration plan inside Phase 1
 
-The roadmap below breaks the seam into four landable PRs so the tree never
-goes red for more than one merge:
+The roadmap below breaks the seam into landable PRs so the tree never
+goes red for more than one merge. Note that the `time::*` audit and the
+`pub(crate)` tightening fold into the same PR as the call-site migration
+to avoid a half-migrated tree (see OS-engineer review B3): once
+`preempt_tick` and `sleep_ms` route through the seam, *all* in-tree
+callers of `time::ticks` / `time::drain_expired` / `time::enqueue_wakeup`
+must be migrated in the same PR (signal delivery in
+`kernel/src/signal/mod.rs` is the known straggler), and the `time::*`
+functions then drop to `pub(crate)` so a regressing PR cannot
+re-introduce a direct caller without a visibility error.
 
 1. **Add `task::env` module + traits, no call-site changes.** Compiles
    into the kernel, dead code. Reviewed in isolation — no behavior risk.
@@ -286,6 +421,15 @@ is a no-cost wrapper. Net memory delta: zero.
 Lock contention: unchanged. `time::WAKEUPS` is still the same `IrqLock<BTreeMap>`;
 the scheduler simply reaches it through `HwClock::drain_expired` /
 `HwClock::enqueue_wakeup` instead of directly.
+
+Simulator-time hot path: under DST the simulator will step the
+scheduler millions of ticks per simulated minute, so the indirect-call
+cost is paid per *simulated* tick rather than per wall-clock tick. That
+amortizes cleanly — a sim run pays for the indirection at native CPU
+speed, not at PIT speed. The `&dyn` choice does not regress simulator
+throughput compared to a generic-monomorphized simulator, because the
+sim's bottleneck is `BTreeMap` operations on the wakeup table, not the
+trait dispatch.
 
 SMP scalability: the trait objects are per-process `static`s today and
 will have to be re-thought for per-CPU state when SMP lands (see
@@ -375,29 +519,71 @@ before merge:
   `&'static dyn Clock` so the question doesn't arise. If host-side tests
   want to swap clocks per-test they'll need `OnceCell<Box<dyn Clock>>` —
   manageable but worth documenting before the first test does it.
+- **POSIX-time syscalls funnel through `Clock`.** The downstream POSIX
+  surface (`nanosleep`, `clock_nanosleep`, `pselect` / `ppoll` /
+  `epoll_wait` timeouts, `futex` with timeout, `sigtimedwait`,
+  `clock_gettime(CLOCK_MONOTONIC)`) MUST route through `Clock`, not
+  through a side-channel into `time::*`. This is the commitment that
+  makes "deterministic scheduler ⇒ deterministic userspace timing"
+  actually true under simulation. *Resolved here in writing; verified
+  per-syscall when each one lands.* `CLOCK_REALTIME` is intentionally
+  out of scope — wall-clock time (CMOS, eventual NTP) does not cross
+  the scheduler boundary, and userspace gets a non-deterministic
+  realtime clock under simulation by design.
+- **LTS equivalence for Phase 2.** The Phase-2 simulator will need the
+  scheduler's externally-observable behavior to be expressible as a
+  labeled transition system over `(Clock-event, IrqSource-event) →
+  state transition`. The seam shape here is *necessary* for this but
+  may not be *sufficient* — for instance, the softirq path
+  (`kernel/src/task/softirq.rs`) currently runs after IRQ ack but
+  before scheduler dispatch, and whether it appears as a labeled
+  transition in the Phase-2 LTS is undecided. *Flagged here so the
+  Phase-2 RFC can validate it before relying on the v1 trait surface.*
+- **Softirq processing relative to the seam.** Softirqs run in
+  IRQ-tail context after `ack_timer` but before `rotate_or_resched`.
+  Phase 1 leaves softirq dispatch direct (not through the trait), on
+  the grounds that softirqs are a kernel-internal scheduling
+  optimization rather than an externally-observable event. If
+  Phase 2 needs to model softirq ordering deterministically, the trait
+  may need a `post_ack_hook` — but that is exactly the kind of
+  speculative method the discipline above forbids adding now.
 
 ## Implementation Roadmap
 
 Independently-landable, dependency-ordered. Each item is reviewable on
-its own and CI-green at every step.
+its own and CI-green at every step. Steps 3 and 4 deliberately fold the
+call-site migration with the visibility tightening so the tree is never
+in a half-migrated state.
 
 - [ ] Add `kernel/src/task/env.rs` with `Tick`, `Clock`, `IrqSource` trait
-      definitions and doc comments. No call-site changes; module is dead
-      code at this point.
+      definitions, IRQ-context doc comments, and the `Tick` arithmetic
+      methods (`checked_add`, `saturating_add`, `raw`). No call-site
+      changes; module is dead code at this point.
 - [ ] Add `HwClock`, `HwIrq` zero-sized production adapters + `env()`
-      accessor in `kernel/src/task/mod.rs`. Still no callers.
-- [ ] Migrate `preempt_tick` and the IRQ-ack path in `kernel/src/task/`
-      to call through `env()`. Existing scheduler tests + fork/exec/wait
-      smoke must stay green.
-- [ ] Migrate `task::sleep_ms` and any other `time::enqueue_wakeup` /
-      `time::drain_expired` callers in `task/` to go through `env()`.
-- [ ] Tighten `time::ticks` / `time::drain_expired` /
-      `time::enqueue_wakeup` to `pub(crate)` (or stricter) so the only
-      caller is `HwClock`. Acts as a regression gate.
-- [ ] Add a `MockClock` + `MockIrqSource` in
-      `kernel/src/task/env.rs` behind `#[cfg(any(test, not(target_os =
-      "none")))]` and convert one existing in-kernel scheduler integration
-      test to use them as proof-of-life.
+      accessor in `kernel/src/task/mod.rs`. Still no callers. PR includes
+      a `debug_assert!` in `task::init()` that confirms `env()` returns
+      the production wire-up before the first scheduler dispatch.
+- [ ] Migrate every in-tree caller of `time::ticks` /
+      `time::drain_expired` / `time::enqueue_wakeup` to go through
+      `env()` *and* tighten those functions to `pub(crate)` in the same
+      PR. Known callers: `task::preempt_tick`, `task::sleep_ms`,
+      `signal::*` (audit needed). The differential test (capture QEMU
+      serial output before+after, assert byte-identical) lands in this
+      PR and runs in CI thereafter as the "Equivalence" gate.
+- [ ] Add a `MockClock` + `MockIrqSource` in `kernel/src/task/env.rs`
+      behind `#[cfg(any(test, feature = "sched-mock"))]` (no
+      `target_os` exception). Convert one existing in-kernel scheduler
+      integration test to use them as proof-of-life.
+- [ ] Add a CI step that runs `nm` over the release kernel ELF and
+      fails if any `MockClock` or `MockIrqSource` symbol is present.
+      This makes the "physically excluded from production" claim
+      enforced rather than asserted.
+- [ ] Rename `IrqSource` → `TimerIrq` (or `PreemptionIrq`) before any
+      Phase-2 simulator work depends on the name (per OS-engineer
+      advisory A1). Mechanical rename, one PR, deferred to last so the
+      earlier PRs don't churn it twice.
 - [ ] Document the seam in `docs/design/scheduler-seam.md` (one-page;
-      links here) so the SMP RFC and the future Phase-2 simulator RFC can
-      cite a stable target.
+      links here) including: trait shape, IRQ-context contract,
+      init-order contract, equivalence property, the
+      "add-a-method-only-when-a-second-impl-needs-it" discipline, and
+      the LTS-equivalence flag for Phase 2.
