@@ -715,8 +715,10 @@ mod kernel_side {
         EPERM, EROFS, EXDEV,
     };
 
-    fn errno_msg(e: i64) -> &'static str {
-        match e {
+    fn errno_msg(e: i64) -> alloc::string::String {
+        use alloc::format;
+        use alloc::string::ToString;
+        let s: &'static str = match e {
             ENOENT => "no such file or directory",
             ENOTDIR => "not a directory",
             EISDIR => "is a directory",
@@ -730,8 +732,12 @@ mod kernel_side {
             ENOSPC => "no space left on device",
             EROFS => "read-only filesystem",
             EXDEV => "cross-device link",
-            _ => "i/o error",
-        }
+            // Unknown / unmapped errno: keep the raw number visible so a
+            // VFS code path that returns something we don't have a string
+            // for is still debuggable.
+            _ => return format!("errno {}", e),
+        };
+        s.to_string()
     }
 
     /// Trim leading whitespace and split off the first whitespace-delimited
@@ -1049,15 +1055,14 @@ mod kernel_side {
             serial_println!("cp: too many arguments");
             return;
         }
-        let data = match vfs_helpers::read_all(src.as_bytes()) {
-            Ok(d) => d,
-            Err(e) => {
-                serial_println!("cp: {}: {}", src, errno_msg(e));
-                return;
-            }
-        };
-        if let Err(e) = vfs_helpers::write_all(dst.as_bytes(), &data) {
-            serial_println!("cp: {}: {}", dst, errno_msg(e));
+        // Stream the copy in fixed-size chunks rather than slurping
+        // the whole source into the kernel heap. The 64 MiB cap keeps
+        // pathological inputs (e.g. `cp /dev/zero ...`) from wedging
+        // the box; a real coreutils-style `cp` would just keep going,
+        // but this is a kernel-resident debug shell.
+        const CP_LIMIT: u64 = 64 * 1024 * 1024;
+        if let Err(e) = vfs_helpers::stream_copy(src.as_bytes(), dst.as_bytes(), CP_LIMIT) {
+            serial_println!("cp: {} -> {}: {}", src, dst, errno_msg(e));
         }
     }
 

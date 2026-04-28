@@ -186,15 +186,19 @@ fn cat_smokes() {
 fn ls_dev() {
     dispatch_for_test("cd /");
     // Just ensure ls /dev dispatches and the directory itself contains
-    // at least the canonical "." / ".." pair plus one device.
+    // at least one real device entry. Counting `.` / `..` would let
+    // an empty /dev pass — skip them so the assert actually means
+    // "devfs is mounted with content."
     dispatch_for_test("ls /dev");
     let r = vfs_helpers::resolve(b"/dev", true).expect("/dev resolves");
     let mut count = 0usize;
-    let _ = vfs_helpers::for_each_dirent(&r.inode, &r.dentry, |_name, _kind| {
-        count += 1;
+    let _ = vfs_helpers::for_each_dirent(&r.inode, &r.dentry, |name, _kind| {
+        if name != b"." && name != b".." {
+            count += 1;
+        }
         true
     });
-    assert!(count >= 2, "/dev should have at least . and ..");
+    assert!(count >= 1, "/dev should have at least one real entry");
 }
 
 fn cd_nonexistent_errors() {

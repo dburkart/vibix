@@ -216,6 +216,70 @@ pub fn link(target_path: &[u8], link_path: &[u8]) -> Result<(), i64> {
     parent_inode.ops.link(&parent_inode, &leaf, &target.inode)
 }
 
+/// Stream the contents of `src_path` to `dst_path` without ever
+/// holding the whole file in memory. Truncates / creates the
+/// destination, then reads `src` in fixed-size chunks and writes each
+/// chunk straight to `dst`. Caps the total bytes copied at
+/// `max_bytes` and returns `EFBIG` if the source exceeds that — this
+/// is the kernel-shell guardrail against `cp /dev/zero …` taking the
+/// box down.
+pub fn stream_copy(src_path: &[u8], dst_path: &[u8], max_bytes: u64) -> Result<u64, i64> {
+    let src = resolve(src_path, /* follow */ true)?;
+    if src.inode.kind == InodeKind::Dir {
+        return Err(crate::fs::EISDIR);
+    }
+    // Resolve-or-create the destination.
+    let dst = match resolve(dst_path, /* follow */ true) {
+        Ok(r) => r,
+        Err(e) if e == ENOENT => {
+            create_file(dst_path, 0o644)?;
+            resolve(dst_path, /* follow */ true)?
+        }
+        Err(e) => return Err(e),
+    };
+    if dst.inode.kind == InodeKind::Dir {
+        return Err(crate::fs::EISDIR);
+    }
+    // Truncate destination.
+    let attr = crate::fs::vfs::ops::SetAttr {
+        mask: crate::fs::vfs::ops::SetAttrMask::SIZE,
+        size: 0,
+        ..crate::fs::vfs::ops::SetAttr::default()
+    };
+    dst.inode.ops.setattr(&dst.inode, &attr)?;
+
+    let src_of = open_inode(&src.inode, &src.dentry)?;
+    let dst_of = open_inode(&dst.inode, &dst.dentry)?;
+
+    let mut buf = [0u8; 4096];
+    let mut copied: u64 = 0;
+    let mut roff: u64 = 0;
+    let mut woff: u64 = 0;
+    loop {
+        let remaining = max_bytes.saturating_sub(copied);
+        if remaining == 0 {
+            return Err(crate::fs::EFBIG);
+        }
+        let take = core::cmp::min(remaining as usize, buf.len());
+        let n = src.inode.file_ops.read(&src_of, &mut buf[..take], roff)?;
+        if n == 0 {
+            break;
+        }
+        roff += n as u64;
+        let mut written = 0usize;
+        while written < n {
+            let w = dst.inode.file_ops.write(&dst_of, &buf[written..n], woff)?;
+            if w == 0 {
+                return Err(crate::fs::EIO);
+            }
+            woff += w as u64;
+            written += w;
+        }
+        copied += n as u64;
+    }
+    Ok(copied)
+}
+
 /// Rename `old_path` to `new_path`. Tries `InodeOps::rename` first;
 /// if the driver returns `EPERM` (no rename support) the caller can
 /// fall back to `link` + `unlink`.
