@@ -54,7 +54,7 @@ use vibix::fs::vfs::{FsId, Inode};
 use vibix::{
     exit_qemu, serial_println, task,
     test_harness::{test_panic_handler, Testable},
-    time, QemuExitCode,
+    QemuExitCode,
 };
 
 #[no_mangle]
@@ -223,10 +223,13 @@ fn writeback_fires_after_interval() {
     let handle = writeback::start(sb.clone(), cache.clone(), dev)
         .expect("writeback daemon must start for a RW mount");
 
-    // Wait up to ~3 s for at least one sweep to land.
-    let start_ticks = time::ticks();
+    // Wait up to ~3 s for at least one sweep to land. Route through
+    // the scheduler/IRQ seam (RFC 0005); production resolves to the
+    // same `time::ticks()` source.
+    let (clock, _irq) = vibix::task::env::env();
+    let start_ticks = clock.now().raw();
     let deadline = start_ticks + 300; // 3 s at 100 Hz
-    while time::ticks() < deadline {
+    while clock.now().raw() < deadline {
         if handle.sweeps() >= 1 {
             break;
         }
@@ -237,7 +240,7 @@ fn writeback_fires_after_interval() {
         handle.sweeps() >= 1,
         "writeback daemon never swept — sweeps={} after {} ticks",
         handle.sweeps(),
-        time::ticks() - start_ticks,
+        clock.now().raw() - start_ticks,
     );
     assert!(
         !bh.state_has(STATE_DIRTY),
@@ -312,8 +315,10 @@ fn join_waits_for_daemon() {
     // with no ready task panics. Busy-wait on `time::ticks` instead;
     // `hlt` yields CPU to the timer ISR so the wait actually advances.
     let sweeps_after = handle.sweeps();
-    let deadline = time::ticks() + 20; // ~200 ms at 100 Hz
-    while time::ticks() < deadline {
+    // Route through the scheduler/IRQ seam (RFC 0005).
+    let (clock, _irq) = vibix::task::env::env();
+    let deadline = clock.now().raw() + 20; // ~200 ms at 100 Hz
+    while clock.now().raw() < deadline {
         x86_64::instructions::hlt();
     }
     assert_eq!(

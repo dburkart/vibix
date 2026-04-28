@@ -40,14 +40,17 @@ fn run_tests() {
 }
 
 fn ticks_advance() {
-    let start = vibix::time::ticks();
+    // Route through the scheduler/IRQ seam (RFC 0005); production
+    // resolves to the same `crate::time::ticks()` source.
+    let (clock, _irq) = vibix::task::env::env();
+    let start = clock.now().raw();
     // Wait for at least ~50 ms worth of ticks (5 @ 100 Hz). Use hlt
     // so the CPU actually sleeps between interrupts — a busy loop
     // under QEMU can race the first tick.
-    while vibix::time::ticks() < start + 5 {
+    while clock.now().raw() < start + 5 {
         x86_64::instructions::hlt();
     }
-    assert!(vibix::time::ticks() >= start + 5);
+    assert!(clock.now().raw() >= start + 5);
 }
 
 fn uptime_monotonic() {

@@ -437,16 +437,22 @@ mod daemon {
         if state.stop.load(Ordering::SeqCst) {
             return;
         }
-        use crate::time::{self, TICK_MS};
+        // Routed through the scheduler/IRQ seam (RFC 0005) so the
+        // simulator and mock tests can drive the writeback daemon's
+        // sleep deterministically. Production resolves to `HwClock`
+        // over `crate::time::*` — semantically identical.
+        use crate::task::env;
+        use crate::time::TICK_MS;
+        let (clock, _irq) = env::env();
         let ticks_to_wait = ms.div_ceil(TICK_MS).max(1);
-        let deadline = time::ticks().saturating_add(ticks_to_wait);
-        time::enqueue_wakeup(deadline, task::current_id());
+        let deadline = clock.now().saturating_add(ticks_to_wait);
+        clock.enqueue_wakeup(deadline, task::current_id());
 
         state.sleep_wq.wait_while(|| {
             if state.stop.load(Ordering::SeqCst) {
                 return false;
             }
-            time::ticks() < deadline
+            clock.now() < deadline
         });
     }
 }

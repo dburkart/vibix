@@ -271,9 +271,12 @@ pub extern "C" fn _start() -> ! {
 
 /// Blink the framebuffer cursor at approximately 1 Hz (toggle every 500 ms).
 fn cursor_blink_task() -> ! {
-    let mut next = vibix::time::ticks() + CURSOR_BLINK_TICKS;
+    // Route through the scheduler/IRQ seam (RFC 0005) so the future
+    // simulator builds use the same clock the scheduler does.
+    let (clock, _irq) = vibix::task::env::env();
+    let mut next = clock.now().raw() + CURSOR_BLINK_TICKS;
     loop {
-        while vibix::time::ticks() < next {
+        while clock.now().raw() < next {
             // Wake on the next timer tick, recheck. Preemption
             // rotates other tasks in and out while we sleep.
             x86_64::instructions::hlt();

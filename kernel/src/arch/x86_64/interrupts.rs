@@ -32,7 +32,14 @@ pub extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
     // task first and *that* task ever re-entered this ISR, the PIC
     // would be carrying an un-acked IRQ and subsequent ticks would
     // stall.
-    notify_eoi(InterruptIndex::Timer.as_u8());
+    //
+    // Routed through the scheduler/IRQ seam (RFC 0005) so the
+    // simulator and mock test wiring can substitute the EOI; in
+    // production this resolves to `notify_eoi(Timer)` →
+    // `apic::lapic_eoi()`. The ordering (EOI before `preempt_tick`)
+    // is preserved deliberately — see equivalence note in PR body.
+    let (_clock, irq) = crate::task::env::env();
+    irq.ack_timer();
     #[cfg(feature = "bench")]
     crate::bench::irq::record_exit();
     crate::task::preempt_tick();

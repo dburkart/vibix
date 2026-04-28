@@ -245,8 +245,13 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
     // matching `irq-post-ring3` snapshot taken on the first SYSCALL
     // from userspace and fails when too few timer interrupts fire in
     // between (the #478 starvation signature).
-    INIT_IRQ_PRE_RING3_TICKS.store(crate::time::ticks(), core::sync::atomic::Ordering::Release);
-    crate::serial_println!("irq-pre-ring3: ticks={}", crate::time::ticks());
+    // Route the diagnostic snapshot through `env()` (RFC 0005) so the
+    // simulator's clock — when we ever drive the ring-3 jump under it
+    // — sees the same `Tick` source the scheduler does.
+    let (clock, _irq) = crate::task::env::env();
+    let pre_ticks = clock.now().raw();
+    INIT_IRQ_PRE_RING3_TICKS.store(pre_ticks, core::sync::atomic::Ordering::Release);
+    crate::serial_println!("irq-pre-ring3: ticks={}", pre_ticks);
     // #478 diagnostic step 1: emit a single-byte marker on the QEMU debug
     // console (port 0xe9) *immediately* before the iretq, and a second
     // byte in the same asm block *after* the iretq frame is pushed but
@@ -339,7 +344,9 @@ pub unsafe extern "C" fn syscall_dispatch(
     // missing marker.
     if !INIT_IRQ_POST_FIRED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         let pre = INIT_IRQ_PRE_RING3_TICKS.load(core::sync::atomic::Ordering::Acquire);
-        let now = crate::time::ticks();
+        // Same seam as the pre-ring3 snapshot above.
+        let (clock, _irq) = crate::task::env::env();
+        let now = clock.now().raw();
         let delta = now.saturating_sub(pre);
         crate::serial_println!("irq-post-ring3: ticks={} pre={} delta={}", now, pre, delta);
     }
