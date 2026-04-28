@@ -234,8 +234,21 @@ fn main() -> R<()> {
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "nm-check" => {
             // RFC 0005 Phase 1 hardening (#669). Build the release
-            // kernel first, then run the static guard. We force
-            // `--release` regardless of `--release` on the CLI: this
+            // kernel first, then run the static guard. Reject any
+            // trailing positional arg up front: `nm-check` takes no
+            // arguments, and silently dropping unknown ones (e.g. a
+            // typo'd `nm-check release` instead of `--release`)
+            // would let an unintended invocation pass for the wrong
+            // reason — exactly the kind of fail-open behaviour this
+            // gate exists to prevent.
+            if !rest.is_empty() {
+                return Err(format!(
+                    "nm-check: unexpected positional arg(s): {:?}; nm-check takes only build flags before the subcommand",
+                    rest,
+                )
+                .into());
+            }
+            // We force `--release` regardless of `--release` on the CLI: this
             // subcommand's whole purpose is to verify the release
             // build, and a debug-build pass would silently
             // misrepresent the answer. We also pin every diagnostic
