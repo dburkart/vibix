@@ -436,6 +436,14 @@ fn build_userspace_repro_fork() -> R<PathBuf> {
     build_userspace_binary("userspace_repro_fork", "userspace/repro_fork/link.ld")
 }
 
+/// Build the no_std pjdfstest runner (#642 option 2). Shipped as
+/// `/init` inside the deterministic ext2 image by
+/// `cargo xtask pjdfstest`. Same link layout as `userspace_init` so
+/// the kernel's ELF loader doesn't need any new code paths.
+pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
+    build_userspace_binary("pjdfstest_runner", "userspace/pjdfstest_runner/link.ld")
+}
+
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
     let profile = if opts.release { "release" } else { "debug" };
     workspace_root()
@@ -973,6 +981,21 @@ fn make_iso_with_cmdline(
 ) -> R<()> {
     let userspace_init = build_userspace_init()?;
     make_iso_inner(kernel, &userspace_init, iso_out, staging, kernel_cmdline)
+}
+
+/// Like [`make_iso_with_cmdline`] but publishes a caller-supplied
+/// binary as `/boot/userspace_init.elf` (PID 1). Used by the
+/// `pjdfstest` subcommand (#642) to swap the no_std runner in for
+/// `userspace_init` without touching the Limine config or the
+/// kernel's module-lookup path.
+pub(crate) fn make_iso_with_cmdline_and_init(
+    kernel: &Path,
+    init_bin: &Path,
+    iso_out: &Path,
+    staging: &str,
+    kernel_cmdline: &str,
+) -> R<()> {
+    make_iso_inner(kernel, init_bin, iso_out, staging, kernel_cmdline)
 }
 
 /// Variant of [`make_iso`] that publishes a caller-supplied binary as

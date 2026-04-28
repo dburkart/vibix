@@ -4,6 +4,7 @@ members = [
     "xtask",
     "userspace/hello",
     "userspace/init",
+    "userspace/pjdfstest_runner",
     "userspace/repro_fork",
 ]
 # tests/pjdfstest is a vendored copy of saidsay-so/pjdfstest (2-clause BSD). It

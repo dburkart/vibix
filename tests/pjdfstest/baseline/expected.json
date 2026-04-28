@@ -1,7 +1,21 @@
 {
-  "total": 0,
-  "passed": 0,
+  "total": 14,
+  "passed": 14,
   "failed": 0,
   "cases": [
+    {"name": "open/creat_excl_creates", "status": "pass"},
+    {"name": "open/excl_eexist", "status": "pass"},
+    {"name": "open/enoent", "status": "pass"},
+    {"name": "rw/write_read_roundtrip", "status": "pass"},
+    {"name": "mkdir/rmdir_roundtrip", "status": "pass"},
+    {"name": "mkdir/eexist", "status": "pass"},
+    {"name": "rmdir/enoent", "status": "pass"},
+    {"name": "unlink/removes_path", "status": "pass"},
+    {"name": "link/two_names_share_inode", "status": "pass"},
+    {"name": "symlink/readlink_roundtrip", "status": "pass"},
+    {"name": "chmod/returns_ok", "status": "pass"},
+    {"name": "chdir/getcwd_roundtrip", "status": "pass"},
+    {"name": "rmdir/enotdir_on_regular", "status": "pass"},
+    {"name": "getuid/init_is_root", "status": "pass"}
   ]
 }

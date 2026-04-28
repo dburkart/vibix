@@ -12,30 +12,29 @@
 //!
 //! # Runner build model
 //!
-//! The vendored pjdfstest crate under `tests/pjdfstest/` is an ordinary
-//! `std` Rust binary with a rich set of POSIX-platform dependencies (`nix`,
-//! `tempfile`, `figment`, `inventory`, …). vibix has no `std`-capable
-//! userspace target today — the sole userspace binaries (`userspace_init`,
-//! `userspace_hello`, `userspace_repro_fork`) are `no_std` + inline-asm and
-//! link at 0x400000. A real port of pjdfstest into vibix requires a
-//! vibix-specific nix shim and at minimum a functioning `std`-on-vibix
-//! target; that work is tracked separately in RFC 0004 §Workstream G.
+//! Per the option-2 direction pinned on #642, the runner is the
+//! in-tree no_std crate at `userspace/pjdfstest_runner/` — built the
+//! same way as `userspace_init` / `userspace_hello` (lower-half ELF
+//! at 0x400000, x86_64-unknown-none target, `-Z build-std`). It
+//! calls vibix syscalls directly and emits the
+//! `TEST_PASS:<name>` / `TEST_FAIL:<name>:<reason>` / `TEST_DONE`
+//! markers this harness already parses.
 //!
-//! Until that lands, `cargo xtask pjdfstest` does everything downstream of
-//! the runner build: stages a best-effort host build of the pjdfstest binary
-//! into the ext2 image at `/bin/pjdfstest`, boots vibix with that image as
-//! the root filesystem, and parses whatever markers the kernel (or a future
-//! vibix-side pjdfstest shim) emits on the serial port. If no markers are
-//! seen, the resulting summary is `0 passed / 0 failed / 0 total` and the
-//! JSON artefact is still written so CI tooling written against this xtask
-//! (#582) has a stable contract.
+//! The vendored `tests/pjdfstest/` tree (saidsay-so/pjdfstest under
+//! 2-clause BSD, vendored by #640) is intentionally **not** built
+//! here — it depends on `std` + `nix` + `tempfile` etc. and there is
+//! no `x86_64-unknown-vibix` `std` target yet. That work is
+//! sequenced behind the DST seam epic and is tracked separately
+//! (option 1 in #642). The vendored case definitions stay around as
+//! a reference for the eventual mechanical port.
 //!
-//! The host build is **best-effort**: if `cargo build --release` inside
-//! `tests/pjdfstest/` fails (missing nightly, missing system deps, …) we log
-//! the failure and fall back to a placeholder `/bin/pjdfstest` so the
-//! harness itself still runs end-to-end. A failed runner build is *not*
-//! fatal to the xtask — the whole point of this issue is to establish the
-//! plumbing, not gate on a runner that vibix can't execute yet.
+//! `cargo xtask pjdfstest` builds the no_std runner, stages it as
+//! `/init` in the deterministic ext2 image, boots vibix with that
+//! image as the root filesystem, and scrapes the markers off the
+//! serial port. A boot that emits no markers (panic, missing
+//! syscall, runner-load failure, …) is reported as
+//! `0 passed / 0 failed / 0 total` and the harness exits non-zero in
+//! `--compare-baseline` mode if the baseline expects more — see #643.
 //!
 //! # Serial marker protocol
 //!
@@ -258,40 +257,21 @@ pub fn parse_transcript(transcript: &str) -> Results {
 
 // --------------------------- subcommand entry point ---------------------
 
-/// Build the vendored pjdfstest binary as a best-effort host target. On
-/// failure, return the error so the caller can choose to fall back to a
-/// placeholder.
-fn build_runner(workspace_root: &Path) -> R<PathBuf> {
-    let crate_dir = workspace_root.join("tests").join("pjdfstest");
-    if !crate_dir.join("Cargo.toml").is_file() {
-        return Err(format!(
-            "pjdfstest crate not found at {} (expected to be vendored by #580)",
-            crate_dir.display()
-        )
-        .into());
-    }
-
-    println!("→ pjdfstest: building runner at {}", crate_dir.display());
-    let status = Command::new("cargo")
-        .current_dir(&crate_dir)
-        .args(["build", "--release", "--bin", "pjdfstest"])
-        .status()
-        .map_err(|e| format!("cargo build: {e}"))?;
-    if !status.success() {
-        return Err(format!("pjdfstest runner build failed: {status}").into());
-    }
-
-    // The vendored crate is its own workspace, so the artefact lives under
-    // `tests/pjdfstest/target/release/pjdfstest`, not the outer `target/`.
-    let bin = crate_dir.join("target").join("release").join("pjdfstest");
-    if !bin.is_file() {
-        return Err(format!(
-            "pjdfstest binary missing at {} after a successful build",
-            bin.display()
-        )
-        .into());
-    }
-    Ok(bin)
+/// Build the no_std `pjdfstest_runner` userspace binary (#642 option 2).
+///
+/// Delegates to `crate::build_pjdfstest_runner` so the runner picks
+/// up the same RUSTFLAGS / link.ld / `-Z build-std` recipe as
+/// `userspace_init`. The artefact lives at
+/// `target/x86_64-unknown-none/debug/pjdfstest_runner`.
+///
+/// If the build fails — typically a missing rust-src component on
+/// fresh checkouts — we surface the error so [`run`] can fall back
+/// to a placeholder `/init` and the harness still exercises its
+/// boot/QEMU/marker-parse path end-to-end. A no-runner boot reports
+/// `0 passed / 0 failed`, which `--compare-baseline` will then flag
+/// against any non-zero baseline.
+fn build_runner(_workspace_root: &Path) -> R<PathBuf> {
+    crate::build_pjdfstest_runner()
 }
 
 /// Write a placeholder binary the ext2-image builder will stage as `/init`.
@@ -687,7 +667,11 @@ pub fn run(
     //    and the ISO staging directory name.
     let kernel = build()?;
     let iso = workspace_root.join("target").join("vibix-pjdfstest.iso");
-    crate::make_iso_with_cmdline(&kernel, &iso, iso_root_name, "root=/dev/vda")?;
+    // Ship the no_std runner as PID 1 (`/boot/userspace_init.elf`) so
+    // it executes inside QEMU. The runner emits the marker contract
+    // `boot_and_capture` scrapes; without this swap the default
+    // `userspace_init` boots and produces zero markers.
+    crate::make_iso_with_cmdline_and_init(&kernel, &runner, &iso, iso_root_name, "root=/dev/vda")?;
     println!("→ pjdfstest: iso at {}", iso.display());
 
     // 4. Boot and scrape.
