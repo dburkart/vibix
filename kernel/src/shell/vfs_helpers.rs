@@ -111,7 +111,12 @@ pub fn open_inode(inode: &Arc<Inode>, dentry: &Arc<Dentry>) -> Result<Arc<OpenFi
 }
 
 /// Read the entire contents of a regular file at `path` into a
-/// heap-allocated buffer.
+/// heap-allocated buffer. Hard-capped at [`READ_ALL_MAX`] bytes to
+/// keep callers honest — a kernel-side `cp` or `cat` should stream
+/// instead (see [`stream_copy`]). Returns `EFBIG` if the source
+/// exceeds the cap.
+pub const READ_ALL_MAX: usize = 1 * 1024 * 1024;
+
 pub fn read_all(path: &[u8]) -> Result<Vec<u8>, i64> {
     let r = resolve(path, /* follow */ true)?;
     if r.inode.kind == InodeKind::Dir {
@@ -122,7 +127,18 @@ pub fn read_all(path: &[u8]) -> Result<Vec<u8>, i64> {
     let mut off: u64 = 0;
     let mut chunk = [0u8; 512];
     loop {
-        let n = match r.inode.file_ops.read(&of, &mut chunk, off) {
+        if out.len() >= READ_ALL_MAX {
+            // Probe once more: a file whose size is exactly
+            // READ_ALL_MAX should still succeed.
+            let mut probe = [0u8; 1];
+            let n = r.inode.file_ops.read(&of, &mut probe, off)?;
+            if n == 0 {
+                break;
+            }
+            return Err(crate::fs::EFBIG);
+        }
+        let want = core::cmp::min(chunk.len(), READ_ALL_MAX - out.len());
+        let n = match r.inode.file_ops.read(&of, &mut chunk[..want], off) {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
@@ -131,11 +147,6 @@ pub fn read_all(path: &[u8]) -> Result<Vec<u8>, i64> {
         }
         out.extend_from_slice(&chunk[..n]);
         off += n as u64;
-        if n < chunk.len() {
-            // Some FOps return a short read at EOF without a follow-up
-            // zero. Probe once more to catch the genuine zero so we
-            // don't loop forever on a saturated buffer.
-        }
     }
     Ok(out)
 }
@@ -239,6 +250,17 @@ pub fn stream_copy(src_path: &[u8], dst_path: &[u8], max_bytes: u64) -> Result<u
     };
     if dst.inode.kind == InodeKind::Dir {
         return Err(crate::fs::EISDIR);
+    }
+    // Same-file guard: refuse `cp foo foo` (and hardlinked aliases)
+    // before we truncate. Without this we would zero the source and
+    // then "successfully" copy nothing.
+    let same_file = src.inode.ino == dst.inode.ino
+        && match (src.inode.sb.upgrade(), dst.inode.sb.upgrade()) {
+            (Some(s), Some(d)) => Arc::ptr_eq(&s, &d),
+            _ => false,
+        };
+    if same_file {
+        return Err(crate::fs::EINVAL);
     }
     // Truncate destination.
     let attr = crate::fs::vfs::ops::SetAttr {
