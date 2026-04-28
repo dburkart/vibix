@@ -24,9 +24,12 @@
 //!   resets the region to the full screen.
 //! - `CSI ? Pm h` / `CSI ? Pm l` (DECSET / DECRST): set / reset DEC private
 //!   modes. Known modes `?1` (cursor-keys app), `?7` (auto-wrap), `?12`
-//!   (cursor blink), `?25` (cursor visible), and `?1049` (alt-screen) are
-//!   accepted as no-ops so real terminal applications (vim, less, htop) do
-//!   not see sequences rejected; unrecognized modes are silently ignored.
+//!   (cursor blink), `?25` (cursor visible) are accepted as no-ops so real
+//!   terminal applications (vim, less, htop) do not see sequences rejected.
+//!   `?1049` (alt-screen with cursor save) and `?1047` (alt-screen, clear
+//!   on exit) swap to a secondary cell grid and back; `?47` (legacy
+//!   alt-screen) is treated as `?1047`; `?1048` is cursor save/restore
+//!   only. Unrecognized modes are silently ignored.
 //!
 //! A blinking cursor is drawn at the write position.  The blink rate is
 //! driven by the kernel task spawned in `main.rs` via [`toggle_cursor`].
@@ -179,8 +182,19 @@ pub(crate) enum DecMode {
     /// Cursor visibility (mode 25). Accepted; gating the actual draw is a
     /// follow-up.
     CursorVisible,
-    /// Alt-screen buffer (mode 1049). Stub — implemented in follow-up #458.
-    AltScreen,
+    /// Alt-screen buffer + cursor save/restore (mode 1049, xterm).
+    /// Switches to a secondary cell grid on `h`, restores the primary on
+    /// `l`. Saves/restores the primary cursor + SGR around the swap.
+    AltScreen1049,
+    /// Legacy alt-screen (mode 47). xterm-compat: treated like `?1047` —
+    /// swap buffers without cursor save/restore.
+    AltScreen47,
+    /// Alt-screen, clear on exit (mode 1047). Like `?1049` but does not
+    /// touch the saved-cursor slot.
+    AltScreen1047,
+    /// Cursor save/restore (mode 1048). `h` saves cursor + SGR, `l`
+    /// restores; no buffer swap.
+    SaveCursor1048,
     /// Recognized as safe-to-ignore so apps don't break.
     NoOp,
     /// Not in the recognized set; caller discards silently.
@@ -195,7 +209,10 @@ pub(crate) fn classify_dec_mode(code: u32) -> DecMode {
         7 => DecMode::AutoWrap,
         12 => DecMode::CursorBlink,
         25 => DecMode::CursorVisible,
-        1049 => DecMode::AltScreen,
+        47 => DecMode::AltScreen47,
+        1047 => DecMode::AltScreen1047,
+        1048 => DecMode::SaveCursor1048,
+        1049 => DecMode::AltScreen1049,
         // Commonly-seen modes whose absence is harmless: keypad
         // application mode (?66), bracketed-paste (?2004), mouse tracking
         // (?1000/?1002/?1003/?1006). Accept without logging — xterm apps
@@ -370,6 +387,29 @@ pub struct Console {
     // screen on RIS (ESC c). Index/Reverse-Index/scroll-on-newline all
     // confine their work to `[region.top, region.bottom]`.
     region: ScrollRegion,
+
+    // Alt-screen buffer (CSI ?1049/?1047/?47). When `alt_active` is true,
+    // `cells` holds the alt grid and `primary_cells` holds the saved
+    // primary grid. On exit, the buffers are swapped back. Scrollback
+    // (#45) only accumulates in primary mode — `scroll_up` consults
+    // `alt_active` and skips the eviction-to-ring step while alt is
+    // showing. The alt buffer is wiped to blanks on every `?1049h` /
+    // `?1047h` entry, so its contents do not survive a round-trip.
+    alt_active: bool,
+    primary_cells: Vec<Cell>,
+    // Saved primary cursor + SGR for `?1049h` (and `?1048h`). Separate
+    // from the DECSC slot so apps that DECSC inside an alt screen
+    // session don't disturb the primary's restoration.
+    alt_saved_cx: usize,
+    alt_saved_cy: usize,
+    alt_saved_fg: Option<u8>,
+    alt_saved_bg: Option<u8>,
+    alt_saved_bold: bool,
+    alt_saved_valid: bool,
+    // Primary's DECSTBM region, parked on alt-screen entry so the alt
+    // session starts with a fresh full-screen region but the primary
+    // gets its old margins back on exit.
+    primary_region: ScrollRegion,
 }
 
 // SAFETY: the framebuffer pointer is stable for the kernel lifetime;
@@ -393,6 +433,12 @@ impl Console {
 
         let mut cells = Vec::with_capacity(rows * cols);
         cells.resize(rows * cols, Cell::blank());
+
+        // Allocate the alt-screen shadow buffer up-front. Same dims as
+        // primary; left as all-blanks until first `?1049h` / `?1047h`.
+        // Pre-allocating means alt-screen entry can never OOM mid-swap.
+        let mut primary_cells = Vec::with_capacity(rows * cols);
+        primary_cells.resize(rows * cols, Cell::blank());
 
         let mut scrollback = Vec::with_capacity(SCROLLBACK_ROWS * cols);
         scrollback.resize(SCROLLBACK_ROWS * cols, Cell::blank());
@@ -426,7 +472,89 @@ impl Console {
             saved_bold: false,
             saved_valid: false,
             region: ScrollRegion::full(rows),
+            alt_active: false,
+            primary_cells,
+            alt_saved_cx: 0,
+            alt_saved_cy: 0,
+            alt_saved_fg: None,
+            alt_saved_bg: None,
+            alt_saved_bold: false,
+            alt_saved_valid: false,
+            primary_region: ScrollRegion::full(rows),
         }
+    }
+
+    /// Construct a `Console` backed by a caller-owned framebuffer slab,
+    /// for host unit tests. The slab must outlive the returned console.
+    /// Tests get real `write_char` / SGR / alt-screen behaviour without
+    /// having to stand up Limine's framebuffer.
+    ///
+    /// `cols * GLYPH_W` must equal `width`, `rows * GLYPH_H` must equal
+    /// `height`, and `slab.len()` must be `>= height * pitch`.
+    #[cfg(test)]
+    pub(crate) fn for_test(slab: &mut [u32], width: usize, height: usize, pitch: usize) -> Self {
+        assert!(slab.len() >= height * pitch, "test slab too small");
+        let cols = width / GLYPH_W;
+        let rows = height / GLYPH_H;
+
+        let mut cells = Vec::with_capacity(rows * cols);
+        cells.resize(rows * cols, Cell::blank());
+        let mut primary_cells = Vec::with_capacity(rows * cols);
+        primary_cells.resize(rows * cols, Cell::blank());
+        let mut scrollback = Vec::with_capacity(SCROLLBACK_ROWS * cols);
+        scrollback.resize(SCROLLBACK_ROWS * cols, Cell::blank());
+
+        Self {
+            buffer: slab.as_mut_ptr(),
+            width,
+            height,
+            pitch,
+            cols,
+            rows,
+            cx: 0,
+            cy: 0,
+            cursor_on: false,
+            cells,
+            scrollback,
+            scroll_head: 0,
+            scroll_filled: 0,
+            scroll_offset: 0,
+            fg_base: None,
+            bg_base: None,
+            bold: false,
+            ansi: Ansi::Normal,
+            params: [0; 8],
+            nparams: 0,
+            cur_param: 0,
+            saved_cx: 0,
+            saved_cy: 0,
+            saved_fg: None,
+            saved_bg: None,
+            saved_bold: false,
+            saved_valid: false,
+            region: ScrollRegion::full(rows),
+            alt_active: false,
+            primary_cells,
+            alt_saved_cx: 0,
+            alt_saved_cy: 0,
+            alt_saved_fg: None,
+            alt_saved_bg: None,
+            alt_saved_bold: false,
+            alt_saved_valid: false,
+            primary_region: ScrollRegion::full(rows),
+        }
+    }
+
+    /// Test accessor: snapshot of the active grid as a `Vec<(char, fg, bg)>`.
+    #[cfg(test)]
+    pub(crate) fn snapshot_cells(&self) -> Vec<(char, u32, u32)> {
+        self.cells.iter().map(|c| (c.ch, c.fg, c.bg)).collect()
+    }
+
+    /// Test accessor: whether the alt screen is currently active.
+    #[cfg(test)]
+    pub(crate) fn is_alt_active(&self) -> bool {
+        self.alt_active
     }
 
     // ── colour helpers ────────────────────────────────────────────────────
@@ -551,8 +679,12 @@ impl Console {
         let cols = self.cols;
         let region = self.region;
 
-        // Full-screen region: feed the evicted row into scrollback.
-        if region.is_full(self.rows) {
+        // Full-screen region: feed the evicted row into scrollback —
+        // but only when the *primary* buffer is active. Alt-screen
+        // applications (vim, less, htop) repaint their own UI; pushing
+        // their per-frame scroll into the user's scrollback would
+        // corrupt the history they expect to see again on `?1049l`.
+        if region.is_full(self.rows) && !self.alt_active {
             let ring_row = (self.scroll_head + self.scroll_filled) % SCROLLBACK_ROWS;
             let dst = ring_row * cols;
             for i in 0..cols {
@@ -935,16 +1067,120 @@ impl Console {
 
     // ── DEC private mode (DECSET / DECRST) ────────────────────────────────
 
-    fn apply_dec_private(&mut self, _set: bool) {
+    fn apply_dec_private(&mut self, set: bool) {
         // Empty param list (`\x1b[?h`) is treated as no mode — do nothing.
         let n = self.nparams;
         for i in 0..n {
-            // Classify for future hookup; all recognized modes are no-ops
-            // until follow-up #458 (alt-screen) wires real behavior here.
-            // The classification keeps unknown modes quiet rather than
-            // dumping them to the framebuffer.
-            let _ = classify_dec_mode(self.params[i]);
+            match classify_dec_mode(self.params[i]) {
+                DecMode::AltScreen1049 => {
+                    if set {
+                        self.save_primary_cursor();
+                        self.enter_alt_screen();
+                    } else {
+                        self.exit_alt_screen();
+                        self.restore_primary_cursor();
+                    }
+                }
+                DecMode::AltScreen1047 | DecMode::AltScreen47 => {
+                    // Pure buffer swap; no cursor save/restore.
+                    if set {
+                        self.enter_alt_screen();
+                    } else {
+                        self.exit_alt_screen();
+                    }
+                }
+                DecMode::SaveCursor1048 => {
+                    if set {
+                        self.save_primary_cursor();
+                    } else {
+                        self.restore_primary_cursor();
+                    }
+                }
+                // Other recognized modes: still no-ops at this layer.
+                DecMode::CursorKeys
+                | DecMode::AutoWrap
+                | DecMode::CursorBlink
+                | DecMode::CursorVisible
+                | DecMode::NoOp
+                | DecMode::Unknown => {}
+            }
         }
+    }
+
+    // ── alt-screen buffer (CSI ?1049 / ?1047 / ?47) ───────────────────────
+
+    /// Save the primary cursor + SGR into the alt-screen save slot.
+    /// Used by `?1049h` (and `?1048h` directly). Separate from DECSC's
+    /// `saved_*` fields so apps that DECSC inside an alt session don't
+    /// disturb the primary's restoration.
+    fn save_primary_cursor(&mut self) {
+        self.alt_saved_cx = self.cx;
+        self.alt_saved_cy = self.cy;
+        self.alt_saved_fg = self.fg_base;
+        self.alt_saved_bg = self.bg_base;
+        self.alt_saved_bold = self.bold;
+        self.alt_saved_valid = true;
+    }
+
+    /// Restore the primary cursor + SGR from the alt-screen save slot.
+    /// No-op if no prior save (xterm-compat).
+    fn restore_primary_cursor(&mut self) {
+        if !self.alt_saved_valid {
+            return;
+        }
+        self.cx = self.alt_saved_cx.min(self.cols.saturating_sub(1));
+        self.cy = self.alt_saved_cy.min(self.rows.saturating_sub(1));
+        self.fg_base = self.alt_saved_fg;
+        self.bg_base = self.alt_saved_bg;
+        self.bold = self.alt_saved_bold;
+        // The saved slot stays valid — xterm allows ?1049l/h to round-trip
+        // multiple times without forcing a fresh save.
+    }
+
+    /// Switch the active grid to the alt buffer, clearing it. The
+    /// primary grid is parked in `primary_cells` until `exit_alt_screen`
+    /// swaps it back.  Cursor stays in place per xterm — apps repaint
+    /// before the user notices.  Idempotent: re-entering while already
+    /// in alt mode just blanks the alt buffer (matches xterm's
+    /// "?1047h while in alt" — clears the alt screen).
+    fn enter_alt_screen(&mut self) {
+        if !self.alt_active {
+            // First entry: park the primary grid + region, swap in a
+            // blank alt with a full-screen region.
+            core::mem::swap(&mut self.cells, &mut self.primary_cells);
+            self.primary_region = self.region;
+            self.alt_active = true;
+        }
+        // Wipe the (now-active) alt buffer.
+        for cell in self.cells.iter_mut() {
+            *cell = Cell::blank();
+        }
+        // TUI apps assume they own the full screen.
+        self.region = ScrollRegion::full(self.rows);
+        self.repaint_viewport();
+    }
+
+    /// Switch the active grid back to the primary buffer, discarding
+    /// alt contents. Per xterm, alt-screen contents do not survive
+    /// `?1049l` — they are wiped on the next entry. We blank
+    /// `primary_cells` (now holding alt) before swapping, so the next
+    /// `enter_alt_screen` starts from a known-blank state without
+    /// having to allocate. Idempotent: a stray `?1049l` while already
+    /// on the primary is a no-op.
+    fn exit_alt_screen(&mut self) {
+        if !self.alt_active {
+            return;
+        }
+        // Wipe the alt grid so a future entry doesn't see stale state,
+        // then swap back to primary.
+        for cell in self.cells.iter_mut() {
+            *cell = Cell::blank();
+        }
+        core::mem::swap(&mut self.cells, &mut self.primary_cells);
+        self.alt_active = false;
+        // Restore the primary's DECSTBM region.
+        self.region = self.primary_region;
+        self.repaint_viewport();
     }
 
     // ── DECSTBM (CSI Pt;Pb r) ─────────────────────────────────────────────
@@ -1240,7 +1476,8 @@ macro_rules! println {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_dec_mode, scroll_region_down, scroll_region_up, Cell, DecMode, ScrollRegion,
+        classify_dec_mode, scroll_region_down, scroll_region_up, Cell, Console, DecMode,
+        ScrollRegion, GLYPH_H, GLYPH_W,
     };
 
     #[test]
@@ -1249,7 +1486,10 @@ mod tests {
         assert_eq!(classify_dec_mode(7), DecMode::AutoWrap);
         assert_eq!(classify_dec_mode(12), DecMode::CursorBlink);
         assert_eq!(classify_dec_mode(25), DecMode::CursorVisible);
-        assert_eq!(classify_dec_mode(1049), DecMode::AltScreen);
+        assert_eq!(classify_dec_mode(47), DecMode::AltScreen47);
+        assert_eq!(classify_dec_mode(1047), DecMode::AltScreen1047);
+        assert_eq!(classify_dec_mode(1048), DecMode::SaveCursor1048);
+        assert_eq!(classify_dec_mode(1049), DecMode::AltScreen1049);
     }
 
     #[test]
@@ -1399,6 +1639,182 @@ mod tests {
         for r in 2..=5 {
             assert_eq!(row_chars(&grid, cols, r), vec![' '; cols]);
         }
+    }
+
+    // ── alt-screen buffer (CSI ?1049 / ?1047 / ?47) ───────────────────────
+
+    /// Build a small headless console for write_char-driven tests.
+    /// 80×25 chars at 8×8 glyphs → 640×200 pixels, pitch == width.
+    fn make_test_console() -> (Console, Vec<u32>) {
+        let cols = 80;
+        let rows = 25;
+        let width = cols * GLYPH_W;
+        let height = rows * GLYPH_H;
+        let pitch = width;
+        let mut slab: Vec<u32> = vec![0; height * pitch];
+        // SAFETY: slab outlives the console for the test's scope; we
+        // return both so the borrow checker enforces that lifetime.
+        let console = Console::for_test(&mut slab, width, height, pitch);
+        (console, slab)
+    }
+
+    fn write_str(c: &mut Console, s: &str) {
+        for ch in s.chars() {
+            c.write_char(ch);
+        }
+    }
+
+    #[test]
+    fn alt_screen_starts_inactive() {
+        let (c, _slab) = make_test_console();
+        assert!(!c.is_alt_active());
+    }
+
+    #[test]
+    fn csi_1049h_then_l_restores_primary_byte_for_byte() {
+        // Required regression test from #458: switch to alt, write
+        // content there, switch back, primary buffer must equal its
+        // pre-switch state byte-for-byte.
+        let (mut c, _slab) = make_test_console();
+
+        write_str(&mut c, "primary content here\nsecond line\n");
+        let pre_switch = c.snapshot_cells();
+        let pre_cx = c.cx;
+        let pre_cy = c.cy;
+
+        // CSI ?1049h — enter alt screen.
+        write_str(&mut c, "\x1b[?1049h");
+        assert!(c.is_alt_active());
+
+        // Alt screen should be blank.
+        for cell in c.snapshot_cells() {
+            assert_eq!(cell.0, ' ', "alt screen must start blank");
+        }
+
+        // Write a bunch on the alt screen.
+        write_str(&mut c, "ALT SCREEN GARBAGE\nlots of stuff\n");
+
+        // CSI ?1049l — exit.
+        write_str(&mut c, "\x1b[?1049l");
+        assert!(!c.is_alt_active());
+
+        let post_switch = c.snapshot_cells();
+        assert_eq!(
+            pre_switch, post_switch,
+            "primary buffer must be byte-identical after alt-screen round trip",
+        );
+        assert_eq!(c.cx, pre_cx, "cursor x must be restored");
+        assert_eq!(c.cy, pre_cy, "cursor y must be restored");
+    }
+
+    #[test]
+    fn csi_1049_cycle_does_not_grow_scrollback() {
+        // Scrollback (#45) must not accumulate alt-screen frames. Run a
+        // full enter/scroll/exit cycle and verify scroll_filled is
+        // unchanged.
+        let (mut c, _slab) = make_test_console();
+        // Force some scrollback first so we have a non-trivial baseline.
+        for _ in 0..3 {
+            for _ in 0..c.rows {
+                c.write_char('x');
+                c.write_char('\n');
+            }
+        }
+        let before = c.scroll_filled;
+        assert!(before > 0, "primary scrollback should accumulate");
+
+        write_str(&mut c, "\x1b[?1049h");
+        // Force many scrolls inside alt mode.
+        for _ in 0..5 {
+            for _ in 0..c.rows {
+                c.write_char('a');
+                c.write_char('\n');
+            }
+        }
+        write_str(&mut c, "\x1b[?1049l");
+
+        assert_eq!(
+            c.scroll_filled, before,
+            "alt-screen scrolls must not feed scrollback",
+        );
+    }
+
+    #[test]
+    fn csi_1047_swaps_buffers_without_cursor_save() {
+        let (mut c, _slab) = make_test_console();
+        write_str(&mut c, "primary text");
+        let pre = c.snapshot_cells();
+
+        write_str(&mut c, "\x1b[?1047h");
+        assert!(c.is_alt_active());
+        write_str(&mut c, "alt text");
+
+        write_str(&mut c, "\x1b[?1047l");
+        assert!(!c.is_alt_active());
+        assert_eq!(c.snapshot_cells(), pre, "primary grid must round-trip");
+    }
+
+    #[test]
+    fn csi_47_treated_as_legacy_alt_screen() {
+        let (mut c, _slab) = make_test_console();
+        write_str(&mut c, "before");
+        let pre = c.snapshot_cells();
+
+        write_str(&mut c, "\x1b[?47h");
+        assert!(c.is_alt_active());
+        write_str(&mut c, "alt");
+
+        write_str(&mut c, "\x1b[?47l");
+        assert!(!c.is_alt_active());
+        assert_eq!(c.snapshot_cells(), pre);
+    }
+
+    #[test]
+    fn csi_1048_saves_and_restores_cursor_only() {
+        let (mut c, _slab) = make_test_console();
+        write_str(&mut c, "abcdef");
+        let saved_cx = c.cx;
+        let saved_cy = c.cy;
+
+        write_str(&mut c, "\x1b[?1048h"); // save
+        write_str(&mut c, "more text after save");
+        assert_ne!(c.cx, saved_cx, "cursor moved after writing more text");
+
+        // ?1048l does NOT swap buffers — only restores cursor.
+        write_str(&mut c, "\x1b[?1048l");
+        assert!(!c.is_alt_active(), "?1048 must not toggle alt buffer");
+        assert_eq!(c.cx, saved_cx);
+        assert_eq!(c.cy, saved_cy);
+    }
+
+    #[test]
+    fn alt_screen_dec_region_does_not_leak_to_primary() {
+        // If app sets a DECSTBM region inside alt mode, primary's
+        // region must be intact on exit.
+        let (mut c, _slab) = make_test_console();
+        write_str(&mut c, "\x1b[5;10r"); // set primary region rows 5..=10
+        let primary_region = c.region;
+        assert_eq!(primary_region.top, 4);
+        assert_eq!(primary_region.bottom, 9);
+
+        write_str(&mut c, "\x1b[?1049h");
+        // In alt mode, the region must be full screen.
+        assert!(c.region.is_full(c.rows));
+        write_str(&mut c, "\x1b[2;3r"); // set tiny alt region
+        write_str(&mut c, "\x1b[?1049l");
+
+        assert_eq!(c.region, primary_region, "primary region must be restored");
+    }
+
+    #[test]
+    fn stray_csi_1049l_on_primary_is_noop() {
+        let (mut c, _slab) = make_test_console();
+        write_str(&mut c, "primary");
+        let pre = c.snapshot_cells();
+        // Already on primary — `?1049l` should be harmless.
+        write_str(&mut c, "\x1b[?1049l");
+        assert!(!c.is_alt_active());
+        assert_eq!(c.snapshot_cells(), pre);
     }
 
     #[test]
