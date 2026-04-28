@@ -142,6 +142,180 @@ vibix/
 └── ...
 ```
 
+### Host-target buildability of `kernel/` (resolves OS-engineer B1)
+
+Before any of the architectural choices below mean anything, the
+`kernel/` crate must compile for the host triple under `--features
+sched-mock`. Today it does not — `kernel/src/task/env.rs` gates
+`HwIrq`, `HW_IRQ`, `env()`, and `assert_production_env()` on
+`#[cfg(target_os = "none")]`. Phase 2 commits to **option (a)** from
+the OS-engineer review:
+
+A parallel `#[cfg(all(not(target_os = "none"), feature =
+"sched-mock"))] fn env()` is added to `kernel/src/task/env.rs`
+returning the mock pair. The mocks are installed into a thread-local
+`OnceCell<(&'static MockClock, &'static MockTimerIrq)>` by the
+simulator's `Simulator::with_seed` constructor before the first
+kernel call:
+
+```rust
+// kernel/src/task/env.rs, sched-mock + host build
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+thread_local! {
+    static SIM_ENV: core::cell::OnceCell<(&'static dyn Clock, &'static dyn TimerIrq)>
+        = core::cell::OnceCell::new();
+}
+
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+pub fn env() -> (&'static dyn Clock, &'static dyn TimerIrq) {
+    SIM_ENV.with(|c| *c.get().expect("simulator must call install_sim_env() first"))
+}
+
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+pub fn install_sim_env(clock: &'static dyn Clock, irq: &'static dyn TimerIrq) {
+    SIM_ENV.with(|c| c.set((clock, irq)).map_err(|_| "already installed").unwrap());
+}
+```
+
+Thread-local (not global) because parallel `cargo test` workers
+each get their own `Simulator` with their own seed — global state
+would serialize them. Each test thread installs its own mock pair
+once and panics if installed twice.
+
+The follow-on work the buildability requires:
+
+1. **Audit and gate `target_os = "none"` callers in
+   `kernel/src/task/`, `kernel/src/sync/`, `kernel/src/signal/`,
+   `kernel/src/syscall/`** under a parallel
+   `cfg(all(not(target_os = "none"), feature = "sched-mock"))` arm
+   that selects a host-buildable substitute. Concretely:
+   - `IrqLock<T>` → `spin::Mutex<T>` on host (matches what
+     `MockClock` already does, RFC 0005 wave 3).
+   - `arch::ack_timer_irq()` is unreachable on host because
+     `HwIrq` doesn't exist; only `MockTimerIrq::ack_timer` is
+     callable. No substitute needed — the call site is reached only
+     via `env()` which returns a mock.
+   - Inline assembly (`cli`/`sti`/IRETQ etc.) is gated to
+     `target_os = "none"` already; under `sched-mock` host build,
+     the no-op host alternative is selected.
+2. **A new CI job — `cargo build -p kernel --target
+   x86_64-unknown-linux-gnu --features sched-mock`** — gates that
+   the host build keeps compiling. It runs alongside the existing
+   bare-metal build and the nm-check.
+
+This is real engineering work, not RFC handwaving — Roadmap item 1
+is rewritten below to land the host-buildability slice **before**
+any simulator code exists, so the rest of Phase 2 builds on a
+verified host-buildable kernel.
+
+### IRQ-context invariants under host driver (resolves OS-engineer B2)
+
+The simulator runs `kernel::task::preempt_tick()` from an ordinary
+host thread; it is not in IRQ context. Two invariants must be
+preserved:
+
+1. **No re-entrancy of `preempt_tick`.** The simulator MUST NOT call
+   `preempt_tick` recursively. The driver loop (§Driver loop)
+   already has this property — it calls `preempt_tick` exactly once
+   per outer-loop iteration, and the FaultPlan's `inject` step runs
+   *before* that call returns to the loop top. If a future
+   FaultPlan grows a callback that fires during
+   `MockClock::drain_expired`, that callback MUST NOT call
+   `preempt_tick`. Enforced by a `#[cfg(debug_assertions)]`
+   re-entrancy guard inside `preempt_tick` itself, gated on
+   `feature = "sched-mock"`:
+
+   ```rust
+   #[cfg(feature = "sched-mock")]
+   thread_local! { static IN_PREEMPT_TICK: Cell<bool> = Cell::new(false); }
+   #[cfg(feature = "sched-mock")]
+   fn preempt_tick_guard() -> impl Drop {
+       IN_PREEMPT_TICK.with(|f| {
+           assert!(!f.get(), "preempt_tick is not re-entrant");
+           f.set(true);
+       });
+       scopeguard::guard((), |_| IN_PREEMPT_TICK.with(|f| f.set(false)))
+   }
+   ```
+
+2. **Host substitutes for IRQ-disable primitives must preserve
+   ordering, not faithfully imitate IRQ masking.** `IrqLock` on host
+   is `spin::Mutex` — fair-ish, contentious enough that lock-order
+   violations surface as deadlocks. `cli`/`sti` becomes no-op
+   (impossible to imitate without a kernel; the simulator's value is
+   in checking ordering invariants the *seam* exposes, not in
+   imitating ring-0 microarchitecture). The RFC commits to:
+   - A list, in `docs/design/simulator.md`, of the IRQ-related
+     primitives that have host substitutes and what those
+     substitutes are. New primitives added to the kernel must
+     declare a host substitute (or document why they're
+     `target_os = "none"`-only and therefore unreachable under the
+     simulator).
+   - The simulator does **not** claim to find bugs that depend on
+     real `cli`/`sti` semantics (e.g. interrupt-window races inside
+     the timer ISR itself). Those remain in QEMU's domain. The
+     simulator's contract is: *if a fault-injected sequence of
+     scheduler-visible events would fail on real hardware, the
+     simulator catches it.* Bugs whose trigger is below the seam
+     (microarchitectural reordering, IRETQ stack-faulting, etc.)
+     are out of scope and route to Phase 2.1's IDT/syscall-seam
+     RFCs.
+
+This boundary is what classifies #527 as deferred to Phase 2.1
+(§Reproduction commitments below) — the residual `#PF` is
+microarchitectural, below the seam.
+
+### Event emit points (resolves OS-engineer B3)
+
+The Event enum has two classes of variants distinguished by how
+they're populated:
+
+**(a) Observed-by-snapshot** (no kernel-side emit point needed):
+- `TimerInjected`, `SpuriousTimerInjected`, `ClockAdvanced` — all
+  driven by the simulator itself; emitted by the driver loop
+  before/after stepping the kernel.
+- `Switch { from, to }` — derived by snapshotting `current_id()`
+  before and after each `preempt_tick` and emitting if it changed.
+  No kernel-side call needed.
+- `TaskReady`, `TaskBlocked` — derived by diffing
+  `task::scheduler::ready_count()` /
+  `task::scheduler::pending_blocked()` snapshots between ticks.
+- `TaskWoken` — derived from the `Vec<TaskId>` returned by
+  `MockClock::drain_expired`, which the simulator already calls
+  through directly.
+
+**(b) Emit-point-required** (kernel emits a tracing call):
+- `Fork`, `Exec`, `Exit`, `Wait`, `SignalDelivered` — these are
+  syscall-handler-level events. The kernel adds a single
+  `sched_mock_trace!(Event::Fork { … })` macro at each emit point.
+
+The macro expands to a no-op when `feature = "sched-mock"` is off
+(zero-cost in production):
+
+```rust
+// kernel/src/sched_mock_trace.rs
+#[cfg(feature = "sched-mock")]
+#[macro_export]
+macro_rules! sched_mock_trace {
+    ($e:expr) => { $crate::sched_mock_trace::push($e) };
+}
+#[cfg(not(feature = "sched-mock"))]
+#[macro_export]
+macro_rules! sched_mock_trace {
+    ($e:expr) => { () };
+}
+
+#[cfg(feature = "sched-mock")]
+pub fn push(event: Event) { /* thread-local Vec, drained by simulator */ }
+```
+
+Verification that production-build emits zero code is by inspecting
+generated assembly for at least one canonical site (`fork` syscall)
+in the same CI job that runs the nm-check, and is gated as a
+verifiable invariant rather than an assertion. Roadmap item 5 is
+extended below to land this macro infrastructure alongside the
+introspection helpers.
+
 ### Crate boundary: single-binary, sched-mock-feature, no separate kernel-FFI
 
 This is the load-bearing architectural choice. The two viable shapes
@@ -312,6 +486,95 @@ The trace is also `serde::Serialize`-able so a failing seed dumps a
 JSON trace alongside the seed itself; reviewers can read the trace
 without re-running anything.
 
+### Reference state machine: invariants over the trace, not refinement (resolves Academic B2)
+
+The Academic reviewer is correct: the v1 starter properties
+("no task in `TaskReady` and `TaskBlocked` simultaneously"; "every
+`Wait` is preceded by an `Exit` of the same child id") are TLA+-style
+**safety invariants over the trace**, not refinement claims that
+"every kernel transition is a transition the reference would have
+made." The RFC makes this explicit:
+
+> **Phase 2 v1 uses invariant-based property checking, not
+> refinement-based.** The `(Tick, Event)` trace is a sequence; an
+> invariant is a predicate `P(prefix) -> bool` that must hold over
+> every prefix. Properties are written as:
+>
+> ```rust
+> trait TraceInvariant {
+>     fn check(&self, prefix: &[TraceRecord]) -> Result<(), Violation>;
+> }
+> ```
+>
+> The reference state machine (`SchedulerStateMachine`) is **not**
+> consulted as an oracle. Its only role is to *generate sequences
+> of transitions* (Spawn / Block / Wake / TickN / InjectIrq) that
+> the simulator then drives the kernel through. The kernel's
+> resulting trace is checked against the invariants directly, with
+> no refinement comparison.
+
+This avoids the false-positive cost of refinement (every
+timing-permitted variation triggering a property failure) while
+keeping the soundness guarantee that *invariant violations are real
+bugs*. Liveness invariants (Academic-A1 absorbed) are expressed as
+"no-progress timer" assertions in the same shape: `LivenessTimeout
+{ task: TaskId, since_tick: u64, max: u64 }` flags any task that
+remains `Blocked` for more than `max` simulated ticks. Default
+`max = 1000`; tests that intentionally test long-blocking paths
+override per-test. This is Lamport's safety-vs-liveness distinction
+made operational, mirroring TigerBeetle's no-progress-timer
+discipline.
+
+A future Phase 3 RFC may add refinement checking (or symbolic
+execution à la Hyperkernel — Academic-A3 absorbed: the seam shape
+inherited from RFC 0005 doesn't preclude it) once the invariant set
+matures and there's evidence false-positive cost is acceptable.
+
+### RNG stream coupling: `proptest` master-seeds the simulator (resolves Academic B1)
+
+The simulator has multiple named RNG streams (`fault_rng`,
+`wakeup_order_rng`, `task_arrival_rng`) all derived from a single
+**master seed** via `splitmix64`. The integration with `proptest`
+is one-way:
+
+> **`proptest`'s `TestRng` master-seeds the simulator's master
+> seed.** The `SchedulerStateMachine: ReferenceStateMachine` impl
+> reads `proptest`'s next u64 once, at `init_state`, and uses that
+> value as `Simulator::with_seed(value)`. The simulator's internal
+> RNG streams derive deterministically from there.
+
+Consequences:
+
+1. A `proptest` failure reports a single seed (proptest's). Replay
+   with `cargo test -- --proptest-seed=<seed>` reproduces both the
+   transition sequence *and* the simulator's internal fault plan.
+2. `proptest`'s shrinker mutates the *transition sequence* (its
+   own input space). Each shrunk sequence runs against a *fresh*
+   simulator with the same proptest seed — so the simulator's
+   master seed stays fixed across one shrink chain. The shrinker
+   reduces the sequence; it doesn't reduce the fault plan.
+3. To reduce the fault plan once the transition sequence is
+   minimal, the §Seed minimization pass (Stage 2 — FaultPlan
+   delta-debugging) runs **after** proptest has shrunk the
+   sequence. This separates the two concerns and matches Hypothesis's
+   internal-test-case-representation discipline (MacIver, 2019)
+   adapted to the seam: proptest owns sequence-space minimization;
+   the simulator owns fault-plan minimization.
+
+This is the design choice the Academic reviewer asked the RFC to
+commit to. It is not the only viable choice — a fully-Hypothesis-style
+"single byte-stream representation" would let one shrinker minimize
+both — but `proptest` doesn't expose that primitive today, and
+re-implementing it for v1 is the kind of speculative engineering
+that this RFC's discipline rejects.
+
+Academic-A2 (`HashMap` ordering): a `clippy::disallowed_types` lint
+forbids `std::collections::HashMap` in `simulator/` and any
+`#[cfg(feature = "sched-mock")]`-gated kernel code, with an explicit
+escape hatch for `HashMap<K, V, FxHasher>` where determinism is
+preserved. Enforced in the same CI job that runs `cargo clippy`.
+Adding to Roadmap item 1.
+
 ### Property-test integration: `proptest-state-machine`-compatible
 
 `simulator/src/proptest_model.rs` exposes:
@@ -356,6 +619,30 @@ property failure. Shrinking falls out automatically from
   fork/exec/wait races (#501): "did the parent's `wait` see the
   child's `exit` first, or vice versa?" becomes a seed.
 
+  **Note (OS-engineer A3 absorbed):** wakeup-reorder is strictly
+  *more* nondeterminism than production exhibits — production
+  `time::WAKEUPS` does not reorder. Reorder is a stress fault that
+  finds bugs of the form "this code is wrong if drain order ever
+  shuffles," not a faithful production reproduction. Failing
+  seeds whose only trigger is reorder are still real bugs (the
+  code shouldn't depend on `BTreeMap` insertion order), but they
+  must be labeled as such in bug reports so reviewers don't
+  dismiss them as "can't happen on real hardware." The trace's
+  `feature_set` records which faults were active; the reproduction
+  bug's title should include `[stress: wakeup-reorder]` when
+  applicable.
+
+  **Softirq-ordering note (OS-engineer A1 absorbed):** the kernel's
+  softirq path runs between `ack_timer` and `rotate_or_resched`
+  inside `preempt_tick`. The simulator's between-tick observation
+  hook does not see intermediate softirq state — only the final
+  state after `preempt_tick` returns. The reference state machine
+  must therefore not predict transitions that softirqs cause; the
+  v1 invariants are written to be robust to softirq-internal state.
+  When a future flake requires softirq-ordering visibility, that's
+  Phase 2.1 RFC #4 (post_ack_hook on `TimerIrq`, foreshadowed in
+  RFC 0005 §"What is *not* covered by this seam").
+
 **Explicitly deferred to Phase 2.1 follow-up RFCs:**
 
 - **Hardware faults (`#PF`, `#GP`, `#DF`).** Requires a new seam in
@@ -383,6 +670,139 @@ This Phase 2.1 boundary is **honest, not aspirational**. v1 ships the
 fault scope the existing seam supports. Each Phase 2.1 RFC is an
 independent unit of work; nothing in v1 should be designed
 "speculatively" for those follow-ups (the seam discipline applies).
+
+### Failing-seed-to-repro path (resolves UserSpace B1)
+
+The seed is the API. Every layer of the harness commits to making
+it findable from a CI failure:
+
+1. **Simulator panic hook (Roadmap item 2 deliverable).** The
+   `Simulator::with_seed` constructor installs a process-global
+   panic hook (idempotent — last installer wins, with a warning) of
+   the form:
+
+   ```text
+   thread 'sim_thread' panicked at … VIBIX_SIM_SEED=0xDEADBEEF
+   COMMIT=abc123 TRACE=target/sim-traces/0xDEADBEEF.json
+   ```
+
+   The `VIBIX_SIM_SEED=` prefix is a load-bearing string —
+   downstream tooling (CI annotations, `auto-engineer` agents) greps
+   for it. The format is committed in `docs/design/simulator.md`
+   and is part of the API contract.
+
+2. **CI surfacing.** A GitHub Actions workflow step parses simulator
+   output for the `VIBIX_SIM_SEED=` line and emits a structured
+   GitHub Actions annotation
+   (`::error file=…::Simulator failed at seed=… commit=…
+   trace=…`). The trace JSON is uploaded as a GitHub Actions
+   artifact `sim-trace-${seed}-${commit}.json` with 30-day
+   retention (Testing-A1 absorbed).
+
+3. **Local repro.** A developer copies the seed from the CI
+   annotation and runs:
+
+   ```sh
+   cargo run -p simulator --bin replay -- --seed=0xDEADBEEF
+   ```
+
+   …which re-runs the simulator at the recorded commit, producing a
+   byte-identical trace. To avoid re-running 100k ticks just to
+   read the trace, an alternate form replays from a previously
+   dumped trace:
+
+   ```sh
+   cargo run -p simulator --bin replay -- --trace-json=path/to.json --explain
+   ```
+
+   The `--explain` flag pretty-prints a tabular timeline (UserSpace-A3
+   absorbed): `Tick 42: Fork(parent=1, child=2) Switch(1→2)`.
+
+4. **Property-test failures.** When a `proptest` failure fires
+   inside the simulator harness, the simulator's master seed is
+   reported alongside `proptest`'s own minimization output. The
+   integration is one-way: proptest's seed seeds the simulator's
+   master via `splitmix64` (committed in §Reference state machine
+   below), so a single proptest seed reproduces both the
+   transition sequence *and* the simulator's fault plan. Reproduce
+   with `cargo test -p simulator <test_name> --
+   --seed=<proptest-seed>`.
+
+5. **`#[non_exhaustive]` on `Event`** (UserSpace-A1 absorbed): the
+   `Event` enum is `#[non_exhaustive]` so external consumers
+   (`#391`, `#390`, future tooling) match exhaustively only inside
+   the simulator crate; new variants don't break SemVer.
+
+6. **Panic hook captures the seed even on `SIGINT`** (UserSpace-A4
+   absorbed): the simulator installs a `Ctrl-C` handler that prints
+   `VIBIX_SIM_SEED=…` before exiting, so an interrupted long-run
+   test doesn't lose the seed.
+
+### Seed minimization and trace shrinking (resolves Testing B2)
+
+A 100k-tick failing trace is unreadable. The simulator commits to a
+two-stage minimizer that runs automatically on any CI-failed seed
+before the trace is checked in:
+
+**Stage 1 — Tick-window binary search.** The minimizer re-runs the
+seed under a `max_ticks` cap and binary-searches the smallest cap
+that still violates the invariant. Cost: ~log₂(100k) ≈ 17 reruns,
+typically completing in seconds because most reruns fail-fast at
+the new cap.
+
+**Stage 2 — FaultPlan delta-debugging.** The seeded RNG draws are
+the input. The minimizer records the sequence of fault decisions
+the seeded run produced (write-only buffer alongside the trace),
+then replays with successively-disabled subsets:
+
+- Disable wakeup-reorder fault → does it still fail? If yes, that
+  fault wasn't load-bearing; drop it from the minimal seed.
+- Disable spurious-IRQ fault → same question.
+- Disable timer-jitter fault → same question.
+
+The result is the minimum subset of fault classes the failure
+needs, recorded in a `FaultProfile` checked-in alongside the seed.
+A reader of the bug report sees: "fails with seed 0xDEADBEEF when
+wakeup-reorder is enabled (the other faults are not needed)" —
+which is enormously more debuggable than "fails at 100k ticks of
+mixed faults."
+
+CLI:
+
+```sh
+cargo run -p simulator --bin replay -- --seed=0xDEADBEEF --minimize
+```
+
+This is mandatory before checking in a repro seed (Roadmap item 6
+gate); auto-minimization is non-negotiable for the harness's
+debuggability promise. The shrinker is implemented by Roadmap
+item 6.5 (new — added below).
+
+### CI perf budget (resolves Testing B1)
+
+The original budget arithmetic was wrong. The honest numbers:
+
+| Workload | Per-PR fast suite | Nightly suite |
+|---|---|---|
+| Realistic per-tick cost (preempt_tick + drain + trace push) | 5–20 µs | same |
+| Per-PR target | **100 seeds × 10k ticks ≈ 10–20 s** | n/a |
+| Nightly target | n/a | **10k seeds × 100k ticks**, parallelized via rayon over seeds (16-core CI) **≈ 10–20 min** |
+| Regression-detection seed list | **bounded by `tests/seeds/*.txt` (~50 seeds × 10k ticks ≈ 5–10 s)** | rolled into nightly |
+
+The fast suite (per-PR) splits into:
+- The bounded regression seed list (always run; <10s).
+- A randomized exploration pass at 100 seeds × 10k ticks (10–20s).
+
+Total per-PR overhead: ~20–30s. Trust-able. (Testing-A5 absorbed:
+the regression-vs-exploration distinction is now explicit.)
+
+The nightly suite uses `rayon` to parallelize across seeds (each
+seed is a fully independent simulator run, embarrassingly parallel)
+and runs `cargo nightly` only when `kernel/src/task/**` /
+`kernel/src/sync/**` changed since the last successful nightly
+(Testing-A2 absorbed).
+
+Roadmap item 8 is rewritten to reflect these numbers.
 
 ### Reproducibility envelope
 
@@ -502,16 +922,90 @@ seam, which is a separate RFC.
 The simulator and its kernel introspection helpers live behind
 `feature = "sched-mock"` and the host-only crate gate. Production
 release ELFs (built by `cargo xtask build --release`) do not pull
-the simulator crate or the `sched-mock` feature. The nm-check guard
-landed in #669 statically verifies `MockClock` / `MockTimerIrq` /
-new `task::scheduler::ready_count`-shaped helpers do not appear in
-the release binary. This is the same guard RFC 0005 committed to;
-Phase 2 extends the regex it greps for and runs in the same CI step.
-
-No new userspace-facing surface; no new MMIO; no new IDT entries.
-The simulator is strictly a host-test artifact. A user who runs
+the simulator crate or the `sched-mock` feature. No new
+userspace-facing surface; no new MMIO; no new IDT entries. The
+simulator is strictly a host-test artifact. A user who runs
 `cargo test -p simulator` is running their own host process — the
 trust boundary is host-process trust, not kernel-privilege trust.
+
+### nm-check guard committed surface (resolves Security B1)
+
+Phase 2 grows the surface of symbols the nm-check (#669) must
+exclude from the release ELF, and commits to a concrete regex
+**now** so the implementing PR cannot widen it silently. The
+regex applies to the *demangled* form of every exported and
+internal Rust symbol in the release ELF (`nm --demangle
+target/release/kernel.elf`):
+
+```text
+^(.*::)?(Mock(Clock|TimerIrq|ClockState|IrqState)|sim_introspect_\w+|sched_mock_trace::push|SchedMockTrace\w*)$
+```
+
+Concretely the regex matches:
+
+- `MockClock`, `MockTimerIrq`, and their internal state types
+  (already gated by `feature = "sched-mock"` per RFC 0005).
+- Any function whose name begins with `sim_introspect_` —
+  the convention for new kernel-side test helpers (e.g.
+  `sim_introspect_ready_count`,
+  `sim_introspect_pending_blocked`).
+- The `sched_mock_trace::push` trampoline that the
+  `sched_mock_trace!` macro expands to (§Event emit points).
+- Any future type prefixed `SchedMockTrace`.
+
+Mangled-symbol robustness: Rust's `_R` v0 mangling encodes the
+fully-qualified path, including `mock` / `sched_mock` module names,
+in a recoverable form. The CI step demangles before grepping
+(`nm --demangle=rust`), which on rust-1.84+ resolves both `_ZN…`
+and `_R…` forms. New code that introduces a new prefix must update
+this regex in the same PR, and the regex is cited at the top of
+`kernel/src/task/env.rs` (and `kernel/src/sched_mock_trace.rs`)
+with a comment so violations of the convention are visible at
+review time.
+
+This converts the "physically excluded from production" claim
+back from an assertion into a verified invariant, restoring the
+RFC-0005 §"Test-time wiring" property as Phase 2 grows the
+mock surface.
+
+### Trace attribution under dirty trees (resolves Security B2)
+
+A trace dump records the commit hash *and* the tree-cleanliness
+status. Concretely, every JSON dump contains:
+
+```json
+{
+  "vibix_simulator_version": 1,
+  "seed": "0xDEADBEEF",
+  "commit": "abc123...",
+  "tree_dirty": false,
+  "rust_toolchain": "nightly-2026-04-27",
+  "feature_set": ["sched-mock", "..."],
+  "trace": [ /* events */ ]
+}
+```
+
+`tree_dirty` is set to the result of `git status --porcelain`-non-empty
+at the moment the trace was written. CI never produces dirty traces:
+the PR's CI job runs in a clean checkout, and the simulator binary
+**refuses to run** without `--allow-dirty` if `tree_dirty` would be
+true. Locally, `--allow-dirty` is permitted but the trace's
+`tree_dirty: true` is loud, and the replay binary refuses to verify
+a trace whose `tree_dirty` is `true` against the recorded commit
+(it explicitly says "this trace was produced from a dirty checkout
+of `abc123`; the contents do not necessarily match commit
+`abc123`"). Bug reports that cite a dirty trace are unambiguously
+flagged as such; clean traces are unambiguously clean.
+
+This resolves the attribution ambiguity: every trace is
+self-describing about whether its commit hash actually corresponds
+to the kernel under test. Borrowed from TigerBeetle's stricter
+discipline (no `--allow-dirty` at all) but with a local-development
+escape hatch that doesn't pretend the trace is canonical.
+
+Security-A1 (resolved-feature-set in trace JSON) and Security-A2
+(seed in panic + SIGINT output) are absorbed into §Failing-seed-to-repro
+path above.
 
 ## Performance Considerations
 
@@ -647,65 +1141,105 @@ recorded below. None block RFC acceptance.
 ## Implementation Roadmap
 
 Independently-landable, dependency-ordered. Each item is reviewable
-on its own and CI-green at every step.
+on its own and CI-green at every step. Items 1–2 land
+infrastructure that the rest depend on; items 3–5 build the trace
+and fault machinery; items 6–8 land the actual P0-flake repros and
+properties; items 9–11 are documentation and follow-up.
 
-- [ ] **Add `simulator/` crate skeleton + pin Rust nightly toolchain
-      date.** New workspace member, depends on `kernel` with
-      `features = ["sched-mock"]`, host-target only
-      (`required-features` or `cfg(not(target_os = "none"))`). The
-      same PR pins `rust-toolchain.toml`'s `channel` to a dated
-      nightly (e.g. `nightly-2026-04-27`). Adds `cargo xtask sim
-      --help` shim. CI: `cargo test -p simulator` runs in a new job;
-      no test bodies yet.
-- [ ] **Implement `Simulator` + linear tick-by-tick run loop.** Wires
-      `MockClock` + `MockTimerIrq` into `task::env()` for the host
-      build, drives `kernel::task::preempt_tick()` per tick, exposes
-      `Simulator::with_seed(u64).run(max_ticks: u64)`. No fault plan
-      yet (always `tick(); inject_timer();`). CI: an integration
-      test that spawns 3 dummy tasks, runs 1000 ticks, asserts each
-      gets at least one switch.
-- [ ] **Add `(Tick, Event)` trace recorder + JSON dump.** `TraceRecorder`
-      with the Event enum from §State-machine model interface;
-      `serde::Serialize`; `cargo run -p simulator --bin replay --
-      --seed=…` reads/writes JSON. CI: golden-file test on a
-      hand-crafted seed.
-- [ ] **Add `FaultPlan`: timer jitter, spurious IRQs, wakeup
-      reorder.** RNG via `rand_chacha::ChaCha8Rng`, named streams via
-      `splitmix64`. Each fault is independently feature-gateable so
-      tests can isolate (e.g. `fault_plan.with_wakeup_reorder()`).
-- [ ] **Wire kernel-side introspection helpers behind `sched-mock`.**
-      `task::scheduler::ready_count()`,
-      `task::scheduler::pending_blocked()`, plus enough to build the
-      Event variants in this RFC's enum. nm-check guard (#669)
-      regex extended to include `(Mock|sim_introspect_)`.
-- [ ] **Reproduce #501 (fork/exec/wait flakiness) as a single
-      failing seed.** This is the gate on Phase 2 v1 being "done".
-      The PR includes a checked-in seed + JSON trace + a
-      `tests/repro_501.rs` that reads the seed, runs the simulator,
-      and asserts the violation is observed at the recorded tick.
+- [ ] **(1) Host-target buildability of `kernel/` + Rust nightly
+      pin + lints.** Audit `kernel/src/{task,sync,signal,syscall}/`
+      for `target_os = "none"` gates that block host build under
+      `feature = "sched-mock"`. Add a parallel
+      `#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]`
+      arm to each — primarily in `kernel/src/task/env.rs` (host
+      `env()` reading from `thread_local! SIM_ENV`) and
+      `kernel/src/sync/` (host `IrqLock` = `spin::Mutex`). Pin
+      `rust-toolchain.toml`'s `channel` to a dated nightly (e.g.
+      `nightly-2026-04-27`). Add `clippy::disallowed_types` lint
+      forbidding `HashMap` under `sched-mock`. New CI job:
+      `cargo build -p kernel --target x86_64-unknown-linux-gnu
+      --features sched-mock` runs alongside the bare-metal build
+      and the nm-check.
+- [ ] **(2) Add `simulator/` crate skeleton + panic hook + replay
+      binary stub.** New workspace member, depends on `kernel` with
+      `features = ["sched-mock"]`, host-target only. Installs the
+      `VIBIX_SIM_SEED=…`-prefixed panic hook on construction.
+      `cargo run -p simulator --bin replay -- --seed=… [--explain]
+      [--minimize] [--allow-dirty]` argument shape committed (no
+      bodies yet). CI: `cargo test -p simulator` runs (empty).
+- [ ] **(3) Implement `Simulator` + linear tick-by-tick run loop.**
+      Wires `MockClock` + `MockTimerIrq` via `install_sim_env`,
+      drives `kernel::task::preempt_tick()` per tick, exposes
+      `Simulator::with_seed(u64).run(max_ticks: u64) -> SimOutcome`.
+      Includes the `cfg(debug_assertions)` re-entrancy guard inside
+      `preempt_tick`. CI: integration test spawning 3 dummy tasks,
+      running 1000 ticks, asserting each gets at least one switch.
+- [ ] **(4) Add `(Tick, Event)` trace recorder + JSON dump (with
+      tree_dirty + commit + toolchain + feature_set fields).**
+      `TraceRecorder` with `#[non_exhaustive] enum Event`;
+      `serde::Serialize`; replay binary now reads/writes JSON and
+      `--explain` pretty-prints. CI: golden-file test on a
+      hand-crafted seed; refuses to run on dirty tree without
+      `--allow-dirty`.
+- [ ] **(5) Wire kernel-side introspection + `sched_mock_trace!`
+      macro.** Add `kernel/src/sched_mock_trace.rs` with the
+      compile-out-when-off macro; place emit-point calls at
+      `fork`, `exec`, `exit`, `wait`, signal-deliver paths.
+      `task::scheduler::sim_introspect_*` helpers added behind
+      `sched-mock`. Extend nm-check regex to the committed surface
+      from §nm-check guard committed surface. CI: assembly
+      inspection step verifies `fork` syscall emits zero code under
+      release build.
+- [ ] **(6) Add `FaultPlan` (timer jitter, spurious IRQs, wakeup
+      reorder).** RNG via `rand_chacha::ChaCha8Rng`; named streams
+      via `splitmix64`. Each fault independently togglable.
+      Per-tick fault decisions logged into a `FaultDecisionsLog`
+      written alongside the trace.
+- [ ] **(6.5) Implement seed minimizer (Stage 1 + Stage 2).**
+      `--minimize` flag drives tick-window binary search and
+      FaultPlan delta-debugging; emits the minimal `FaultProfile`.
+      Mandatory before any seed is checked in as a repro. CI:
+      smoke test that synthetic-violation seed minimizes from
+      100k ticks down to <100 ticks.
+- [ ] **(7) Reproduce #501 (fork/exec/wait flakiness) as a single
+      minimized failing seed.** Gate on Phase 2 v1 "done": PR
+      includes a checked-in seed + minimized JSON trace + a
+      `tests/repro_501.rs` reading the seed, running the simulator,
+      and asserting the violation is observed at the recorded tick.
       Closes #501 when the underlying bug is then fixed.
-- [ ] **Add proptest-state-machine reference model.**
-      `simulator/src/proptest_model.rs` exposes
-      `SchedulerStateMachine: ReferenceStateMachine`. Two starter
-      properties: "no task is in `TaskReady` and `TaskBlocked`
-      simultaneously"; "every `Wait` is preceded by an `Exit` of the
-      same child id". This is the integration point #391 plugs
-      into.
-- [ ] **CI: per-PR fast suite (1k seeds × 100k ticks) + nightly
-      slow suite (10× that).** `cargo test -p simulator
-      --test stress`. Target: <60s per-PR overhead.
-- [ ] **Reproduce #478 if classifiable.** Run the v1 simulator
-      against the #478 surface; if a wakeup-drain trace shows up,
-      check in the seed. If it's an IRETQ microcode race, file
-      Phase 2.1 RFC #2 (syscall-entry seam) instead with the
-      finding written up.
-- [ ] **File Phase 2.1 follow-up RFC issues.** Three discussions:
-      IDT/hardware-fault seam (for #527), syscall-entry seam,
-      SMP simulator. Each is its own RFC, prioritized when the next
+- [ ] **(8) Add invariant + liveness checkers + proptest-state-machine
+      integration.** `simulator/src/invariants.rs` with the v1
+      starter properties (no task in Ready+Blocked simultaneously;
+      every Wait preceded by an Exit; `LivenessTimeout` for
+      blocked > 1000 ticks). `simulator/src/proptest_model.rs`
+      exposes `SchedulerStateMachine: ReferenceStateMachine`,
+      master-seeding the `Simulator` from `proptest`'s `TestRng`.
+      This is #391's integration point.
+- [ ] **(9) CI: per-PR fast suite + nightly suite + artifact
+      upload.** Per-PR: bounded regression seeds in `tests/seeds/`
+      (~50 × 10k ticks ≈ 5–10s) plus randomized exploration (100
+      × 10k ticks ≈ 10–20s). Nightly: 10k × 100k ticks via
+      rayon-over-seeds (≈10–20 min on 16-core CI), gated to fire
+      only when `kernel/src/{task,sync}/**` changed since last
+      successful nightly. Failing seed traces upload as
+      `sim-trace-${seed}-${commit}.json` with 30-day retention; PR
+      job emits structured GitHub Actions annotations parsed from
+      the `VIBIX_SIM_SEED=…` panic-hook output.
+- [ ] **(10) Reproduce #478 if classifiable.** Run v1 simulator
+      against #478 surface. If a wakeup-drain trace shows up, check
+      in seed. If IRETQ microcode race, file Phase 2.1 RFC #2
+      (syscall-entry seam) with the finding written up.
+- [ ] **(11) File Phase 2.1 follow-up RFC discussions.** Four
+      discussions: IDT/hardware-fault seam (for #527), syscall-entry
+      seam (for IRETQ-class flakes), SMP simulator (extends to
+      `cpu_id`-aware seam), softirq `post_ack_hook` (foreshadowed
+      in RFC 0005). Each is its own RFC, prioritized when the next
       flake demands it.
-- [ ] **Document the simulator in `docs/design/simulator.md`.**
-      One-page quick reference (parallel to
-      `docs/design/scheduler-seam.md`): how to write a new repro,
+- [ ] **(12) Document the simulator in `docs/design/simulator.md`.**
+      One-page quick reference parallel to
+      `docs/design/scheduler-seam.md`: how to write a new repro,
       how to read a trace, how to add a new event variant, how to
-      add a new fault knob. Includes the reproducibility-envelope
-      contract verbatim.
+      add a new fault knob, the host-substitute table for
+      sync primitives, the reproducibility-envelope contract
+      verbatim, and the panic-hook `VIBIX_SIM_SEED=` format
+      string as a stable interface.
