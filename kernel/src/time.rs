@@ -146,7 +146,15 @@ pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn ticks() -> u64 {
+/// Monotonic PIT tick count since boot.
+///
+/// `pub(crate)` per RFC 0005 — the only intended caller is
+/// [`crate::task::env::HwClock::now`]; every other in-tree reader
+/// goes through `task::env::env()` so the simulator/mock builds can
+/// substitute a deterministic clock. A future PR that reintroduces
+/// a direct caller fails at compile time, which is the intended
+/// regression gate.
+pub(crate) fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
@@ -247,7 +255,9 @@ pub fn calibrate_tsc() {}
 /// `deadline_ticks`. Callers are task context only — uses a blocking
 /// lock. A deadline of `0` or one already in the past will be drained
 /// on the very next `preempt_tick`.
-pub fn enqueue_wakeup(deadline_ticks: u64, id: usize) {
+/// `pub(crate)` per RFC 0005 — only intended caller is
+/// [`crate::task::env::HwClock::enqueue_wakeup`]. See `ticks()`.
+pub(crate) fn enqueue_wakeup(deadline_ticks: u64, id: usize) {
     WAKEUPS.lock().entry(deadline_ticks).or_default().push(id);
 }
 
@@ -258,7 +268,9 @@ pub fn enqueue_wakeup(deadline_ticks: u64, id: usize) {
 /// Safe to call from an interrupt context: uses `try_lock` and bails
 /// cleanly on contention. A missed drain is self-healing — the next
 /// tick's call picks the same entries up.
-pub fn drain_expired(now: u64) -> Vec<usize> {
+/// `pub(crate)` per RFC 0005 — only intended caller is
+/// [`crate::task::env::HwClock::drain_expired`]. See `ticks()`.
+pub(crate) fn drain_expired(now: u64) -> Vec<usize> {
     let Some(mut wakeups) = WAKEUPS.try_lock() else {
         return Vec::new();
     };

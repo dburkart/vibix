@@ -1209,7 +1209,14 @@ pub fn preempt_tick() {
     // Drain any tick-deadline wakeups (see `task::sleep_ms`) and
     // promote their targets. Runs before the preemption decision so a
     // freshly-unparked task is visible in the highest-ready check.
-    for id in crate::time::drain_expired(crate::time::ticks()) {
+    //
+    // Routed through `env()` (RFC 0005) so the host-side simulator and
+    // mock tests can substitute their own clock. Production resolves
+    // to `HwClock` over `crate::time::*` — pure forwarding, no added
+    // synchronization (see `env::HwClock`).
+    let (clock, _irq) = env::env();
+    let now = clock.now();
+    for id in clock.drain_expired(now) {
         wake_in_sched(&mut sched, id);
     }
 
@@ -1468,9 +1475,14 @@ fn wake_in_sched(sched: &mut Scheduler, id: usize) {
 /// Resolution is the PIT tick (10 ms at 100 Hz); callers asking for
 /// less will sleep for at least one full tick.
 pub fn sleep_ms(ms: u64) {
+    // Routed through `env()` (RFC 0005) so simulator/mock builds can
+    // drive sleeps deterministically. Production resolves to
+    // `HwClock` — semantically identical to the previous direct
+    // `time::ticks` / `time::enqueue_wakeup` pair.
+    let (clock, _irq) = env::env();
     let ticks_to_wait = ms.div_ceil(crate::time::TICK_MS).max(1);
-    let deadline = crate::time::ticks().saturating_add(ticks_to_wait);
+    let deadline = clock.now().saturating_add(ticks_to_wait);
     let id = current_id();
-    crate::time::enqueue_wakeup(deadline, id);
+    clock.enqueue_wakeup(deadline, id);
     block_current();
 }
