@@ -26,20 +26,39 @@
 //!
 //! ## Surface
 //!
-//! Intentionally minimal — just the constructor, the read-only latch,
-//! the write-count probe, and the `BlockDevice` impl:
+//! Kept lean — just the constructors, the read-only latch, the
+//! write-count probe, two image-poking accessors, and the
+//! `BlockDevice` impl:
 //!
 //! - [`RamDisk::from_image`] — wrap an in-memory image, asserting the
 //!   length is a multiple of `block_size`.
+//! - [`RamDisk::zeroed`] — allocate a zero-initialized image of
+//!   `block_size * blocks` bytes (used by the block-cache /
+//!   writeback tests, which don't seed from a fixture).
 //! - [`RamDisk::set_read_only`] — flip the harness-level RO latch so a
 //!   forgotten dirty-writeback path surfaces as `BlockError::ReadOnly`
 //!   instead of silently mutating the image.
 //! - [`RamDisk::writes`] — observe the cumulative write count for
 //!   "RO mount must not issue any writes" assertions.
+//! - [`RamDisk::read_slot`] / [`RamDisk::patch`] — direct byte-level
+//!   peek / poke into the backing storage, used by the `ext2_mount`
+//!   tests to surgically corrupt header fields before mount.
 //! - `BlockDevice` impl — block-aligned `read_at` / `write_at` over a
 //!   `Mutex<Vec<u8>>`.
+//!
+//! ## Cross-area use
+//!
+//! The block-cache tests (`block_cache_sync_fs.rs`,
+//! `block_writeback.rs`) and the VFS mount-path test
+//! (`mount_dev_resolve.rs`) also pull this in even though they aren't
+//! ext2-specific. Splitting a second copy under e.g.
+//! `tests/common/block_ramdisk.rs` would just re-introduce the
+//! duplication this module exists to kill, so the helper lives here
+//! and the non-ext2 consumers document the cross-area pull at the
+//! include site.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -47,6 +66,14 @@ use spin::Mutex;
 
 use vibix::block::{BlockDevice, BlockError};
 
+// Each integration test pulls this module in via `#[path = ...] mod`,
+// which means rustc sees the file fresh in every consumer crate and
+// flags any helper that crate doesn't call. The set of methods used
+// per consumer varies (some only need `from_image`, the block-cache
+// tests need `zeroed`+`writes`, `ext2_mount` needs `patch`+`read_slot`,
+// etc.), so suppressing the dead-code warning at the module level is
+// simpler than chasing per-call-site allows.
+#[allow(dead_code)]
 pub struct RamDisk {
     block_size: u32,
     storage: Mutex<Vec<u8>>,
@@ -54,16 +81,35 @@ pub struct RamDisk {
     read_only: AtomicBool,
 }
 
+#[allow(dead_code)]
 impl RamDisk {
     /// Wrap `bytes` as an in-memory block device with the given
     /// `block_size`. The image length must be a multiple of the block
     /// size — otherwise `read_at` / `write_at` would have unreachable
     /// trailing bytes.
     pub fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
-        assert!(bytes.len() % block_size as usize == 0);
+        assert!(
+            bytes.len() % block_size as usize == 0,
+            "image size {} must be a multiple of block_size {}",
+            bytes.len(),
+            block_size,
+        );
         Arc::new(Self {
             block_size,
             storage: Mutex::new(bytes.to_vec()),
+            writes: AtomicU32::new(0),
+            read_only: AtomicBool::new(false),
+        })
+    }
+
+    /// Allocate a zero-initialized image of `block_size * blocks`
+    /// bytes. Used by the block-cache and writeback tests, which
+    /// don't seed from a fixture.
+    pub fn zeroed(block_size: u32, blocks: usize) -> Arc<Self> {
+        let bytes = (block_size as usize) * blocks;
+        Arc::new(Self {
+            block_size,
+            storage: Mutex::new(vec![0u8; bytes]),
             writes: AtomicU32::new(0),
             read_only: AtomicBool::new(false),
         })
@@ -80,6 +126,24 @@ impl RamDisk {
     /// Lets RO tests assert `writes() == 0`.
     pub fn writes(&self) -> u32 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Copy `buf.len()` bytes out of the backing storage starting at
+    /// `offset`, with no alignment / block-size requirement. Lets a
+    /// test inspect a slice of the image directly (e.g. confirming an
+    /// on-disk header reverted after a failed mount).
+    pub fn read_slot(&self, offset: usize, buf: &mut [u8]) {
+        let storage = self.storage.lock();
+        buf.copy_from_slice(&storage[offset..offset + buf.len()]);
+    }
+
+    /// Run `f` against an exclusive view of the backing storage. Lets
+    /// a test surgically corrupt an on-disk field before mount
+    /// without going through the `BlockDevice` write path (so it
+    /// doesn't bump the `writes` counter or trip the RO latch).
+    pub fn patch<F: FnOnce(&mut [u8])>(&self, f: F) {
+        let mut storage = self.storage.lock();
+        f(&mut storage);
     }
 }
 

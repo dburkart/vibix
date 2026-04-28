@@ -36,9 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
-use spin::Mutex;
-
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::fs::vfs::devfs::register_block_device;
 use vibix::fs::vfs::ops::MountSource;
 use vibix::fs::vfs::MountFlags;
@@ -95,60 +93,11 @@ fn run_tests() {
 // in `ext2_mount.rs` but slimmer — no write counter, no patch hook.
 // ---------------------------------------------------------------------------
 
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-}
-
-impl RamDisk {
-    fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(bytes.to_vec()),
-        })
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -25,15 +25,10 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use spin::Mutex;
 
 use vibix::block::cache::{BlockCache, STATE_DIRTY};
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::{
     exit_qemu, serial_println,
     test_harness::{test_panic_handler, Testable},
@@ -76,68 +71,11 @@ fn run_tests() {
 // semantics.
 // ---------------------------------------------------------------------------
 
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-    writes: AtomicU32,
-}
-
-impl RamDisk {
-    fn new(block_size: u32, blocks: usize) -> Arc<Self> {
-        let bytes = (block_size as usize) * blocks;
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(vec![0u8; bytes]),
-            writes: AtomicU32::new(0),
-        })
-    }
-
-    fn writes(&self) -> u32 {
-        self.writes.load(Ordering::Relaxed)
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -151,7 +89,7 @@ impl BlockDevice for RamDisk {
 /// This is the "write + sync_fs + drop cache + remount; data is
 /// present" test from issue #554.
 fn sync_fs_persists_across_cache_teardown() {
-    let disk = RamDisk::new(512, 16);
+    let disk = RamDisk::zeroed(512, 16);
 
     // --- Phase 1: mount 1, dirty block 5, sync_fs, drop cache. ---
     {
@@ -207,7 +145,7 @@ fn sync_fs_persists_across_cache_teardown() {
 /// This is the "sync_fs does NOT flush buffers belonging to a
 /// different mount" test from issue #554.
 fn sync_fs_does_not_flush_other_mount() {
-    let disk = RamDisk::new(512, 16);
+    let disk = RamDisk::zeroed(512, 16);
     let cache = BlockCache::new(disk.clone() as Arc<dyn BlockDevice>, 512, 8);
     let dev_a = cache.register_device();
     let dev_b = cache.register_device();

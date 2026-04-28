@@ -34,11 +34,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, Ordering};
 
-use spin::Mutex;
-
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::fs::ext2::Ext2Fs;
 use vibix::fs::vfs::ops::{FileSystem as _, MountSource};
 use vibix::fs::vfs::super_block::SbFlags;
@@ -115,70 +112,11 @@ fn run_tests() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RamDisk (mirrors ext2_mount.rs / ext2_inode_iget.rs, simplified to a
-// single owning constructor since every test here patches the image
-// in-place before mount).
-// ---------------------------------------------------------------------------
-
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-    writes: AtomicU32,
-}
-
-impl RamDisk {
-    fn new(bytes: Vec<u8>, block_size: u32) -> Arc<Self> {
-        assert!(bytes.len() % block_size as usize == 0);
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(bytes),
-            writes: AtomicU32::new(0),
-        })
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 // ---------------------------------------------------------------------------
 // Image-patching helpers. The fixture is a 1 KiB-block, 16-inode,
@@ -232,7 +170,7 @@ fn mount_with(
     Arc<vibix::fs::ext2::Ext2Fs>,
     Arc<vibix::fs::ext2::Ext2Super>,
 ) {
-    let disk = RamDisk::new(img, 512);
+    let disk = RamDisk::from_image(&img, 512);
     let fs = Ext2Fs::new_with_device(disk as Arc<dyn BlockDevice>);
     let sb = fs
         .mount(MountSource::None, flags)

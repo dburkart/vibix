@@ -27,13 +27,9 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use spin::Mutex;
-
-use vibix::block::{BlockDevice, BlockError};
+use vibix::block::BlockDevice;
 use vibix::fs::ext2::{finalize_orphan, iget, Ext2Fs, Ext2Super};
 use vibix::fs::vfs::ops::{FileSystem as _, MountSource};
 use vibix::fs::vfs::super_block::SuperBlock;
@@ -81,77 +77,11 @@ fn run_tests() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RamDisk — matches ext2_unlink.rs.
-// ---------------------------------------------------------------------------
-
-struct RamDisk {
-    block_size: u32,
-    storage: Mutex<Vec<u8>>,
-    writes: AtomicU32,
-    read_only: AtomicBool,
-}
-
-impl RamDisk {
-    fn from_image(bytes: &[u8], block_size: u32) -> Arc<Self> {
-        assert!(bytes.len() % block_size as usize == 0);
-        Arc::new(Self {
-            block_size,
-            storage: Mutex::new(bytes.to_vec()),
-            writes: AtomicU32::new(0),
-            read_only: AtomicBool::new(false),
-        })
-    }
-
-    fn set_read_only(&self, ro: bool) {
-        self.read_only.store(ro, Ordering::Relaxed);
-    }
-}
-
-impl BlockDevice for RamDisk {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::OutOfRange);
-        }
-        let off = offset as usize;
-        buf.copy_from_slice(&storage[off..off + buf.len()]);
-        Ok(())
-    }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(BlockError::ReadOnly);
-        }
-        let bs = self.block_size as u64;
-        if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
-            return Err(BlockError::BadAlign);
-        }
-        let mut storage = self.storage.lock();
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or(BlockError::Enospc)?;
-        if end > storage.len() as u64 {
-            return Err(BlockError::Enospc);
-        }
-        let off = offset as usize;
-        storage[off..off + buf.len()].copy_from_slice(buf);
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    fn capacity(&self) -> u64 {
-        self.storage.lock().len() as u64
-    }
-}
+// Shared `RamDisk` — see kernel/tests/common/ext2_ramdisk.rs (issues
+// #627, #658).
+#[path = "common/ext2_ramdisk.rs"]
+mod ext2_ramdisk;
+use ext2_ramdisk::RamDisk;
 
 fn mount_rw() -> (Arc<SuperBlock>, Arc<Ext2Fs>, Arc<Ext2Super>, Arc<RamDisk>) {
     let disk = RamDisk::from_image(GOLDEN_IMG.as_slice(), 512);
@@ -288,7 +218,13 @@ fn finalize_rmdir_orphan_frees_blocks_and_chain_head() {
     //    directly off the RamDisk storage so we bypass any in-memory
     //    cache of the Ext2Inode.
     {
-        let storage = _disk.storage.lock();
+        // Snapshot the full image out of the shared `RamDisk` so we
+        // can reuse the existing offset helpers, which are written
+        // against `&[u8]`. The image is only 64 KiB, so the copy is
+        // cheap and keeps this site honest with the helper's public
+        // surface (no peeking through `pub(crate)` storage).
+        let mut storage = [0u8; 65_536];
+        _disk.read_slot(0, &mut storage);
         let slot_off = inode_slot_offset(&storage, 11);
         let links = u16_le(&storage, slot_off + INODE_OFF_LINKS_COUNT);
         let dtime = u32_le(&storage, slot_off + INODE_OFF_DTIME);
