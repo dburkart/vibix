@@ -18,6 +18,8 @@
 //!                      without booting QEMU (issue #526, for CI pre-build)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
+//!   fuzz          — bounded-iteration host fuzz of an FS layer (#677)
+//!                   `cargo xtask fuzz ext2 [--iters=N]` (defaults to 2000)
 //!   clean         — remove build artifacts
 //!
 //! Flags (apply where sensible): --release, --fault-test, --panic-test
@@ -278,11 +280,38 @@ fn main() -> R<()> {
                 mode,
             )?;
         }
+        "fuzz" => {
+            // `xtask fuzz <target>`. Currently only `ext2` is wired
+            // (#677); future targets will add more match arms.
+            let which = rest
+                .first()
+                .ok_or("fuzz: missing target name (try `xtask fuzz ext2`)")?;
+            match which.as_str() {
+                "ext2" => {
+                    // Pull `--iters=N` straight from the `rest` tail so the
+                    // CI lane can throttle work. Default tuned for a
+                    // ~few-second wall-clock on a cold runner.
+                    let iters = rest
+                        .iter()
+                        .find_map(|a| {
+                            a.strip_prefix("--iters=")
+                                .and_then(|v| v.parse::<u64>().ok())
+                        })
+                        .unwrap_or(2000);
+                    fuzz_ext2(iters)?;
+                }
+                other => {
+                    return Err(
+                        format!("fuzz: unknown target '{other}' (only 'ext2' is wired)").into(),
+                    );
+                }
+            }
+        }
         "clean" => clean()?,
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|lint|isr-audit|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|lint|isr-audit|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -1952,6 +1981,59 @@ fn lint() -> R<()> {
     println!("→ isr-audit: scanning ISR-reachable files");
     isr_audit::run(&workspace_root())?;
 
+    Ok(())
+}
+
+/// `xtask fuzz ext2` — bounded-iteration smoke run of the ext2 host
+/// fuzz harness (#677). Drives `kernel/fuzz/src/bin/ext2_fuzz_runner`
+/// over the committed seed corpus and a deterministic mutation
+/// budget. Build is forced through `--release` so libstd-side cost
+/// (read_dir, sorting) doesn't dominate the iteration budget.
+///
+/// The runner prints per-seed verdicts and the mutation total; this
+/// xtask wrapper just translates `--iters` and surfaces the child
+/// process exit status.
+fn fuzz_ext2(iters: u64) -> R<()> {
+    let root = workspace_root();
+    let manifest = root.join("kernel").join("fuzz").join("Cargo.toml");
+    if !manifest.exists() {
+        return Err(format!(
+            "fuzz: manifest not found at {} — kernel/fuzz crate missing?",
+            manifest.display()
+        )
+        .into());
+    }
+    let corpus = root
+        .join("kernel")
+        .join("fuzz")
+        .join("corpus")
+        .join("ext2_mount");
+    if !corpus.exists() {
+        return Err(format!(
+            "fuzz: corpus dir not found at {} — repo layout drift?",
+            corpus.display()
+        )
+        .into());
+    }
+    let iters_arg = format!("--iters={iters}");
+
+    println!("→ fuzz/ext2: corpus={} iters={}", corpus.display(), iters,);
+    check(
+        Command::new("cargo")
+            .current_dir(root)
+            .args([
+                "run",
+                "--manifest-path",
+                manifest.to_str().unwrap(),
+                "--bin",
+                "ext2_fuzz_runner",
+                "--release",
+                "--",
+                corpus.to_str().unwrap(),
+                &iters_arg,
+            ])
+            .status()?,
+    )?;
     Ok(())
 }
 
