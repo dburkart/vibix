@@ -109,6 +109,20 @@ jobs:
       - name: cargo xtask build --release
         run: cargo xtask build --release
 
+      # RFC 0005 Phase 1 hardening (#669). Static guard that the
+      # `#[cfg(feature = "sched-mock")]` gate around `MockClock` /
+      # `MockIrqSource` from #668 actually holds: even if a future PR
+      # accidentally enables `sched-mock` in the default feature set or
+      # a non-gated `pub use` re-exports a mock type, this step fails
+      # the release pipeline before the binary ships. Runs `llvm-nm`
+      # over the freshly-built release kernel ELF (and the ISO-bundled
+      # ELF as defense-in-depth) and fails on any forbidden symbol.
+      #
+      # See `docs/RFC/0005-scheduler-irq-seam.md` "Test-time wiring"
+      # and Security review B1.
+      - name: RFC 0005 nm-check (no MockClock/MockIrqSource in release)
+        run: cargo xtask nm-check --release
+
   unit-tests:
     name: host unit tests
     runs-on: ubuntu-latest
