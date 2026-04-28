@@ -249,8 +249,9 @@ pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
     // simulator's clock — when we ever drive the ring-3 jump under it
     // — sees the same `Tick` source the scheduler does.
     let (clock, _irq) = crate::task::env::env();
-    INIT_IRQ_PRE_RING3_TICKS.store(clock.now().raw(), core::sync::atomic::Ordering::Release);
-    crate::serial_println!("irq-pre-ring3: ticks={}", clock.now().raw());
+    let pre_ticks = clock.now().raw();
+    INIT_IRQ_PRE_RING3_TICKS.store(pre_ticks, core::sync::atomic::Ordering::Release);
+    crate::serial_println!("irq-pre-ring3: ticks={}", pre_ticks);
     // #478 diagnostic step 1: emit a single-byte marker on the QEMU debug
     // console (port 0xe9) *immediately* before the iretq, and a second
     // byte in the same asm block *after* the iretq frame is pushed but
