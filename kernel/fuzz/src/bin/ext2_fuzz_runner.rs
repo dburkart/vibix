@@ -8,15 +8,19 @@
 //! CI can exercise the harness on every PR without installing extra
 //! tooling.
 //!
-//! Exit code is 0 on success, non-zero only if the harness itself
-//! panics out-of-band (libstd catches it and aborts) — `fuzz_one` is
-//! contract-bound never to panic, so any non-zero exit is itself a
-//! finding.
+//! Exit codes:
+//!   - 0 on success.
+//!   - 2 on usage error, missing corpus, or a Phase 1 verdict
+//!     mismatch (a synthesized seed yielding a different `FuzzExit`
+//!     than the harness's stated contract).
+//!   - Anything else (typically aborts via libstd) is the harness
+//!     itself panicking out-of-band — `fuzz_one` is contract-bound
+//!     never to panic, so that's itself a finding.
 //!
 //! Usage (driven by `cargo xtask fuzz ext2`):
 //!
 //! ```text
-//! ext2_fuzz_runner <corpus-dir> [--iters N] [--seed S]
+//! ext2_fuzz_runner <corpus-dir> [--iters=N | --iters N] [--seed=S | --seed S]
 //! ```
 
 use std::env;
@@ -242,7 +246,11 @@ fn run() -> Result<(), String> {
     let corpus_dir = args
         .first()
         .map(PathBuf::from)
-        .ok_or_else(|| "usage: ext2_fuzz_runner <corpus-dir> [--iters=N] [--seed=S]".to_string())?;
+        .ok_or_else(|| {
+            "usage: ext2_fuzz_runner <corpus-dir> \
+             [--iters=N | --iters N] [--seed=S | --seed S]"
+                .to_string()
+        })?;
     let iters: usize = parse_arg::<usize>(&args, "--iters").unwrap_or(1000);
     let seed: u64 = parse_arg::<u64>(&args, "--seed").unwrap_or(0xDEAD_BEEF_FACE_F00D);
 
