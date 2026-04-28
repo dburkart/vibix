@@ -1,0 +1,10 @@
+[package]
+name = "pjdfstest_runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pjdfstest_runner"
+path = "src/main.rs"
