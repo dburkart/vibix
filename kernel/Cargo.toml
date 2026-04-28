@@ -483,3 +483,7 @@ required-features = ["ext2"]
 name = "ext2_crash_consistency"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "block_cache_stress"
+harness = false
