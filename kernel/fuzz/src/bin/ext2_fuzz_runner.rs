@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use vibix_ext2_fuzz::fuzz_one;
+use vibix_ext2_fuzz::{fuzz_one, FuzzExit};
 
 /// Tiny SplitMix64 — deterministic, no external dep, "random enough"
 /// for byte-flip fuzzing of small images.
@@ -85,8 +85,15 @@ fn read_corpus_seeds(dir: &Path) -> std::io::Result<Vec<(PathBuf, Vec<u8>)>> {
 /// `fuzz_targets/ext2_mount.rs` target uses the on-disk corpus
 /// directory directly, while the smoke runner here mixes synthesized
 /// scenarios in alongside whatever's on disk.
-fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+/// Each synthesized seed is paired with an `Option<FuzzExit>` describing
+/// the expected outcome. `Some(v)` is an exact-match assertion: phase 1
+/// must observe `fuzz_one(seed) == v` or CI fails. `None` means the
+/// scenario doesn't have a structural validator yet (e.g. BGDT free-
+/// count fields aren't sanity-checked) — the only contract is "must not
+/// panic / OOB / hang", which is enforced by virtue of the runner not
+/// crashing.
+fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>, Option<FuzzExit>)> {
+    let mut out: Vec<(String, Vec<u8>, Option<FuzzExit>)> = Vec::new();
 
     // (a) zeroed superblock — magic and everything else is zero.
     {
@@ -94,7 +101,11 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
         for b in &mut img[1024..1024 + 1024] {
             *b = 0;
         }
-        out.push(("synth:zeroed_superblock".into(), img));
+        out.push((
+            "synth:zeroed_superblock".into(),
+            img,
+            Some(FuzzExit::BadSuperblock),
+        ));
     }
 
     // (b) bad magic — flip the EF53 to AABB.
@@ -102,25 +113,43 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut img = golden.to_vec();
         img[1024 + 56] = 0xAA;
         img[1024 + 57] = 0xBB;
-        out.push(("synth:bad_magic".into(), img));
+        out.push((
+            "synth:bad_magic".into(),
+            img,
+            Some(FuzzExit::BadSuperblock),
+        ));
     }
 
     // (c) inflated `s_blocks_count`.
     {
         let mut img = golden.to_vec();
         img[1024 + 4..1024 + 8].copy_from_slice(&u32::MAX.to_le_bytes());
-        out.push(("synth:inflated_s_blocks_count".into(), img));
+        out.push((
+            "synth:inflated_s_blocks_count".into(),
+            img,
+            Some(FuzzExit::BadSuperblock),
+        ));
     }
 
     // (d) BGDT with negative-equivalent free counts (u16::MAX).
     //     Block size on golden.img is 1024, so BGDT lives at byte
     //     2048; first descriptor at 2048..2080.
+    //
+    //     The harness doesn't directly validate `bg_free_*_count`, but
+    //     stomping u16::MAX into adjacent BGDT bytes typically tips a
+    //     pointer field (bg_block_bitmap / bg_inode_bitmap /
+    //     bg_inode_table) out of range too. In practice the verdict is
+    //     `BadGroupDesc`; assert it explicitly so any drift trips CI.
     {
         let mut img = golden.to_vec();
         // bg_free_blocks_count at offset 12, bg_free_inodes_count at 14.
         img[2048 + 12..2048 + 14].copy_from_slice(&u16::MAX.to_le_bytes());
         img[2048 + 14..2048 + 16].copy_from_slice(&u16::MAX.to_le_bytes());
-        out.push(("synth:bgdt_negative_free".into(), img));
+        out.push((
+            "synth:bgdt_negative_free".into(),
+            img,
+            Some(FuzzExit::BadGroupDesc),
+        ));
     }
 
     // (e) directory record `rec_len` overrun. The 64 KiB golden image
@@ -132,7 +161,11 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
     {
         let mut img = golden.to_vec();
         img[7168 + 4..7168 + 6].copy_from_slice(&u16::MAX.to_le_bytes());
-        out.push(("synth:dir_rec_len_overrun".into(), img));
+        out.push((
+            "synth:dir_rec_len_overrun".into(),
+            img,
+            Some(FuzzExit::BadDirEntry),
+        ));
     }
 
     // (f) indirect block pointing back at itself. Shape it via the
@@ -145,8 +178,8 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
     //         image) and stamp it into i_block[12].
     //       - Write a single u32 self-pointer at that block, byte 0.
     //
-    //     The harness's collect_data_blocks will detect the self-loop
-    //     and return BadFileBlocks.
+    //     This corrupts the *root* inode's block list, so the verdict
+    //     must surface as `BadRootInode` (the root walk's error remap).
     {
         let mut img = golden.to_vec();
         let ind_block: u32 = 30;
@@ -154,11 +187,16 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
         img[i_block_12_off..i_block_12_off + 4].copy_from_slice(&ind_block.to_le_bytes());
         let blk_off = (ind_block as usize) * 1024;
         img[blk_off..blk_off + 4].copy_from_slice(&ind_block.to_le_bytes());
-        out.push(("synth:indirect_self_loop".into(), img));
+        out.push((
+            "synth:indirect_self_loop".into(),
+            img,
+            Some(FuzzExit::BadRootInode),
+        ));
     }
 
     // (g) indirect block pointing out of range. Same i_block[12]
-    //     trick but the indirect block contains a u32 = u32::MAX.
+    //     trick on the root inode but the indirect block contains a
+    //     u32 = u32::MAX. Same `BadRootInode` remap as (f).
     {
         let mut img = golden.to_vec();
         let ind_block: u32 = 31;
@@ -166,14 +204,22 @@ fn synthesize_malformed_seeds(golden: &[u8]) -> Vec<(String, Vec<u8>)> {
         img[i_block_12_off..i_block_12_off + 4].copy_from_slice(&ind_block.to_le_bytes());
         let blk_off = (ind_block as usize) * 1024;
         img[blk_off..blk_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        out.push(("synth:indirect_oob".into(), img));
+        out.push((
+            "synth:indirect_oob".into(),
+            img,
+            Some(FuzzExit::BadRootInode),
+        ));
     }
 
     // (h) bad `s_log_block_size` (≥ 32 → block_size() returns None).
     {
         let mut img = golden.to_vec();
         img[1024 + 24..1024 + 28].copy_from_slice(&32u32.to_le_bytes());
-        out.push(("synth:bad_log_block_size".into(), img));
+        out.push((
+            "synth:bad_log_block_size".into(),
+            img,
+            Some(FuzzExit::BadSuperblock),
+        ));
     }
 
     out
@@ -188,17 +234,25 @@ fn run() -> Result<(), String> {
     let iters: usize = parse_arg::<usize>(&args, "--iters").unwrap_or(1000);
     let seed: u64 = parse_arg::<u64>(&args, "--seed").unwrap_or(0xDEAD_BEEF_FACE_F00D);
 
-    let mut seeds: Vec<(String, Vec<u8>)> = read_corpus_seeds(&corpus_dir)
+    // On-disk corpus seeds. Each is paired with `Some(FuzzExit::Ok)` —
+    // committed seeds must walk cleanly, otherwise the corpus itself is
+    // broken. Synthesized malformed seeds are appended below with their
+    // own expected verdicts.
+    let on_disk: Vec<(String, Vec<u8>)> = read_corpus_seeds(&corpus_dir)
         .map_err(|e| format!("read corpus {}: {e}", corpus_dir.display()))?
         .into_iter()
         .map(|(p, b)| (p.display().to_string(), b))
         .collect();
-    if seeds.is_empty() {
+    if on_disk.is_empty() {
         return Err(format!(
             "corpus directory {} contained no seed files",
             corpus_dir.display()
         ));
     }
+    let mut seeds: Vec<(String, Vec<u8>, Option<FuzzExit>)> = on_disk
+        .into_iter()
+        .map(|(label, bytes)| (label, bytes, Some(FuzzExit::Ok)))
+        .collect();
 
     // Synthesize the issue-#677 malformed scenarios from the largest
     // committed seed (whichever it is, typically the golden 64 KiB
@@ -206,8 +260,8 @@ fn run() -> Result<(), String> {
     // to ship eight binary blobs.
     let largest = seeds
         .iter()
-        .max_by_key(|(_, b)| b.len())
-        .map(|(_, b)| b.clone())
+        .max_by_key(|(_, b, _)| b.len())
+        .map(|(_, b, _)| b.clone())
         .unwrap_or_default();
     if largest.len() >= 65_536 {
         seeds.extend(synthesize_malformed_seeds(&largest));
@@ -221,30 +275,47 @@ fn run() -> Result<(), String> {
         seed
     );
 
-    // Phase 1: walk every seed verbatim. The harness must accept all
-    // of them without panicking, OOB, or hanging. The `Ok` verdict is
-    // the golden image; everything else returns a `FuzzExit::Bad*`
-    // variant which is itself a clean reject.
-    for (label, bytes) in &seeds {
+    // Phase 1: walk every seed verbatim. Each seed carries an expected
+    // verdict (or `None` for "must not panic" probes); a mismatch is a
+    // CI failure — silent verdict drift is exactly the regression class
+    // this harness is meant to catch.
+    let mut mismatches: Vec<String> = Vec::new();
+    for (label, bytes, expected) in &seeds {
         let verdict = fuzz_one(bytes);
-        println!("seed {label} -> {verdict:?}");
+        match expected {
+            Some(want) if verdict != *want => {
+                let msg = format!("seed {label} -> {verdict:?} (expected {want:?})");
+                println!("MISMATCH {msg}");
+                mismatches.push(msg);
+            }
+            _ => println!("seed {label} -> {verdict:?}"),
+        }
+    }
+    if !mismatches.is_empty() {
+        return Err(format!(
+            "{} seed verdict mismatch(es); harness contract drifted:\n  {}",
+            mismatches.len(),
+            mismatches.join("\n  ")
+        ));
     }
 
     // Phase 2: bounded random mutations of each seed. Three primitive
     // mutators chosen for cheapness: single-byte XOR flip, single-byte
-    // store, and 4-byte little-endian splat. Skip any seed shorter
-    // than 8 bytes — too small to mutate meaningfully.
+    // store, and 4-byte little-endian splat. Drive the loop directly
+    // from `total < iters` — pre-splitting via `iters / seeds.len()`
+    // floors the budget and zeroes out when iters < seeds.len().
     let mut rng = SplitMix64::new(seed);
     let mut total = 0usize;
-    'outer: for (_label, base) in &seeds {
-        if base.len() < 8 {
-            continue;
-        }
-        let per_seed = iters / seeds.len().max(1);
-        for _ in 0..per_seed {
+    'outer: while total < iters {
+        let mut made_progress = false;
+        for (_label, base, _) in &seeds {
             if total >= iters {
                 break 'outer;
             }
+            if base.len() < 8 {
+                continue;
+            }
+            made_progress = true;
             total += 1;
             let mut buf = base.clone();
             let n_mutations = 1 + rng.next_usize(4);
@@ -268,6 +339,11 @@ fn run() -> Result<(), String> {
                 }
             }
             let _ = fuzz_one(&buf);
+        }
+        if !made_progress {
+            // Every seed was below the 8-byte mutation floor — nothing
+            // left to mutate, so don't spin forever.
+            break;
         }
     }
     println!("ext2 fuzz runner: completed {total} mutated iterations cleanly");

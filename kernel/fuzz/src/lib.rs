@@ -221,11 +221,23 @@ pub fn fuzz_one(data: &[u8]) -> FuzzExit {
     // indirect) and run the per-block iterator. Collect the inos of
     // any regular files for the read-pretend pass below.
     let filetype_valid = (sb.s_feature_incompat & INCOMPAT_FILETYPE) != 0;
-    let mut file_inos: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    // Track each candidate ino plus its dir-entry file_type so the
+    // pretend-read pass below can decide whether a `BadFileBlocks` from
+    // its inode is a real corruption (regular file → propagate) or a
+    // benign shape mismatch (e.g. attacker named a directory, where
+    // `i_block[]` semantics are different and a swallowed error is the
+    // right call).
+    let mut file_inos: alloc::vec::Vec<(u32, u8)> = alloc::vec::Vec::new();
 
+    // Any error walking the *root* inode is structural corruption of
+    // the root, not of "some file" — remap to `BadRootInode` so the
+    // verdict matches the contract. `LoopCap` stays as itself: it's
+    // the harness's own budget tripping, orthogonal to which inode
+    // ran us out of pointers.
     let dir_blocks = match collect_data_blocks(data, &root_inode, block_size, device_blocks) {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(FuzzExit::LoopCap) => return FuzzExit::LoopCap,
+        Err(_) => return FuzzExit::BadRootInode,
     };
 
     for blk in dir_blocks.iter().copied() {
@@ -254,7 +266,7 @@ pub fn fuzz_one(data: &[u8]) -> FuzzExit {
                         && view.inode != EXT2_ROOT_INO
                         && (view.inode as u64) <= sb.s_inodes_count as u64
                     {
-                        file_inos.push(view.inode);
+                        file_inos.push((view.inode, view.file_type));
                     }
                     // align4_rec_len is the same primitive the driver
                     // uses; running it on attacker bytes catches any
@@ -269,7 +281,7 @@ pub fn fuzz_one(data: &[u8]) -> FuzzExit {
     //    3, walk a bounded number of its direct + single-indirect
     //    blocks, and bail cleanly on any out-of-range pointer or
     //    self-loop.
-    for &ino in &file_inos {
+    for &(ino, file_type) in &file_inos {
         if ino < 1 {
             continue;
         }
@@ -292,6 +304,13 @@ pub fn fuzz_one(data: &[u8]) -> FuzzExit {
             continue;
         }
         let inode = Ext2Inode::decode(&data[slot_byte as usize..slot_end as usize]);
+        // Whether the dir entry positively names a regular file. If
+        // `filetype_valid` is false (pre-rev-1 / no INCOMPAT_FILETYPE)
+        // every entry surfaces as `EXT2_FT_UNKNOWN`, meaning we *cannot*
+        // disambiguate — be conservative and treat it as "could be a
+        // regular file" so we don't silently swallow real corruption.
+        let entry_is_definitely_not_regular =
+            filetype_valid && file_type != disk::EXT2_FT_REG_FILE;
         match collect_data_blocks(data, &inode, block_size, device_blocks) {
             Ok(blocks) => {
                 for blk in blocks.iter().copied().take(MAX_INDIRECT_PTRS) {
@@ -301,6 +320,16 @@ pub fn fuzz_one(data: &[u8]) -> FuzzExit {
                 }
             }
             Err(FuzzExit::LoopCap) => return FuzzExit::LoopCap,
+            Err(FuzzExit::BadFileBlocks) => {
+                // Only swallow when we're sure this entry is not a
+                // regular file. Otherwise propagate — corrupted file
+                // block lists must surface as `BadFileBlocks`, that's
+                // the variant's whole purpose.
+                if entry_is_definitely_not_regular {
+                    continue;
+                }
+                return FuzzExit::BadFileBlocks;
+            }
             Err(_) => continue,
         }
     }
@@ -410,12 +439,21 @@ fn collect_data_blocks(
                 Some(b) => b,
                 None => return Err(FuzzExit::BadFileBlocks),
             };
-            let mut walked = 0usize;
+            // Global cap on pointer *words* inspected across the entire
+            // double-indirect walk — both the L1 array and every L2
+            // block. Without this an adversarial image where L1 is
+            // entirely nonzero (so `walked` only counts L1 slots, all
+            // legal) but every L2 block is sparse (so `blocks.len()`
+            // never trips) can still force `ptrs_per_block^2` reads.
+            // The cap mirrors the per-list limit since the surface area
+            // is the same: we promise never to chew through more than
+            // `MAX_INDIRECT_PTRS` pointer words on any single inode.
+            let mut inspected_words = 0usize;
             for i in 0..ptrs_per_block {
-                if walked >= MAX_INDIRECT_PTRS {
+                if inspected_words >= MAX_INDIRECT_PTRS {
                     return Err(FuzzExit::LoopCap);
                 }
-                walked += 1;
+                inspected_words += 1;
                 let off = i * 4;
                 let l2 = u32::from_le_bytes([
                     dind_block[off],
@@ -435,6 +473,10 @@ fn collect_data_blocks(
                     None => return Err(FuzzExit::BadFileBlocks),
                 };
                 for j in 0..ptrs_per_block {
+                    if inspected_words >= MAX_INDIRECT_PTRS {
+                        return Err(FuzzExit::LoopCap);
+                    }
+                    inspected_words += 1;
                     let joff = j * 4;
                     let p = u32::from_le_bytes([
                         l2_block[joff],
