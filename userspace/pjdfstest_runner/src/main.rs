@@ -74,7 +74,11 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_STAT: u64 = 4;
 const SYS_LSEEK: u64 = 8;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_GETCWD: u64 = 79;
+const SYS_CHDIR: u64 = 80;
 const SYS_MKDIR: u64 = 83;
 const SYS_RMDIR: u64 = 84;
 const SYS_LINK: u64 = 86;
@@ -82,10 +86,21 @@ const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_CHMOD: u64 = 90;
-const SYS_CHDIR: u64 = 80;
-const SYS_GETCWD: u64 = 79;
+const SYS_CHOWN: u64 = 92;
 const SYS_GETUID: u64 = 102;
 const SYS_EXIT: u64 = 60;
+const SYS_UTIMENSAT: u64 = 280;
+
+// `utimensat(2)` directory-fd sentinel for "current working directory" —
+// used here as the dirfd whenever `path` is absolute, matching the Linux
+// idiom. Negative is intentional: kernel/src/arch/x86_64/syscalls/vfs.rs
+// exposes `AT_FDCWD: i32 = -100`.
+const AT_FDCWD: i32 = -100;
+
+// `utimensat(2)` per-field sentinels. UTIME_OMIT means "leave this
+// timestamp unchanged"; UTIME_NOW means "set to wall-clock now". Mirrored
+// from kernel/src/arch/x86_64/syscalls/vfs.rs — keep in sync.
+const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 // open(2) flags — Linux x86_64 values, matching kernel/src/fs constants.
 const O_RDONLY: i32 = 0;
@@ -97,6 +112,7 @@ const O_TRUNC: i32 = 0o1000;
 
 // Errno negatives we test against. Kernel returns these as -<errno>
 // from the syscall return path; we negate before comparing.
+const EBADF: i64 = 9;
 const EEXIST: i64 = 17;
 const ENOENT: i64 = 2;
 const ENOTDIR: i64 = 20;
@@ -160,6 +176,94 @@ unsafe fn sc3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
         options(nostack),
     );
     ret
+}
+
+#[inline(always)]
+unsafe fn sc4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") nr => ret,
+        inlateout("rdi") a0 => _,
+        inlateout("rsi") a1 => _,
+        inlateout("rdx") a2 => _,
+        inlateout("r10") a3 => _,
+        lateout("rcx") _,
+        lateout("r8") _,
+        lateout("r9") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+    ret
+}
+
+// ---------------------------------------------------------------------------
+// `struct stat` mirror — kernel/src/fs/vfs/ops.rs::Stat.
+// ---------------------------------------------------------------------------
+//
+// Layout MUST stay byte-compatible with the kernel side (size 0x90,
+// align 8). The kernel zero-initialises the buffer before the copy-out,
+// so reading any field from a zeroed `Stat` here is safe even if the
+// kernel-side ABI grows.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Stat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    __unused: [i64; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<Stat>() == 0x90);
+
+impl Stat {
+    const fn zeroed() -> Self {
+        Stat {
+            st_dev: 0,
+            st_ino: 0,
+            st_nlink: 0,
+            st_mode: 0,
+            st_uid: 0,
+            st_gid: 0,
+            __pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 0,
+            st_blocks: 0,
+            st_atime: 0,
+            st_atime_nsec: 0,
+            st_mtime: 0,
+            st_mtime_nsec: 0,
+            st_ctime: 0,
+            st_ctime_nsec: 0,
+            __unused: [0; 3],
+        }
+    }
+}
+
+/// Kernel `struct timespec` — used by utimensat(2). Two of these,
+/// laid out contiguously, form the `times[2]` argument the kernel
+/// reads.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +332,36 @@ fn sys_readlink(path: &CStr, buf: &mut [u8]) -> i64 {
 
 fn sys_chmod(path: &CStr, mode: u32) -> i64 {
     unsafe { sc2(SYS_CHMOD, path.as_ptr() as u64, mode as u64) }
+}
+
+fn sys_chown(path: &CStr, uid: u32, gid: u32) -> i64 {
+    unsafe { sc3(SYS_CHOWN, path.as_ptr() as u64, uid as u64, gid as u64) }
+}
+
+fn sys_ftruncate(fd: i32, length: i64) -> i64 {
+    unsafe { sc2(SYS_FTRUNCATE, fd as u64, length as u64) }
+}
+
+/// `stat(path, *statbuf)` — follows symlinks. We pass `statbuf` as a
+/// raw pointer; the kernel zero-initialises before copy-out so the
+/// caller need not pre-zero, but we do anyway for defence in depth.
+fn sys_stat(path: &CStr, st: &mut Stat) -> i64 {
+    unsafe { sc2(SYS_STAT, path.as_ptr() as u64, st as *mut Stat as u64) }
+}
+
+/// `utimensat(dirfd, path, times[2], flags)`. `times` is two
+/// contiguous `timespec`s; pass `core::ptr::null()` (i.e. 0) for
+/// "set both to now".
+fn sys_utimensat(dirfd: i32, path: &CStr, times: *const Timespec, flags: u32) -> i64 {
+    unsafe {
+        sc4(
+            SYS_UTIMENSAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            times as u64,
+            flags as u64,
+        )
+    }
 }
 
 fn sys_chdir(path: &CStr) -> i64 {
@@ -401,6 +535,66 @@ struct TestErr {
 
 fn err(reason: &'static [u8], rc: i64) -> TestErr {
     TestErr { reason, rc }
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers
+// ---------------------------------------------------------------------------
+//
+// These trim the boilerplate the original 14 cases open-coded. They are
+// macros (not functions) so the failure-path early return propagates
+// out of the calling case via `?`-style sugar without each call site
+// repeating the `if rc != ... { return Err(err(...)) }` shape.
+
+/// Assert that a syscall call returned exactly `-EXPECTED`. Used for
+/// "this should fail with errno X" cases (e.g. `chmod` on a missing
+/// path → `ENOENT`). Mirrors pjdfstest's `expect_error!` macro from
+/// the vendored `tests/pjdfstest/src/test_case.rs` family.
+///
+/// On success → does nothing. On a positive-or-zero rc (call did not
+/// fail at all) → returns Err(`reason_ok`). On a different errno →
+/// returns Err(`reason_errno`).
+macro_rules! expect_err {
+    ($call:expr, $expected:expr, $reason_ok:expr, $reason_errno:expr) => {{
+        let __rc = $call;
+        if __rc >= 0 {
+            return Err(err($reason_ok, __rc));
+        }
+        if __rc != -($expected) {
+            return Err(err($reason_errno, __rc));
+        }
+    }};
+}
+
+/// Stat `$path` and assert one field of the resulting `struct stat`
+/// equals an expected value. Stat() failures and field mismatches both
+/// surface as Err with a descriptive reason. Modeled after
+/// pjdfstest's `assert_metadata!` shorthand.
+///
+/// The masked variant (`@mask`) is for fields like `st_mode` where
+/// only the permission bits are interesting — file-type bits depend on
+/// the inode and would otherwise leak into the comparison.
+macro_rules! assert_stat_field {
+    ($path:expr, $field:ident, $expected:expr, $reason:expr) => {{
+        let mut __st = Stat::zeroed();
+        let __rc = sys_stat($path, &mut __st);
+        if __rc != 0 {
+            return Err(err(b"stat for readback failed", __rc));
+        }
+        if __st.$field as i64 != $expected as i64 {
+            return Err(err($reason, __st.$field as i64));
+        }
+    }};
+    (@mask $path:expr, $field:ident, $mask:expr, $expected:expr, $reason:expr) => {{
+        let mut __st = Stat::zeroed();
+        let __rc = sys_stat($path, &mut __st);
+        if __rc != 0 {
+            return Err(err(b"stat for readback failed", __rc));
+        }
+        if (__st.$field as u64 & ($mask as u64)) != ($expected as u64 & ($mask as u64)) {
+            return Err(err($reason, (__st.$field as u64 & ($mask as u64)) as i64));
+        }
+    }};
 }
 
 /// Best-effort per-case scratch dir cleanup. Order matters — files
@@ -653,10 +847,10 @@ fn case_symlink_readlink(scratch: &CStr) -> Result<(), TestErr> {
     Ok(())
 }
 
-/// chmod() updates the file mode bits; the change is observable via
-/// open() succeeding/failing accordingly. We don't have stat() in the
-/// runner so we settle for "chmod returned 0" — coverage of the bit
-/// readback is deferred to the follow-up matrix.
+/// chmod() updates the file mode bits; readback via stat() observes
+/// the new permission bits. The mask is `0o7777` (set-id + sticky +
+/// rwx triplets) — the file-type bits in the high half of `st_mode`
+/// belong to the inode, not the chmod call.
 fn case_chmod_returns_ok(scratch: &CStr) -> Result<(), TestErr> {
     let path = join(&scratch.bytes[..scratch.len], b"chm");
     let fd = sys_open(&path, O_WRONLY | O_CREAT, 0o644);
@@ -669,7 +863,163 @@ fn case_chmod_returns_ok(scratch: &CStr) -> Result<(), TestErr> {
         let _ = sys_unlink(&path);
         return Err(err(b"chmod failed", rc));
     }
+    assert_stat_field!(@mask &path, st_mode, 0o7777u32, 0o600u32, b"st_mode != 0o600 after chmod");
     let _ = sys_unlink(&path);
+    Ok(())
+}
+
+/// chmod() of a non-existent path fails with -ENOENT. Errno-helper
+/// macro coverage — mirrors pjdfstest's `chmod/00.t` errno tail.
+fn case_chmod_enoent(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"missing");
+    expect_err!(
+        sys_chmod(&path, 0o600),
+        ENOENT,
+        b"chmod on missing path succeeded",
+        b"chmod errno != ENOENT"
+    );
+    Ok(())
+}
+
+/// chown() to (0, 0) on a fresh file is a no-op in terms of owner
+/// identity (PID 1 already runs as uid/gid 0), but the call must
+/// succeed and the readback must show uid/gid 0.
+fn case_chown_returns_ok(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"chw");
+    let fd = sys_open(&path, O_WRONLY | O_CREAT, 0o644);
+    if fd < 0 {
+        return Err(err(b"create failed", fd));
+    }
+    let _ = sys_close(fd as i32);
+    let rc = sys_chown(&path, 0, 0);
+    if rc != 0 {
+        let _ = sys_unlink(&path);
+        return Err(err(b"chown failed", rc));
+    }
+    assert_stat_field!(&path, st_uid, 0i64, b"st_uid != 0 after chown");
+    assert_stat_field!(&path, st_gid, 0i64, b"st_gid != 0 after chown");
+    let _ = sys_unlink(&path);
+    Ok(())
+}
+
+/// chown() of a non-existent path fails with -ENOENT.
+fn case_chown_enoent(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"missing");
+    expect_err!(
+        sys_chown(&path, 0, 0),
+        ENOENT,
+        b"chown on missing path succeeded",
+        b"chown errno != ENOENT"
+    );
+    Ok(())
+}
+
+/// ftruncate() sets the file length; readback via stat() observes the
+/// new st_size. Sequence: write 16 bytes, ftruncate to 4, expect
+/// st_size == 4.
+fn case_ftruncate_sets_size(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"ftr");
+    let fd = sys_open(&path, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 {
+        return Err(err(b"create failed", fd));
+    }
+    let payload = b"sixteen-bytes!!!";
+    let nw = sys_write(fd as i32, payload);
+    if nw != payload.len() as i64 {
+        let _ = sys_close(fd as i32);
+        let _ = sys_unlink(&path);
+        return Err(err(b"short write", nw));
+    }
+    let rc = sys_ftruncate(fd as i32, 4);
+    if rc != 0 {
+        let _ = sys_close(fd as i32);
+        let _ = sys_unlink(&path);
+        return Err(err(b"ftruncate failed", rc));
+    }
+    let _ = sys_close(fd as i32);
+    assert_stat_field!(&path, st_size, 4i64, b"st_size != 4 after ftruncate");
+    let _ = sys_unlink(&path);
+    Ok(())
+}
+
+/// ftruncate() on a closed/invalid fd fails with -EBADF. Use a fresh
+/// file we then close so the fd is guaranteed to be invalid in the
+/// current process.
+fn case_ftruncate_ebadf(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"ftrx");
+    let fd = sys_open(&path, O_WRONLY | O_CREAT, 0o644);
+    if fd < 0 {
+        return Err(err(b"create failed", fd));
+    }
+    let _ = sys_close(fd as i32);
+    expect_err!(
+        sys_ftruncate(fd as i32, 0),
+        EBADF,
+        b"ftruncate on closed fd succeeded",
+        b"ftruncate errno != EBADF"
+    );
+    let _ = sys_unlink(&path);
+    Ok(())
+}
+
+/// utimensat() with explicit timestamps updates st_mtime; readback via
+/// stat() observes the new value. UTIME_OMIT is used on atime so we
+/// only assert the field we intend to change.
+fn case_utimensat_updates_mtime(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"uts");
+    let fd = sys_open(&path, O_WRONLY | O_CREAT, 0o644);
+    if fd < 0 {
+        return Err(err(b"create failed", fd));
+    }
+    let _ = sys_close(fd as i32);
+
+    // Pick an arbitrary fixed mtime; the assertion is "what we asked
+    // for is what we read back," not any wall-clock relationship.
+    let target_mtime: i64 = 1_700_000_000;
+    let times = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        Timespec {
+            tv_sec: target_mtime,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = sys_utimensat(AT_FDCWD, &path, times.as_ptr(), 0);
+    if rc != 0 {
+        let _ = sys_unlink(&path);
+        return Err(err(b"utimensat failed", rc));
+    }
+    assert_stat_field!(
+        &path,
+        st_mtime,
+        target_mtime,
+        b"st_mtime != target after utimensat"
+    );
+    let _ = sys_unlink(&path);
+    Ok(())
+}
+
+/// utimensat() on a non-existent path fails with -ENOENT.
+fn case_utimensat_enoent(scratch: &CStr) -> Result<(), TestErr> {
+    let path = join(&scratch.bytes[..scratch.len], b"missing");
+    let times = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        Timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 0,
+        },
+    ];
+    expect_err!(
+        sys_utimensat(AT_FDCWD, &path, times.as_ptr(), 0),
+        ENOENT,
+        b"utimensat on missing path succeeded",
+        b"utimensat errno != ENOENT"
+    );
     Ok(())
 }
 
@@ -789,6 +1139,41 @@ const CASES: &[Case] = &[
         name: b"chmod/returns_ok",
         slug: b"chmd",
         run: case_chmod_returns_ok,
+    },
+    Case {
+        name: b"chmod/enoent",
+        slug: b"chme",
+        run: case_chmod_enoent,
+    },
+    Case {
+        name: b"chown/returns_ok",
+        slug: b"chwn",
+        run: case_chown_returns_ok,
+    },
+    Case {
+        name: b"chown/enoent",
+        slug: b"chwe",
+        run: case_chown_enoent,
+    },
+    Case {
+        name: b"ftruncate/sets_size",
+        slug: b"ftrs",
+        run: case_ftruncate_sets_size,
+    },
+    Case {
+        name: b"ftruncate/ebadf",
+        slug: b"ftre",
+        run: case_ftruncate_ebadf,
+    },
+    Case {
+        name: b"utimensat/updates_mtime",
+        slug: b"utsm",
+        run: case_utimensat_updates_mtime,
+    },
+    Case {
+        name: b"utimensat/enoent",
+        slug: b"utse",
+        run: case_utimensat_enoent,
     },
     Case {
         name: b"chdir/getcwd_roundtrip",

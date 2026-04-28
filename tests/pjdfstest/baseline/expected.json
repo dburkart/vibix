@@ -1,6 +1,6 @@
 {
-  "total": 14,
-  "passed": 14,
+  "total": 21,
+  "passed": 21,
   "failed": 0,
   "cases": [
     {"name": "open/creat_excl_creates", "status": "pass"},
@@ -14,6 +14,13 @@
     {"name": "link/two_names_share_inode", "status": "pass"},
     {"name": "symlink/readlink_roundtrip", "status": "pass"},
     {"name": "chmod/returns_ok", "status": "pass"},
+    {"name": "chmod/enoent", "status": "pass"},
+    {"name": "chown/returns_ok", "status": "pass"},
+    {"name": "chown/enoent", "status": "pass"},
+    {"name": "ftruncate/sets_size", "status": "pass"},
+    {"name": "ftruncate/ebadf", "status": "pass"},
+    {"name": "utimensat/updates_mtime", "status": "pass"},
+    {"name": "utimensat/enoent", "status": "pass"},
     {"name": "chdir/getcwd_roundtrip", "status": "pass"},
     {"name": "rmdir/enotdir_on_regular", "status": "pass"},
     {"name": "getuid/init_is_root", "status": "pass"}
