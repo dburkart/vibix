@@ -16,6 +16,8 @@
 //!   repro-fork    — boot with the fork-loop reproducer harness as PID 1 (issue #506)
 //!   repro-fork-build — build-only variant of `repro-fork`: warm kernel + ISO
 //!                      without booting QEMU (issue #526, for CI pre-build)
+//!   shell-pipeline — boot with the shell-pipeline integration binary as PID 1
+//!                    and assert `SHELL_PIPELINE_OK: 4` on serial (issue #462)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   fuzz          — bounded-iteration host fuzz of an FS layer (#677)
@@ -222,6 +224,7 @@ fn main() -> R<()> {
         "repro-fork-build" => {
             repro_fork_build(&opts)?;
         }
+        "shell-pipeline" => shell_pipeline(&opts)?,
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "initrd" => {
@@ -311,7 +314,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|lint|isr-audit|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
             );
             std::process::exit(2);
         }
@@ -463,6 +466,20 @@ fn build_userspace_hello() -> R<PathBuf> {
 /// ~50 %-rate flake bisected to PR #206 into a deterministic repro.
 fn build_userspace_repro_fork() -> R<PathBuf> {
     build_userspace_binary("userspace_repro_fork", "userspace/repro_fork/link.ld")
+}
+
+/// Build the shell-pipeline integration binary (issue #462).
+///
+/// Shipped as `userspace_init.elf` when `cargo xtask shell-pipeline` is
+/// used — the binary internally simulates `echo foo | cat | wc -c`
+/// using pipe2/fork/dup2/close/wait4 and prints `SHELL_PIPELINE_OK: 4`
+/// on success. See `userspace/shell_pipeline/src/main.rs` for the
+/// rationale on why all three pipeline stages live in one binary.
+fn build_userspace_shell_pipeline() -> R<PathBuf> {
+    build_userspace_binary(
+        "userspace_shell_pipeline",
+        "userspace/shell_pipeline/link.ld",
+    )
 }
 
 /// Build the no_std pjdfstest runner (#642 option 2). Shipped as
@@ -1857,6 +1874,164 @@ fn repro_fork(opts: &BuildOpts) -> R<()> {
             Err(format!("repro-fork: {msg}").into())
         }
         (false, None) => Err("repro-fork: terminated with no success and no failure marker".into()),
+    }
+}
+
+/// Boot the shell-pipeline integration binary as PID 1 and assert
+/// the `SHELL_PIPELINE_OK: 4` marker on serial (issue #462).
+///
+/// Mirrors the `repro-fork` plumbing: builds an ISO that swaps
+/// `userspace_shell_pipeline` in for `userspace_init.elf`, boots it
+/// under QEMU, mirrors serial to stdout, and watches for either the
+/// success marker, a `SHELL_PIPELINE_FAIL:` line, or a kernel panic.
+fn shell_pipeline(opts: &BuildOpts) -> R<()> {
+    use std::collections::VecDeque;
+    use std::io::BufRead as _;
+    use std::time::Instant;
+
+    /// Hard ceiling on the whole run. Three forks plus a few pipe
+    /// reads should finish well inside one second on accelerated
+    /// hardware, but un-accelerated CI QEMU plus first-boot kernel
+    /// init can stretch to tens of seconds. 120 s is generous.
+    const HARD_CAP: Duration = Duration::from_secs(120);
+
+    const SUCCESS_MARKER: &str = "SHELL_PIPELINE_OK: 4";
+    const FAIL_MARKER: &str = "SHELL_PIPELINE_FAIL:";
+    const PANIC_MARKER: &str = "KERNEL PANIC:";
+
+    let kernel = build(opts)?;
+    let init_bin = build_userspace_shell_pipeline()?;
+    let iso = workspace_root()
+        .join("target")
+        .join("vibix-shell-pipeline.iso");
+    make_iso_with_init(&kernel, &init_bin, &iso, "iso_shell_pipeline")?;
+    let disk = ensure_test_disk()?;
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M",
+            "q35",
+            "-cpu",
+            "max",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .args(virtio_blk_args(&disk))
+        .arg("-cdrom")
+        .arg(&iso)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+
+    // Hard-cap watchdog (same cancel-channel pattern as repro_fork).
+    let hard_pid = pid;
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let hard_watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(HARD_CAP) {
+            let _ = Command::new("kill").arg(hard_pid.to_string()).status();
+        }
+    });
+
+    // Reader thread → channel; main thread polls with a short timeout
+    // so the absolute deadline stays accurate even if the kernel hangs
+    // before any line arrives.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut success = false;
+    let mut failure: Option<String> = None;
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(64);
+    const TICK: Duration = Duration::from_millis(200);
+
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(line) => {
+                print!("{line}");
+                if tail.len() == 64 {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
+
+                if line.contains(PANIC_MARKER) {
+                    failure = Some(format!("kernel panic: {}", line.trim_end()));
+                    break;
+                }
+                if line.contains(FAIL_MARKER) {
+                    failure = Some(format!("harness failure: {}", line.trim_end()));
+                    break;
+                }
+                if line.contains(SUCCESS_MARKER) {
+                    success = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if start.elapsed() > HARD_CAP {
+                    failure = Some(format!("hard cap exceeded ({HARD_CAP:?}) without success"));
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !success && failure.is_none() {
+                    failure = Some(format!("QEMU exited before `{SUCCESS_MARKER}` marker"));
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(cancel_tx);
+    let _ = hard_watchdog.join();
+    let _ = reader_handle.join();
+    let _ = child.wait();
+
+    match (success, failure) {
+        (true, _) => {
+            println!(
+                "→ shell-pipeline: SHELL_PIPELINE_OK in {:?} ✓",
+                start.elapsed()
+            );
+            Ok(())
+        }
+        (false, Some(msg)) => {
+            eprintln!("--- captured serial (tail) ---");
+            for line in &tail {
+                eprint!("{line}");
+            }
+            eprintln!("------------------------------");
+            Err(format!("shell-pipeline: {msg}").into())
+        }
+        (false, None) => {
+            Err("shell-pipeline: terminated with no success and no failure marker".into())
+        }
     }
 }
 

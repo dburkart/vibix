@@ -29,7 +29,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use crate::arch::x86_64::fpu::FpuArea;
-use crate::fork_abi::prime_fork_child_stack;
+use crate::fork_abi::{prime_fork_child_stack, ForkUserRegs};
 use crate::fs::vfs::Credential;
 use crate::fs::FileDescTable;
 use crate::mem::addrspace::AddressSpace;
@@ -396,8 +396,11 @@ impl Task {
     /// returns to ring-3 via `fork_child_sysret` with rax=0 (the child's
     /// fork() return value).
     ///
-    /// `user_rip`, `user_rflags`, and `user_rsp` are the saved ring-3
-    /// register context from the parent's SYSCALL entry.
+    /// `regs` is the parent's full saved ring-3 GPR snapshot taken at the
+    /// FORK SYSCALL boundary — including the SysV callee-saved set
+    /// (`rbx`, `rbp`, `r12`–`r15`) per #690 so any userspace local the
+    /// compiler held in one of those across `sys_fork()` survives in the
+    /// child too.
     /// `parent_fpu` is the parent's current FPU save area (copied verbatim
     /// so the child inherits the same floating-point state at fork time).
     /// `parent_priority` / `parent_affinity` are copied directly.
@@ -406,9 +409,7 @@ impl Task {
     /// `parent_fpu` must be a valid, aligned `FpuArea` that remains live
     /// for the duration of this call (the FPU copy happens before return).
     pub unsafe fn new_forked(
-        user_rip: u64,
-        user_rflags: u64,
-        user_rsp: u64,
+        regs: &ForkUserRegs,
         parent_priority: u8,
         parent_affinity: u64,
         parent_fpu: *const crate::arch::x86_64::fpu::FpuArea,
@@ -420,8 +421,8 @@ impl Task {
     ) -> Result<Self, crate::mem::addrspace::ForkError> {
         crate::fork_trace!(
             "fork-trace: [Task::new_forked enter] user_rip={:#x} user_rsp={:#x}",
-            user_rip,
-            user_rsp
+            regs.user_rip,
+            regs.user_rsp
         );
         // Reserve a fresh guard+stack slot. Recycles a freed slot if
         // one is available, otherwise bumps `NEXT_STACK_VA` (#646).
@@ -477,24 +478,17 @@ impl Task {
         // SAFETY: the 56 bytes at the top of the freshly-mapped stack
         // were just made valid by `map_range` above and are owned
         // exclusively by this Task until the first context switch.
-        let rsp = unsafe {
-            prime_fork_child_stack(
-                top,
-                user_rip,
-                user_rflags,
-                user_rsp,
-                fork_child_sysret as *const () as usize,
-            )
-        };
+        let rsp =
+            unsafe { prime_fork_child_stack(top, regs, fork_child_sysret as *const () as usize) };
 
         let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
         crate::fork_trace!(
             "fork-trace: [Task::new_forked] child stack primed rsp={:#x} sysret_rip={:#x} \
              sysret_rsp={:#x} sysret_rflags={:#x} fork_child_sysret={:#x} child_id={}",
             rsp,
-            user_rip,
-            user_rsp,
-            user_rflags,
+            regs.user_rip,
+            regs.user_rsp,
+            regs.user_rflags,
             fork_child_sysret as *const () as usize,
             id
         );

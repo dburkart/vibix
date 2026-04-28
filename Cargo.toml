@@ -6,6 +6,7 @@ members = [
     "userspace/init",
     "userspace/pjdfstest_runner",
     "userspace/repro_fork",
+    "userspace/shell_pipeline",
 ]
 # tests/pjdfstest is a vendored copy of saidsay-so/pjdfstest (2-clause BSD). It
 # is intentionally kept outside the workspace until #581 wires it into xtask —
