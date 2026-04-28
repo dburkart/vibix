@@ -458,6 +458,14 @@ mod tests {
     struct FakeOps(Arc<FakeFs>);
     impl InodeOps for FakeOps {
         fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, i64> {
+            // POSIX §4.13: lookup must reject a non-directory parent
+            // with ENOTDIR before any name resolution. Real FS drivers
+            // are expected to honor this contract; a test stub that
+            // unconditionally returned ENOENT would mask a missing
+            // kind check elsewhere in the resolver chain.
+            if dir.kind != InodeKind::Dir {
+                return Err(ENOTDIR);
+            }
             self.0
                 .children
                 .lock()
@@ -672,6 +680,20 @@ mod tests {
         let fx = build();
         let mut nd = new_nd(&fx, LookupFlags::default());
         let e = path_walk(&mut nd, b"/a/b/", &NullMountResolver);
+        assert_eq!(e, Err(ENOTDIR));
+    }
+
+    #[test]
+    fn walk_through_nondir_parent_is_enotdir() {
+        // POSIX §4.13: when an intermediate component of a path is not
+        // a directory, resolution must fail with ENOTDIR. The fixture's
+        // /notadir is a regular file (ino=16, InodeKind::Reg); walking
+        // /notadir/foo asks the resolver to lookup "foo" inside a
+        // non-directory parent, and FakeOps::lookup must reject that
+        // with ENOTDIR rather than masking the violation with ENOENT.
+        let fx = build();
+        let mut nd = new_nd(&fx, LookupFlags::default());
+        let e = path_walk(&mut nd, b"/notadir/foo", &NullMountResolver);
         assert_eq!(e, Err(ENOTDIR));
     }
 
