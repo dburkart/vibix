@@ -531,13 +531,20 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SIG_RING3: ${{ steps.agg.outputs.sig_ring3 }}
-          SIG_STALL: ${{ steps.agg.outputs.sig_stall }}
-          SIG_LEAK:  ${{ steps.agg.outputs.sig_leak }}
-          SIG_POST_WAIT: ${{ steps.agg.outputs.sig_post_wait_stall }}
-          SIG_POST_FORK: ${{ steps.agg.outputs.sig_post_fork_stall }}
-          AGG_FAILS: ${{ steps.agg.outputs.fails }}
-          AGG_TOTAL: ${{ steps.agg.outputs.total }}
+          # Fallback to "?" when an output is missing — happens when
+          # the aggregate step exits early at the
+          # incomplete-shard-reporting check before reaching the
+          # `echo ... >> $GITHUB_OUTPUT` block. In that infrastructure-
+          # failure path the run URL alone is the actionable trail,
+          # but rendering empty strings in the issue body would be
+          # confusing; "?" makes the missingness explicit.
+          SIG_RING3: ${{ steps.agg.outputs.sig_ring3 || '?' }}
+          SIG_STALL: ${{ steps.agg.outputs.sig_stall || '?' }}
+          SIG_LEAK:  ${{ steps.agg.outputs.sig_leak  || '?' }}
+          SIG_POST_WAIT: ${{ steps.agg.outputs.sig_post_wait_stall || '?' }}
+          SIG_POST_FORK: ${{ steps.agg.outputs.sig_post_fork_stall || '?' }}
+          AGG_FAILS: ${{ steps.agg.outputs.fails || '?' }}
+          AGG_TOTAL: ${{ steps.agg.outputs.total || '?' }}
         run: |
           # `-e` halts on any unexpected failure (e.g. transient gh API
           # errors that would otherwise let the script continue with
