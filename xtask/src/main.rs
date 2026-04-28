@@ -21,8 +21,10 @@
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   nm-check      — RFC 0005 Phase 1 (#669): build the release kernel + ISO
-//!                   and fail if any `MockClock` / `MockIrqSource` symbol
-//!                   leaks past the `sched-mock` cfg gate
+//!                   and fail if any `sched-mock`-gated symbol
+//!                   (`MockClock`, `MockClockState`, `MockIrqSource`,
+//!                   `MockIrqState`, `MockTimerIrq`) leaks past the
+//!                   `#[cfg(feature = "sched-mock")]` gate
 //!   fuzz          — bounded-iteration host fuzz of an FS layer (#677)
 //!                   `cargo xtask fuzz ext2 [--iters=N]` (defaults to 2000)
 //!   clean         — remove build artifacts
@@ -263,7 +265,14 @@ fn main() -> R<()> {
             // catches a hypothetical future ISO post-processing step
             // (compression, signing, relink) that mutates the bundled
             // ELF away from the original.
-            let iso_path = iso(&release_opts)?;
+            //
+            // We call `make_iso` directly with the already-built
+            // `kernel` rather than `iso(&release_opts)` to avoid a
+            // second cargo-build of the same release ELF (it's the
+            // same bytes both times — `iso()` would re-invoke
+            // `build()`).
+            let iso_path = workspace_root().join("target").join("vibix.iso");
+            make_iso(&kernel, &iso_path, "iso_root")?;
             println!("→ nm-check: iso built at {}", iso_path.display());
             let staged_kernel = workspace_root().join("build/iso_root/boot/vibix");
             nm_check_no_mocks(&staged_kernel)?;
