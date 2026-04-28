@@ -1,7 +1,7 @@
 ---
 rfc: 0005
 title: Scheduler / IRQ Seam for Deterministic Simulation Testing
-status: In Review
+status: Accepted
 created: 2026-04-27
 ---
 
@@ -491,8 +491,8 @@ incrementally and impossible to bisect when (not if) it regresses.
 
 ## Open Questions
 
-These are explicitly flagged for resolution during implementation, not
-before merge:
+All open questions are deferred to implementation per the resolutions
+recorded below. None block RFC acceptance.
 
 - **`Clock` resolution after LAPIC-timer migration.** Today `Tick` is PIT
   ticks (10 ms). When the kernel migrates to LAPIC-timer (likely as part
