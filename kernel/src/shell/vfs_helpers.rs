@@ -258,6 +258,14 @@ pub fn stream_copy(src_path: &[u8], dst_path: &[u8], max_bytes: u64) -> Result<u
     loop {
         let remaining = max_bytes.saturating_sub(copied);
         if remaining == 0 {
+            // We've copied exactly `max_bytes`. Probe one more byte
+            // to see whether the source is at EOF — a file whose size
+            // is exactly `max_bytes` is a successful copy, not EFBIG.
+            let mut probe = [0u8; 1];
+            let n = src.inode.file_ops.read(&src_of, &mut probe, roff)?;
+            if n == 0 {
+                break;
+            }
             return Err(crate::fs::EFBIG);
         }
         let take = core::cmp::min(remaining as usize, buf.len());
