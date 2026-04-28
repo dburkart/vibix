@@ -99,7 +99,7 @@ CI runs this in the `fmt + build (release)` job (`.github/workflows/ci.yml`).
 Do not disable or weaken the check without an RFC update — it is the
 "physically excluded from production" evidence Security review B1 asked for.
 When the mocks rename (e.g. #670: `MockIrqSource` → `MockTimerIrq`), update the
-`FORBIDDEN` list in `xtask/src/main.rs::nm_check_no_mocks` in the same PR.
+`NM_CHECK_FORBIDDEN` list in `xtask/src/main.rs` in the same PR.
 
 ## Gotchas
 

@@ -640,7 +640,13 @@ fn find_llvm_tool(name: &str) -> Option<std::ffi::OsString> {
 ///
 /// Per #670, `MockIrqSource` may rename to `MockTimerIrq`; add the
 /// new name here when that lands so the gate keeps biting.
-const NM_CHECK_FORBIDDEN: &[&str] = &["MockClock", "MockIrqSource", "MockTimerIrq"];
+const NM_CHECK_FORBIDDEN: &[&str] = &[
+    "MockClock",
+    "MockClockState",
+    "MockIrqSource",
+    "MockIrqState",
+    "MockTimerIrq",
+];
 
 /// Pure scan over `nm --demangle` stdout: returns the lines that name a
 /// forbidden mock symbol. Pulled out as a free function so the host
