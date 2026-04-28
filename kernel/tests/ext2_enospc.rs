@@ -278,6 +278,11 @@ fn block_exhaustion_then_unlink_recovers() {
     }
     let free_blocks_full_recovery = super_arc.sb_disk.lock().s_free_blocks_count;
     assert!(
+        free_blocks_full_recovery <= free_blocks_initial,
+        "recovery must not exceed the pre-test free-block count \
+         (initial={free_blocks_initial}, recovered={free_blocks_full_recovery})",
+    );
+    assert!(
         free_blocks_full_recovery + 4 >= free_blocks_initial,
         "after freeing drained blocks the counter must rebound to ~initial \
          (initial={free_blocks_initial}, recovered={free_blocks_full_recovery})",
@@ -291,6 +296,19 @@ fn block_exhaustion_then_unlink_recovers() {
     let n = do_write(&sb, &recovered, b"recovered\n", 0)
         .expect("post-finalize write must accept bytes");
     assert_eq!(n, b"recovered\n".len());
+
+    // Global end-of-test invariant: no orphan pins anywhere, s_last_orphan
+    // clear. Catches regressions that leave an extra orphan behind beyond
+    // the per-ino checks above.
+    assert!(
+        super_arc.orphan_list.lock().is_empty(),
+        "orphan_list must be empty at end of test"
+    );
+    assert_eq!(
+        super_arc.sb_disk.lock().s_last_orphan,
+        0,
+        "s_last_orphan must be zero at end of test"
+    );
 
     drop(recovered);
     drop(root_vfs);
@@ -407,6 +425,11 @@ fn inode_exhaustion_then_unlink_half_recovers() {
 
     let free_after_finalize = super_arc.sb_disk.lock().s_free_inodes_count;
     assert!(
+        free_after_finalize <= free_inodes_initial,
+        "finalize must not over-increment free inodes \
+         (initial={free_inodes_initial}, after_finalize={free_after_finalize})",
+    );
+    assert!(
         free_after_finalize >= half as u32,
         "finalize must restore at least {half} free inodes \
          (after_full={free_after_full}, after_finalize={free_after_finalize})",
@@ -432,6 +455,19 @@ fn inode_exhaustion_then_unlink_half_recovers() {
     assert_eq!(
         recovered, half,
         "post-finalize FS must accept all {half} freed-up create slots (got {recovered})"
+    );
+
+    // Global end-of-test invariant: no orphan pins anywhere, s_last_orphan
+    // clear. Catches regressions that leave an extra orphan behind beyond
+    // the per-ino checks above.
+    assert!(
+        super_arc.orphan_list.lock().is_empty(),
+        "orphan_list must be empty at end of test"
+    );
+    assert_eq!(
+        super_arc.sb_disk.lock().s_last_orphan,
+        0,
+        "s_last_orphan must be zero at end of test"
     );
 
     drop(root_vfs);
