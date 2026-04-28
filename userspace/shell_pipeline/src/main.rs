@@ -101,6 +101,13 @@ pub extern "C" fn _start() -> ! {
     // line for log triage.
     write_all(STDOUT, b"shell_pipeline: starting echo|cat|wc-c\n");
 
+    // Diagnostic preflight: confirm fd 0/1/2 are open in the supervisor
+    // before any pipe2/fork — if any of these are closed at PID-1 entry
+    // we'd see write_all to STDERR silently fail downstream.
+    diag_fd("supervisor.0", STDIN);
+    diag_fd("supervisor.1", STDOUT);
+    diag_fd("supervisor.2", STDERR);
+
     // Pipe 1: echo → cat
     let mut p1: [i32; 2] = [-1, -1];
     if sys_pipe2(p1.as_mut_ptr(), 0) < 0 {
@@ -109,6 +116,8 @@ pub extern "C" fn _start() -> ! {
     }
     let p1r = p1[0] as u64;
     let p1w = p1[1] as u64;
+    diag_kv(b"shell_pipeline: p1r=", p1r);
+    diag_kv(b"shell_pipeline: p1w=", p1w);
 
     // Pipe 2: cat → wc
     let mut p2: [i32; 2] = [-1, -1];
@@ -118,6 +127,8 @@ pub extern "C" fn _start() -> ! {
     }
     let p2r = p2[0] as u64;
     let p2w = p2[1] as u64;
+    diag_kv(b"shell_pipeline: p2r=", p2r);
+    diag_kv(b"shell_pipeline: p2w=", p2w);
 
     // ── Stage A: echo (writes ECHO_PAYLOAD to its stdout)
     let pid_echo = sys_fork();
@@ -126,12 +137,18 @@ pub extern "C" fn _start() -> ! {
         sys_exit(2);
     }
     if pid_echo == 0 {
+        // Probe pipe fds in the child to confirm fork-cloned fd table
+        // actually has them.
+        diag_fd("echo-child.p1r", p1r);
+        diag_fd("echo-child.p1w", p1w);
         // Child: stdout → p1w, then close every pipe fd we still hold.
         let r = sys_dup2(p1w, STDOUT);
+        diag_kvi(b"echo-child: dup2(p1w, STDOUT)=", r);
         if r < 0 {
             write_all(STDERR, b"shell_pipeline[echo-child]: dup2 stdout failed\n");
             sys_exit(11);
         }
+        diag_fd("echo-child.STDOUT-after-dup2", STDOUT);
         write_all(STDERR, b"shell_pipeline[echo-child]: dup2 stdout ok\n");
         sys_close(p1r);
         sys_close(p1w);
@@ -147,7 +164,13 @@ pub extern "C" fn _start() -> ! {
         sys_exit(2);
     }
     if pid_cat == 0 {
-        if sys_dup2(p1r, STDIN) < 0 {
+        diag_fd("cat-child.p1r", p1r);
+        diag_fd("cat-child.p1w", p1w);
+        diag_fd("cat-child.p2r", p2r);
+        diag_fd("cat-child.p2w", p2w);
+        let r = sys_dup2(p1r, STDIN);
+        diag_kvi(b"cat-child: dup2(p1r, STDIN)=", r);
+        if r < 0 {
             write_all(STDERR, b"shell_pipeline[cat-child]: dup2 stdin failed\n");
             sys_exit(12);
         }
@@ -171,6 +194,7 @@ pub extern "C" fn _start() -> ! {
         sys_exit(2);
     }
     if pid_wc == 0 {
+        diag_fd("wc-child.p2r", p2r);
         if sys_dup2(p2r, STDIN) < 0 {
             write_all(STDERR, b"shell_pipeline[wc-child]: dup2 stdin failed\n");
             sys_exit(14);
@@ -320,6 +344,57 @@ fn write_all(fd: u64, buf: &[u8]) -> bool {
         off += n as usize;
     }
     true
+}
+
+/// Probe whether `fd` is currently open in this task's fd table by doing
+/// a 0-length write — kernel returns EBADF if closed, 0 if open. Logs
+/// to STDERR; never panics.
+fn diag_fd(label: &str, fd: u64) {
+    let r = sys_write(fd, core::ptr::null(), 0);
+    write_all(STDERR, b"shell_pipeline: diag_fd[");
+    write_all(STDERR, label.as_bytes());
+    write_all(STDERR, b"=");
+    write_u64_to(STDERR, fd);
+    write_all(STDERR, b"] write0=");
+    write_i64_to(STDERR, r);
+    write_all(STDERR, b"\n");
+}
+
+fn diag_kv(label: &[u8], v: u64) {
+    write_all(STDERR, label);
+    write_u64_to(STDERR, v);
+    write_all(STDERR, b"\n");
+}
+
+fn diag_kvi(label: &[u8], v: i64) {
+    write_all(STDERR, label);
+    write_i64_to(STDERR, v);
+    write_all(STDERR, b"\n");
+}
+
+fn write_u64_to(fd: u64, mut n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    } else {
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    write_all(fd, &buf[i..]);
+}
+
+fn write_i64_to(fd: u64, n: i64) {
+    if n < 0 {
+        write_all(fd, b"-");
+        write_u64_to(fd, (-(n + 1)) as u64 + 1);
+    } else {
+        write_u64_to(fd, n as u64);
+    }
 }
 
 fn write_u32(mut n: u32) {
