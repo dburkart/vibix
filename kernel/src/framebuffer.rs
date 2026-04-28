@@ -12,6 +12,16 @@
 //!
 //! DEC private and extended VT100 sequences handled:
 //! - `ESC 7` / `ESC 8` (DECSC / DECRC): save / restore cursor + SGR state.
+//! - `ESC D` (Index, IND): move cursor down one row, scrolling the active
+//!   region if at the bottom margin.
+//! - `ESC M` (Reverse Index, RI): move cursor up one row, scrolling the
+//!   active region down if at the top margin.
+//! - `ESC E` (Next Line, NEL): CR + LF, region-aware.
+//! - `ESC c` (RIS, full reset): clear screen, reset SGR, reset scroll
+//!   region to full screen, restore default state.
+//! - `CSI Pt;Pb r` (DECSTBM): set scroll-region top/bottom margins (clamped
+//!   to screen rows) and home the cursor to (1,1). An empty parameter list
+//!   resets the region to the full screen.
 //! - `CSI ? Pm h` / `CSI ? Pm l` (DECSET / DECRST): set / reset DEC private
 //!   modes. Known modes `?1` (cursor-keys app), `?7` (auto-wrap), `?12`
 //!   (cursor blink), `?25` (cursor visible), and `?1049` (alt-screen) are
@@ -195,6 +205,112 @@ pub(crate) fn classify_dec_mode(code: u32) -> DecMode {
     }
 }
 
+// ─── DECSTBM scroll region ─────────────────────────────────────────────────
+
+/// VT100 scroll region (DECSTBM). Stores 0-indexed inclusive row bounds.
+///
+/// The active region is `top..=bottom`. Index/Reverse-Index/CR-LF
+/// scrolling is confined to that band; rows outside it are unaffected.
+/// When the region spans the full screen (`top == 0 && bottom == rows-1`),
+/// scroll-up evicts the top row into the scrollback ring; partial regions
+/// do *not* push to scrollback because the evicted row isn't truly
+/// off-screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+pub(crate) struct ScrollRegion {
+    pub top: usize,
+    pub bottom: usize,
+}
+
+impl ScrollRegion {
+    /// Region covering every row of an `rows`-tall screen.
+    pub fn full(rows: usize) -> Self {
+        Self {
+            top: 0,
+            bottom: rows.saturating_sub(1),
+        }
+    }
+
+    /// True when this region equals `ScrollRegion::full(rows)`.
+    pub fn is_full(&self, rows: usize) -> bool {
+        self.top == 0 && self.bottom + 1 == rows
+    }
+
+    /// Clamp DECSTBM 1-indexed parameters `(pt, pb)` against an `rows`-tall
+    /// screen, returning the resulting 0-indexed inclusive region. Per
+    /// VT100, an empty / zero parameter list selects the full screen, and
+    /// invalid combinations (where the requested top is not strictly
+    /// above the requested bottom after clamping) are rejected — the
+    /// caller should leave the existing region untouched in that case.
+    ///
+    /// Returns `None` if the request is invalid.
+    pub fn from_decstbm(pt: u32, pb: u32, rows: usize) -> Option<Self> {
+        if rows == 0 {
+            return None;
+        }
+        // VT100: empty / zero pt or pb selects full screen for that edge.
+        let top = if pt == 0 { 1 } else { pt } as usize;
+        let bottom = if pb == 0 { rows } else { pb as usize };
+        // Clamp to screen.
+        let top = top.min(rows);
+        let bottom = bottom.min(rows);
+        // Per VT100, a valid region requires top < bottom (1-indexed).
+        if top >= bottom {
+            return None;
+        }
+        Some(Self {
+            top: top - 1,
+            bottom: bottom - 1,
+        })
+    }
+}
+
+/// Scroll the rows of `cells` (a `rows`-by-`cols` row-major grid) up by
+/// one within `region`. Rows outside `[region.top, region.bottom]` are
+/// untouched; the bottom row of the region is filled with `blank`.
+///
+/// This is the pure data-model side of `Console::scroll_up`; the pixel
+/// blit lives in the impl. Factored out so it can be exercised under
+/// host `cargo test` without standing up a framebuffer.
+fn scroll_region_up(cells: &mut [Cell], cols: usize, region: ScrollRegion, blank: Cell) {
+    if region.top >= region.bottom {
+        return;
+    }
+    for r in region.top..region.bottom {
+        let dst = r * cols;
+        let src = (r + 1) * cols;
+        for c in 0..cols {
+            cells[dst + c] = cells[src + c];
+        }
+    }
+    let last = region.bottom * cols;
+    for c in 0..cols {
+        cells[last + c] = blank;
+    }
+}
+
+/// Scroll the rows of `cells` down by one within `region` (Reverse Index).
+/// Rows outside the region are untouched; the top row of the region is
+/// filled with `blank`.
+fn scroll_region_down(cells: &mut [Cell], cols: usize, region: ScrollRegion, blank: Cell) {
+    if region.top >= region.bottom {
+        return;
+    }
+    let mut r = region.bottom;
+    while r > region.top {
+        let dst = r * cols;
+        let src = (r - 1) * cols;
+        for c in 0..cols {
+            cells[dst + c] = cells[src + c];
+        }
+        r -= 1;
+    }
+    let top = region.top * cols;
+    for c in 0..cols {
+        cells[top + c] = blank;
+    }
+}
+
 // ─── Console ───────────────────────────────────────────────────────────────
 
 pub struct Console {
@@ -249,6 +365,11 @@ pub struct Console {
     saved_bg: Option<u8>,
     saved_bold: bool,
     saved_valid: bool,
+
+    // DECSTBM scroll region. Initialized to full screen; reset to full
+    // screen on RIS (ESC c). Index/Reverse-Index/scroll-on-newline all
+    // confine their work to `[region.top, region.bottom]`.
+    region: ScrollRegion,
 }
 
 // SAFETY: the framebuffer pointer is stable for the kernel lifetime;
@@ -304,6 +425,7 @@ impl Console {
             saved_bg: None,
             saved_bold: false,
             saved_valid: false,
+            region: ScrollRegion::full(rows),
         }
     }
 
@@ -408,49 +530,102 @@ impl Console {
 
     // ── scrolling ─────────────────────────────────────────────────────────
 
-    /// Scroll the screen up by one row.
+    /// Scroll the active region up by one row.
     ///
+    /// When the region spans the whole screen:
     /// - The departing top row is pushed into the scrollback ring.
-    /// - Cell data is shifted up with `Vec::copy_within`.
-    /// - Pixel rows are blitted up on the framebuffer with a memmove-style
+    /// - The pixel blit covers the full framebuffer with a memmove-style
     ///   `ptr::copy` (handles overlap).
-    /// - The vacated last pixel row is cleared to `DEFAULT_BG`.
+    ///
+    /// When the region is partial (DECSTBM has narrowed it):
+    /// - Only rows in `[region.top, region.bottom]` move; rows outside
+    ///   are untouched.
+    /// - No scrollback push — the evicted top-of-region row isn't truly
+    ///   leaving the screen, so preserving it in the back-scroll would
+    ///   corrupt history with split-region snippets.
+    /// - The pixel blit covers only the region.
+    ///
+    /// In both cases the vacated bottom-of-region pixel row is cleared
+    /// to `DEFAULT_BG`.
     fn scroll_up(&mut self) {
         let cols = self.cols;
+        let region = self.region;
 
-        // Save row 0 into the scrollback ring.
-        let ring_row = (self.scroll_head + self.scroll_filled) % SCROLLBACK_ROWS;
-        let dst = ring_row * cols;
-        for i in 0..cols {
-            self.scrollback[dst + i] = self.cells[i];
-        }
-        if self.scroll_filled < SCROLLBACK_ROWS {
-            self.scroll_filled += 1;
-        } else {
-            self.scroll_head = (self.scroll_head + 1) % SCROLLBACK_ROWS;
-        }
-
-        // Shift cell grid up one row.
-        self.cells.copy_within(cols.., 0);
-        let last = (self.rows - 1) * cols;
-        for i in 0..cols {
-            self.cells[last + i] = Cell::blank();
+        // Full-screen region: feed the evicted row into scrollback.
+        if region.is_full(self.rows) {
+            let ring_row = (self.scroll_head + self.scroll_filled) % SCROLLBACK_ROWS;
+            let dst = ring_row * cols;
+            for i in 0..cols {
+                self.scrollback[dst + i] = self.cells[i];
+            }
+            if self.scroll_filled < SCROLLBACK_ROWS {
+                self.scroll_filled += 1;
+            } else {
+                self.scroll_head = (self.scroll_head + 1) % SCROLLBACK_ROWS;
+            }
         }
 
-        // Blit pixel rows up (rows 1..rows → rows 0..rows-1).
+        // Shift cell grid up within the region.
+        scroll_region_up(&mut self.cells, cols, region, Cell::blank());
+
+        // Pixel blit: rows [top+1..=bottom] → [top..=bottom-1].
         let row_pixels = self.pitch * GLYPH_H;
-        unsafe {
-            // ptr::copy is memmove-compatible and handles overlap.
-            core::ptr::copy(
-                self.buffer.add(row_pixels),
-                self.buffer,
-                row_pixels * (self.rows - 1),
-            );
+        let copy_rows = region.bottom - region.top;
+        if copy_rows > 0 {
+            let src = region.top + 1;
+            let dst = region.top;
+            unsafe {
+                // ptr::copy is memmove-compatible and handles overlap.
+                core::ptr::copy(
+                    self.buffer.add(src * row_pixels),
+                    self.buffer.add(dst * row_pixels),
+                    row_pixels * copy_rows,
+                );
+            }
         }
 
-        // Clear the last pixel row.
-        let last_py = (self.rows - 1) * GLYPH_H;
+        // Clear the bottom-of-region pixel row.
+        let last_py = region.bottom * GLYPH_H;
         for y in last_py..last_py + GLYPH_H {
+            for x in 0..self.width {
+                unsafe {
+                    self.buffer
+                        .add(y * self.pitch + x)
+                        .write_volatile(DEFAULT_BG);
+                }
+            }
+        }
+    }
+
+    /// Scroll the active region down by one row (Reverse Index).
+    /// Rows outside `[region.top, region.bottom]` are untouched. The
+    /// top-of-region row is cleared. No scrollback interaction —
+    /// reverse-index never evicts to history.
+    fn scroll_down(&mut self) {
+        let cols = self.cols;
+        let region = self.region;
+
+        // Shift cell grid down within the region.
+        scroll_region_down(&mut self.cells, cols, region, Cell::blank());
+
+        // Pixel blit: rows [top..=bottom-1] → [top+1..=bottom].
+        let row_pixels = self.pitch * GLYPH_H;
+        let copy_rows = region.bottom - region.top;
+        if copy_rows > 0 {
+            let src = region.top;
+            let dst = region.top + 1;
+            unsafe {
+                core::ptr::copy(
+                    self.buffer.add(src * row_pixels),
+                    self.buffer.add(dst * row_pixels),
+                    row_pixels * copy_rows,
+                );
+            }
+        }
+
+        // Clear the top-of-region pixel row.
+        let top_py = region.top * GLYPH_H;
+        for y in top_py..top_py + GLYPH_H {
             for x in 0..self.width {
                 unsafe {
                     self.buffer
@@ -619,13 +794,35 @@ impl Console {
         let (cx, cy) = (self.cx, self.cy);
         self.draw_cursor(cx, cy, false);
         self.cx = 0;
-        self.cy += 1;
-        if self.cy >= self.rows {
-            self.scroll_up();
-            self.cy = self.rows - 1;
-        }
+        self.line_feed_at_cursor();
         let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
         self.draw_cursor(cx, cy, on);
+    }
+
+    /// Index (LF / ESC D) semantics: if the cursor is on the bottom
+    /// margin of the active scroll region, scroll the region up by one;
+    /// otherwise, advance the cursor down by one and clamp to the last
+    /// physical row. Does not touch the cursor visual — caller handles
+    /// erase/redraw around this.
+    fn line_feed_at_cursor(&mut self) {
+        if self.cy == self.region.bottom {
+            self.scroll_up();
+            // Cursor stays at region.bottom; no advance.
+        } else if self.cy + 1 < self.rows {
+            self.cy += 1;
+        }
+        // If cy is already at rows-1 and below the region, just clamp.
+    }
+
+    /// Reverse Index (ESC M) semantics: if the cursor is on the top
+    /// margin of the active region, scroll the region down by one;
+    /// otherwise, move the cursor up by one (clamped at row 0).
+    fn reverse_index_at_cursor(&mut self) {
+        if self.cy == self.region.top {
+            self.scroll_down();
+        } else if self.cy > 0 {
+            self.cy -= 1;
+        }
     }
 
     // ── character output ──────────────────────────────────────────────────
@@ -651,11 +848,7 @@ impl Console {
         self.cx += 1;
         if self.cx >= self.cols {
             self.cx = 0;
-            self.cy += 1;
-            if self.cy >= self.rows {
-                self.scroll_up();
-                self.cy = self.rows - 1;
-            }
+            self.line_feed_at_cursor();
         }
 
         // Draw cursor at new position.
@@ -747,11 +940,50 @@ impl Console {
         let n = self.nparams;
         for i in 0..n {
             // Classify for future hookup; all recognized modes are no-ops
-            // until follow-up issues (#458 alt-screen, #457 scroll region)
-            // wire real behavior here.  The classification keeps unknown
-            // modes quiet rather than dumping them to the framebuffer.
+            // until follow-up #458 (alt-screen) wires real behavior here.
+            // The classification keeps unknown modes quiet rather than
+            // dumping them to the framebuffer.
             let _ = classify_dec_mode(self.params[i]);
         }
+    }
+
+    // ── DECSTBM (CSI Pt;Pb r) ─────────────────────────────────────────────
+
+    /// Apply a parsed `CSI Pt;Pb r` (DECSTBM).
+    ///
+    /// - With no parameters (or both 0), resets the region to the full
+    ///   screen.
+    /// - Otherwise sets the region to `[pt..=pb]` (1-indexed, clamped to
+    ///   screen rows). Invalid params (top >= bottom after clamp) leave
+    ///   the existing region untouched.
+    /// - In all valid cases, homes the cursor to the top-left (1,1) per
+    ///   the VT100 spec.
+    fn apply_decstbm(&mut self) {
+        let (pt, pb) = match self.nparams {
+            0 => (0, 0),
+            1 => (self.params[0], 0),
+            _ => (self.params[0], self.params[1]),
+        };
+        // `from_decstbm` interprets a 0 in either slot as "the default
+        // edge" (top→1, bottom→rows). When *both* slots are 0 — bare
+        // `CSI r` or `CSI ;r` — that resolves to the full screen anyway,
+        // so we don't special-case it.
+        if let Some(region) = ScrollRegion::from_decstbm(pt, pb, self.rows) {
+            self.region = region;
+        } else {
+            // Invalid request — drop without homing the cursor or
+            // touching state, matching xterm behavior.
+            return;
+        }
+
+        // Home cursor to (1,1).
+        self.pin_to_bottom();
+        let (cx, cy) = (self.cx, self.cy);
+        self.draw_cursor(cx, cy, false);
+        self.cx = 0;
+        self.cy = 0;
+        let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+        self.draw_cursor(cx, cy, on);
     }
 
     // ── public character writer ───────────────────────────────────────────
@@ -808,6 +1040,50 @@ impl Console {
                     self.restore_cursor();
                     self.ansi = Ansi::Normal;
                 }
+                'D' => {
+                    // IND (Index): line-feed-style downward scroll
+                    // honoring the active region.
+                    self.pin_to_bottom();
+                    let (cx, cy) = (self.cx, self.cy);
+                    self.draw_cursor(cx, cy, false);
+                    self.line_feed_at_cursor();
+                    let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+                    self.draw_cursor(cx, cy, on);
+                    self.ansi = Ansi::Normal;
+                }
+                'M' => {
+                    // RI (Reverse Index): upward scroll honoring the region.
+                    self.pin_to_bottom();
+                    let (cx, cy) = (self.cx, self.cy);
+                    self.draw_cursor(cx, cy, false);
+                    self.reverse_index_at_cursor();
+                    let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+                    self.draw_cursor(cx, cy, on);
+                    self.ansi = Ansi::Normal;
+                }
+                'E' => {
+                    // NEL (Next Line): equivalent to CR + LF.
+                    self.pin_to_bottom();
+                    let (cx, cy) = (self.cx, self.cy);
+                    self.draw_cursor(cx, cy, false);
+                    self.cx = 0;
+                    self.line_feed_at_cursor();
+                    let (cx, cy, on) = (self.cx, self.cy, self.cursor_on);
+                    self.draw_cursor(cx, cy, on);
+                    self.ansi = Ansi::Normal;
+                }
+                'c' => {
+                    // RIS (Reset to Initial State): reset SGR, drop saved
+                    // cursor, reset DECSTBM region, then clear the screen.
+                    // `clear()` homes the cursor to (0,0).
+                    self.fg_base = None;
+                    self.bg_base = None;
+                    self.bold = false;
+                    self.saved_valid = false;
+                    self.region = ScrollRegion::full(self.rows);
+                    self.clear();
+                    self.ansi = Ansi::Normal;
+                }
                 _ => {
                     // Unrecognised escape — discard and resume normal parsing.
                     self.ansi = Ansi::Normal;
@@ -844,6 +1120,18 @@ impl Console {
                         self.nparams += 1;
                     }
                     self.apply_sgr();
+                    self.ansi = Ansi::Normal;
+                }
+                'r' => {
+                    // DECSTBM — set scroll region. Commit the in-flight
+                    // parameter (mirrors `m` and the DEC-private branch).
+                    // `apply_decstbm` treats `(0, 0)` as "reset to full
+                    // screen", so a bare `CSI r` lands there cleanly.
+                    if self.nparams < self.params.len() {
+                        self.params[self.nparams] = self.cur_param;
+                        self.nparams += 1;
+                    }
+                    self.apply_decstbm();
                     self.ansi = Ansi::Normal;
                 }
                 _ => {
@@ -951,7 +1239,9 @@ macro_rules! println {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_dec_mode, DecMode};
+    use super::{
+        classify_dec_mode, scroll_region_down, scroll_region_up, Cell, DecMode, ScrollRegion,
+    };
 
     #[test]
     fn named_modes_classify() {
@@ -978,5 +1268,152 @@ mod tests {
         assert_eq!(classify_dec_mode(0), DecMode::Unknown);
         assert_eq!(classify_dec_mode(999), DecMode::Unknown);
         assert_eq!(classify_dec_mode(u32::MAX), DecMode::Unknown);
+    }
+
+    // ── DECSTBM scroll region ─────────────────────────────────────────────
+
+    #[test]
+    fn scroll_region_full_covers_whole_screen() {
+        let r = ScrollRegion::full(24);
+        assert_eq!(r.top, 0);
+        assert_eq!(r.bottom, 23);
+        assert!(r.is_full(24));
+    }
+
+    #[test]
+    fn from_decstbm_basic() {
+        // CSI 3;6 r on a 24-row screen → 0-indexed [2, 5].
+        let r = ScrollRegion::from_decstbm(3, 6, 24).unwrap();
+        assert_eq!(r, ScrollRegion { top: 2, bottom: 5 });
+    }
+
+    #[test]
+    fn from_decstbm_clamps_to_screen() {
+        // CSI 3;999 r on a 24-row screen → bottom clamped to 24 (1-idx),
+        // i.e. 23 (0-idx).
+        let r = ScrollRegion::from_decstbm(3, 999, 24).unwrap();
+        assert_eq!(r, ScrollRegion { top: 2, bottom: 23 });
+    }
+
+    #[test]
+    fn from_decstbm_zero_means_default_edge() {
+        // CSI ;6 r → top defaults to 1, bottom = 6 → [0, 5].
+        let r = ScrollRegion::from_decstbm(0, 6, 24).unwrap();
+        assert_eq!(r, ScrollRegion { top: 0, bottom: 5 });
+        // CSI 3; r → top = 3, bottom defaults to rows → [2, 23].
+        let r = ScrollRegion::from_decstbm(3, 0, 24).unwrap();
+        assert_eq!(r, ScrollRegion { top: 2, bottom: 23 });
+        // Both zero → full screen.
+        let r = ScrollRegion::from_decstbm(0, 0, 24).unwrap();
+        assert!(r.is_full(24));
+    }
+
+    #[test]
+    fn from_decstbm_rejects_inverted_or_degenerate() {
+        // top >= bottom is invalid per VT100.
+        assert!(ScrollRegion::from_decstbm(5, 5, 24).is_none());
+        assert!(ScrollRegion::from_decstbm(10, 3, 24).is_none());
+        // Zero rows: nothing to do.
+        assert!(ScrollRegion::from_decstbm(0, 0, 0).is_none());
+    }
+
+    /// Build a `rows × cols` grid where each cell's `ch` is its row index
+    /// as a digit ('0'..'9'). Lets us read the post-scroll grid back as a
+    /// per-row identity check.
+    fn marked_grid(rows: usize, cols: usize) -> Vec<Cell> {
+        let mut g = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            let ch = char::from_u32('0' as u32 + r as u32).unwrap_or('?');
+            for _ in 0..cols {
+                g.push(Cell { ch, fg: 0, bg: 0 });
+            }
+        }
+        g
+    }
+
+    fn row_chars(grid: &[Cell], cols: usize, row: usize) -> Vec<char> {
+        (0..cols).map(|c| grid[row * cols + c].ch).collect()
+    }
+
+    #[test]
+    fn scroll_region_up_only_touches_region() {
+        let cols = 4;
+        let rows = 8;
+        let mut grid = marked_grid(rows, cols);
+        let region = ScrollRegion { top: 2, bottom: 5 };
+        scroll_region_up(&mut grid, cols, region, Cell::blank());
+        // Rows outside region untouched.
+        assert_eq!(row_chars(&grid, cols, 0), vec!['0'; cols]);
+        assert_eq!(row_chars(&grid, cols, 1), vec!['1'; cols]);
+        assert_eq!(row_chars(&grid, cols, 6), vec!['6'; cols]);
+        assert_eq!(row_chars(&grid, cols, 7), vec!['7'; cols]);
+        // Inside region: rows shifted up by one, bottom blanked.
+        assert_eq!(row_chars(&grid, cols, 2), vec!['3'; cols]);
+        assert_eq!(row_chars(&grid, cols, 3), vec!['4'; cols]);
+        assert_eq!(row_chars(&grid, cols, 4), vec!['5'; cols]);
+        assert_eq!(row_chars(&grid, cols, 5), vec![' '; cols]);
+    }
+
+    #[test]
+    fn scroll_region_down_only_touches_region() {
+        let cols = 4;
+        let rows = 8;
+        let mut grid = marked_grid(rows, cols);
+        let region = ScrollRegion { top: 2, bottom: 5 };
+        scroll_region_down(&mut grid, cols, region, Cell::blank());
+        // Rows outside region untouched.
+        assert_eq!(row_chars(&grid, cols, 0), vec!['0'; cols]);
+        assert_eq!(row_chars(&grid, cols, 1), vec!['1'; cols]);
+        assert_eq!(row_chars(&grid, cols, 6), vec!['6'; cols]);
+        assert_eq!(row_chars(&grid, cols, 7), vec!['7'; cols]);
+        // Inside region: rows shifted down by one, top blanked.
+        assert_eq!(row_chars(&grid, cols, 2), vec![' '; cols]);
+        assert_eq!(row_chars(&grid, cols, 3), vec!['2'; cols]);
+        assert_eq!(row_chars(&grid, cols, 4), vec!['3'; cols]);
+        assert_eq!(row_chars(&grid, cols, 5), vec!['4'; cols]);
+    }
+
+    #[test]
+    fn region_3_through_6_survives_ten_newlines() {
+        // The required regression test from #457: with region [3..6]
+        // (1-indexed inclusive) and 10 newlines emitted at the bottom of
+        // the region, rows 1-2 and 7+ must remain untouched.
+        let cols = 4;
+        let rows = 10;
+        let mut grid = marked_grid(rows, cols);
+        // 1-indexed [3..6] → 0-indexed [2, 5].
+        let region = ScrollRegion::from_decstbm(3, 6, rows).unwrap();
+        for _ in 0..10 {
+            scroll_region_up(&mut grid, cols, region, Cell::blank());
+        }
+        // Rows 1-2 (1-indexed) i.e. 0-1 (0-indexed) are above the region.
+        assert_eq!(row_chars(&grid, cols, 0), vec!['0'; cols]);
+        assert_eq!(row_chars(&grid, cols, 1), vec!['1'; cols]);
+        // Rows 7+ (1-indexed) i.e. 6+ (0-indexed) are below.
+        for r in 6..rows {
+            let ch = char::from_u32('0' as u32 + r as u32).unwrap();
+            assert_eq!(row_chars(&grid, cols, r), vec![ch; cols]);
+        }
+        // Region itself should be entirely blank — 10 scrolls evicted
+        // every original character in [2, 5].
+        for r in 2..=5 {
+            assert_eq!(row_chars(&grid, cols, r), vec![' '; cols]);
+        }
+    }
+
+    #[test]
+    fn scroll_region_is_noop_when_top_equals_bottom() {
+        // Defensive: a degenerate region must not panic or write OOB.
+        let cols = 4;
+        let rows = 4;
+        let mut grid = marked_grid(rows, cols);
+        let region = ScrollRegion { top: 1, bottom: 1 };
+        scroll_region_up(&mut grid, cols, region, Cell::blank());
+        scroll_region_down(&mut grid, cols, region, Cell::blank());
+        // Grid should be unchanged.
+        for r in 0..rows {
+            let ch = char::from_u32('0' as u32 + r as u32).unwrap();
+            assert_eq!(row_chars(&grid, cols, r), vec![ch; cols]);
+        }
     }
 }
