@@ -384,6 +384,21 @@ impl FileSystem for Ext2Fs {
             ext2_flags |= Ext2MountFlags::FORCED_RDONLY;
         }
 
+        // 7c. Mount-time BGDT / bitmap consistency checks (issue #678,
+        //     RFC 0004 §Robustness / §Security). Cross-checks per-group
+        //     bitmap clear-bit counts against `bg_free_*_count`,
+        //     verifies the reserved-inode range is allocated in group
+        //     0, and that the superblock totals equal the BGDT sums. A
+        //     `Yes` verdict demotes the mount to RO before the
+        //     `s_state := ERROR_FS` stamp, so a corrupt image never
+        //     accepts a write.
+        let bgdt_verdict =
+            super::validate::validate_bgdt(&cache, device_id, &on_disk_sb, &bgdt, first_ino);
+        if bgdt_verdict == super::orphan::ForceRo::Yes {
+            effective_rdonly = true;
+            ext2_flags |= Ext2MountFlags::FORCED_RDONLY;
+        }
+
         // 8. RW bring-up: stamp `s_state := ERROR_FS` so an unclean
         //    crash is detectable on the next mount. The canonical
         //    `VALID_FS` is rewritten only by a clean unmount. RO

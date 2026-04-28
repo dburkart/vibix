@@ -473,3 +473,8 @@ required-features = ["ext2"]
 name = "ext2_rename"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_validate_bgdt"
+harness = false
+required-features = ["ext2"]

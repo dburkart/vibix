@@ -74,6 +74,15 @@ pub mod file;
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod orphan;
 
+// Mount-time BGDT / bitmap consistency checks (#678). Same feature
+// gate as `orphan` — uses the BlockCache to read bitmap blocks before
+// the `Arc<SuperBlock>` is built. Host unit tests for pure helpers
+// (clear-bit counting, per-group size) live behind `#[cfg(test)]`
+// inside the module; the full surface is exercised by the QEMU
+// integration test `kernel/tests/ext2_validate_bgdt.rs`.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod validate;
+
 // Block bitmap allocator (#565). Same gate as `fs` / `inode` — it
 // mutates `Ext2Super::bgdt` + `Ext2Super::sb_disk` through the buffer
 // cache, both of which are gated on `target_os = "none"`. The pure
@@ -95,6 +104,9 @@ pub use file::{read_file_at, write_file_at};
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use orphan::{validate_orphan_chain, ForceRo};
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use validate::validate_bgdt;
 
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub use balloc::{alloc_block, free_block};
