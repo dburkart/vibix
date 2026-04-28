@@ -228,6 +228,19 @@ fn stack_top() -> u64 {
 /// - `stack_top` must point to a mapped, writable user-space page.
 /// - `setup_ring3_stacks` must have been called so TSS.rsp[0] is valid.
 pub unsafe fn jump_to_ring3(entry: u64, stack_top: u64) -> ! {
+    // #709 localizing marker: emitted at the very top of `jump_to_ring3`
+    // so a missing `ring3-iretq` line on a failing-soak run can be
+    // distinguished into "child task never reached the iretq trampoline
+    // at all" vs. "child reached the trampoline but wedged inside it"
+    // (the latter would still print `child-prep-iretq` but not
+    // `ring3-iretq`). The line is independent of any further setup;
+    // it's the first observable signal that the trampoline started.
+    crate::serial_println!(
+        "child-prep-iretq: task_id={} entry={:#x} rsp={:#x}",
+        crate::task::current_id(),
+        entry,
+        stack_top,
+    );
     // #478 diagnostic: log the exact IRETQ frame values at the last
     // kernel-side instruction before the ring-0→ring-3 transition, so
     // smoke can tell a silent #GP/#PF from a pre-IRETQ failure when the

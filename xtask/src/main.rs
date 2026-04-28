@@ -162,6 +162,12 @@ const SMOKE_MARKERS: &[&str] = &[
     // now and missing them indicates a real regression in the fork /
     // exec / wait path. HARD_CAP is owned by #511 and tuned separately.
     "hello: hello from execed child",
+    // #710 localizing marker: emitted by userspace init immediately
+    // after `wait4` returns, before the final `fork+exec+wait ok`
+    // write. Promoting it to a hard marker means a failing-soak run
+    // will show *exactly* which side of the stall fired — wait4
+    // returned (this fires) vs. parent never woke (this missing).
+    "init: wait4-return",
     "init: fork+exec+wait ok",
 ];
 
