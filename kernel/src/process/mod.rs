@@ -150,7 +150,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
         "fork-trace: [process::register] allocated pid={} → TABLE.lock()",
         pid
     );
-    let mut t = TABLE.lock();
+    let mut t = lock_table_with_soak_check("register");
     crate::fork_trace!("fork-trace: [process::register] TABLE locked");
     let (session_id, pgrp_id, controlling_tty) = t
         .by_pid
@@ -217,6 +217,15 @@ pub const CURRENT_PID_SOAK_THRESHOLD: u64 = 100_000_000;
 /// builds when the spin count exceeds [`CURRENT_PID_SOAK_THRESHOLD`] —
 /// loud failure for the #478-class hang. Release builds use the plain
 /// blocking `lock()` to keep the hot path branchless.
+///
+/// Used by every TABLE acquirer reachable from a userspace syscall —
+/// in particular the wait4 wakeup path (`reap_child`, `has_children`,
+/// `mark_zombie`, `reparent_children`) — so a #478/#710-class wedged
+/// holder is caught loudly rather than as a silent serial-marker
+/// dropout. Integration tests that exercise the helper directly are
+/// permitted to call with IF=0 (the soak threshold still bounds any
+/// genuine spin); the IF=1 invariant is enforced at the userspace-
+/// reachable callers, not inside the helper.
 #[inline]
 fn lock_table_with_soak_check(caller: &'static str) -> spin::MutexGuard<'static, Table> {
     #[cfg(debug_assertions)]
@@ -231,7 +240,7 @@ fn lock_table_with_soak_check(caller: &'static str) -> spin::MutexGuard<'static,
                 panic!(
                     "process::TABLE: {caller}() spin exceeded soak threshold \
                      ({CURRENT_PID_SOAK_THRESHOLD} iters) — holder appears wedged \
-                     (likely lock-ordering violation; see #478/#647)"
+                     (likely lock-ordering violation; see #478/#647/#710)"
                 );
             }
             core::hint::spin_loop();
@@ -269,8 +278,14 @@ fn is_if_set() -> bool {
 /// sleeping in `waitpid`. TABLE is released before notify to satisfy
 /// the lock-ordering rule described in the module docs.
 pub fn mark_zombie(pid: u32, status: i32) {
+    debug_assert!(
+        is_if_set(),
+        "mark_zombie() called with interrupts disabled — \
+         this is the wait4 wakeup path; spinning on TABLE/CHILD_WAIT \
+         with IF=0 starves the timer ISR (#478/#647/#710)"
+    );
     {
-        let mut t = TABLE.lock();
+        let mut t = lock_table_with_soak_check("mark_zombie");
         if let Some(entry) = t.by_pid.get_mut(&pid) {
             entry.state = ProcessState::Zombie;
             entry.exit_status = Some(status);
@@ -295,7 +310,13 @@ pub fn exit_event_count() -> u32 {
 /// Returns `Some((child_pid, exit_status))` on success, `None` if no
 /// matching zombie child exists.
 pub fn reap_child(parent_pid: u32, target_pid: i32) -> Option<(u32, i32)> {
-    let mut t = TABLE.lock();
+    debug_assert!(
+        is_if_set(),
+        "reap_child() called with interrupts disabled — \
+         this is the wait4 hot path (#710); spinning on TABLE with IF=0 \
+         starves the timer ISR (#478/#647)"
+    );
+    let mut t = lock_table_with_soak_check("reap_child");
     let zombie_pid = t
         .by_pid
         .values()
@@ -317,8 +338,13 @@ pub fn reap_child(parent_pid: u32, target_pid: i32) -> Option<(u32, i32)> {
 /// Returns `true` if `parent_pid` has at least one child (alive or
 /// zombie) in the process table.
 pub fn has_children(parent_pid: u32) -> bool {
-    TABLE
-        .lock()
+    debug_assert!(
+        is_if_set(),
+        "has_children() called with interrupts disabled — \
+         wait4 entry path (#710); spinning on TABLE with IF=0 starves \
+         the timer ISR (#478/#647)"
+    );
+    lock_table_with_soak_check("has_children")
         .by_pid
         .values()
         .any(|e| e.parent_pid == parent_pid)
@@ -328,7 +354,13 @@ pub fn has_children(parent_pid: u32) -> bool {
 /// orphaned. Called by the `exit()` syscall before marking the process
 /// as a zombie.
 pub fn reparent_children(dead_pid: u32) {
-    let mut t = TABLE.lock();
+    debug_assert!(
+        is_if_set(),
+        "reparent_children() called with interrupts disabled — \
+         exit() pre-mark_zombie path; spinning on TABLE with IF=0 \
+         starves the timer ISR (#478/#647/#710)"
+    );
+    let mut t = lock_table_with_soak_check("reparent_children");
     for entry in t.by_pid.values_mut() {
         if entry.parent_pid == dead_pid {
             entry.parent_pid = 1;

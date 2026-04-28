@@ -89,6 +89,16 @@ const PRE_WRITE_MSG: &[u8] = b"init: pre-write marker\n";
 /// restore of user context) is the culprit, not the write itself.
 const POST_WRITE_MSG: &[u8] = b"init: post-write marker\n";
 
+/// Localizing marker for #710 (parent stalls after wait4 returns).
+/// Emitted on fd=1 immediately after the wait4 syscall returns to the
+/// parent, before the `init: fork+exec+wait ok` write. If this marker
+/// is present in a failing-soak run but `init: fork+exec+wait ok` is
+/// missing, the stall is strictly between the two writes — wait4
+/// returned, control reached userspace, but the next syscall never
+/// dispatched. If this marker is also absent, the parent never woke
+/// from the wait4 condvar park.
+const WAIT4_RETURN_MSG: &[u8] = b"init: wait4-return\n";
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Pre-write diagnostic marker — see #478. Emitted on fd=2 so it
@@ -179,6 +189,14 @@ pub extern "C" fn _start() -> ! {
                 options(nostack),
             );
         }
+        // #710 localizing marker: emitted IMMEDIATELY after `wait4`
+        // returns to the parent. If the soak fails with this marker
+        // present but `init: fork+exec+wait ok` missing, the stall is
+        // strictly between the two `write()` syscalls below — i.e.
+        // wait4 returned but the *next* userspace instruction never
+        // ran. If this marker is also missing, wait4 itself never
+        // returned (parent never woke from the condvar park).
+        write(1, WAIT4_RETURN_MSG);
         write(1, DONE_MSG);
     }
 
