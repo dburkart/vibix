@@ -12,6 +12,8 @@
 
 #[cfg(any(target_os = "none", test))]
 pub mod aops;
+#[cfg(any(target_os = "none", test))]
+pub mod file_object;
 pub mod frame;
 #[cfg(any(target_os = "none", test))]
 pub mod page_cache;
