@@ -5,6 +5,14 @@
 //! location, and patches the result into the kernel's `LNTAB_RESERVATION`
 //! section. See `kernel/src/lntab.rs` for the on-wire format.
 
+// xtask is host build tooling — its output is a build artefact, not a
+// kernel trace. The DST-simulator determinism lint (RFC 0006 / issue
+// #714) targets kernel `sched-mock` paths and the `simulator/` crate;
+// `HashMap` here is just a per-call lookup cache. Allows are kept on
+// the two specific fns that construct one so a future addition does
+// not silently inherit the exemption.
+
+#[allow(clippy::disallowed_types)] // see fn-level allows on `collect_rows` / `build_blob`
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -35,6 +43,7 @@ struct LnRow {
 
 /// Parse `.debug_line` across all compilation units, returning one row
 /// per (pc, file, line) triple. The caller sorts and deduplicates.
+#[allow(clippy::disallowed_types)] // per-call file_index cache; not a seeded trace
 fn collect_rows(obj: &object::File<'_>) -> R<Vec<LnRow>> {
     let endian = gimli::RunTimeEndian::Little;
 
@@ -225,6 +234,7 @@ fn sort_and_dedup(rows: &mut Vec<LnRow>) {
 }
 
 /// Serialize collected rows into the on-wire blob the kernel decodes.
+#[allow(clippy::disallowed_types)] // per-call string-dedup table; not a seeded trace
 fn build_blob(rows: &[LnRow], workspace_root: &Path) -> Vec<u8> {
     let mut strtab: Vec<u8> = Vec::new();
     let mut file_offsets: HashMap<String, (u32, u32)> = HashMap::new();

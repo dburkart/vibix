@@ -1573,6 +1573,11 @@ fn test_all() -> R<()> {
     Ok(())
 }
 
+// xtask is host build tooling — the `HashSet`s in this function track
+// marker membership for a single smoke run, not a deterministic seeded
+// trace. The DST-simulator determinism lint (RFC 0006 / issue #714)
+// does not apply to xtask scaffolding.
+#[allow(clippy::disallowed_types)]
 fn smoke(opts: &BuildOpts) -> R<()> {
     use std::collections::HashSet;
     use std::time::Instant;
@@ -2602,7 +2607,11 @@ ffffffff80020100 t core::ptr::drop_in_place::<vibix::task::env::MockIrqState>
         );
     }
 
+    // xtask test scaffolding — see `fn smoke` for why
+    // `clippy::disallowed_types` is allowed for these `HashSet`s
+    // (RFC 0006 / issue #714).
     #[test]
+    #[allow(clippy::disallowed_types)]
     fn smoke_markers_satisfied_only_when_every_hard_marker_seen() {
         // Mirrors the retain+contains loop in `fn smoke`: an accumulated
         // serial-capture string drives the hard/soft marker sets to empty.

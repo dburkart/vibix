@@ -5,8 +5,19 @@
 //! same code. The `#![no_std]` attribute is gated on `not(test)` so
 //! host unit tests (`cargo test --lib`) compile against the standard
 //! library and can run on the development machine.
+//!
+//! RFC 0006 (host-side DST simulator) adds a second host-build path:
+//! `cargo build --target x86_64-unknown-linux-gnu --features sched-mock`.
+//! That build also needs `std` because the host arm of `task::env::env()`
+//! is implemented with `thread_local!` (issue #714). The exception is
+//! kept narrow — only the host triple **plus** the explicit `sched-mock`
+//! feature pulls `std` in; production bare-metal (`target_os = "none"`)
+//! and feature-off host builds stay `#![no_std]`.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(
+    all(not(test), not(all(not(target_os = "none"), feature = "sched-mock"))),
+    no_std
+)]
 #![cfg_attr(target_os = "none", feature(abi_x86_interrupt))]
 
 extern crate alloc;
@@ -69,10 +80,14 @@ pub mod sync;
 // "none"`. The exception is the `task::env` submodule (RFC 0005
 // scheduler / IRQ seam), whose trait definitions and `MockClock` /
 // `MockTimerIrq` impls (gated behind `feature = "sched-mock"`) are
-// host-buildable so the seam has CI-runnable host unit tests. Hence
-// the wider gate here; the body of `task/mod.rs` stays gated to
-// `target_os = "none"` internally.
-#[cfg(any(target_os = "none", all(test, feature = "sched-mock")))]
+// host-buildable so the seam has CI-runnable host unit tests. RFC 0006
+// (issue #714) extends the host-build arm to plain `cargo build`
+// (not just `cargo test`) so the future `simulator/` crate can link
+// the kernel with `--features sched-mock` without depending on the
+// `cfg(test)` hack — hence the `feature = "sched-mock"` arm covers
+// both. The body of `task/mod.rs` stays gated to `target_os = "none"`
+// internally; only `task::env` is reachable from a host build.
+#[cfg(any(target_os = "none", feature = "sched-mock"))]
 pub mod task;
 #[cfg(target_os = "none")]
 pub mod test_harness;

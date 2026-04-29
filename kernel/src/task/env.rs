@@ -161,8 +161,18 @@ pub trait TimerIrq: Sync {
 
 /// Production `Clock` over the PIT tick counter and the
 /// `crate::time::WAKEUPS` deadline map.
+///
+/// The `Clock` impl reaches into `crate::time::*`, which is itself
+/// gated to `cfg(any(test, target_os = "none"))` (see
+/// `kernel/src/lib.rs`). Under a plain host build with `--features
+/// sched-mock` the `time` module is configured out and the production
+/// adapter is unreachable — only the host arm of [`env`] (which hands
+/// out the simulator's mocks) is callable. Mirror that gate here so
+/// the host-build CI lane (RFC 0006 / issue #714) compiles.
+#[cfg(any(test, target_os = "none"))]
 pub struct HwClock;
 
+#[cfg(any(test, target_os = "none"))]
 impl Clock for HwClock {
     fn now(&self) -> Tick {
         Tick(crate::time::ticks())
@@ -189,6 +199,7 @@ impl TimerIrq for HwIrq {
 }
 
 /// Singleton `HwClock` handed out by [`env`].
+#[cfg(any(test, target_os = "none"))]
 pub static HW_CLOCK: HwClock = HwClock;
 
 /// Singleton `HwIrq` handed out by [`env`].
@@ -206,6 +217,66 @@ pub static HW_IRQ: HwIrq = HwIrq;
 #[cfg(target_os = "none")]
 pub fn env() -> (&'static dyn Clock, &'static dyn TimerIrq) {
     (&HW_CLOCK, &HW_IRQ)
+}
+
+// ---------------------------------------------------------------------------
+// Host-build arm (RFC 0006, issue #714).
+//
+// `cargo build --target x86_64-unknown-linux-gnu --features sched-mock` is
+// the build the Phase-2 host-side simulator (DST) sits on top of. The
+// production `env()` above is gated to `target_os = "none"` because it
+// reaches into `crate::arch::*`; on the host triple, the arch module does
+// not exist. In its place, the host arm hands out a thread-local
+// `(&'static dyn Clock, &'static dyn TimerIrq)` pair that the simulator
+// installs once per worker thread via [`install_sim_env`].
+//
+// Per-thread (not global) so parallel `cargo test` workers do not
+// serialize on a shared mutex — every worker constructs its own
+// `Simulator` with its own seed and installs its own mocks. A second
+// `install_sim_env` call on the same thread panics rather than silently
+// swapping mocks under a running test.
+//
+// Today, the only callers of `env()` from host-buildable code paths
+// live in tests under the `sched-mock` feature; the future
+// `simulator/` crate (RFC 0006) calls into the kernel through this
+// same accessor.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+std::thread_local! {
+    static SIM_ENV: core::cell::OnceCell<(&'static dyn Clock, &'static dyn TimerIrq)>
+        = const { core::cell::OnceCell::new() };
+}
+
+/// Host-build arm of [`env`]. Returns the simulator-installed
+/// `(Clock, TimerIrq)` pair for the current thread.
+///
+/// Panics if called before [`install_sim_env`] on this thread — the
+/// simulator's `Simulator::with_seed` constructor is responsible for
+/// installing the pair before any kernel code reaches `env()`.
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+pub fn env() -> (&'static dyn Clock, &'static dyn TimerIrq) {
+    SIM_ENV.with(|c| {
+        *c.get()
+            .expect("task::env::install_sim_env must be called before env()")
+    })
+}
+
+/// Install the simulator's `(Clock, TimerIrq)` pair for the current
+/// thread. Panics if called twice on the same thread — every test /
+/// simulator worker installs exactly one pair for its lifetime.
+///
+/// The pair is `&'static` so the thread-local can store plain
+/// references; in practice the simulator owns its `MockClock` and
+/// `MockTimerIrq` in `Box::leak`-style `'static` storage for the
+/// duration of one seeded run.
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+pub fn install_sim_env(clock: &'static dyn Clock, irq: &'static dyn TimerIrq) {
+    SIM_ENV.with(|c| {
+        c.set((clock, irq))
+            .map_err(|_| "task::env::install_sim_env called twice on the same thread")
+            .unwrap()
+    });
 }
 
 /// Debug-only invariant: the references returned by [`env`] are the
@@ -405,6 +476,81 @@ impl Default for MockTimerIrq {
 impl TimerIrq for MockTimerIrq {
     fn ack_timer(&self) {
         self.inner.lock().ack_calls += 1;
+    }
+}
+
+#[cfg(all(test, feature = "sched-mock", not(target_os = "none")))]
+mod host_env_tests {
+    use super::*;
+
+    /// Each test thread starts with a fresh `SIM_ENV` thread-local;
+    /// installing once and reading back hands the same pair out
+    /// for the lifetime of the thread.
+    #[test]
+    fn install_then_env_returns_installed_pair() {
+        // Use Box::leak so the references are genuinely 'static —
+        // matches the real simulator's storage shape.
+        let clock: &'static MockClock = Box::leak(Box::new(MockClock::new(0)));
+        let irq: &'static MockTimerIrq = Box::leak(Box::new(MockTimerIrq::new()));
+        install_sim_env(clock, irq);
+
+        let (got_clock, got_irq) = env();
+        // Step the clock through the trait object and observe through the
+        // concrete reference — proves `env()` and the installed pair point
+        // to the same underlying state.
+        clock.advance(7);
+        assert_eq!(got_clock.now().raw(), 7);
+
+        got_irq.ack_timer();
+        assert_eq!(irq.ack_count(), 1);
+    }
+
+    /// Second install on the same thread panics rather than silently
+    /// swapping mocks under a running test.
+    #[test]
+    #[should_panic(expected = "install_sim_env called twice")]
+    fn install_twice_on_same_thread_panics() {
+        let clock: &'static MockClock = Box::leak(Box::new(MockClock::new(0)));
+        let irq: &'static MockTimerIrq = Box::leak(Box::new(MockTimerIrq::new()));
+        install_sim_env(clock, irq);
+
+        let clock2: &'static MockClock = Box::leak(Box::new(MockClock::new(99)));
+        let irq2: &'static MockTimerIrq = Box::leak(Box::new(MockTimerIrq::new()));
+        install_sim_env(clock2, irq2);
+    }
+
+    /// `env()` before any install on this thread panics with a clear
+    /// message — the simulator must install before the first kernel
+    /// call reaches the seam.
+    #[test]
+    #[should_panic(expected = "install_sim_env must be called before env()")]
+    fn env_without_install_panics() {
+        let _ = env();
+    }
+
+    /// Cargo test workers each get their own thread-local — installs on
+    /// one thread are not visible to another. This is the property the
+    /// RFC requires so parallel seeds do not serialize on a global lock.
+    #[test]
+    fn install_is_per_thread() {
+        let clock_a: &'static MockClock = Box::leak(Box::new(MockClock::new(11)));
+        let irq_a: &'static MockTimerIrq = Box::leak(Box::new(MockTimerIrq::new()));
+        install_sim_env(clock_a, irq_a);
+        assert_eq!(env().0.now().raw(), 11);
+
+        // A fresh thread has an uninstalled `SIM_ENV` and can install
+        // its own pair without colliding with the outer install.
+        let handle = std::thread::spawn(|| {
+            let clock_b: &'static MockClock = Box::leak(Box::new(MockClock::new(22)));
+            let irq_b: &'static MockTimerIrq = Box::leak(Box::new(MockTimerIrq::new()));
+            install_sim_env(clock_b, irq_b);
+            env().0.now().raw()
+        });
+        let inner = handle.join().expect("worker thread panicked");
+        assert_eq!(inner, 22);
+
+        // Outer thread still sees its own pair.
+        assert_eq!(env().0.now().raw(), 11);
     }
 }
 
