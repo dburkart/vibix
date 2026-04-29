@@ -1,6 +1,13 @@
 [workspace]
 members = [
     "kernel",
+    # `simulator/` is the host-side DST simulator (RFC 0006). It is part
+    # of the workspace so plain `cargo build` / `cargo test` exercise
+    # the host-target build path that future Phase 2 work depends on,
+    # but its only kernel dependency is gated on
+    # `cfg(not(target_os = "none"))` so a bare-metal build of `vibix`
+    # never pulls it in. See `simulator/Cargo.toml`.
+    "simulator",
     "xtask",
     "userspace/hello",
     "userspace/init",
