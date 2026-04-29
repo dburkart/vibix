@@ -77,6 +77,17 @@ vfs_creds = []
 # driver (`ext2_mount`, future waves) flip this on with
 # `--features ext2`.
 ext2 = []
+# RFC 0007 page-cache migration window. When on, `Inode` carries a
+# `mapping: BlockingRwLock<Option<Arc<PageCache>>>` slot that backing
+# filesystems lazily install on first mmap or first read-via-cache (RFC
+# 0007 §Inode-binding rule). Off by default for the migration window so
+# the field's memory and lock costs land on a deliberate flip rather
+# than implicitly. The follow-on wave-2 sites (`sys_mmap`, per-FS
+# `FileOps::mmap` impls) will gate their reads on the same flag; until
+# they land, the field is constructible but unused, and the
+# `Inode::page_cache_or_create` install-once helper is the only call
+# site.
+page_cache = []
 
 [[test]]
 name = "basic_boot"
