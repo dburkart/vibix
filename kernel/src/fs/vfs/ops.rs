@@ -15,7 +15,9 @@ use super::inode::{Inode, InodeMeta};
 use super::open_file::OpenFile;
 use super::super_block::SuperBlock;
 use super::{Access, Credential, InodeKind, Timespec};
-use crate::fs::{EACCES, EINVAL, ENOENT, ENOTDIR, ENOTTY, EPERM, ESPIPE};
+use crate::fs::{EACCES, EINVAL, ENODEV, ENOENT, ENOTDIR, ENOTTY, EPERM, ESPIPE};
+use crate::mem::vmatree::{ProtUser, Share};
+use crate::mem::vmobject::VmObject;
 
 /// Source of a mount operation. Separated from the target path so
 /// future sources (block device, ramdisk module, network URL) can be
@@ -338,6 +340,44 @@ pub trait FileOps: Send + Sync {
     /// caller; drivers should `kwarn!` and absorb any I/O failure (the
     /// next mount-time replay path will retry).
     fn release(&self, _f: &OpenFile) {}
+
+    /// Produce a backing [`VmObject`] for an `mmap(2)` of this open file.
+    ///
+    /// Called by `sys_mmap` after it has validated the userspace
+    /// arguments and looked up the [`OpenFile`]. The returned object is
+    /// plugged into the caller's VMA tree at the chosen virtual address;
+    /// page faults inside the resulting VMA are dispatched to
+    /// [`VmObject::fault`] by the fault resolver.
+    ///
+    /// `file_offset` is the byte offset into the file at which the
+    /// mapping begins (page-aligned per `mmap(2)` rules — `sys_mmap`
+    /// rejects unaligned values with `EINVAL` before this hook fires).
+    /// `len_pages` is the mapping length in 4 KiB pages. `share`
+    /// distinguishes `MAP_PRIVATE` from `MAP_SHARED`. `prot` carries the
+    /// `PROT_*` bits the caller requested; the FS may inspect these to
+    /// reject unsupported combinations (e.g. a read-only FS rejecting
+    /// `MAP_SHARED + PROT_WRITE`).
+    ///
+    /// The default impl returns `-ENODEV`, which `sys_mmap` translates
+    /// to the userspace `ENODEV` errno per the RFC 0007 errno table.
+    /// File types that are not memory-mappable (sockets, FIFOs,
+    /// directories, devfs control nodes) keep this default. Concrete
+    /// filesystems that support `mmap` (ext2, ramfs, tarfs) override it
+    /// in follow-up issues.
+    ///
+    /// See `docs/RFC/0007-page-cache-file-mmap.md` §`FileOps::mmap` for
+    /// the full contract; sys_mmap's argument validation and errno
+    /// translation are issue #746.
+    fn mmap(
+        &self,
+        _f: &OpenFile,
+        _file_offset: u64,
+        _len_pages: usize,
+        _share: Share,
+        _prot: ProtUser,
+    ) -> Result<Arc<dyn VmObject>, i64> {
+        Err(ENODEV)
+    }
 }
 
 /// Default POSIX permission check: owner / group / other bits in
@@ -640,6 +680,40 @@ mod tests {
             let cred = Credential::kernel();
             assert!(default_permission(inode, &cred, Access::EXECUTE).is_ok());
         });
+    }
+
+    #[test]
+    fn fileops_mmap_default_returns_enodev() {
+        // The default `FileOps::mmap` impl is the contract every
+        // non-mmappable FS (sockets, FIFOs, control nodes, and — until
+        // #753 — ext2) inherits. RFC 0007's errno table mandates
+        // `ENODEV` for "file type not mmappable"; sys_mmap (issue #746)
+        // translates the negative errno verbatim.
+        use crate::fs::vfs::dentry::Dentry;
+        use crate::fs::vfs::open_file::OpenFile;
+        use crate::fs::vfs::super_block::SbActiveGuard;
+        use crate::mem::vmatree::Share;
+        let sb = Arc::new(SuperBlock::new(
+            FsId(1),
+            Arc::new(StubSuper),
+            "stub",
+            512,
+            SbFlags::default(),
+        ));
+        let inode = Arc::new(Inode::new(
+            1,
+            Arc::downgrade(&sb),
+            Arc::new(StubInodeOps),
+            Arc::new(StubFileOps),
+            InodeKind::Reg,
+            InodeMeta::default(),
+        ));
+        let dentry = Dentry::new_root(inode.clone());
+        let file_ops: Arc<dyn FileOps> = Arc::new(StubFileOps);
+        let guard = SbActiveGuard::try_acquire(&sb).expect("guard");
+        let of = OpenFile::new(dentry, inode, file_ops, sb.clone(), 0, guard);
+        let r = StubFileOps.mmap(&of, 0, 1, Share::Private, 0);
+        assert_eq!(r.err(), Some(crate::fs::ENODEV));
     }
 
     #[test]
