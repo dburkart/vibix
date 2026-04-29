@@ -11,6 +11,8 @@
 //!    the kernel can own its own `map`/`unmap`/`translate` API.
 
 pub mod frame;
+#[cfg(any(target_os = "none", test))]
+pub mod page_cache;
 pub mod refcount;
 pub mod tlb;
 
