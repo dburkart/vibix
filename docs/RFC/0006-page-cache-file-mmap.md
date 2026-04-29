@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Demand-Paged File mmap and Page Cache for ext2
-status: In Review
+status: Accepted
 created: 2026-04-28
 ---
 
@@ -1265,35 +1265,34 @@ clarity; no normative change to the design.
 
 ## Open Questions
 
-- [ ] **rootfs block size.** RFC 0004 left this open
-  ("`-b 4096` matches host defaults; `1 KiB` makes indirect-block
-  math smaller"). Page cache shifts the calculus toward 4 KiB:
-  a 4 KiB block size means one `bread` per `readpage`, vs four for
-  1 KiB. Recommend flipping to 4 KiB in the same epic that lands the
-  page cache. Decided: 4 KiB.
-- [ ] **In-place buffer hand-off vs always-memcpy.** When `block_size
-  == 4096` and the buffer is page-aligned, `readpage` could reuse the
-  `BufferHead.data` slab as the cache page directly (zero-copy).
-  This requires teaching the buffer cache to release frame ownership
-  on demand and the page cache to accept ownership; coupling that
-  the explicit-handoff layering was specifically chosen to avoid.
-  **Defer** to a follow-up perf RFC; first ship the always-memcpy
-  path. Memcpy of one 4 KiB page is ~1 µs.
-- [ ] **`msync(2)` syscall.** Out of this epic; deferred. The
-  writeback daemon + `fsync` is sufficient for the static + dynamic
-  binary userspace this RFC enables. Track as a follow-up issue.
+All open questions are **deferred to implementation** — none block
+the design as accepted.
+
+- [ ] **rootfs block size.** Recommend flipping to 4 KiB in the same
+  epic that lands the page cache (decided: 4 KiB; track as a small
+  bring-up issue alongside Workstream C).
+- [ ] **In-place buffer hand-off vs always-memcpy.** Ship the
+  always-memcpy path first; revisit zero-copy as a follow-up perf
+  RFC if the ~1 µs/page memcpy shows up in profiles.
+- [ ] **`msync(2)` syscall.** Deferred to a follow-up. Writeback
+  daemon + `fsync` covers durability; no current userspace caller.
 - [ ] **TLB shootdown on truncate / page eviction.** Out of scope
   (uniproc). Resolved by SMP RFC.
-- [ ] **`MAP_HUGETLB`, `MAP_LOCKED`, `MAP_NORESERVE`.** All rejected
-  with `EINVAL` for the initial implementation. Track as follow-ups.
-- [ ] **Mincore, posix_fadvise.** Out of scope. The cache structure
-  trivially supports both; ship in the same epic if a userspace
-  caller materialises before merge.
-- [ ] **`MAP_SHARED` over `tmpfs` / `tarfs`.** ramfs/tarfs override
-  `FileOps::mmap` to return an `AnonObject`-style backing — no page
-  cache, no writeback. Document this in the FS impls; `MAP_SHARED`
-  on a tarfs file is read-only by mount semantics anyway, so no
-  writeback is sensible.
+- [ ] **`MAP_HUGETLB`, `MAP_LOCKED`, `MAP_NORESERVE`.** Rejected
+  with `EINVAL` for the initial implementation. Each lands as a
+  small follow-up RFC if a userspace caller appears.
+- [ ] **`mincore`, `posix_fadvise`.** Cache trivially supports both;
+  ship if a userspace caller materialises during the implementation
+  epic.
+- [ ] **`MAP_SHARED` over `tarfs`/`ramfs`.** Override `FileOps::mmap`
+  to return `AnonObject`-style backing; document in the FS impls.
+  No writeback; tarfs is read-only by mount semantics.
+- [ ] **`ra_state` placement (per-inode vs per-OpenFile).** Pick
+  per-`PageCache` for MVP; revisit when concurrent-readers-of-same-
+  file becomes a measured workload (Performance cycle-2 A1).
+- [ ] **`dirty_ratio` writer-throttling.** Linux-style throttle
+  knob to bound `cache.dirty` growth under sustained pressure.
+  Defer to a follow-up perf RFC (Performance cycle-1 A3).
 
 ### Resolved during peer review
 
