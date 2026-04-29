@@ -207,10 +207,24 @@ jobs:
       - name: cargo xtask test-unit
         run: cargo xtask test-unit
 
+  # Issue #766: shard the integration-tests job across N parallel
+  # runners to cut the long-pole CI lane. Pre-#766 the single job ran
+  # 100+ QEMU integration tests serially and was the wall-clock floor
+  # (~5 min). Each shard pays the kernel `-Z build-std` build cost
+  # once, so wall-clock improvement is sub-linear in N. We pick N=4 as
+  # the point where adding more shards mainly adds runner cost without
+  # meaningfully shrinking wall-clock (each shard already amortizes the
+  # build floor across ~25 tests). To re-tune, change `matrix.shard`
+  # below — `cargo xtask test-integration --shard=I/N` partitions
+  # deterministically (see xtask/src/main.rs::partition_for_shard).
   integration-tests:
-    name: integration tests (QEMU)
+    name: integration tests (QEMU) ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -227,6 +241,12 @@ jobs:
           components: rust-src, llvm-tools, rustfmt, clippy
           targets: x86_64-unknown-none
 
+      # Cache key is intentionally shared across shards (no
+      # ${{ matrix.shard }} component) so all shards hit the same
+      # `~/.cargo/registry` + dep-build cache. The kernel binaries
+      # themselves are per-test under `target/x86_64-unknown-none/`,
+      # but the dependency builds (which dominate cold-cache time)
+      # amortize across the matrix.
       - name: Cache cargo + limine
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -240,8 +260,8 @@ jobs:
             ${{ runner.os }}-cargo-integration-
             ${{ runner.os }}-cargo-
 
-      - name: cargo xtask test-integration
-        run: cargo xtask test-integration
+      - name: cargo xtask test-integration --shard=${{ matrix.shard }}/4
+        run: cargo xtask test-integration --shard=${{ matrix.shard }}/4
 
   ext2-image:
     name: ext2 rootfs image (determinism + hash)
