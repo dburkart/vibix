@@ -32,3 +32,15 @@ path = "src/bin/replay.rs"
 # `x86_64-unknown-linux-gnu`, which matches the gate.
 [target.'cfg(not(target_os = "none"))'.dependencies]
 vibix = { path = "../kernel", features = ["sched-mock"] }
+# ChaCha8 is the simulator's master PRNG (RFC 0006 §RNG): seeded from a
+# u64 master seed, named sub-streams derived via `splitmix64`. We pull
+# `rand_chacha` *without* default features so that nothing along the
+# transitive dep chain reaches `getrandom` / OS entropy — every byte
+# the simulator produces must derive from the master seed alone, or
+# the determinism contract (RFC 0006 §"Reproducibility Envelope")
+# silently breaks.
+rand_chacha = { version = "0.10", default-features = false }
+# `rand_core` brings in the `RngCore` / `SeedableRng` traits; the
+# `os_rng` / `std` features are gated off for the same reason as
+# above.
+rand_core = { version = "0.10", default-features = false }
