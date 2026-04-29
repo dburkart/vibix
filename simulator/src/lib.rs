@@ -75,15 +75,19 @@
 #![deny(clippy::disallowed_types)]
 
 #[cfg(not(target_os = "none"))]
+pub mod trace;
+
+#[cfg(not(target_os = "none"))]
 mod imp {
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
-    use std::vec::Vec;
 
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
 
-    use vibix::task::env::{install_sim_env, Clock, MockClock, MockTimerIrq, TaskId};
+    use vibix::task::env::{install_sim_env, Clock, MockClock, MockTimerIrq};
+
+    pub use crate::trace::{BlockReason, Event, FaultKind, Trace, TraceRecord, SCHEMA_VERSION};
 
     /// A simulator seed.
     ///
@@ -150,99 +154,6 @@ mod imp {
     impl Default for SimulatorConfig {
         fn default() -> Self {
             Self::with_seed(0)
-        }
-    }
-
-    /// One observable transition recorded by the simulator.
-    ///
-    /// Today the schema is the minimal set the run loop emits:
-    /// `ClockAdvanced` / `TimerInjected` / `TaskWoken` / `TimerAcked`.
-    /// Issue #717 (`(Tick, Event)` recorder + JSON dump) extends this
-    /// with the full RFC 0006 §"State-machine model interface" event
-    /// set; keeping the variants small and additive here means the
-    /// determinism-equality assertions in the smoke test do not have
-    /// to be revisited every time the schema grows a field.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Event {
-        /// The mock clock advanced from `from` to `to`. Emitted before
-        /// any wakeups for the destination tick are drained so a
-        /// reader can correlate the new `now` value with the wakeup
-        /// list that follows.
-        ClockAdvanced {
-            /// Tick value before the advance.
-            from: u64,
-            /// Tick value after the advance.
-            to: u64,
-        },
-        /// A virtual timer IRQ was injected by the simulator.
-        TimerInjected,
-        /// The simulator acked the just-injected IRQ via the
-        /// [`TimerIrq::ack_timer`] seam method.
-        TimerAcked,
-        /// A task became runnable because its sleep deadline was at or
-        /// before the new tick.
-        ///
-        /// On host the simulator does not own a real ready bank; it
-        /// records the woken id so the trace and downstream invariant
-        /// checkers (#722) can correlate enqueues with wakeups.
-        TaskWoken {
-            /// Task id whose deadline expired.
-            id: TaskId,
-        },
-    }
-
-    /// One `(tick, event)` row in the trace stream.
-    ///
-    /// `tick` is the value of [`MockClock::now`] *at the time the
-    /// event was emitted*, not when it was scheduled. For
-    /// `ClockAdvanced` the recorded tick is `to`; for
-    /// `TimerInjected`/`TimerAcked`/`TaskWoken` it is `now()` after the
-    /// owning `step` call has advanced the clock.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TraceRecord {
-        /// Tick at which this record was emitted.
-        pub tick: u64,
-        /// The transition itself.
-        pub event: Event,
-    }
-
-    /// A `(Tick, Event)` trace stream emitted by a simulator run.
-    ///
-    /// Today the on-wire shape is the in-memory `Vec<TraceRecord>`
-    /// inside the simulator; #717 wires up `serde::Serialize` and
-    /// JSON-out. We expose only borrowed read accessors so future
-    /// changes to the storage shape (e.g. arena-backed records, or a
-    /// streaming writer) do not break callers.
-    #[derive(Clone, Debug, Default)]
-    pub struct Trace {
-        records: Vec<TraceRecord>,
-    }
-
-    impl Trace {
-        /// Construct an empty trace.
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        /// Number of records in the trace.
-        pub fn len(&self) -> usize {
-            self.records.len()
-        }
-
-        /// `true` if the trace has no records.
-        pub fn is_empty(&self) -> bool {
-            self.records.is_empty()
-        }
-
-        /// Borrow the records as a slice. Iteration order is the
-        /// emission order, which is also the deterministic order
-        /// imposed by the run loop.
-        pub fn records(&self) -> &[TraceRecord] {
-            &self.records
-        }
-
-        fn push(&mut self, rec: TraceRecord) {
-            self.records.push(rec);
         }
     }
 
@@ -509,7 +420,7 @@ mod imp {
 
             self.trace.push(TraceRecord {
                 tick: now_after,
-                event: Event::ClockAdvanced {
+                event: Event::TickAdvance {
                     from: now_before,
                     to: now_after,
                 },
@@ -530,14 +441,14 @@ mod imp {
             for id in clock.drain_expired(now) {
                 self.trace.push(TraceRecord {
                     tick: now_after,
-                    event: Event::TaskWoken { id },
+                    event: Event::WakeupFired { id },
                 });
             }
 
             irq.ack_timer();
             self.trace.push(TraceRecord {
                 tick: now_after,
-                event: Event::TimerAcked,
+                event: Event::TimerIrqAcked,
             });
         }
 
@@ -675,7 +586,8 @@ mod imp {
 
 #[cfg(not(target_os = "none"))]
 pub use imp::{
-    install_panic_hook, Event, Seed, SimRng, Simulator, SimulatorConfig, Trace, TraceRecord,
+    install_panic_hook, BlockReason, Event, FaultKind, Seed, SimRng, Simulator, SimulatorConfig,
+    Trace, TraceRecord, SCHEMA_VERSION,
 };
 
 // On `target_os = "none"` (the bare-metal kernel image), the simulator
@@ -756,10 +668,10 @@ mod tests {
             assert_eq!(recs.len(), 3);
             assert!(matches!(
                 recs[0].event,
-                Event::ClockAdvanced { from: 0, to: 1 }
+                Event::TickAdvance { from: 0, to: 1 }
             ));
             assert!(matches!(recs[1].event, Event::TimerInjected));
-            assert!(matches!(recs[2].event, Event::TimerAcked));
+            assert!(matches!(recs[2].event, Event::TimerIrqAcked));
             // Every record's tick is the post-advance value.
             for r in recs {
                 assert_eq!(r.tick, 1);
@@ -796,7 +708,7 @@ mod tests {
                 .records()
                 .iter()
                 .filter_map(|r| match r.event {
-                    Event::TaskWoken { id } => Some((r.tick, id)),
+                    Event::WakeupFired { id } => Some((r.tick, id)),
                     _ => None,
                 })
                 .collect();
@@ -904,17 +816,64 @@ mod tests {
         // times, and the 1000-tick run drove the canonical seam shape.
         let wakes_1: usize = a
             .iter()
-            .filter(|r| matches!(r.event, Event::TaskWoken { id: 1 }))
+            .filter(|r| matches!(r.event, Event::WakeupFired { id: 1 }))
             .count();
         let wakes_2: usize = a
             .iter()
-            .filter(|r| matches!(r.event, Event::TaskWoken { id: 2 }))
+            .filter(|r| matches!(r.event, Event::WakeupFired { id: 2 }))
             .count();
         // Task 1 fires at ticks 7, 14, 21, ... up to 994 → 142 wakes.
         // Task 2 fires at ticks 11, 22, 33, ... up to 990 → 90 wakes.
         // Exact counts are part of the determinism contract here.
         assert_eq!(wakes_1, 1000 / 7);
         assert_eq!(wakes_2, 1000 / 11);
+    }
+
+    /// RFC 0006 / issue #717 acceptance: a recorded trace round-trips
+    /// through the stable JSON schema without drift.
+    ///
+    /// Property: `record → JSON → parse → re-record → identical trace`.
+    /// Using the same #716 cooperating-tasks workload as the
+    /// determinism smoke test so the round-trip is tested against a
+    /// non-trivial trace (~1000 records, every variant the run loop
+    /// emits today, including `WakeupFired` for both task ids).
+    #[test]
+    fn smoke_recorded_trace_round_trips_through_json() {
+        on_fresh_thread(|| {
+            let mut sim = Simulator::new(0xC0FF_EE42, SimulatorConfig::with_seed(0xC0FF_EE42));
+            let (clock, _irq) = vibix::task::env::env();
+            let start = clock.now();
+            clock.enqueue_wakeup(start.saturating_add(7), 1);
+            clock.enqueue_wakeup(start.saturating_add(11), 2);
+
+            for _ in 0..200 {
+                sim.step();
+                let now = clock.now();
+                if now.raw() % 7 == 0 {
+                    clock.enqueue_wakeup(now.saturating_add(7), 1);
+                }
+                if now.raw() % 11 == 0 {
+                    clock.enqueue_wakeup(now.saturating_add(11), 2);
+                }
+            }
+
+            let json1 = sim.trace().to_json_string();
+            let parsed = Trace::from_json(&json1).expect("parse round-trip");
+            assert_eq!(
+                sim.trace().records(),
+                parsed.records(),
+                "parsed trace differs from original"
+            );
+            assert_eq!(sim.trace().diff(&parsed), None);
+
+            // Re-serialize the parsed trace and demand byte-identical
+            // JSON. This is the strict round-trip property — any field
+            // ordering drift in the encoder would fail here even if
+            // `records()` happened to compare equal via the
+            // `PartialEq` derive.
+            let json2 = parsed.to_json_string();
+            assert_eq!(json1, json2, "JSON drifted across record→json→parse→record");
+        });
     }
 
     #[test]
