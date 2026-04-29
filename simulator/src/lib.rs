@@ -80,6 +80,9 @@ pub mod fault_plan;
 #[cfg(not(target_os = "none"))]
 pub mod invariants;
 
+#[cfg(not(target_os = "none"))]
+pub mod minimize;
+
 // `proptest_model` is `cfg(test)`-gated at the file level — it pulls
 // in `proptest` / `proptest-state-machine` from `[dev-dependencies]`,
 // neither of which appear in production builds. See
@@ -109,6 +112,9 @@ mod imp {
         AllRunnableEventuallyRun, BlockedToRunnableNeedsWakeup, ForkHasMatchingExitOrWait,
         InvariantSet, LivenessInvariant, MonotonicPids, NoStrandedWakeups, SafetyInvariant,
         SingleRunningPerCpu, Violation,
+    };
+    pub use crate::minimize::{
+        closure_reproducer, minimize, ClosureReproducer, MinimizeOutput, Reproducer, TickWindow,
     };
     pub use crate::trace::{BlockReason, Event, FaultKind, Trace, TraceRecord, SCHEMA_VERSION};
 
@@ -886,10 +892,11 @@ mod imp {
 
 #[cfg(not(target_os = "none"))]
 pub use imp::{
-    install_panic_hook, AllRunnableEventuallyRun, BlockReason, BlockedToRunnableNeedsWakeup, Event,
-    FaultEvent, FaultKind, FaultPlan, FaultPlanBuilder, ForkHasMatchingExitOrWait, InvariantSet,
-    LivenessInvariant, MonotonicPids, NoStrandedWakeups, SafetyInvariant, Seed, SimRng, Simulator,
-    SimulatorConfig, SingleRunningPerCpu, Trace, TraceRecord, VariantMask, Violation,
+    closure_reproducer, install_panic_hook, minimize, AllRunnableEventuallyRun, BlockReason,
+    BlockedToRunnableNeedsWakeup, ClosureReproducer, Event, FaultEvent, FaultKind, FaultPlan,
+    FaultPlanBuilder, ForkHasMatchingExitOrWait, InvariantSet, LivenessInvariant, MinimizeOutput,
+    MonotonicPids, NoStrandedWakeups, Reproducer, SafetyInvariant, Seed, SimRng, Simulator,
+    SimulatorConfig, SingleRunningPerCpu, TickWindow, Trace, TraceRecord, VariantMask, Violation,
     FAULT_PLAN_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 
