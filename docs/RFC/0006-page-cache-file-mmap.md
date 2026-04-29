@@ -197,18 +197,27 @@ refcount.
 pub struct CachePage {
     /// Physical frame containing the cached file data. Refcounted via
     /// the existing `mem::refcount` machinery — the cache holds one
-    /// reference; every PTE mapping it holds one more.
+    /// reference; every PTE mapping it holds one more. **`Arc::strong_count`
+    /// of `CachePage` and `mem::refcount` of `phys` are independent
+    /// counters with non-overlapping responsibilities** (see §Refcount
+    /// discipline below). Padded to 64 bytes to avoid false-sharing on
+    /// `state` between adjacent cache entries on SMP (uniproc today).
     pub phys: u64,
 
     /// Page index = file_offset / 4096.
     pub pgoff: u64,
 
-    /// State bits — see `PG_*` below. AtomicU8 so reads in the fault
-    /// hot path don't take any lock.
+    /// State bits — see `PG_*` below. `AtomicU8` so reads in the fault
+    /// hot path don't take any lock. **All transitions documented in
+    /// §State-bit ordering** — `PG_UPTODATE` and `PG_LOCKED` are released
+    /// with `Release`; observers must use `Acquire` for the inverse load.
     pub state: AtomicU8,
 
-    /// Wait-queue for the IN_FLIGHT handshake. A second fault on the
-    /// same page parks here until the original reader publishes UPTODATE.
+    /// Wait-queue for the LOCKED-fill and WRITEBACK handshakes. A second
+    /// fault on the same page parks here until the original reader
+    /// publishes UPTODATE; `truncate_below` parks here on `PG_WRITEBACK`
+    /// to wait out an in-flight `writepage` before the FS is allowed to
+    /// free the underlying blocks.
     pub wait: WaitQueue,
 }
 
@@ -297,7 +306,11 @@ pub trait AddressSpaceOps: Send + Sync {
 pub struct FileObject {
     /// The page cache to consult on faults. Arc so a `MAP_PRIVATE`
     /// CoW that mutates a page does so against a fresh copy without
-    /// racing the cache.
+    /// racing the cache. **Bound to the inode at construction and
+    /// never rebound** — see §Security inode-binding rule. A second
+    /// `execve` of the same path that resolves to a different inode
+    /// constructs a *new* `FileObject` against that inode's distinct
+    /// `Arc<PageCache>`; the old one continues serving the old mapping.
     cache: Arc<PageCache>,
 
     /// Region [object_offset .. object_offset + len_pages*4096) of
@@ -311,6 +324,22 @@ pub struct FileObject {
     /// dirty the cache page (Shared) or trigger CoW into a fresh
     /// AnonObject-backed page (Private).
     share: Share,
+
+    /// Snapshot of the `OpenFile.f_mode` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`)
+    /// at `mmap` time. Consulted by `mprotect` so `PROT_WRITE` cannot
+    /// be added to a Shared mapping that was opened read-only — closes
+    /// the TOCTOU surface raised by Security B1. Snapshot, not a live
+    /// reference: `OpenFile` may close before `munmap`; the VMA owns the
+    /// access decision.
+    open_mode: u32,
+
+    /// Per-VMA private-frame cache for `MAP_PRIVATE` write faults.
+    /// Empty for Shared mappings. After a CoW write fault, the new
+    /// private frame is recorded here so re-faults (e.g. after
+    /// `madvise(MADV_DONTNEED)` or a TLB shootdown) hit the same
+    /// physical frame instead of allocating a fresh one. Mirrors the
+    /// `clone_private` / `evict_range` plumbing of `AnonObject`.
+    private_frames: BlockingMutex<BTreeMap<u64, u64>>, // pgoff → phys
 }
 
 impl VmObject for FileObject {
@@ -363,6 +392,181 @@ ext2's impl returns `Arc::new(FileObject { cache: inode.mapping.clone(), ... })`
 ramfs and tarfs override the default with a thin `AnonObject`-style
 wrapper (their data is already in memory; no `AddressSpaceOps` needed).
 
+### Refcount discipline
+
+Two independent counters track different things and are **never
+intermixed** by the implementation:
+
+1. **`mem::refcount::get(phys)`** — counts the number of installed PTEs
+   plus the cache's own ownership. Bumped by the fault path when a
+   PTE is installed; decremented in `AddressSpace::drop` /
+   `cow_copy_and_remap` when a PTE is removed; the cache itself holds
+   exactly one reference to each `phys` it caches. This is the
+   counter the existing CoW resolver uses; nothing changes here.
+2. **`Arc::strong_count(&CachePage)`** — counts the cache index entry
+   (1) plus any in-flight fault that has cloned the `Arc` *before*
+   installing its PTE plus the writeback daemon's snapshot. **Eviction
+   blocks on `Arc::strong_count > 1`** because a clone in flight
+   indicates a fault has not yet decided whether to install a PTE
+   (and possibly bump `mem::refcount`).
+
+Concretely, the fault hot path:
+
+```
+let page = cache.inner.lock().pages.get(&pgoff).cloned();  // strong+1
+drop(lock);
+mem::refcount::try_inc_refcount(page.phys)?;               // PTE refcount+1
+install_pte(page.phys);
+// `page` Arc drops at scope end                           // strong-1
+```
+
+The strong count is back to 1 (the cache's own) once the fault
+returns. The `mem::refcount` is `1 + (PTEs installed)`. Eviction sees
+`strong_count == 1`, which means no fault is currently mid-resolution;
+it then checks `mem::refcount::get(phys) <= 1` (only the cache holds
+it) and frees the frame. If any PTE is still installed, the eviction
+path skips the page even though `strong_count == 1` — the frame
+refcount is the gating signal there. Both checks are needed; neither
+subsumes the other.
+
+This is the same separation Linux maintains via `page->_refcount`
+(physical) vs `folio->_mapcount` (PTE) vs caller-held references; the
+naming differs but the discipline is identical.
+
+### State-bit ordering
+
+`PG_LOCKED` and `PG_UPTODATE` are the two bits with cross-thread
+correctness obligations. Their transitions are governed by:
+
+- **Filler side** (the task that won the install race):
+  `state.fetch_or(PG_LOCKED, Acquire)` is implicit in the install
+  step (the page is constructed locked). After `readpage` returns,
+  the filler issues `state.fetch_or(PG_UPTODATE, Release)` *before*
+  `state.fetch_and(!PG_LOCKED, Release)`. The Release on the
+  `PG_LOCKED` clear synchronises-with the Acquire load below; together
+  they ensure the page contents (the writes performed *during*
+  `readpage`) are visible to any observer that sees `PG_LOCKED` clear.
+- **Observer side**: every reader does
+  `state.load(Acquire)` and treats `PG_LOCKED` clear as the signal that
+  the data is committed. `PG_UPTODATE` and the page bytes are guaranteed
+  visible after the `Acquire`.
+- **Writer side** (Shared write fault):
+  `state.fetch_or(PG_DIRTY, AcqRel)`. The `dirty` index update happens
+  *under* `cache.inner.lock()` — see §Algorithms — so the daemon's
+  snapshot never sees an inconsistent (`PG_DIRTY` set, index
+  unenrolled) state.
+- **Writeback side**: `state.fetch_or(PG_WRITEBACK, AcqRel)` before
+  the snapshot memcpy; `state.fetch_and(!PG_WRITEBACK, Release)` +
+  `wait.wake_all()` after the writepage returns. `truncate_below`
+  parks on `wait` while `PG_WRITEBACK` is set.
+- **Filler error handling**: if `readpage` returns `Err`, the filler
+  must:
+  1. acquire `cache.inner.lock()`,
+  2. remove the page from `pages` (the cache index),
+  3. drop the cache's strong ref,
+  4. `state.fetch_and(!PG_LOCKED, Release)` and `wait.wake_all()` so
+     parked waiters retry the slow path against a fresh stub,
+  5. `frame::put` the stub's physical frame.
+  The page is *never* left in the cache with `PG_LOCKED` clear and
+  `PG_UPTODATE` clear — that combination is reserved for the (yet
+  unobservable) just-allocated state.
+
+### Lock-order (normative)
+
+The full lock order, top to bottom (acquire higher first; release
+lower first):
+
+```
+1. Task::credentials  (BlockingRwLock<Arc<Credential>>)
+2. Inode::meta        (RwLock — the per-inode metadata)
+3. AddressSpace::vmas (BlockingRwLock — the VMA tree)
+4. PageCache::inner   (BlockingMutex — per-inode cache index)
+5. CachePage::wait    (WaitQueue — per-page parking)
+6. BlockCache::inner  (BlockingMutex — RFC 0004 buffer cache)
+7. mem::refcount      (lock-free atomics)
+8. mem::frame         (BlockingMutex — global frame allocator)
+```
+
+The page-fault handler enters at level 3 (resolving the VMA), drops
+to level 4 (cache lookup), drops to level 5 (parking on a slow path),
+and lets `AddressSpaceOps::readpage` (run with no level-3-or-4 lock
+held) take level 6 internally. **`assert_no_spinlocks_held()` is
+asserted at the entry of every `AddressSpaceOps` method** — this is
+a hard runtime assertion (not debug-only) for the same reason RFC 0004
+makes it hard for the buffer cache: regression here is an immediate
+deadlock on first contention.
+
+### Page-fault IRQ discipline
+
+The current `arch::x86_64::idt::page_fault` handler runs with IRQs
+disabled (interrupt gate). The slow path of a `FileObject` fault
+must:
+
+1. Sample CR2 and the error code into local variables on the kernel
+   stack (mandatory — re-enabling IRQs may cause a nested fault that
+   clobbers CR2 before we read it).
+2. Re-enable interrupts (`sti`) **before** the first `BlockingMutex::lock`
+   call. The pure-logic gates in `mem::pf` (SMAP, RSVD, canonical, prot)
+   already complete with IRQs disabled and produce a verdict before
+   `sti`; the verdict-then-sti split is the safe place to reopen
+   interrupts.
+3. Drive the slow path with IRQs enabled — the task is now preemptible
+   and may park.
+4. On return from `obj.fault`, disable interrupts again before the
+   final PTE install + TLB flush, then return through the IRET frame
+   normally.
+
+This requires the page-fault gate to remain an *interrupt* gate (not
+a trap gate) so we control the precise STI placement. The change
+lands as part of Workstream A and is the first sequenced step of the
+fault rewrite — without it the slow path deadlocks the first time it
+is hit.
+
+### Eviction liveness
+
+The cache's eviction policy returns `ENOMEM` only after a documented
+**direct-reclaim** wait:
+
+1. CLOCK-Pro sweep finds zero victims (every page is pinned, dirty, or
+   locked).
+2. The faulter parks on `BlockCache::writeback_complete_wq` — a
+   per-cache waitqueue kicked by the writeback daemon every time it
+   completes a `writepage`.
+3. The faulter wakes on either: (a) a writepage completion
+   (`PG_DIRTY`-pinned page may now be evictable), or (b) a soft timeout
+   of **2 seconds** (configurable via the same
+   `writeback_secs=<N>` cmdline knob, with a separate
+   `direct_reclaim_timeout_ms=<N>` override).
+4. On wake, the sweep retries once. A second no-victim outcome
+   surfaces `ENOMEM` to the caller, which the resolver maps to SIGBUS.
+
+The 2-second cap exists so a pathological workload cannot park a
+faulting thread for the full 30 s writeback interval. With the cap,
+liveness reduces to "if a writepage ever completes within 2 s of the
+fault, the fault will retry"; under sustained pressure the SIGBUS
+surface is reachable, but it is reachable only when the system is
+genuinely OOM by the standard the writeback daemon's cadence
+defines. This is the bounded-direct-reclaim option (a) from the
+academic blocking finding.
+
+### Inode-binding rule
+
+`FileObject.cache: Arc<PageCache>` is set at construction and is
+**never** mutated for the lifetime of the `FileObject`. `PageCache`
+holds an `inode_id: InodeId` and a per-inode `Arc<dyn AddressSpaceOps>`
+captured from the `Arc<Inode>` at cache-construction time; the cache's
+identity is the inode's identity. A second `execve` of the same path
+that resolves to a different inode (the rename/unlink-then-replace
+attack) constructs a *separate* `FileObject` against the new inode's
+*separate* `Arc<PageCache>`. The first execve's mapping continues
+serving the original inode's cache until the original mapping is
+torn down.
+
+This closes the TOCTOU surface raised in Security B3 by making
+"refresh the FileObject's backing on inode replacement" a non-existent
+operation — there is no API to do it, and any future API would have
+to thread through the entire `VmObject` trait.
+
 ### Algorithms and protocols
 
 #### Page-fault path
@@ -396,7 +600,12 @@ fault(off, access):
                 if access == Write && self.share == Private:
                     drop(guard); return Err(VmFault::CoWNeeded)
                 if access == Write && self.share == Shared:
-                    set PG_DIRTY; guard.dirty.insert(pgoff)
+                    // Linearization: enrol in dirty index *first*,
+                    // then atomic state OR. Daemon's snapshot reads
+                    // index-then-state and treats either signal as
+                    // "still dirty" for the next sweep.
+                    guard.dirty.insert(pgoff)
+                    page.state.fetch_or(PG_DIRTY, AcqRel)
                 inc_refcount(page.phys)         // PTE reference
                 return Ok(page.phys)
     }
@@ -413,15 +622,38 @@ fault(off, access):
 
     if installed is the stub:
         // We own the fill. Drop nothing, but we MUST NOT hold cache.inner.
-        debug_assert!(!holding_cache_inner_lock());
-        ops.readpage(pgoff, hhdm_window(installed.phys))   // blocks
-        installed.state.fetch_or(PG_UPTODATE, Release)
-        installed.state.fetch_and(!PG_LOCKED, Release)
-        installed.wait.wake_all()
+        assert_no_spinlocks_held()
+        match ops.readpage(pgoff, hhdm_window(installed.phys)):
+          Ok(_) ->
+            installed.state.fetch_or(PG_UPTODATE, Release)
+            installed.state.fetch_and(!PG_LOCKED, Release)
+            installed.wait.wake_all()
+          Err(e) ->
+            // Filler error contract — keep the cache index clean.
+            let mut guard = cache.inner.lock()
+            guard.pages.remove(&pgoff)        // drops the cache's strong ref
+            drop(guard)
+            installed.state.fetch_and(!PG_LOCKED, Release)
+            installed.wait.wake_all()         // parked waiters retry slow path
+            mem::frame::put(installed.phys)   // release stub frame
+            return Err(VmFault::ReadFailed(e))
+
+        // Truncate-vs-fill race recheck under cache.inner: i_size may
+        // have shrunk while readpage was in flight. If so, evict the
+        // page we just installed and surface OutOfRange.
+        if pgoff >= cache.i_size_pages_locked():
+            let mut guard = cache.inner.lock()
+            guard.pages.remove(&pgoff)
+            return Err(VmFault::OutOfRange)
     else:
         // Someone else owns the fill. Park if still locked.
-        while installed.state & PG_LOCKED != 0:
-            installed.wait.park_until(|| installed.state & PG_LOCKED == 0)
+        while installed.state.load(Acquire) & PG_LOCKED != 0:
+            installed.wait.park_until(|| installed.state.load(Acquire) & PG_LOCKED == 0)
+        // Wake-on-error: page may have been evicted from the index.
+        // Retry the entire slow path; the recursion is bounded by the
+        // monotonic FS-side outcome.
+        if installed.state.load(Acquire) & PG_UPTODATE == 0:
+            return retry_slow_path()
 
     // Re-enter fast path (recursion bounded by 1 — page is now
     // UPTODATE and we hold a strong Arc, so a second eviction is
@@ -444,7 +676,19 @@ Three rules embedded above are normative:
 > → buffer_cache.inner`**. Acquiring in any other order is a bug. The
 > page-fault handler must not hold the VMA-tree spin while it calls
 > `obj.fault`; today's handler already drops it before the dispatch
-> per RFC 0001 — this RFC reaffirms the order.
+> per RFC 0001 — this RFC reaffirms the order. Full-stack order in
+> §Lock-order (normative) above.
+>
+> **N4 — Read-after-writeback consistency** (Mach memory-object
+> contract). A `read(2)` that observes a page returned from
+> `cache.pages.get(&pgoff)` after a `writepage(pgoff, _)` has
+> committed observes the post-writepage contents. Trivially holds
+> today because both `read(2)` and `writepage` go through the same
+> `Arc<CachePage>`; the rule is normative for future direct-IO
+> bypass and for the SMP write-then-read-on-different-CPU case.
+> Stated as an explicit invariant per Rashid et al. 1988
+> ("Machine-Independent Virtual Memory Management for Paged
+> Uniprocessor and Multiprocessor Architectures").
 
 #### `MAP_PRIVATE` on a write fault
 
@@ -520,11 +764,48 @@ naturally because the writer's `set_dirty` runs under
 `cache.inner.lock()`, observes `PG_WRITEBACK`, and re-enlists the
 page in `dirty` even if `writepage` is concurrently in flight.
 
-**Ordering vs `fsync(2)`.** `FileOps::fsync(data_only=false)`
-synchronously walks `cache.dirty`, flushes everything, then fences on
-`BlockCache::sync_fs(sb_dev)`. Two-stage flush so a crash after
-`fsync` returns has both the page-cache contents and the inode
-metadata committed.
+**Ordering vs `fsync(2)` and `fdatasync(2)`.**
+
+`FileOps::fsync(data_only=false)` synchronously walks `cache.dirty`,
+calls `writepage` on every dirty page, then fences on
+`BlockCache::sync_fs(sb_dev)`. The per-page `writepage` performs its
+own internal ordering: each data block is `sync_dirty_buffer`'d
+*before* its parent indirect-block buffer is, matching RFC 0004
+§create normative create-ordering (bitmap → inode → dirent, each
+synchronous). The two-stage flush guarantees both page-cache contents
+and inode-table metadata are on stable storage when `fsync` returns.
+
+`FileOps::fsync(data_only=true)` (i.e. `fdatasync`) walks `cache.dirty`
+and calls `writepage` exactly as the full path does, but **skips the
+inode-table flush** if the dirty pages do not extend the file. Linux's
+rule: `fdatasync` must flush whatever metadata is required for a
+subsequent `read(2)` to see the post-fsync data — that is, indirect
+blocks and the bitmap (if newly-allocated), but *not* `i_mtime` /
+`i_atime` updates. Concretely:
+
+- If `writepage` did not allocate any new blocks, only `s_state` and
+  `i_mtime` would be dirty in the buffer cache, both of which are
+  metadata-only and skipped.
+- If `writepage` did allocate new blocks (the §writepage block
+  allocation path below), the bitmap and indirect-block buffers are
+  flushed via `sync_dirty_buffer` as part of `writepage` itself —
+  before the data block — so `fdatasync` already has what it needs.
+
+Database workloads (sqlite, postgres, leveldb) that issue
+`fdatasync` after every transaction therefore avoid the
+inode-table-block sync cost, which is the entire point of the API
+distinction.
+
+**Per-page write-error reporting.** A `writepage` failure marks the
+inode's `mapping` with `wb_err: AtomicU32` (a monotonic counter that
+increments on every distinct write failure). `fsync` returns `EIO`
+if `wb_err` advanced since the last `fsync` on this `OpenFile`;
+`OpenFile` snapshots `wb_err` at `open` and re-reads it on `fsync`.
+This is the `errseq_t` pattern from Linux ≥ 4.13; vibix's
+implementation is a flat counter rather than the multi-fd-snapshot
+structure, accepting that two `fsync` callers may both observe the
+same `EIO` once. Fully addresses the durability surface raised by
+the filesystem reviewer (advisory A1).
 
 **`msync(2)`.** Out of scope as a syscall in this RFC (no userspace
 caller yet); the underlying writeback path described above is the
@@ -533,6 +814,58 @@ substrate `msync` will eventually call. Open Question: ship a
 follow-up. Default plan: defer; the writeback daemon plus `fsync`
 provide the same durability guarantees for the static-binary
 userspace this enables.
+
+#### `writepage` block allocation (MAP_SHARED extend / sparse fill-in)
+
+A `writepage` for a `(pgoff, buf)` whose underlying ext2 blocks are
+unallocated (the file was extended via `ftruncate(fd, NEW_SIZE)` with
+`NEW_SIZE > old_i_size`, or a sparse hole was written through
+`MAP_SHARED`) **must** allocate the blocks before issuing the data
+write. The allocation is performed by `Ext2Inode::writepage` — not
+by the page cache — and follows RFC 0004 §create normative ordering:
+
+1. Allocate the data block(s) via the block bitmap allocator
+   (RFC 0004 Workstream E machinery). On 4 KiB blocks: one block per
+   page; on 1 KiB blocks: up to four blocks per page; allocator runs
+   in the parent inode's block group with linear spill.
+2. If a new indirect-block pointer slot is needed (single/double/
+   triple indirect), allocate that block too.
+3. `sync_dirty_buffer` the bitmap (block bitmap reflects allocation).
+4. `sync_dirty_buffer` the new indirect block (its forward pointer
+   to the data block is set, but the data block contents are still
+   undefined).
+5. Write the data block via `mark_dirty + sync_dirty_buffer`.
+6. Update `i_blocks` on the inode by `block_size / 512` per allocated
+   block (data + every indirect), update `i_size` if the page extends
+   the file, and `mark_dirty` the inode-table buffer.
+
+The order is "allocate, advertise the pointer, commit the data" —
+matches RFC 0004's "bitmap → inode → dirent" discipline and means a
+crash between any pair of steps leaves the FS in one of these
+recoverable states:
+
+- Crash after step 3, before 4: bitmap shows the block as allocated
+  but the indirect block doesn't reference it (orphan block — fsck
+  reclaims).
+- Crash after step 4, before 5: indirect block references a data
+  block whose contents are whatever the freshly-allocated block
+  contained on disk (zeros from `mkfs`, or stale from a prior file).
+  This is the same "uninitialised data exposure" hole RFC 0004
+  documents for the eager `FileOps::write` path; mitigation is the
+  same: ext2 has no journal, so the application-visible state after
+  crash recovery may include stale block contents. **An `O_TRUNC`
+  + sparse-extend pattern over `MAP_SHARED` therefore inherits the
+  same disclosure-via-crash surface that `write(2)` already has on
+  ext2.** Documented; not a regression.
+
+Rollback on per-step failure: every allocator returns the block to
+the bitmap if a downstream step fails; the inode's in-memory
+`i_blocks` / `i_size` are updated only after step 6. This matches
+RFC 0004 Workstream E's rollback discipline.
+
+`writepage`'s error path propagates to the writeback daemon's
+`wb_err` increment (above) so a sticky `EIO` surfaces on the next
+`fsync`.
 
 #### Demand-paged execve
 
@@ -608,13 +941,34 @@ This is **strict invariant parity** with RFC 0004 Workstream C.
 #### Truncate, unmap, and `MADV_DONTNEED`
 
 - **`ftruncate(fd, new_size)` shrink.** ext2's `setattr` calls
-  `inode.mapping.truncate_below(new_size)`, which evicts every cached
-  page with `pgoff * 4096 >= new_size_page_aligned_up`. PTEs in
-  outstanding mappings into the truncated range are *not* invalidated
-  by this RFC; per POSIX, accessing past EOF after a `ftruncate` is a
-  SIGBUS, and the existing PTE-residency check at fault time
-  (i.e. the fault retried after a TLB shootdown) takes care of it.
-  See Open Question on TLB shootdown for the deferred SMP story.
+  `inode.mapping.truncate_below(new_size)`, which:
+  1. acquires `cache.inner`,
+  2. updates `i_size: AtomicU64` to the new value,
+  3. for every page in `[new_size_page_aligned_up..)`: if the page has
+     `PG_WRITEBACK` set, **drop `cache.inner` and park on
+     `page.wait` until `PG_WRITEBACK` clears**, then re-acquire and
+     retry the sweep. This wait is mandatory — without it an in-flight
+     `writepage` can commit stale data into blocks that the FS is
+     concurrently freeing (the on-disk UAF surface raised by the
+     filesystem reviewer's blocking finding).
+  4. evicts the page (drops the cache strong ref + `frame::put`).
+  5. returns to the FS, which then frees the on-disk blocks.
+
+  PTEs in outstanding mappings into the truncated range are *not*
+  invalidated by this RFC; per POSIX, accessing past EOF after a
+  `ftruncate` is a SIGBUS, and the slow-path bounds recheck described
+  in `FileObject::fault` (re-reads `i_size` after acquiring
+  `cache.inner`) makes this correct on uniproc. See Open Question on
+  TLB shootdown for the deferred SMP story.
+
+- **`ftruncate(fd, new_size)` grow.** Lands as a metadata-only update
+  on the inode (`i_size := new_size`, no block allocation). The cache
+  takes the new `i_size` via `truncate_grow_to(new_size)`; subsequent
+  faults into the extended range fault via the `readpage` slow path,
+  which sees an unallocated indirect-block pointer and zero-fills the
+  cache page (sparse hole). The first `MAP_SHARED + write` to such a
+  page transitions through `writepage`, which **must allocate**: see
+  §"writepage block allocation" below.
 - **`munmap`.** Unchanged. `VmaTree::unmap_range` already drops the
   `Arc<dyn VmObject>` reference per VMA; for a `FileObject` the cache
   itself is held via `Arc<PageCache>` and lives until the inode dies.
@@ -629,7 +983,7 @@ This is **strict invariant parity** with RFC 0004 Workstream C.
 
 | Syscall | Change |
 |---|---|
-| `mmap(addr, len, prot, flags, fd, off)` | When `fd != -1`, look up the `OpenFile`, validate `prot` ⊆ open flags (write to `O_RDONLY` → `EACCES`), call `OpenFile::file_ops.mmap(...)`, plug the returned `VmObject` into the VMA tree. `MAP_SHARED + PROT_WRITE` requires `O_RDWR` or `O_WRONLY`. |
+| `mmap(addr, len, prot, flags, fd, off)` | When `fd != -1` and `MAP_ANONYMOUS` is **not** set, look up the `OpenFile`, validate `prot` against open flags (see errno table below), call `OpenFile::file_ops.mmap(...)`, plug the returned `VmObject` into the VMA tree. **`MAP_SHARED + PROT_WRITE` requires `O_RDWR`** (not `O_WRONLY` — the write-fault path must read the page on miss before mutating it; an `O_WRONLY`-opened file cannot service that read). `MAP_ANONYMOUS` ignores `fd` per Linux semantics. |
 | `munmap(addr, len)` | Unchanged. |
 | `mprotect(addr, len, prot)` | Unchanged structurally; new errno: `EACCES` when `prot ⊆ open_flags` is violated for a `FileObject`-backed VMA. |
 | `madvise(addr, len, advice)` | Unchanged. `MADV_WILLNEED` becomes a hint to `AddressSpaceOps::readahead`. |
@@ -645,13 +999,23 @@ Question).
 | Condition | Errno |
 |---|---|
 | `fd` not open | `EBADF` |
-| File type not mmappable (socket, FIFO) | `ENODEV` |
-| `MAP_SHARED + PROT_WRITE` on `O_RDONLY` open | `EACCES` |
+| File type not mmappable (socket, FIFO, directory) | `ENODEV` |
+| `MAP_SHARED + PROT_WRITE` and `OpenFile.f_mode` is not `O_RDWR` (i.e. `O_RDONLY` *or* `O_WRONLY`) | `EACCES` |
+| `MAP_PRIVATE + PROT_WRITE` on `O_WRONLY` open (cannot read on miss) | `EACCES` |
 | `off` not page-aligned | `EINVAL` |
 | `len == 0` | `EINVAL` |
-| `off + len` overflow or past `i_size` | `EINVAL` (Linux uses `ENXIO` on `i_size` overflow at fault time, not at mmap; this RFC matches Linux — `mmap` past EOF *succeeds*, the SIGBUS surfaces at fault) |
+| `off + len` overflows `off_t` | `EOVERFLOW` |
+| `off + len` past `i_size` | **succeeds** — Linux/POSIX `mmap` is allowed past EOF; SIGBUS surfaces at fault time when the page is touched (matches Linux `mmap(2) NOTES`) |
 | Out of memory installing VMA | `ENOMEM` |
 | Cache-fill OOM at fault time | SIGBUS (signal, not errno) |
+| Sparse hole at `pgoff` (no allocated block) | **succeeds** — `readpage` zero-fills the page; first `MAP_SHARED + write` fault dirties it, `writepage` allocates blocks per §writepage block allocation |
+
+`mprotect` upgrade rules apply the same `f_mode` snapshot stored on
+the VMA: `PROT_WRITE` cannot be added to a Shared mapping whose
+`open_mode` was not `O_RDWR`; `PROT_EXEC` cannot be added to a
+mapping whose backing file was not opened with execute permission
+(no separate `O_EXEC` flag exists, so this check uses the
+`Inode.permission(EXECUTE)` result snapshotted at `mmap` time).
 
 ## Security Considerations
 
@@ -705,16 +1069,51 @@ Question).
   acquire-and-release on `cache.inner`, one `BTreeMap::get`, one
   atomic load on `state`, one refcount increment. Zero block I/O.
   Comparable to today's `AnonObject::fault` cache-hit path.
-- **Mutex granularity.** The per-inode mutex serialises faults
-  against the same inode. For uniproc this is irrelevant. Under SMP
-  it becomes the bottleneck for hot files (`/lib/libc.so`); the SMP
-  follow-up RFC will shard or replace with an XArray-style
-  fine-grained lock. Out of scope here, but the data structure
-  choice (BTreeMap-on-mutex) deliberately matches `AnonObject` so
-  the same shard fix applies uniformly.
-- **Readahead window.** Default 8 pages on sequential miss
-  (`AddressSpaceOps::readahead`). Bounded by RFC 0004 buffer cache
-  invariants — we never trigger sync flushes from readahead.
+- **Mutex granularity (split-lock from day 1).** The per-inode mutex
+  is **split** between the cache *index* and per-page *state*:
+  - `PageCacheInner.pages` (`BTreeMap`) and `PageCacheInner.dirty`
+    (`BTreeSet`) sit under one `BlockingMutex` — held only for the
+    O(log n) lookup/insert/remove and dropped immediately.
+  - `CachePage.state` is `AtomicU8` and `CachePage.wait` is its own
+    `WaitQueue` — neither requires the index mutex to access. The
+    fast path holds the index mutex for the lookup, drops it,
+    releases the page atomic operations independently.
+
+  This split is identical in shape to Linux's `i_pages` (XArray, lock
+  per leaf) + per-folio `flags`/`waitqueue`. On uniproc the
+  index mutex is uncontended; on SMP, the per-page state path lets
+  faults against the same inode but different pages proceed in
+  parallel, with only the index lookup serialised. This is the
+  performance-engineer's "option (b)" — split-lock from day one —
+  picked over a future BTreeMap → concurrent_btree swap because
+  the migration path of swapping the index data structure is
+  drop-in (it's already behind one mutex), whereas re-architecting
+  the page state to a per-page lock *post hoc* is invasive.
+  Cost: ~16 bytes per `CachePage` for the wait-queue (already in
+  the structure). No additional RAM for the split.
+
+- **Cache-line-friendly `CachePage`.** Padded to 64 bytes via
+  `#[repr(align(64))]` so `state` does not false-share with the next
+  `CachePage`'s metadata on SMP. Uniproc cost: zero. Acknowledges
+  the perf-reviewer advisory A2.
+- **Readahead policy (heuristic, not blanket).** The default
+  read-ahead window is **0 pages** for a "cold" inode (no prior
+  faults observed). The cache tracks a tiny per-inode read-ahead
+  state (`ra_state: { last_pgoff, hit_streak }`); on each miss:
+  - if `pgoff == ra_state.last_pgoff + 1`, increment `hit_streak`;
+  - if `hit_streak >= 2`, set the next miss's read-ahead window to
+    `min(2^hit_streak, RA_MAX_PAGES)` (cap `RA_MAX_PAGES = 8`);
+  - on any non-sequential miss, reset to 0.
+
+  This is the same exponential-ramp Linux's `file_ra_state` uses,
+  miniaturised. `posix_fadvise(POSIX_FADV_SEQUENTIAL)` and
+  `madvise(MADV_SEQUENTIAL)` (when implemented) jump straight to the
+  cap; `POSIX_FADV_RANDOM` / `MADV_RANDOM` permanently disable
+  read-ahead for the inode. The execve fault stream — typically not
+  sequential past the first few pages — observes 0 read-ahead until
+  `_start` -> `.text` produces a streak. This addresses the
+  performance-engineer blocking finding that an unconditional
+  8-page read-ahead would *increase* cold-execve latency.
 - **Memory overhead per cached page.** `CachePage` is 24 bytes of
   metadata (`phys: u64`, `pgoff: u64`, `state: AtomicU8`,
   `wait: WaitQueue<small_repr>`) + the 4 KiB data frame +
@@ -864,7 +1263,66 @@ clarity; no normative change to the design.
 
 ### Resolved during peer review
 
-*(populated during defense cycles)*
+**Defense cycle 1** (six archetype reviewers, all `CHANGES REQUESTED`):
+
+- *Security B1* — `f_mode` snapshot now lives explicitly on
+  `FileObject.open_mode`; `mprotect` consults it. (§Key data
+  structures, §Errno table.)
+- *Security B2* — `readpage` filler-error contract spelt out:
+  remove from index, drop strong ref, clear `PG_LOCKED`, wake
+  waiters, free stub frame, surface `VmFault::ReadFailed`. No
+  uninitialised tail bytes leak via SIGBUS-restart cycles.
+  (§Algorithms, fault slow path.)
+- *Security B3* — `FileObject` is bound to its `Arc<PageCache>`
+  for life and never rebound; second execve of the same path
+  resolving to a different inode constructs a fresh object.
+  (§Inode-binding rule.)
+- *OS B1* — IRQ discipline made explicit: the page-fault handler
+  STIs after the pure-logic verdict, drives the slow path with
+  IRQs enabled, then CLI before the PTE install. (§Page-fault IRQ
+  discipline.)
+- *OS B2* — `PG_LOCKED`/`PG_UPTODATE` ordering specified Acquire/
+  Release; full state transition table in §State-bit ordering.
+- *OS B3* — `Arc::strong_count` and `mem::refcount` now have
+  explicit, non-overlapping responsibilities. (§Refcount discipline.)
+- *OS B4* — Truncate-vs-fill race fixed: `truncate_below` updates
+  `i_size` under `cache.inner` before evicting; the fault slow
+  path re-checks `pgoff < i_size_pages_locked()` after install.
+- *Userspace B1* — Errno table corrected: `mmap` past `i_size`
+  succeeds; SIGBUS surfaces at fault. `EOVERFLOW` on `off + len`
+  overflowing `off_t`.
+- *Userspace B2* — `MAP_SHARED + PROT_WRITE` requires `O_RDWR`,
+  not `O_RDWR or O_WRONLY`. Errno table updated.
+- *Userspace B3* — `fdatasync` semantics specified to skip
+  inode-table flush when no blocks were allocated; matches Linux
+  per-API distinction.
+- *Academic B1* — Eviction liveness: bounded direct-reclaim wait
+  on the writeback-completion waitqueue, with a 2 s soft cap
+  before surfacing SIGBUS. Faults under contention no longer
+  silently spuriously fail. (§Eviction liveness.)
+- *Filesystem B1* — `MAP_SHARED + ftruncate-up + write` path
+  fully specified: `writepage` allocates blocks via the ext2
+  bitmap allocator with RFC 0004 §create normative ordering.
+  (§writepage block allocation.)
+- *Filesystem B2* — `truncate_below` parks on `PG_WRITEBACK`
+  before evicting and freeing on-disk blocks, closing the
+  on-disk-UAF surface. (§Truncate, unmap, MADV_DONTNEED.)
+- *Filesystem B3* — Per-block ordering inside `writepage`
+  (data-block synced before parent indirect-block) made
+  normative. (§Ordering vs fsync.)
+- *Performance B1* — Split lock from day one: index mutex is
+  separate from per-page state atomics + per-page wait-queue,
+  matching Linux's i_pages-XArray + per-folio locking shape.
+- *Performance B2* — Read-ahead policy is now an exponential
+  ramp gated on observed sequential access; cold-execve sees 0
+  read-ahead until a streak develops.
+
+Also folded in: read-after-writeback invariant (Academic A1),
+sparse-hole zero-fill (Userspace A5), wb_err errseq counter
+(Filesystem A1), full lock-order ladder (OS A4), inode-meta lock
+position (OS A4), `mprotect` PROT_EXEC rule (Userspace A3),
+`MAP_ANONYMOUS + fd != -1` Linux compatibility (Userspace A1),
+`mmap` of directory errno (Userspace A2).
 
 ### Deferred to follow-up RFCs
 
@@ -884,36 +1342,42 @@ on wave 1; wave 3 blocks on wave 2.
 
 ### Workstream A — Page cache core (wave 1)
 
-- [ ] mem: introduce `PageCache`, `CachePage`, `PG_*` state bits, per-cache `BlockingMutex<PageCacheInner>` (BTreeMap + dirty BTreeSet)
+- [ ] arch/x86_64/idt: rework page-fault gate to STI after the pure-logic verdict and CLI before PTE install + IRET; mandatory before any blocking-mutex slow path can be exercised (§Page-fault IRQ discipline)
+- [ ] mem: introduce `PageCache`, `CachePage`, `PG_*` state bits with documented Acquire/Release transitions; per-cache `BlockingMutex<PageCacheInner>` (BTreeMap pages + BTreeSet dirty); `CachePage` is `#[repr(align(64))]`
 - [ ] mem: `AddressSpaceOps` trait (`readpage`/`writepage`/`readahead`/`truncate_below`) with default no-op `readahead`/`truncate_below`
-- [ ] mem: `FileObject : VmObject` with `share`-aware `fault` (Shared write → mark dirty; Private write → `VmFault::CoWNeeded`); `frame_at`/`clone_private`/`truncate_from_page`/`evict_range`
-- [ ] mem: page-fault path threads `VmFault::CoWNeeded` and `VmFault::ParkAndRetry` into the existing resolver — re-uses `cow_copy_and_remap` unchanged
-- [ ] mem: page-cache CLOCK-Pro eviction matching the four buffer-cache invariants; `ENOMEM` rather than sync flush; host unit tests for skip-pinned, skip-DIRTY, no-victim
-- [ ] mem: **invariant assertion** — `debug_lockdep::assert_no_spinlocks_held()` at the top of `AddressSpaceOps::{readpage, writepage}`; assert `cache.inner` is not held when crossing the FS hook
+- [ ] mem: `FileObject : VmObject` with `share`-aware `fault`, `open_mode` snapshot, per-VMA `private_frames` map; `frame_at`/`clone_private`/`truncate_from_page`/`evict_range`
+- [ ] mem: page-fault path threads `VmFault::CoWNeeded`, `VmFault::ParkAndRetry`, `VmFault::ReadFailed(errno)` into the existing resolver — re-uses `cow_copy_and_remap` unchanged for CoW
+- [ ] mem: page-cache CLOCK-Pro eviction with the four buffer-cache invariants + the bounded direct-reclaim wait (2 s cap, configurable; parks on writeback-completion waitqueue) before surfacing `ENOMEM`/SIGBUS; host unit tests for skip-pinned, skip-DIRTY, no-victim, direct-reclaim-progress
+- [ ] mem: per-inode read-ahead heuristic (`ra_state: { last_pgoff, hit_streak }`) — exponential ramp on sequential, hard reset on non-sequential; cap `RA_MAX_PAGES = 8`
+- [ ] mem: **invariant assertions (runtime, not debug-only)** — `assert_no_spinlocks_held()` at the top of every `AddressSpaceOps` method; `cache.inner` not held across `readpage`/`writepage`
+- [ ] mem: refcount-discipline tests — `Arc::strong_count(CachePage)` vs `mem::refcount::get(phys)` gating eviction independently; verify a cache page held only by an installed PTE is *not* evicted
 
 ### Workstream B — VFS plumbing (wave 1)
 
 - [ ] vfs: add `FileOps::mmap(f, file_offset, len_pages, share, prot) -> Result<Arc<dyn VmObject>, i64>` defaulting to `ENODEV`
-- [ ] vfs: extend `Inode` with `mapping: Option<Arc<PageCache>>` (gated by `#[cfg(feature = "page_cache")]` initially); construct lazily on first mmap or first read
-- [ ] sys: rewire `sys_mmap` for `fd != -1` — look up `OpenFile`, validate `prot ⊆ f_mode` (write-to-RO ⇒ `EACCES`), call `FileOps::mmap`, plug into VMA tree; preserve `MAP_FIXED`/`MAP_FIXED_NOREPLACE` semantics
-- [ ] sys: extend `mprotect` to reject `PROT_WRITE` upgrades on Shared-O_RDONLY `FileObject`-backed VMAs (`EACCES`)
-- [ ] sys: extend `fsync` to flush `inode.mapping.dirty` before `BlockCache::sync_fs`; both error paths surface `EIO`
+- [ ] vfs: extend `Inode` with `mapping: Option<Arc<PageCache>>` (gated by `#[cfg(feature = "page_cache")]` initially); construct lazily on first mmap or first read; the cache holds a `Arc<dyn AddressSpaceOps>` captured from the inode at construction (inode-binding rule)
+- [ ] sys: rewire `sys_mmap` for `fd != -1` — look up `OpenFile`, validate per the new errno table (`EACCES` for `MAP_SHARED + PROT_WRITE` without `O_RDWR`; `EOVERFLOW` on `off + len`; **succeed** past `i_size`; `MAP_ANONYMOUS` ignores `fd`), call `FileOps::mmap`, snapshot `open_mode` onto the returned `FileObject`, plug into VMA tree; preserve `MAP_FIXED`/`MAP_FIXED_NOREPLACE` semantics
+- [ ] sys: extend `mprotect` — consult `FileObject.open_mode` snapshot; reject `PROT_WRITE` upgrades on `MAP_SHARED` mappings whose `open_mode` is not `O_RDWR` (`EACCES`); reject `PROT_EXEC` upgrades on mappings backed by a non-executable inode at `mmap` time (`EACCES`)
+- [ ] sys: extend `fsync(fd, data_only=false)` to flush `inode.mapping.dirty` (calls `writepage` on each), then `BlockCache::sync_fs(sb_dev)`; surface `EIO` if `mapping.wb_err` advanced since the `OpenFile`'s last fsync snapshot (errseq pattern)
+- [ ] sys: implement `fdatasync` (the `data_only=true` path) — same data flush, **skip** inode-table-buffer sync when no allocation occurred; allocation flushes are issued inside `writepage` so they're already on stable storage
 
 ### Workstream C — ext2 AddressSpaceOps (wave 2, blocks on A + B + RFC 0004 #537 — already merged)
 
-- [ ] fs/ext2: implement `AddressSpaceOps` for `Ext2Inode` — `readpage` walks indirect blocks, `bread`s through the buffer cache, memcpys 4 KiB into the page, zero-fills the `[i_size .. page_end)` tail
-- [ ] fs/ext2: implement `writepage` — splits the page back into block-sized fragments, `mark_dirty` + `sync_dirty_buffer` per fragment; rollback on per-block failure (best-effort: the next sweep retries)
-- [ ] fs/ext2: implement 8-page sequential-readahead in `readahead` — never holds the cache mutex; bounded by buffer-cache invariants
-- [ ] fs/ext2: hook `truncate_below` into `setattr(size)` — evict pages past `new_size_page_aligned_up` *before* freeing on-disk blocks
-- [ ] fs/ext2: implement `FileOps::mmap` returning `Arc<FileObject>` with the inode's lazily-constructed `mapping`
+- [ ] fs/ext2: implement `AddressSpaceOps::readpage` for `Ext2Inode` — walks indirect blocks, `bread`s through the buffer cache, memcpys 4 KiB into the page, zero-fills the `[i_size .. page_end)` tail; sparse holes (indirect-block pointer == 0) zero-fill the whole page; on `Err`, returns a faithful errno that the page-cache filler propagates
+- [ ] fs/ext2: implement `AddressSpaceOps::writepage` — split into block-sized fragments; **for unallocated underlying blocks**, call into the bitmap allocator (RFC 0004 Workstream E machinery) and follow the normative ordering: bitmap → indirect-block → data block, each via `sync_dirty_buffer`; rollback on per-block failure; updates `i_blocks` and `i_size` only after the data write succeeds
+- [ ] fs/ext2: hook `truncate_below` into `setattr(size)` — wait on every `PG_WRITEBACK` page in the truncated range to drain *before* the FS frees the on-disk blocks (closes the on-disk UAF surface); evict, then return to the FS for block free
+- [ ] fs/ext2: cache-readahead implementation — heuristic-driven (per Workstream A's `ra_state`); never holds the cache mutex; bounded by buffer-cache invariants
+- [ ] fs/ext2: implement `FileOps::mmap` returning `Arc<FileObject>` with the inode's lazily-constructed `mapping` and the `OpenFile.f_mode` snapshot
 - [ ] fs/ext2: route `FileOps::read` through the page cache when present (so a `read` after `mmap` and a `read` without share the same backing copy); fall back to direct `bread` if `mapping` is `None`
 
 ### Workstream D — Writeback daemon extension (wave 2)
 
-- [ ] block: extend the per-mount writeback daemon to walk every superblock-mounted inode's `mapping` and call `writepage` on every dirty pgoff (snapshot-collect under cache mutex, write outside)
-- [ ] block: writeback ordering — page-cache pages flushed first, then `BlockCache::sync_fs`; documents the soft-update style ordering already used by ext2 for create/unlink
+- [ ] block: extend the per-mount writeback daemon to walk every superblock-mounted inode's `mapping` and call `writepage` on every dirty pgoff (snapshot-collect under cache mutex, write outside; the snapshot-then-writepage discipline keeps a concurrent writer's re-dirty observable for the next sweep)
+- [ ] block: writeback ordering — page-cache pages flushed first (`writepage` does its own bitmap → indirect → data ordering internally), then `BlockCache::sync_fs`; matches RFC 0004 §create normative ordering
 - [ ] block: `sync(2)` / `sync_fs(sb)` triggers an immediate page-cache + buffer-cache flush (no waiting for the next interval)
-- [ ] block: writeback-daemon unit + integration tests (kernel test marker) — one MAP_SHARED writer, kill -9 mid-flight, verify the next mount sees a consistent prefix
+- [ ] block: writeback-completion waitqueue (`writeback_complete_wq` per cache, kicked after every `writepage` returns); the eviction direct-reclaim path parks on this with the configurable 2 s soft cap
+- [ ] block: per-cache `wb_err: AtomicU32` errseq counter; advanced on every `writepage` failure; `OpenFile` snapshots at `open` and re-reads at `fsync` to surface a sticky `EIO`
+- [ ] block: writeback-daemon unit + integration tests (kernel test marker) — one MAP_SHARED writer, kill -9 mid-flight, verify the next mount sees a consistent prefix; truncate-vs-writeback race test verifies no on-disk UAF
 
 ### Workstream E — Demand-paged loader + execve (wave 3, blocks on A + C)
 
