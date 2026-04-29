@@ -9,8 +9,6 @@
 //! Out of scope here (tracked under sibling issues, see RFC 0007
 //! Workstream A roadmap):
 //!
-//! - The [`AddressSpaceOps`] trait and the `ops: Arc<dyn AddressSpaceOps>`
-//!   field of [`PageCache`] (#737).
 //! - `FileObject` and the `VmObject` integration (#738).
 //! - The page-fault path wiring (#739).
 //! - Eviction and the writeback-completion waitqueue (#740).
@@ -49,15 +47,21 @@
 //! independent locks, so a slow `readpage` cannot hold the per-inode
 //! cache mutex against another task's lookup of an unrelated page.
 //!
-//! Until #737 lands an `AddressSpaceOps` impl that can drive a real
-//! `readpage`, the public API here is enough for unit-test
-//! coverage of the install-race / state-bit-ordering / filler-error
-//! protocols. Higher layers will compose against this foundation.
+//! [`PageCache`] now carries the `Arc<dyn AddressSpaceOps>` per-FS
+//! hook captured at construction (#737). The cache itself does not
+//! yet *invoke* `readpage` / `writepage` — that wiring is the
+//! page-fault and writeback-daemon work in #739/#740/#742. Until
+//! those land, host unit tests construct a `PageCache` against a
+//! stub ops impl (see `mem::aops::tests::MemoryBackedOps`) and
+//! exercise the install-race / state-bit-ordering / filler-error
+//! protocols against it.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+
+use crate::mem::aops::AddressSpaceOps;
 
 // Sync primitives.
 //
@@ -445,11 +449,24 @@ pub enum InstallOutcome {
 
 /// Per-inode page cache.
 ///
-/// Owned by the inode (the `mapping` field added in #738 wave-1
-/// VFS plumbing). Only the foundation fields land here; per RFC 0007
-/// the `ops`, `ra_state`, and `writeback_complete_wq` fields are
-/// added by the workstream-A follow-ups.
+/// Owned by the inode (the `mapping` field added by #745 wave-2
+/// VFS plumbing). The `ra_state` (#741) and `writeback_complete_wq`
+/// (#740) fields are still deferred to their respective sibling
+/// issues; the `ops` per-FS hook lands here (#737).
 pub struct PageCache {
+    /// Per-FS hook for backing I/O. Captured at construction and
+    /// **never rebound** for the lifetime of this cache (RFC 0007
+    /// §Inode-binding rule). A different inode resolved by a
+    /// subsequent path lookup constructs its own distinct
+    /// [`PageCache`] against its own ops.
+    ///
+    /// Typed as `Arc<dyn AddressSpaceOps>` so the writeback daemon
+    /// (#742) and the page-fault path (#739) can each clone the
+    /// pointer cheaply into their own task contexts. The cache
+    /// itself does not yet invoke `ops.readpage` / `ops.writepage`
+    /// — that wiring is the next-wave work.
+    pub ops: Arc<dyn AddressSpaceOps>,
+
     /// The level-4 per-inode mutex. Cache lookups acquire it only
     /// long enough to clone the [`Arc<CachePage>`]; the actual fill
     /// work runs with the mutex dropped under the page-level
@@ -481,14 +498,29 @@ pub struct PageCache {
 
 impl PageCache {
     /// Construct an empty per-inode cache bound to `inode_id` with
-    /// `i_size` as the initial size cap and `wb_err` reset to zero.
-    pub fn new(inode_id: InodeId, i_size: u64) -> Self {
+    /// `i_size` as the initial size cap, `wb_err` reset to zero,
+    /// and `ops` as the per-FS hook.
+    ///
+    /// `ops` is captured here and stored verbatim on the cache; it
+    /// is **never rebound** for the cache's lifetime (RFC 0007
+    /// §Inode-binding rule). A different inode constructs its own
+    /// distinct [`PageCache`].
+    pub fn new(inode_id: InodeId, i_size: u64, ops: Arc<dyn AddressSpaceOps>) -> Self {
         Self {
+            ops,
             inner: BlockingMutex::new(PageCacheInner::new()),
             i_size: AtomicU64::new(i_size),
             inode_id,
             wb_err: AtomicU32::new(0),
         }
+    }
+
+    /// Borrow the per-FS hook. Returned as a clone of the
+    /// `Arc<dyn AddressSpaceOps>` so callers can move the trait
+    /// object into their own task context without holding any
+    /// reference into `self` across a block I/O wait.
+    pub fn ops(&self) -> Arc<dyn AddressSpaceOps> {
+        self.ops.clone()
     }
 
     /// Lookup `pgoff` in the cache index and return the entry if
@@ -681,7 +713,7 @@ mod tests {
     }
 
     fn fresh_cache() -> PageCache {
-        PageCache::new(fake_inode_id(), 0)
+        PageCache::new(fake_inode_id(), 0, crate::mem::aops::fresh_ops())
     }
 
     fn fake_phys(pgoff: u64) -> u64 {
@@ -996,6 +1028,40 @@ mod tests {
         let d = a;
         let _ = a;
         assert_eq!(d, b);
+    }
+
+    #[test]
+    fn ops_field_round_trips_through_constructor() {
+        // RFC 0007 §Inode-binding rule: `ops` is captured at
+        // construction. Verify the constructor stores the same Arc
+        // we passed in (Arc::ptr_eq) and that `ops()` returns a
+        // clone pointing at the same allocation.
+        let backing = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let ops_in: Arc<dyn AddressSpaceOps> = backing.clone();
+        let cache = PageCache::new(fake_inode_id(), 0, ops_in.clone());
+        let ops_out = cache.ops();
+        assert!(Arc::ptr_eq(&ops_in, &ops_out));
+    }
+
+    #[test]
+    fn ops_dispatch_through_cache_handle() {
+        // Once the page-fault path is wired (#739), the cache will
+        // call `self.ops.readpage` from inside the install-then-fill
+        // routine. Today the cache does not call into ops itself;
+        // this test stands in for that future call by dispatching
+        // through `cache.ops()` and verifying the round-trip.
+        let backing = crate::mem::aops::MemoryBackedOps::with_pages(4);
+        let cache = PageCache::new(fake_inode_id(), 0, backing.clone());
+        let ops = cache.ops();
+        let mut buf = [0u8; 4096];
+        ops.readpage(2, &mut buf).expect("readpage ok");
+        assert_eq!(buf[0], 2);
+        assert_eq!(
+            backing
+                .readpage_calls
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
