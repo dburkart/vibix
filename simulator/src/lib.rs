@@ -261,9 +261,30 @@ mod imp {}
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize tests that touch the process-global panic hook,
+    /// seed cell, and tick cell.
+    ///
+    /// Cargo runs tests in this binary on multiple threads by
+    /// default, but every test below mutates state shared by
+    /// `Simulator::with_seed`, `install_panic_hook`, and
+    /// `test_only_set_tick`. Without this guard, e.g.
+    /// `current_tick_starts_at_zero` and `test_hook_can_set_tick`
+    /// race on the tick cell and fail nondeterministically. The
+    /// guard ignores poisoning so a panic in one test does not
+    /// permanently lock out the rest of the suite.
+    fn serial_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn seed_round_trips_through_simulator() {
+        let _guard = serial_test_guard();
         let sim = Simulator::with_seed(0xDEAD_BEEF);
         assert_eq!(sim.seed(), Seed(0xDEAD_BEEF));
         assert_eq!(sim.config().seed.as_u64(), 0xDEAD_BEEF);
@@ -271,12 +292,17 @@ mod tests {
 
     #[test]
     fn current_tick_starts_at_zero() {
+        let _guard = serial_test_guard();
         let sim = Simulator::with_seed(0);
         assert_eq!(sim.current_tick(), 0);
     }
 
     #[test]
     fn trace_default_is_empty() {
+        // No global state touched, but the suite is small enough
+        // that taking the guard unconditionally keeps reasoning
+        // simple as future tests are added.
+        let _guard = serial_test_guard();
         // Today `Trace` is empty by construction. This test exists so
         // that the schema-bearing PR (#717) has to update an
         // assertion when it adds real fields, surfacing the change in
@@ -287,6 +313,7 @@ mod tests {
 
     #[test]
     fn install_panic_hook_is_idempotent() {
+        let _guard = serial_test_guard();
         // Multiple installs must not stack hooks. We can't observe
         // the hook stack directly, but we can at least verify the
         // function is callable repeatedly with different seeds
@@ -298,6 +325,7 @@ mod tests {
 
     #[test]
     fn panic_hook_records_latest_seed() {
+        let _guard = serial_test_guard();
         // The hook always reports the *current* seed, not the first
         // one installed. The hook chaining is exercised end-to-end
         // by manual repro; this test pins the seed-cell behaviour.
@@ -311,6 +339,7 @@ mod tests {
 
     #[test]
     fn test_hook_can_set_tick() {
+        let _guard = serial_test_guard();
         let sim = Simulator::with_seed(7);
         super::imp::test_only_set_tick(42);
         assert_eq!(sim.current_tick(), 42);

@@ -18,6 +18,12 @@
 //! that exits with status `2` so shell-side tooling can distinguish a
 //! caller mistake from a real simulator failure (which the run-loop
 //! PR will surface as exit `1` plus `SIMULATOR PANIC ...`).
+//!
+//! `--help` / `-h` is treated as a success path (exit `0`, help on
+//! stdout) — matching `clap`'s default and the GNU/POSIX convention.
+//! It is recognised only when it stands alone as an argument, not
+//! when consumed as the value of `--trace-out` (so a literal path of
+//! `--help` is still legal, awkward as that may be).
 
 use std::process::ExitCode;
 
@@ -44,7 +50,14 @@ Exit codes:
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Outcome::Ran) => ExitCode::SUCCESS,
+        Ok(Outcome::Help) => {
+            // Help goes to stdout (clap convention) and exits 0 so a
+            // shell wrapper that asks `replay --help` doesn't see a
+            // failure status.
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
         Err(CliError::Usage(msg)) => {
             eprintln!("{msg}");
             eprintln!();
@@ -59,14 +72,27 @@ enum CliError {
     Usage(String),
 }
 
-fn run(args: Vec<String>) -> Result<(), CliError> {
-    let parsed = parse_args(&args)?;
-    println!(
-        "replay: unimplemented (seed={:#x}, trace_out={})",
-        parsed.seed,
-        parsed.trace_out.as_deref().unwrap_or("<none>")
-    );
-    Ok(())
+/// Result of a successful CLI parse + run.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// `--help` / `-h` was requested.
+    Help,
+    /// The stub ran (and printed `unimplemented`).
+    Ran,
+}
+
+fn run(args: Vec<String>) -> Result<Outcome, CliError> {
+    match parse_args(&args)? {
+        ParseOutcome::Help => Ok(Outcome::Help),
+        ParseOutcome::Run(parsed) => {
+            println!(
+                "replay: unimplemented (seed={:#x}, trace_out={})",
+                parsed.seed,
+                parsed.trace_out.as_deref().unwrap_or("<none>")
+            );
+            Ok(Outcome::Ran)
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,21 +101,26 @@ struct ParsedArgs {
     trace_out: Option<String>,
 }
 
-fn parse_args(args: &[String]) -> Result<ParsedArgs, CliError> {
-    // Bare `--help` / `-h` short-circuits to a usage error so the help
-    // text gets printed and the process exits non-zero — matches the
-    // convention `clap` uses by default and keeps the stub honest
-    // about not being a real CLI yet.
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        return Err(CliError::Usage(String::from("replay: help requested")));
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum ParseOutcome {
+    Help,
+    Run(ParsedArgs),
+}
 
+fn parse_args(args: &[String]) -> Result<ParseOutcome, CliError> {
     let mut seed: Option<u64> = None;
     let mut trace_out: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            // `--help` / `-h` is recognised only at the top level —
+            // after `--trace-out` consumes its value below, the next
+            // iteration of this loop sees the *following* argument,
+            // so a literal `--trace-out --help` still uses `--help`
+            // as the path. That is intentional: it preserves the
+            // "values are values, flags are flags" boundary.
+            "-h" | "--help" => return Ok(ParseOutcome::Help),
             "--seed" => {
                 let raw = iter.next().ok_or_else(|| {
                     CliError::Usage(String::from("replay: --seed requires a value"))
@@ -117,7 +148,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, CliError> {
 
     let seed = seed.ok_or_else(|| CliError::Usage(String::from("replay: --seed is required")))?;
 
-    Ok(ParsedArgs { seed, trace_out })
+    Ok(ParseOutcome::Run(ParsedArgs { seed, trace_out }))
 }
 
 fn parse_seed(raw: &str) -> Result<u64, CliError> {
@@ -148,34 +179,42 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    fn unwrap_run(outcome: ParseOutcome) -> ParsedArgs {
+        match outcome {
+            ParseOutcome::Run(p) => p,
+            ParseOutcome::Help => panic!("expected Run, got Help"),
+        }
+    }
+
     #[test]
     fn parses_decimal_seed() {
-        let parsed = parse_args(&args(&["--seed", "42"])).unwrap();
+        let parsed = unwrap_run(parse_args(&args(&["--seed", "42"])).unwrap());
         assert_eq!(parsed.seed, 42);
         assert_eq!(parsed.trace_out, None);
     }
 
     #[test]
     fn parses_hex_seed_with_underscores() {
-        let parsed = parse_args(&args(&["--seed", "0xDEAD_BEEF"])).unwrap();
+        let parsed = unwrap_run(parse_args(&args(&["--seed", "0xDEAD_BEEF"])).unwrap());
         assert_eq!(parsed.seed, 0xDEAD_BEEF);
     }
 
     #[test]
     fn parses_decimal_seed_with_underscores() {
-        let parsed = parse_args(&args(&["--seed", "1_234_567"])).unwrap();
+        let parsed = unwrap_run(parse_args(&args(&["--seed", "1_234_567"])).unwrap());
         assert_eq!(parsed.seed, 1_234_567);
     }
 
     #[test]
     fn parses_uppercase_hex_prefix() {
-        let parsed = parse_args(&args(&["--seed", "0XAA"])).unwrap();
+        let parsed = unwrap_run(parse_args(&args(&["--seed", "0XAA"])).unwrap());
         assert_eq!(parsed.seed, 0xAA);
     }
 
     #[test]
     fn parses_trace_out() {
-        let parsed = parse_args(&args(&["--seed", "1", "--trace-out", "/tmp/t.json"])).unwrap();
+        let parsed =
+            unwrap_run(parse_args(&args(&["--seed", "1", "--trace-out", "/tmp/t.json"])).unwrap());
         assert_eq!(parsed.seed, 1);
         assert_eq!(parsed.trace_out.as_deref(), Some("/tmp/t.json"));
     }
@@ -219,9 +258,19 @@ mod tests {
     }
 
     #[test]
-    fn help_flag_short_circuits() {
-        let err = parse_args(&args(&["-h"])).unwrap_err();
-        let CliError::Usage(msg) = err;
-        assert!(msg.contains("help requested"), "got: {msg}");
+    fn help_flag_returns_help_outcome() {
+        // `--help` and `-h` must succeed (clap convention, exit 0).
+        assert_eq!(parse_args(&args(&["-h"])).unwrap(), ParseOutcome::Help);
+        assert_eq!(parse_args(&args(&["--help"])).unwrap(), ParseOutcome::Help);
+    }
+
+    #[test]
+    fn help_does_not_swallow_trace_out_value() {
+        // Regression cover for the CodeRabbit review on PR #767:
+        // a literal `--help` after `--trace-out` should be consumed
+        // as the path value, not as a help request.
+        let parsed =
+            unwrap_run(parse_args(&args(&["--seed", "1", "--trace-out", "--help"])).unwrap());
+        assert_eq!(parsed.trace_out.as_deref(), Some("--help"));
     }
 }
