@@ -19,6 +19,34 @@
 //! follow-ups (#159 and #160) because they need task/addrspace state
 //! that isn't reachable from pure logic.
 //!
+//! ### IRQ discipline (RFC 0007 §Page-fault IRQ discipline)
+//!
+//! The page-fault gate is an **interrupt** gate (the `x86_64` crate's
+//! `set_handler_fn` default), so IF is hardware-cleared on entry. The
+//! handler in `idt::page_fault` keeps that ordering load-bearing:
+//!
+//! * CR2 is sampled into a kernel-stack local **before** any code path
+//!   that could `sti`. A nested fault after `sti` would clobber the
+//!   hardware CR2; the local survives because the kernel stack is
+//!   distinct from the faulter's frame state.
+//! * Steps 1, 3, 4, 6 above (the gates this module owns) are pure
+//!   logic and run with IRQs still disabled. The verdict they produce
+//!   is the *safe seam* at which to reopen interrupts.
+//! * Immediately before any `VmObject::fault` / `cow_copy_and_remap`
+//!   call (step 7's slow path), the handler issues `sti` so the
+//!   slow path may freely take a `BlockingMutex` and park. Without
+//!   this, the first `BlockingMutex::lock` against contention would
+//!   deadlock the CPU — there is no preemption to land the wake.
+//! * `cli` fires again immediately on return from the slow path,
+//!   before the PTE install + TLB flush + IRET. The page-table
+//!   mutator and the IRETQ frame restoration both expect IF=0 inside
+//!   the handler proper.
+//!
+//! Pre-`sti` work (the gates) and post-`cli` work (the PTE install)
+//! never block; the only window where the handler is preemptible is
+//! the bracketed slow path, which is exactly the window the RFC's
+//! design demands.
+//!
 //! Security note on the panic paths: both `panic_smap_violation` and
 //! `panic_rsvd_corruption` must **log the faulting VA only**, never the
 //! PTE word or the frame's physaddr. A reserved-bit fault often means

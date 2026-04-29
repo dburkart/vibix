@@ -142,6 +142,16 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     if crate::cpu::has(crate::cpu::Feature::Smap) {
         unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
     }
+    // RFC 0007 §Page-fault IRQ discipline, step 1: sample CR2 into a
+    // kernel-stack local **before** any path that could re-enable
+    // interrupts. A nested fault that fires after `sti` will overwrite
+    // CR2 in hardware; once we have `addr_u64` on our stack the value is
+    // safe across re-entry. The error `code` parameter is already a
+    // hardware-pushed local, so it survives the same way. The pure-logic
+    // gates below (SMAP, RSVD, canonical, prot) all run with IRQs still
+    // disabled (interrupt gate) — they don't block — and the verdict
+    // they produce is the safe seam at which to reopen interrupts before
+    // entering the `VmObject::fault` slow path.
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
     // Defer `log_first_ring3_fault` to the terminal paths below. A
@@ -247,7 +257,29 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             } else {
                 Access::Read
             };
-            match object.fault(offset, access) {
+            // RFC 0007 §Page-fault IRQ discipline steps 2–4: with the
+            // pure-logic verdict already produced under IF=0, reopen
+            // interrupts before entering the `VmObject::fault` slow
+            // path. `obj.fault` can take a `BlockingMutex` (every
+            // `FileObject::fault` does) and would deadlock against any
+            // task already holding the same mutex if we left IRQs
+            // disabled. Disable them again before the PTE install +
+            // TLB flush below so IRET returns to the faulter with a
+            // coherent IF=1 / IF=0 state per the saved RFLAGS.
+            //
+            // SAFETY: `sti` only sets IF in RFLAGS; the page-fault
+            // gate is an interrupt gate (the `x86_64` crate's
+            // `set_handler_fn` default), so IF was hardware-cleared on
+            // entry and the saved `frame.cpu_flags` retains the
+            // pre-fault value untouched.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+            let fault_res = object.fault(offset, access);
+            // SAFETY: `cli` only clears IF. We re-disable before the
+            // PTE install below so the page-table mutator sees a
+            // coherent ring-0/IF=0 environment matching the rest of
+            // the kernel paging layer.
+            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+            match fault_res {
                 Ok(phys) => {
                     let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
                         .expect("#PF: VmObject returned unaligned phys");
@@ -276,7 +308,17 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             // frame the PTE currently points at — the right source in
             // every generation of a nested fork, and robust to the
             // child VMA having an empty `clone_private()` cache.
-            match crate::mem::paging::cow_copy_and_remap(active, page, pte_flags) {
+            //
+            // RFC 0007 §Page-fault IRQ discipline: `cow_copy_and_remap`
+            // allocates a fresh frame and memcpys 4 KiB — both can
+            // contend on the frame allocator's `BlockingMutex`. STI
+            // before, CLI after, same as the demand-fault path above.
+            //
+            // SAFETY: see the demand-fault arm.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+            let cow_res = crate::mem::paging::cow_copy_and_remap(active, page, pte_flags);
+            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+            match cow_res {
                 Ok(_) => return,
                 Err(e) => serial_println!(
                     "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
@@ -305,7 +347,16 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             .expect("#PF growsdown: new_vma_start not page-aligned");
         let active = x86_64::registers::control::Cr3::read().0;
         let pte_flags = PageTableFlags::from_bits_truncate(prot_pte);
-        match object.fault(offset, Access::Write) {
+        // RFC 0007 §Page-fault IRQ discipline: same STI/CLI bracket as
+        // the demand-fault arm above — `obj.fault` here is the
+        // growsdown stack page's filler and may block on the frame
+        // allocator's `BlockingMutex`.
+        //
+        // SAFETY: see the demand-fault arm.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let fault_res = object.fault(offset, Access::Write);
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+        match fault_res {
             Ok(phys) => {
                 let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
                     .expect("#PF growsdown: VmObject returned unaligned phys");
