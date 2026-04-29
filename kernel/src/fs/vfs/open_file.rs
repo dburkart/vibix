@@ -96,9 +96,26 @@ impl OpenFile {
         // pending writeback error could be re-reported repeatedly,
         // or worse, a flush-hook error could mask a sticky EIO that
         // a *subsequent* `fsync` would then see as fresh.
+        // CAS-based catch-up: under interleaved concurrent fsync, two
+        // overlapping calls could otherwise race so an older sampled
+        // wb_err overwrites a newer snapshot, re-surfacing already-
+        // consumed EIO on later calls. The compare_exchange loop
+        // ensures we only ever advance the snapshot toward the
+        // freshest observed counter and never regress it.
         let consume_wb_err = || {
             let current = self.inode.wb_err();
-            self.wb_err_snapshot.store(current, Ordering::Release);
+            let mut seen = self.wb_err_snapshot.load(Ordering::Acquire);
+            while seen != current {
+                match self.wb_err_snapshot.compare_exchange_weak(
+                    seen,
+                    current,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => seen = observed,
+                }
+            }
         };
 
         // 1. Driver hook. Concrete filesystems may override
@@ -143,9 +160,20 @@ impl OpenFile {
         //    consume_wb_err) so the comparison reflects the freshest
         //    counter after the flush hooks ran.
         let current = self.inode.wb_err();
-        let snapshot = self.wb_err_snapshot.load(Ordering::Acquire);
-        if current != snapshot {
-            self.wb_err_snapshot.store(current, Ordering::Release);
+        let mut snapshot = self.wb_err_snapshot.load(Ordering::Acquire);
+        let advanced = snapshot != current;
+        while snapshot != current {
+            match self.wb_err_snapshot.compare_exchange_weak(
+                snapshot,
+                current,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => snapshot = observed,
+            }
+        }
+        if advanced {
             return Err(crate::fs::EIO);
         }
         Ok(())
