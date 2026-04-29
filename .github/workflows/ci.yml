@@ -172,6 +172,22 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             --features sched-mock
 
+      # RFC 0006 / issue #716: host-side DST simulator run loop.
+      # The smoke test in `simulator/src/lib.rs` runs a 1000-tick
+      # two-task scenario and asserts byte-identical traces from two
+      # `Simulator` instances built off the same seed. Running it
+      # twice back-to-back here is the merge-gate phrasing from the
+      # issue ("Two consecutive `cargo test -p simulator` runs of
+      # the smoke test produce byte-identical output") — a
+      # determinism regression in the run loop, the seam, the
+      # `BTreeMap` drain order, or the ChaCha8 sub-stream derivation
+      # would surface as a diff between the two invocations rather
+      # than a flaky failure on one of them.
+      - name: cargo test -p simulator (deterministic — first pass)
+        run: cargo test -p simulator
+      - name: cargo test -p simulator (deterministic — second pass)
+        run: cargo test -p simulator
+
   unit-tests:
     name: host unit tests
     runs-on: ubuntu-latest
