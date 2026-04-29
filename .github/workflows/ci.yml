@@ -146,7 +146,11 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: nightly
+          # Match the dated nightly in `rust-toolchain.toml` so the
+          # action and rustup don't briefly disagree on which nightly
+          # to install (a floating `nightly` here would still work via
+          # rustup auto-fetch, but installs two toolchains per run).
+          toolchain: nightly-2026-04-16
           components: rust-src, llvm-tools, rustfmt, clippy
           targets: x86_64-unknown-none, x86_64-unknown-linux-gnu
 
