@@ -44,3 +44,17 @@ rand_chacha = { version = "0.10", default-features = false }
 # `os_rng` / `std` features are gated off for the same reason as
 # above.
 rand_core = { version = "0.10", default-features = false }
+
+# `proptest` and `proptest-state-machine` are dev-only dependencies (they
+# never enter the production build graph) so the workspace's strict
+# determinism envelope — no `getrandom` / OS entropy in `simulator/`'s
+# transitive deps (RFC 0006 §"Reproducibility Envelope") — is
+# preserved. Test-time entropy is acceptable: proptest's `TestRng`
+# master-seed is the single u64 we plumb into `Simulator::new(seed)`,
+# so every shrunk replay still re-runs against a byte-identical
+# simulator (RFC 0006 §"RNG stream coupling").
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+proptest-state-machine = { version = "0.8", default-features = false, features = [
+    "std",
+] }

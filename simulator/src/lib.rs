@@ -75,6 +75,18 @@
 #![deny(clippy::disallowed_types)]
 
 #[cfg(not(target_os = "none"))]
+pub mod invariants;
+
+// `proptest_model` is `cfg(test)`-gated at the file level — it pulls
+// in `proptest` / `proptest-state-machine` from `[dev-dependencies]`,
+// neither of which appear in production builds. See
+// `proptest_model.rs` for the rationale on why we use the
+// `ReferenceStateMachine` strategy half rather than the full
+// `prop_state_machine!` macro.
+#[cfg(all(test, not(target_os = "none")))]
+mod proptest_model;
+
+#[cfg(not(target_os = "none"))]
 pub mod trace;
 
 #[cfg(not(target_os = "none"))]
@@ -87,6 +99,11 @@ mod imp {
 
     use vibix::task::env::{install_sim_env, Clock, MockClock, MockTimerIrq};
 
+    pub use crate::invariants::{
+        AllRunnableEventuallyRun, BlockedToRunnableNeedsWakeup, ForkHasMatchingExitOrWait,
+        InvariantSet, LivenessInvariant, MonotonicPids, NoStrandedWakeups, SafetyInvariant,
+        SingleRunningPerCpu, Violation,
+    };
     pub use crate::trace::{BlockReason, Event, FaultKind, Trace, TraceRecord, SCHEMA_VERSION};
 
     /// A simulator seed.
@@ -121,7 +138,7 @@ mod imp {
     /// carries the minimum needed to plumb [`Simulator::run_for`] and
     /// [`Simulator::run_until`] without churning the constructor
     /// signature again later.
-    #[derive(Clone, Debug)]
+    #[derive(Debug)]
     pub struct SimulatorConfig {
         /// Master seed for the run.
         pub seed: Seed,
@@ -137,16 +154,23 @@ mod imp {
         /// fails fast under `cargo test` rather than wedging the
         /// process.
         pub max_ticks: u64,
+        /// Safety + liveness invariants checked during / at the end of
+        /// the run. Default is [`InvariantSet::v1`] (RFC 0006 §"v1
+        /// invariant catalogue", issue #722). Tests that build a
+        /// `SimulatorConfig` from defaults and want a different
+        /// invariant surface mutate this field after construction.
+        pub invariants: InvariantSet,
     }
 
     impl SimulatorConfig {
         /// Construct a config from a raw `u64` seed, with default
-        /// `max_ticks`. Callers that need a different cap mutate the
-        /// returned struct.
+        /// `max_ticks` and the v1 invariant set. Callers that need a
+        /// different cap or invariant set mutate the returned struct.
         pub fn with_seed(seed: u64) -> Self {
             Self {
                 seed: Seed(seed),
                 max_ticks: 1_000_000,
+                invariants: InvariantSet::v1(),
             }
         }
     }
@@ -506,6 +530,37 @@ mod imp {
         /// (separate Phase 2 issue) cover the rotation and softirq
         /// paths against the bare-metal `preempt_tick`.
         pub fn step(&mut self) {
+            // RFC 0006 §"invariants over the trace, not refinement":
+            // every safety invariant must hold over every prefix.
+            // The shared body in `step_inner` runs the tick + records
+            // every event before checking; failure here is a panic so
+            // the panic hook installed by `Simulator::new` can print
+            // `SIMULATOR PANIC seed=… tick=…` before `panic =
+            // "abort"` terminates the run. Property-test callers that
+            // need unwinding-shaped failures use
+            // [`Simulator::step_checked`] instead.
+            if let Err(v) = self.step_inner() {
+                panic!("{v}");
+            }
+        }
+
+        /// Like [`Simulator::step`] but returns `Err(Violation)` on a
+        /// safety-invariant failure rather than panicking.
+        ///
+        /// Intended for the proptest integration (#722,
+        /// `proptest_model.rs`): proptest's shrinker needs a
+        /// `Result`-shaped failure to drive its sequence-space
+        /// minimisation. The invariant the panicking variant guards
+        /// is the same; only the failure shape differs.
+        pub fn step_checked(&mut self) -> Result<(), Violation> {
+            self.step_inner()
+        }
+
+        /// Shared per-tick body for [`Simulator::step`] /
+        /// [`Simulator::step_checked`]. Returns the first safety
+        /// invariant violation discovered after the tick's records
+        /// are pushed; both public entry points wrap this.
+        fn step_inner(&mut self) -> Result<(), Violation> {
             let now_before = self.clock.now().raw();
             self.clock.tick();
             let now_after = self.clock.now().raw();
@@ -543,6 +598,15 @@ mod imp {
                 tick: now_after,
                 event: Event::TimerIrqAcked,
             });
+
+            self.cfg.invariants.check_safety(self.trace.records())
+        }
+
+        /// Run the registered liveness invariants against the closed
+        /// trace. Intended to be called once at end-of-run; returns
+        /// the first violation, if any.
+        pub fn check_liveness(&self) -> Result<(), Violation> {
+            self.cfg.invariants.check_liveness(self.trace.records())
         }
 
         /// Advance the simulator by exactly `ticks` calls to
@@ -692,8 +756,10 @@ mod imp {
 
 #[cfg(not(target_os = "none"))]
 pub use imp::{
-    install_panic_hook, BlockReason, Event, FaultKind, Seed, SimRng, Simulator, SimulatorConfig,
-    Trace, TraceRecord, SCHEMA_VERSION,
+    install_panic_hook, AllRunnableEventuallyRun, BlockReason, BlockedToRunnableNeedsWakeup, Event,
+    FaultKind, ForkHasMatchingExitOrWait, InvariantSet, LivenessInvariant, MonotonicPids,
+    NoStrandedWakeups, SafetyInvariant, Seed, SimRng, Simulator, SimulatorConfig,
+    SingleRunningPerCpu, Trace, TraceRecord, Violation, SCHEMA_VERSION,
 };
 
 // On `target_os = "none"` (the bare-metal kernel image), the simulator
