@@ -140,6 +140,18 @@ impl FileObject {
         share: Share,
         open_mode: u32,
     ) -> Arc<Self> {
+        // Validate the file-page window: `file_offset_pages + len_pages`
+        // must not wrap. Lookups below combine the two via `pgoff_of`,
+        // and a wrapped sum would index unrelated cache entries instead
+        // of failing cleanly. Caught at construction (the call site is
+        // `sys_mmap` post-validation, so a panic here indicates a bug
+        // in the syscall layer, not user-recoverable input).
+        assert!(
+            file_offset_pages
+                .checked_add(len_pages as u64)
+                .is_some(),
+            "FileObject::new: file_offset_pages={file_offset_pages} + len_pages={len_pages} overflows u64",
+        );
         Arc::new(Self {
             cache,
             file_offset_pages,
@@ -240,6 +252,30 @@ impl FileObject {
         }
         Ok(())
     }
+
+    /// Concrete-typed sibling of [`VmObject::clone_private`]. The trait
+    /// method returns `Arc<dyn VmObject>` for the resolver's polymorphic
+    /// dispatch; this helper preserves the `Arc<FileObject>` type so
+    /// host tests can assert against `FileObject`-specific invariants
+    /// (`private_frames` empty, `share` flipped to `Private`, etc.)
+    /// without an `Any`-flavored downcast. The trait impl forwards
+    /// here, so the construction is verified against the same code
+    /// path the kernel uses post-fork.
+    fn clone_private_concrete(&self) -> Arc<Self> {
+        Arc::new(Self {
+            cache: self.cache.clone(),
+            file_offset_pages: self.file_offset_pages,
+            len_pages: self.len_pages,
+            share: Share::Private,
+            // The open_mode snapshot is per-VMA, not per-inode — but
+            // a post-fork child inherits the parent's `mprotect`
+            // gate exactly. Carrying the value verbatim preserves
+            // the "PROT_WRITE upgrade needs O_RDWR" rule across a
+            // fork. RFC 0007 §FileObject `open_mode` snapshot.
+            open_mode: self.open_mode,
+            private_frames: BlockingMutex::new(BTreeMap::new()),
+        })
+    }
 }
 
 impl VmObject for FileObject {
@@ -314,17 +350,41 @@ impl VmObject for FileObject {
         //
         // This is invoked with no spinlock or BlockingMutex held above
         // level 4 (we have just released `cache.inner`'s guard at the
-        // close of `cache.lookup`). The install-race entry point's
-        // `make_stub` closure runs *under* `cache.inner`, so its body
-        // must be lock-free aside from the frame allocator's level-8
-        // mutex; the filler then drops the mutex and enters
-        // `ops.readpage` with *no* spinlock held.
-        let outcome = self
-            .cache
-            .install_or_get(pgoff, || alloc_locked_stub(pgoff));
+        // close of `cache.lookup`).
+        //
+        // Pre-allocate the stub *before* taking `cache.inner` so a
+        // frame-allocator miss surfaces as `VmFault::OutOfMemory`
+        // rather than a kernel panic (mirrors `AnonObject::fault`,
+        // RFC 0007 §FileObject — fault dispatch). The stub is handed
+        // to `install_or_get` via a `move` closure; if we lose the
+        // install race the closure is never called and the stub is
+        // dropped on the loser path below, after which the underlying
+        // frame is returned to the allocator via `release_unused_stub`.
+        let stub = alloc_locked_stub(pgoff)?;
+        let stub_for_closure = stub.clone();
+        let outcome = self.cache.install_or_get(pgoff, move || stub_for_closure);
         let (page, won_install) = match outcome {
-            InstallOutcome::InstalledNew(p) => (p, true),
-            InstallOutcome::AlreadyPresent(p) => (p, false),
+            InstallOutcome::InstalledNew(p) => {
+                // We won. Both `stub` (outer) and `p` reference the
+                // same `Arc<CachePage>`; drop our outer copy so the
+                // cache is the sole strong-ref owner once this scope
+                // exits. The frame stays alive — the cache index
+                // owns it now.
+                drop(stub);
+                (p, true)
+            }
+            InstallOutcome::AlreadyPresent(p) => {
+                // Lost the install race: `make_stub` was never
+                // invoked, so the closure's `stub_for_closure` clone
+                // was dropped silently. Our outer `stub` is now the
+                // sole strong reference to a `CachePage` that no
+                // index ever observed; `Arc<CachePage>` has no
+                // `Drop` impl that frees its physical frame, so we
+                // must reclaim it explicitly before dropping.
+                release_unused_stub(&stub);
+                drop(stub);
+                (p, false)
+            }
         };
 
         if won_install {
@@ -453,19 +513,7 @@ impl VmObject for FileObject {
     /// parent and child via the existing `cow_copy_and_remap` path
     /// (#739).
     fn clone_private(&self) -> Arc<dyn VmObject> {
-        Arc::new(Self {
-            cache: self.cache.clone(),
-            file_offset_pages: self.file_offset_pages,
-            len_pages: self.len_pages,
-            share: Share::Private,
-            // The open_mode snapshot is per-VMA, not per-inode — but
-            // a post-fork child inherits the parent's `mprotect`
-            // gate exactly. Carrying the value verbatim preserves
-            // the "PROT_WRITE upgrade needs O_RDWR" rule across a
-            // fork. RFC 0007 §FileObject `open_mode` snapshot.
-            open_mode: self.open_mode,
-            private_frames: BlockingMutex::new(BTreeMap::new()),
-        })
+        self.clone_private_concrete()
     }
 
     /// Drop cached private frames for VMA-local page indices ≥
@@ -516,20 +564,27 @@ fn cache_i_size_pages(cache: &PageCache) -> u64 {
     (bytes + FRAME_SIZE - 1) / FRAME_SIZE
 }
 
-/// Stub-allocation closure passed to [`PageCache::install_or_get`].
+/// Stub allocator used by [`FileObject::fault`]'s slow path. Returns a
+/// freshly allocated `PG_LOCKED` / `!PG_UPTODATE` cache page so the
+/// caller can hand it to [`PageCache::install_or_get`] via a `move`
+/// closure.
 ///
 /// On bare metal we ask the global frame allocator for a fresh frame
 /// and zero it through the HHDM; the resulting [`crate::mem::page_cache::CachePage`]
 /// is locked (filler protocol) until the caller publishes
 /// `PG_UPTODATE`+`!PG_LOCKED` via
 /// [`crate::mem::page_cache::CachePage::publish_uptodate_and_unlock`].
+/// Frame exhaustion is *recoverable*: we surface
+/// [`VmFault::OutOfMemory`] so the resolver can SIGBUS the offending
+/// thread instead of panicking the whole kernel (mirrors
+/// `AnonObject::fault`).
 ///
 /// On host (`cfg(test)`) the frame number is a deterministic stand-in
 /// — the cache never dereferences `phys` and host tests do not
-/// install PTEs against it.
+/// install PTEs against it; allocation is therefore infallible.
 #[cfg(target_os = "none")]
-fn alloc_locked_stub(pgoff: u64) -> Arc<crate::mem::page_cache::CachePage> {
-    let phys = crate::mem::frame::alloc().expect("FileObject: frame allocator empty");
+fn alloc_locked_stub(pgoff: u64) -> Result<Arc<crate::mem::page_cache::CachePage>, VmFault> {
+    let phys = crate::mem::frame::alloc().ok_or(VmFault::OutOfMemory)?;
     let hhdm = crate::mem::paging::hhdm_offset().as_u64();
     // SAFETY: `phys` was just allocated for us, is 4 KiB-aligned,
     // and is covered by the HHDM mapping. We hold exclusive
@@ -538,17 +593,28 @@ fn alloc_locked_stub(pgoff: u64) -> Arc<crate::mem::page_cache::CachePage> {
     unsafe {
         core::ptr::write_bytes((hhdm + phys) as *mut u8, 0, FRAME_SIZE as usize);
     }
-    crate::mem::page_cache::CachePage::new_locked(phys, pgoff)
+    Ok(crate::mem::page_cache::CachePage::new_locked(phys, pgoff))
 }
 
 #[cfg(not(target_os = "none"))]
-fn alloc_locked_stub(pgoff: u64) -> Arc<crate::mem::page_cache::CachePage> {
+fn alloc_locked_stub(pgoff: u64) -> Result<Arc<crate::mem::page_cache::CachePage>, VmFault> {
     // Deterministic stand-in for `frame::allocate`. Page-aligned,
     // non-zero, well above any real-world frame address used by other
     // tests so collisions stay obvious if they do occur.
     let phys = 0x4_0000_0000 + pgoff * FRAME_SIZE;
-    crate::mem::page_cache::CachePage::new_locked(phys, pgoff)
+    Ok(crate::mem::page_cache::CachePage::new_locked(phys, pgoff))
 }
+
+/// Return a stub frame to the global allocator when the install race
+/// is lost. Bare-metal-only; on host the stub frame is fictitious and
+/// there is nothing to reclaim.
+#[cfg(target_os = "none")]
+fn release_unused_stub(stub: &Arc<crate::mem::page_cache::CachePage>) {
+    crate::mem::frame::free(stub.phys);
+}
+
+#[cfg(not(target_os = "none"))]
+fn release_unused_stub(_stub: &Arc<crate::mem::page_cache::CachePage>) {}
 
 /// Copy `buf` into the cache stub's physical frame through the HHDM.
 /// Bare-metal-only; on host the test harness skips the copy.
@@ -712,17 +778,22 @@ mod tests {
     #[test]
     fn clone_private_starts_with_empty_private_frames() {
         let parent = fresh_object(Share::Private);
-        // Plant a private frame on the parent.
+        // Plant a private frame on the parent so a buggy
+        // `clone_private` that copied (rather than zeroed) the
+        // `private_frames` map would surface as a non-`None`
+        // observation on the child.
         parent.record_private_frame(0, 0xdead_0000);
-        // Cast: clone_private returns Arc<dyn VmObject>; reach
-        // through FileObject's own constructor to assert the
-        // emptiness invariant. (We can't downcast trait objects
-        // without `Any`; instead verify via the public observation:
-        // a freshly-cloned object's private_frame_at returns None
-        // through a direct FileObject constructor with the same
-        // cache.)
-        let parent_clone = FileObject::new(parent.cache(), 0, 8, Share::Private, 0o2);
-        assert_eq!(parent_clone.private_frame_at(0), None);
+        assert_eq!(parent.private_frame_at(0), Some(0xdead_0000));
+        // Exercise the actual `clone_private` code path. The
+        // concrete-typed sibling helper forwards through the same
+        // construction as the trait impl (see
+        // `FileObject::clone_private_concrete`); using it here
+        // avoids a trait-object downcast while still asserting
+        // against the post-clone `FileObject` state.
+        let child = parent.clone_private_concrete();
+        assert_eq!(child.private_frame_at(0), None);
+        // Parent's own private_frames is untouched.
+        assert_eq!(parent.private_frame_at(0), Some(0xdead_0000));
     }
 
     #[test]
