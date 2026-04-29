@@ -125,12 +125,22 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, CliError> {
                 let raw = iter.next().ok_or_else(|| {
                     CliError::Usage(String::from("replay: --seed requires a value"))
                 })?;
+                if seed.is_some() {
+                    return Err(CliError::Usage(String::from(
+                        "replay: --seed may be specified only once",
+                    )));
+                }
                 seed = Some(parse_seed(raw)?);
             }
             "--trace-out" => {
                 let raw = iter.next().ok_or_else(|| {
                     CliError::Usage(String::from("replay: --trace-out requires a value"))
                 })?;
+                if trace_out.is_some() {
+                    return Err(CliError::Usage(String::from(
+                        "replay: --trace-out may be specified only once",
+                    )));
+                }
                 if raw.is_empty() {
                     return Err(CliError::Usage(String::from(
                         "replay: --trace-out requires a non-empty path",
@@ -262,6 +272,34 @@ mod tests {
         // `--help` and `-h` must succeed (clap convention, exit 0).
         assert_eq!(parse_args(&args(&["-h"])).unwrap(), ParseOutcome::Help);
         assert_eq!(parse_args(&args(&["--help"])).unwrap(), ParseOutcome::Help);
+    }
+
+    #[test]
+    fn duplicate_seed_is_usage_error() {
+        let err = parse_args(&args(&["--seed", "1", "--seed", "2"])).unwrap_err();
+        let CliError::Usage(msg) = err;
+        assert!(
+            msg.contains("--seed may be specified only once"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_trace_out_is_usage_error() {
+        let err = parse_args(&args(&[
+            "--seed",
+            "1",
+            "--trace-out",
+            "/tmp/a.json",
+            "--trace-out",
+            "/tmp/b.json",
+        ]))
+        .unwrap_err();
+        let CliError::Usage(msg) = err;
+        assert!(
+            msg.contains("--trace-out may be specified only once"),
+            "got: {msg}"
+        );
     }
 
     #[test]
