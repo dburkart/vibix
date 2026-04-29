@@ -389,10 +389,28 @@ fn main() -> R<()> {
             }
         }
         "clean" => clean()?,
+        "bench" => {
+            // `xtask bench <target>`. Currently only `page-cache` is
+            // wired (#743 — RFC 0007 host-side cold-mmap fault-latency
+            // baseline). Future bench targets will add more match arms
+            // here rather than each growing its own subcommand.
+            let which = rest
+                .first()
+                .ok_or("bench: missing target name (try `xtask bench page-cache`)")?;
+            match which.as_str() {
+                "page-cache" => bench_page_cache()?,
+                other => {
+                    return Err(format!(
+                        "bench: unknown target '{other}' (only 'page-cache' is wired)"
+                    )
+                    .into());
+                }
+            }
+        }
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
             );
             std::process::exit(2);
         }
@@ -2448,6 +2466,47 @@ fn fuzz_ext2(iters: u64) -> R<()> {
                 "--",
                 corpus.to_str().unwrap(),
                 &iters_arg,
+            ])
+            .status()?,
+    )?;
+    Ok(())
+}
+
+/// `cargo xtask bench page-cache` — RFC 0007 cold-mmap fault-latency
+/// host benchmark (#743).
+///
+/// Dispatches to the `bench-page-cache` binary in
+/// `bench/page-cache/`. The bench builds with `--release` so the
+/// reported numbers are not optimisation-suppressed; the binary is
+/// host-target (no `-Z build-std`, no kernel feature flags), so a
+/// stock toolchain on any developer host can reproduce the baseline.
+///
+/// The bench is intentionally a separate workspace member rather
+/// than an inline xtask helper: the cold-fault model needs its own
+/// `Cargo.toml` so future revisions (e.g. switching to the real
+/// kernel `AddressSpaceOps` once #737/#738/#739 stabilise) don't
+/// rewire xtask itself.
+fn bench_page_cache() -> R<()> {
+    let root = workspace_root();
+    let manifest = root.join("bench").join("page-cache").join("Cargo.toml");
+    if !manifest.exists() {
+        return Err(format!(
+            "bench page-cache: manifest not found at {} — bench/page-cache/ crate missing?",
+            manifest.display()
+        )
+        .into());
+    }
+    println!("→ bench page-cache: building bench-page-cache (release)…");
+    check(
+        Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "run",
+                "--manifest-path",
+                manifest.to_str().unwrap(),
+                "--bin",
+                "bench-page-cache",
+                "--release",
             ])
             .status()?,
     )?;
