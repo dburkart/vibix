@@ -437,6 +437,37 @@ mod imp {
         /// (separate Phase 2 issue) cover the rotation and softirq
         /// paths against the bare-metal `preempt_tick`.
         pub fn step(&mut self) {
+            // RFC 0006 §"invariants over the trace, not refinement":
+            // every safety invariant must hold over every prefix.
+            // The shared body in `step_inner` runs the tick + records
+            // every event before checking; failure here is a panic so
+            // the panic hook installed by `Simulator::new` can print
+            // `SIMULATOR PANIC seed=… tick=…` before `panic =
+            // "abort"` terminates the run. Property-test callers that
+            // need unwinding-shaped failures use
+            // [`Simulator::step_checked`] instead.
+            if let Err(v) = self.step_inner() {
+                panic!("{v}");
+            }
+        }
+
+        /// Like [`Simulator::step`] but returns `Err(Violation)` on a
+        /// safety-invariant failure rather than panicking.
+        ///
+        /// Intended for the proptest integration (#722,
+        /// `proptest_model.rs`): proptest's shrinker needs a
+        /// `Result`-shaped failure to drive its sequence-space
+        /// minimisation. The invariant the panicking variant guards
+        /// is the same; only the failure shape differs.
+        pub fn step_checked(&mut self) -> Result<(), Violation> {
+            self.step_inner()
+        }
+
+        /// Shared per-tick body for [`Simulator::step`] /
+        /// [`Simulator::step_checked`]. Returns the first safety
+        /// invariant violation discovered after the tick's records
+        /// are pushed; both public entry points wrap this.
+        fn step_inner(&mut self) -> Result<(), Violation> {
             let now_before = self.clock.now().raw();
             self.clock.tick();
             let now_after = self.clock.now().raw();
@@ -460,69 +491,6 @@ mod imp {
             // path the bare-metal `preempt_tick` takes — so a future
             // `Clock` impl swap is immediately visible through the
             // simulator's trace.
-            let (clock, irq) = vibix::task::env::env();
-            let now = clock.now();
-            for id in clock.drain_expired(now) {
-                self.trace.push(TraceRecord {
-                    tick: now_after,
-                    event: Event::WakeupFired { id },
-                });
-            }
-
-            irq.ack_timer();
-            self.trace.push(TraceRecord {
-                tick: now_after,
-                event: Event::TimerIrqAcked,
-            });
-
-            // RFC 0006 §"invariants over the trace, not refinement":
-            // every safety invariant must hold over every prefix.
-            // Run them after the step has finished pushing all of
-            // its records, so the prefix the predicate sees matches
-            // the public `trace()`.
-            //
-            // Failure is a panic — the panic hook installed by
-            // `Simulator::new` prints `SIMULATOR PANIC seed=… tick=…`
-            // before re-raising, and `panic = "abort"` (workspace
-            // policy) terminates the run cleanly. Property-test
-            // callers that need unwinding-shaped failures use
-            // [`Simulator::step_checked`] instead.
-            if let Err(v) = self.cfg.invariants.check_safety(self.trace.records()) {
-                panic!("{v}");
-            }
-        }
-
-        /// Like [`Simulator::step`] but returns `Err(Violation)` on a
-        /// safety-invariant failure rather than panicking.
-        ///
-        /// Intended for the proptest integration (#722,
-        /// `proptest_model.rs`): proptest's shrinker needs a
-        /// `Result`-shaped failure to drive its sequence-space
-        /// minimisation. The invariant the panicking variant guards
-        /// is the same; only the failure shape differs.
-        pub fn step_checked(&mut self) -> Result<(), Violation> {
-            // We can't trivially reuse `step` here because it panics
-            // on violation. Inline the body, then run safety with
-            // the `Result` shape.
-            let now_before = self.clock.now().raw();
-            self.clock.tick();
-            let now_after = self.clock.now().raw();
-            self.current_tick.store(now_after, Ordering::SeqCst);
-
-            self.trace.push(TraceRecord {
-                tick: now_after,
-                event: Event::TickAdvance {
-                    from: now_before,
-                    to: now_after,
-                },
-            });
-
-            self.irq.inject_timer();
-            self.trace.push(TraceRecord {
-                tick: now_after,
-                event: Event::TimerInjected,
-            });
-
             let (clock, irq) = vibix::task::env::env();
             let now = clock.now();
             for id in clock.drain_expired(now) {
