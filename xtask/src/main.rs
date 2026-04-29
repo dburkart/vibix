@@ -225,7 +225,16 @@ fn main() -> R<()> {
         }
         "test" => test_all()?,
         "test-unit" => test_unit()?,
-        "test-integration" => test_integration()?,
+        "test-integration" => {
+            // `--shard=I/N` partitions the integration-test set across
+            // N CI matrix shards. Default (no flag) preserves the
+            // pre-#766 single-job behaviour for local dev. Issue #766.
+            let shard = match rest.iter().find_map(|a| a.strip_prefix("--shard=")) {
+                Some(spec) => Some(parse_shard(spec)?),
+                None => None,
+            };
+            test_integration(shard)?;
+        }
         "test-runner" => {
             let kernel = rest.first().ok_or("test-runner: missing kernel ELF path")?;
             test_runner(Path::new(kernel))?;
@@ -383,7 +392,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
             );
             std::process::exit(2);
         }
@@ -1537,7 +1546,7 @@ fn test_unit() -> R<()> {
     Ok(())
 }
 
-fn test_integration() -> R<()> {
+fn test_integration(shard: Option<Shard>) -> R<()> {
     // QEMU integration tests. Each is invoked by name so cargo doesn't
     // also try to build the lib's no_std test harness (which would
     // require std). Cargo's runner config invokes us back as
@@ -1554,8 +1563,31 @@ fn test_integration() -> R<()> {
     // effect on boot-path behaviour (those call sites stay gated even
     // with the feature on until an explicit registration hook lands in
     // a later wave).
-    println!("→ integration tests under QEMU");
-    let tests = integration_test_names()?;
+    let all = integration_test_names()?;
+    let tests: Vec<String> = match shard {
+        None => all,
+        Some(s) => {
+            let subset = partition_for_shard(&all, s);
+            println!(
+                "→ integration tests under QEMU (shard {}/{}: {} of {} tests)",
+                s.index,
+                s.total,
+                subset.len(),
+                all.len()
+            );
+            subset
+        }
+    };
+    if shard.is_none() {
+        println!("→ integration tests under QEMU");
+    }
+    if tests.is_empty() {
+        // A shard can legitimately be empty if `total` exceeds the
+        // number of tests. Treat as a no-op success rather than letting
+        // `cargo test` fail with "no test target named --test".
+        println!("→ shard is empty (more shards than tests); nothing to run");
+        return Ok(());
+    }
     let mut cmd = Command::new("cargo");
     cmd.current_dir(workspace_root())
         .args(["test", "--package", "vibix", "--features", "ext2"])
@@ -1567,9 +1599,55 @@ fn test_integration() -> R<()> {
     Ok(())
 }
 
+/// One shard of an N-way partition of the integration-test list.
+/// `index` is 1-based to match `--shard=I/N` user syntax.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Shard {
+    index: usize,
+    total: usize,
+}
+
+/// Parse `I/N` (1 ≤ I ≤ N, both positive) into a [`Shard`]. Used by
+/// both the `--shard=I/N` CLI flag and unit tests.
+fn parse_shard(spec: &str) -> R<Shard> {
+    let (i, n) = spec
+        .split_once('/')
+        .ok_or_else(|| format!("--shard expects I/N (e.g. 1/4), got {spec:?}"))?;
+    let index: usize = i
+        .parse()
+        .map_err(|e| format!("--shard: invalid index {i:?}: {e}"))?;
+    let total: usize = n
+        .parse()
+        .map_err(|e| format!("--shard: invalid total {n:?}: {e}"))?;
+    if total == 0 {
+        return Err("--shard: total (N) must be ≥ 1".into());
+    }
+    if index == 0 || index > total {
+        return Err(format!("--shard: index must be in 1..={total}, got {index}").into());
+    }
+    Ok(Shard { index, total })
+}
+
+/// Partition `tests` deterministically across `shard.total` shards and
+/// return the subset for `shard.index`. The partitioning sorts the
+/// input first so the assignment is independent of declaration order
+/// in `kernel/Cargo.toml`, then strides by `total`. Stride (vs.
+/// contiguous chunks) keeps shards balanced when neighbouring tests
+/// have correlated runtimes (e.g. ext2-heavy tests bunched together).
+fn partition_for_shard(tests: &[String], shard: Shard) -> Vec<String> {
+    let mut sorted: Vec<String> = tests.to_vec();
+    sorted.sort();
+    sorted
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| idx % shard.total == shard.index - 1)
+        .map(|(_, name)| name)
+        .collect()
+}
+
 fn test_all() -> R<()> {
     test_unit()?;
-    test_integration()?;
+    test_integration(None)?;
     Ok(())
 }
 
@@ -2706,6 +2784,92 @@ harness = false
 name = "vibix"
 "#;
         assert!(parse_test_names(manifest).is_err());
+    }
+
+    #[test]
+    fn parse_shard_accepts_valid_specs() {
+        assert_eq!(parse_shard("1/4").unwrap(), Shard { index: 1, total: 4 });
+        assert_eq!(parse_shard("4/4").unwrap(), Shard { index: 4, total: 4 });
+        assert_eq!(parse_shard("1/1").unwrap(), Shard { index: 1, total: 1 });
+    }
+
+    #[test]
+    fn parse_shard_rejects_invalid_specs() {
+        assert!(parse_shard("0/4").is_err()); // index < 1
+        assert!(parse_shard("5/4").is_err()); // index > total
+        assert!(parse_shard("1/0").is_err()); // total = 0
+        assert!(parse_shard("1").is_err()); //   missing /
+        assert!(parse_shard("a/4").is_err()); // non-numeric
+        assert!(parse_shard("1/b").is_err()); // non-numeric
+    }
+
+    #[test]
+    fn partition_for_shard_each_test_appears_once() {
+        // Property: across all N shards of any (tests, N) combo, every
+        // test appears in exactly one shard. This is the invariant that
+        // makes the matrix split safe — a missed test would silently
+        // disappear from CI; a doubled test wastes runner time.
+        let tests: Vec<String> = (0..101).map(|i| format!("t{i:03}")).collect();
+        for total in [1usize, 2, 3, 4, 8, 16, 200] {
+            let mut seen: Vec<String> = Vec::new();
+            for index in 1..=total {
+                let subset = partition_for_shard(&tests, Shard { index, total });
+                seen.extend(subset);
+            }
+            seen.sort();
+            let mut expected = tests.clone();
+            expected.sort();
+            assert_eq!(seen, expected, "shard total={total}");
+        }
+    }
+
+    #[test]
+    fn partition_for_shard_is_deterministic_and_input_order_insensitive() {
+        // Sorting first means the partition is stable when
+        // `kernel/Cargo.toml` reorders `[[test]]` blocks. A reordered
+        // input must yield the same per-shard subsets.
+        let a: Vec<String> = (0..50).map(|i| format!("t{i:03}")).collect();
+        let mut b = a.clone();
+        b.reverse();
+        for (idx, total) in [(1, 4), (2, 4), (3, 4), (4, 4)] {
+            let s = Shard { index: idx, total };
+            assert_eq!(partition_for_shard(&a, s), partition_for_shard(&b, s));
+        }
+        // Calling twice on the same input also matches.
+        let s = Shard { index: 1, total: 4 };
+        assert_eq!(partition_for_shard(&a, s), partition_for_shard(&a, s));
+    }
+
+    #[test]
+    fn partition_for_shard_balances_within_one() {
+        // Stride partitioning over a sorted list balances shard sizes
+        // within ⌈total/N⌉ vs. ⌊total/N⌋, i.e. at most one test apart.
+        let tests: Vec<String> = (0..101).map(|i| format!("t{i:03}")).collect();
+        for total in [2usize, 3, 4, 8] {
+            let sizes: Vec<usize> = (1..=total)
+                .map(|index| partition_for_shard(&tests, Shard { index, total }).len())
+                .collect();
+            let max = *sizes.iter().max().unwrap();
+            let min = *sizes.iter().min().unwrap();
+            assert!(
+                max - min <= 1,
+                "imbalanced shard sizes for total={total}: {sizes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_for_shard_more_shards_than_tests() {
+        // When total > tests.len(), tail shards are legitimately empty.
+        // `test_integration()` short-circuits on empty; here we just
+        // check the partitioner doesn't panic and total coverage holds.
+        let tests: Vec<String> = (0..3).map(|i| format!("t{i}")).collect();
+        let mut all = Vec::new();
+        for index in 1..=5 {
+            all.extend(partition_for_shard(&tests, Shard { index, total: 5 }));
+        }
+        all.sort();
+        assert_eq!(all, vec!["t0", "t1", "t2"]);
     }
 
     #[test]
