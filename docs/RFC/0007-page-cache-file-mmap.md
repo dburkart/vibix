@@ -1,11 +1,11 @@
 ---
-rfc: 0006
+rfc: 0007
 title: Demand-Paged File mmap and Page Cache for ext2
 status: Accepted
 created: 2026-04-28
 ---
 
-# RFC 0006: Demand-Paged File mmap and Page Cache for ext2
+# RFC 0007: Demand-Paged File mmap and Page Cache for ext2
 
 ## Abstract
 
@@ -41,7 +41,7 @@ a `PT_INTERP` returns `ENOEXEC` (RFC 0004 Workstream F). That blocks:
 
 The right shape for this is one design document, not three: every
 question of cache layering, locking, and writeback ordering recurs
-identically across mmap, read, and execve. RFC 0006 fixes the
+identically across mmap, read, and execve. RFC 0007 fixes the
 architecture and lets the three downstream epics ship as execution-only
 work.
 
