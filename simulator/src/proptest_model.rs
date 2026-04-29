@@ -49,6 +49,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, TestRunner};
 use proptest_state_machine::ReferenceStateMachine;
 
+use crate::fault_plan::FaultEvent;
 use crate::invariants::Violation;
 use crate::trace::Trace;
 use crate::{Simulator, SimulatorConfig};
@@ -75,10 +76,14 @@ use vibix::task::env::TaskId;
 ///   it through so the proptest harness exercises a real seam path
 ///   even before #718 lands.
 /// - [`SchedulerTransition::Yield`] is `step()` once.
-/// - [`SchedulerTransition::InjectFault`] is a no-op until #719's
-///   `FaultPlan` lands. We keep it in the transition set so the day
-///   #719 merges the strategy already generates fault-injection
-///   sequences; the `apply_to_simulator` body grows then.
+/// - [`SchedulerTransition::InjectFault`] drives the v1 fault-
+///   injection surface landed by #719. Each transition appends one
+///   entry to the simulator's installed [`crate::FaultPlan`] at the
+///   tick immediately following the transition's apply point —
+///   `SpuriousTimerIrq`, `TimerDrift`, or `WakeupReorder` selected
+///   from the `kind: u8` range `0..3`. Hardware faults (`#PF` /
+///   `#GP` / `#DF`) are deferred to Phase 2.1 and are
+///   unrepresentable here.
 #[derive(Clone, Debug)]
 pub enum SchedulerTransition {
     /// Spawn a child task with the given id.
@@ -117,10 +122,16 @@ pub enum SchedulerTransition {
     },
     /// Cooperative yield: one `step()`.
     Yield,
-    /// Stubbed fault injection — no-op until #719's `FaultPlan` lands.
+    /// v1 fault injection (#719). The `kind` index selects one of
+    /// the three [`crate::FaultEvent`] variants; the
+    /// `apply_to_simulator` body translates the index to a concrete
+    /// `FaultEvent` and appends it to the simulator's [`crate::FaultPlan`]
+    /// at `current_tick + 1` so the next `step` dispatches it.
     InjectFault {
-        /// Fault kind index. Reserved for #719.
-        #[allow(dead_code)]
+        /// Fault kind index, range `0..3`:
+        /// `0 = SpuriousTimerIrq`, `1 = TimerDrift{ticks: 1}`,
+        /// `2 = WakeupReorder{within_tick: 1}`. Hardware-fault
+        /// indices (`#PF` / `#GP` / `#DF`) are unrepresentable.
         kind: u8,
     },
 }
@@ -188,10 +199,11 @@ impl ReferenceStateMachine for SchedulerStateMachine {
         };
         let next_id = state.next_id;
 
-        // Note: `InjectFault` is included in the strategy but stubbed
-        // in `apply_to_simulator` until #719 (FaultPlan) lands. We
-        // keep the strategy weight low so it does not crowd out the
-        // transitions that exercise real seam paths today.
+        // `InjectFault` is now wired to the live `FaultPlan` (#719).
+        // The strategy weight stays modest so a 16-step shrunk
+        // sequence is dominated by `Wake`/`Yield` (the seam paths
+        // every flake actually catches), with fault injection layered
+        // on top to surface ordering hazards.
         prop_oneof![
             // Fork: introduces a new id from the model's monotonic
             // counter. Cap arrivals so the strategy converges.
@@ -203,7 +215,7 @@ impl ReferenceStateMachine for SchedulerStateMachine {
             }),
             5 => (some_id, 1u64..16).prop_map(|(id, delta)| SchedulerTransition::Wake { id, delta }),
             5 => Just(SchedulerTransition::Yield),
-            1 => (0u8..4).prop_map(|kind| SchedulerTransition::InjectFault { kind }),
+            1 => (0u8..3).prop_map(|kind| SchedulerTransition::InjectFault { kind }),
         ]
         .boxed()
     }
@@ -232,7 +244,10 @@ impl ReferenceStateMachine for SchedulerStateMachine {
             }
             SchedulerTransition::Yield => {}
             SchedulerTransition::InjectFault { .. } => {
-                // Stubbed until #719.
+                // The reference model does not predict the
+                // simulator's fault-plan state — that is the
+                // simulator's owned object and the trace is the
+                // judge. We leave the model state untouched.
             }
         }
         state
@@ -293,11 +308,35 @@ fn apply_to_simulator(
             Ok(())
         }
         SchedulerTransition::Yield => sim.step_checked(),
-        SchedulerTransition::InjectFault { .. } => {
-            // Stubbed until #719's FaultPlan lands. Skipped from the
-            // simulator side; the proptest strategy still generates
-            // it so the day #719 merges the existing shrink
-            // sequences include fault-injection points.
+        SchedulerTransition::InjectFault { kind } => {
+            // Append a v1 fault-plan entry scheduled for the *next*
+            // tick (current_tick + 1) — the simulator's `step()`
+            // dispatches every entry whose tick equals the
+            // post-advance tick value, so a tick of `current_tick`
+            // would be late and dispatch as a "missed entry"
+            // sweep-up; using `+1` keeps the dispatch tight against
+            // the transition that scheduled it.
+            //
+            // Parameters are deliberately conservative (`ticks: 1`,
+            // `within_tick: 1`) — proptest's shrinker only sees the
+            // `kind: u8` index and trims the sequence; widening the
+            // parameter space here would expand the search space
+            // without giving the shrinker a way to minimize within
+            // it. Wider exploration lives in `FaultPlanBuilder`,
+            // which a randomized run can opt into via
+            // `cfg.fault_plan = FaultPlanBuilder::new(...).build()`.
+            let event = match kind {
+                0 => FaultEvent::SpuriousTimerIrq,
+                1 => FaultEvent::TimerDrift { ticks: 1 },
+                2 => FaultEvent::WakeupReorder { within_tick: 1 },
+                // The strategy clamps `kind` to `0..3`; treat any
+                // out-of-range value as a no-op rather than
+                // panicking — a panic here would obscure the actual
+                // proptest failure.
+                _ => return Ok(()),
+            };
+            let next_tick = sim.current_tick().saturating_add(1);
+            sim.push_fault_event(next_tick, event);
             Ok(())
         }
     }

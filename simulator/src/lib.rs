@@ -75,6 +75,9 @@
 #![deny(clippy::disallowed_types)]
 
 #[cfg(not(target_os = "none"))]
+pub mod fault_plan;
+
+#[cfg(not(target_os = "none"))]
 pub mod invariants;
 
 // `proptest_model` is `cfg(test)`-gated at the file level — it pulls
@@ -99,6 +102,9 @@ mod imp {
 
     use vibix::task::env::{install_sim_env, Clock, MockClock, MockTimerIrq};
 
+    pub use crate::fault_plan::{
+        FaultEvent, FaultPlan, FaultPlanBuilder, VariantMask, FAULT_PLAN_SCHEMA_VERSION,
+    };
     pub use crate::invariants::{
         AllRunnableEventuallyRun, BlockedToRunnableNeedsWakeup, ForkHasMatchingExitOrWait,
         InvariantSet, LivenessInvariant, MonotonicPids, NoStrandedWakeups, SafetyInvariant,
@@ -160,6 +166,17 @@ mod imp {
         /// `SimulatorConfig` from defaults and want a different
         /// invariant surface mutate this field after construction.
         pub invariants: InvariantSet,
+        /// Seeded fault-injection plan (RFC 0006 §"Failure-injection
+        /// scope", issue #719). The simulator drains every entry whose
+        /// `tick` matches the current post-advance tick on each
+        /// [`Simulator::step`] and dispatches the corresponding
+        /// perturbation against the seam mocks.
+        ///
+        /// Default is the empty plan — runs that don't opt into fault
+        /// injection see byte-identical traces to the pre-#719
+        /// behaviour. Tests that want injection construct a builder
+        /// off `SimRng::rng_for("faults")` and assign the result here.
+        pub fault_plan: FaultPlan,
     }
 
     impl SimulatorConfig {
@@ -171,6 +188,7 @@ mod imp {
                 seed: Seed(seed),
                 max_ticks: 1_000_000,
                 invariants: InvariantSet::v1(),
+                fault_plan: FaultPlan::new(),
             }
         }
     }
@@ -309,6 +327,11 @@ mod imp {
         /// atomic so the panic hook can report `tick=<N>` even after
         /// the owning `Simulator` has unwound.
         current_tick: &'static AtomicU64,
+        /// `Some(n)` after a `WakeupReorder { within_tick: n }` fault
+        /// has been dispatched and before the corresponding wakeup
+        /// drain has consumed it. Cleared every step regardless of
+        /// whether the drain produced a non-empty batch.
+        pending_reorder: Option<u64>,
     }
 
     impl Simulator {
@@ -349,6 +372,7 @@ mod imp {
                 rng: SimRng::new(seed),
                 trace: Trace::new(),
                 current_tick,
+                pending_reorder: None,
             }
         }
 
@@ -491,6 +515,25 @@ mod imp {
             &mut self.rng
         }
 
+        /// Borrow the simulator's currently-installed [`FaultPlan`].
+        ///
+        /// Reading this during a run shows the *unconsumed* tail —
+        /// every entry whose `tick` is strictly greater than the last
+        /// call to [`Simulator::step`]. Callers that want the original
+        /// recorded plan capture a clone before constructing the
+        /// simulator.
+        pub fn fault_plan(&self) -> &FaultPlan {
+            &self.cfg.fault_plan
+        }
+
+        /// Append a [`FaultEvent`] at `tick` to the simulator's
+        /// installed [`FaultPlan`]. Used by the proptest-state-machine
+        /// integration's `InjectFault` transition (issue #722) so the
+        /// shrunk transition sequence directly drives fault dispatch.
+        pub fn push_fault_event(&mut self, tick: u64, event: FaultEvent) {
+            self.cfg.fault_plan.push(tick, event);
+        }
+
         /// Borrow the installed `MockClock`. Test introspection only —
         /// production code should reach the clock through `task::env()`
         /// like the kernel does.
@@ -563,7 +606,7 @@ mod imp {
         fn step_inner(&mut self) -> Result<(), Violation> {
             let now_before = self.clock.now().raw();
             self.clock.tick();
-            let now_after = self.clock.now().raw();
+            let mut now_after = self.clock.now().raw();
             self.current_tick.store(now_after, Ordering::SeqCst);
 
             self.trace.push(TraceRecord {
@@ -573,6 +616,81 @@ mod imp {
                     to: now_after,
                 },
             });
+
+            // RFC 0006 §"Failure-injection scope" / issue #719:
+            // dispatch every fault-plan entry due at the just-advanced
+            // tick *before* the canonical timer-IRQ injection. The
+            // ordering matters because `TimerDrift` must extend the
+            // tick interval visible to the upcoming `drain_expired`
+            // call (a wakeup armed for `now_after + 2` becomes due at
+            // this tick if the drift is `>= 2`); `WakeupReorder` must
+            // arm the rotation before the drain consumes it; and
+            // `SpuriousTimerIrq` is a pre-canonical extra inject so the
+            // post-drift IRQ count visible to the kernel is the sum
+            // (canonical + spurious).
+            let due = self.cfg.fault_plan.drain_due(now_after);
+            for fault in due {
+                match fault {
+                    FaultEvent::SpuriousTimerIrq => {
+                        // Push the FaultInjected record *before* the
+                        // extra inject so a reader of the trace can
+                        // tell which `TimerInjected` is the spurious
+                        // one (the next one). The trace shape after a
+                        // SpuriousTimerIrq fault at tick T is therefore
+                        // `TickAdvance, FaultInjected{Other},
+                        // TimerInjected (spurious), TimerInjected
+                        // (canonical), …`.
+                        self.trace.push(TraceRecord {
+                            tick: now_after,
+                            event: Event::FaultInjected {
+                                kind: fault.fault_kind(),
+                            },
+                        });
+                        self.irq.inject_timer();
+                        self.trace.push(TraceRecord {
+                            tick: now_after,
+                            event: Event::TimerInjected,
+                        });
+                    }
+                    FaultEvent::TimerDrift { ticks } => {
+                        self.trace.push(TraceRecord {
+                            tick: now_after,
+                            event: Event::FaultInjected {
+                                kind: fault.fault_kind(),
+                            },
+                        });
+                        if ticks > 0 {
+                            self.clock.advance(ticks);
+                            let drifted = self.clock.now().raw();
+                            self.trace.push(TraceRecord {
+                                tick: drifted,
+                                event: Event::TickAdvance {
+                                    from: now_after,
+                                    to: drifted,
+                                },
+                            });
+                            now_after = drifted;
+                            self.current_tick.store(now_after, Ordering::SeqCst);
+                        }
+                    }
+                    FaultEvent::WakeupReorder { within_tick } => {
+                        self.trace.push(TraceRecord {
+                            tick: now_after,
+                            event: Event::FaultInjected {
+                                kind: fault.fault_kind(),
+                            },
+                        });
+                        // Arm the rotation. If a previous reorder for
+                        // this tick was already pending it stacks
+                        // (sum of rotations modulo batch len at drain
+                        // time) — that keeps two `WakeupReorder`
+                        // entries at the same tick observably distinct
+                        // when the batch length is >= 3.
+                        let prev = self.pending_reorder.unwrap_or(0);
+                        self.pending_reorder = Some(prev.wrapping_add(within_tick));
+                    }
+                }
+            }
 
             self.irq.inject_timer();
             self.trace.push(TraceRecord {
@@ -586,7 +704,19 @@ mod imp {
             // simulator's trace.
             let (clock, irq) = vibix::task::env::env();
             let now = clock.now();
-            for id in clock.drain_expired(now) {
+            let mut drained = clock.drain_expired(now);
+            if let Some(rot) = self.pending_reorder.take() {
+                if drained.len() >= 2 {
+                    let n = drained.len();
+                    let r = (rot as usize) % n;
+                    drained.rotate_left(r);
+                }
+                // Even if the batch was too small to observably
+                // reorder, we already emitted the `FaultInjected`
+                // record so replay equivalence holds; the rotation
+                // state is consumed regardless.
+            }
+            for id in drained {
                 self.trace.push(TraceRecord {
                     tick: now_after,
                     event: Event::WakeupFired { id },
@@ -757,9 +887,10 @@ mod imp {
 #[cfg(not(target_os = "none"))]
 pub use imp::{
     install_panic_hook, AllRunnableEventuallyRun, BlockReason, BlockedToRunnableNeedsWakeup, Event,
-    FaultKind, ForkHasMatchingExitOrWait, InvariantSet, LivenessInvariant, MonotonicPids,
-    NoStrandedWakeups, SafetyInvariant, Seed, SimRng, Simulator, SimulatorConfig,
-    SingleRunningPerCpu, Trace, TraceRecord, Violation, SCHEMA_VERSION,
+    FaultEvent, FaultKind, FaultPlan, FaultPlanBuilder, ForkHasMatchingExitOrWait, InvariantSet,
+    LivenessInvariant, MonotonicPids, NoStrandedWakeups, SafetyInvariant, Seed, SimRng, Simulator,
+    SimulatorConfig, SingleRunningPerCpu, Trace, TraceRecord, VariantMask, Violation,
+    FAULT_PLAN_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 
 // On `target_os = "none"` (the bare-metal kernel image), the simulator
@@ -1182,6 +1313,162 @@ mod tests {
             });
             assert_eq!(sim.pid_table_snapshot(), vec![7, 8, 9]);
         });
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 0006 / issue #719: FaultPlan acceptance tests.
+    //
+    // The acceptance criteria for #719 are:
+    //   1. A plan recorded from a flaky run replays bit-identically.
+    //   2. Each v1 fault variant produces an observable trace
+    //      divergence vs. an unmoderated run on the same seed.
+    //
+    // The two-task workload below is the same shape the determinism
+    // smoke test uses, with a third task added so `WakeupReorder` can
+    // observably permute a multi-id batch (a single-id drain has
+    // nothing to rotate).
+    // -----------------------------------------------------------------
+
+    fn run_with_plan(seed: u64, plan: FaultPlan, ticks: u64) -> Vec<TraceRecord> {
+        let mut cfg = SimulatorConfig::with_seed(seed);
+        cfg.fault_plan = plan;
+        let mut sim = Simulator::new(seed, cfg);
+        let (clock, _irq) = vibix::task::env::env();
+        let start = clock.now();
+        // Three cooperating tasks with co-prime periods so the
+        // wakeup batches at certain ticks contain >= 2 ids — that's
+        // the precondition for `WakeupReorder` to observably permute
+        // the trace.
+        clock.enqueue_wakeup(start.saturating_add(2), 1);
+        clock.enqueue_wakeup(start.saturating_add(2), 2);
+        clock.enqueue_wakeup(start.saturating_add(3), 3);
+        for _ in 0..ticks {
+            sim.step();
+            let now = clock.now();
+            // Re-arm at every wake. Multiple ids share several ticks
+            // (e.g. tick 6: id 1 from period 2 *and* id 3 from period
+            // 3), guaranteeing batches the reorder fault can act on.
+            if now.raw() % 2 == 0 {
+                clock.enqueue_wakeup(now.saturating_add(2), 1);
+                clock.enqueue_wakeup(now.saturating_add(2), 2);
+            }
+            if now.raw() % 3 == 0 {
+                clock.enqueue_wakeup(now.saturating_add(3), 3);
+            }
+        }
+        sim.trace().records().to_vec()
+    }
+
+    /// Recorded plan replays bit-identically — the property that
+    /// makes seed-reproducible flake bug reports possible.
+    #[test]
+    fn fault_plan_recorded_run_replays_bit_identically() {
+        // Build a randomized plan from `rng_for("faults")`.
+        let plan = {
+            let r = SimRng::new(0xFEED_FACE);
+            let mut s = r.rng_for("faults");
+            crate::FaultPlanBuilder::new(&mut s)
+                .max_tick(64)
+                .density(0.10)
+                .build()
+        };
+        // Round-trip the plan through JSON before replay so the
+        // recorded form (the wire artifact a CI dump would carry) is
+        // what feeds the second run.
+        let plan_json = plan.to_json_string();
+        let plan_replay = crate::FaultPlan::from_json(&plan_json).expect("plan parse");
+        assert_eq!(plan, plan_replay);
+
+        let a = on_fresh_thread(move || run_with_plan(0xFEED_FACE, plan, 64));
+        let b = on_fresh_thread(move || run_with_plan(0xFEED_FACE, plan_replay, 64));
+        assert_eq!(
+            a,
+            b,
+            "recorded plan replay drifted (lengths {} vs {})",
+            a.len(),
+            b.len()
+        );
+        // The plan must have actually injected something — otherwise
+        // "replays identically" is trivial.
+        let injected = a
+            .iter()
+            .filter(|r| matches!(r.event, Event::FaultInjected { .. }))
+            .count();
+        assert!(
+            injected > 0,
+            "expected at least one FaultInjected event in the recorded run"
+        );
+    }
+
+    /// Each v1 fault variant produces an observable trace divergence
+    /// vs. an unmoderated run on the same seed. This is the
+    /// "fault has effect" half of the acceptance — without it, the
+    /// plan could be silently dropped and the determinism property
+    /// would still hold trivially.
+    #[test]
+    fn fault_plan_each_variant_diverges_from_unmoderated_run() {
+        let baseline = on_fresh_thread(|| run_with_plan(0xABCD, crate::FaultPlan::new(), 32));
+
+        // SpuriousTimerIrq at tick 4: emits an extra TimerInjected
+        // record + a FaultInjected record, neither of which appears
+        // in the baseline.
+        let plan_irq =
+            crate::FaultPlan::from_entries(vec![(4, crate::FaultEvent::SpuriousTimerIrq)]);
+        let with_irq = on_fresh_thread(move || run_with_plan(0xABCD, plan_irq, 32));
+        assert_ne!(
+            baseline, with_irq,
+            "SpuriousTimerIrq did not perturb the trace"
+        );
+
+        // TimerDrift at tick 4 by 2 extra ticks: shifts subsequent
+        // wakeup deadlines forward; the trace diverges at the drifted
+        // tick.
+        let plan_drift =
+            crate::FaultPlan::from_entries(vec![(4, crate::FaultEvent::TimerDrift { ticks: 2 })]);
+        let with_drift = on_fresh_thread(move || run_with_plan(0xABCD, plan_drift, 32));
+        assert_ne!(baseline, with_drift, "TimerDrift did not perturb the trace");
+
+        // WakeupReorder at tick 6 (where the workload guarantees a
+        // 3-element batch: ids 1, 2, 3 all due). Rotating by 1
+        // observably permutes the WakeupFired records.
+        let plan_reorder = crate::FaultPlan::from_entries(vec![(
+            6,
+            crate::FaultEvent::WakeupReorder { within_tick: 1 },
+        )]);
+        let with_reorder = on_fresh_thread(move || run_with_plan(0xABCD, plan_reorder, 32));
+        assert_ne!(
+            baseline, with_reorder,
+            "WakeupReorder did not perturb the trace"
+        );
+
+        // The three perturbed runs are also pairwise distinct: each
+        // variant exercises a different lever.
+        assert_ne!(with_irq, with_drift);
+        assert_ne!(with_irq, with_reorder);
+        assert_ne!(with_drift, with_reorder);
+    }
+
+    /// Empty plan must produce a byte-identical trace to a run that
+    /// never received a `fault_plan` field at all — the
+    /// "default-zero" property the existing run-loop tests implicitly
+    /// rely on.
+    #[test]
+    fn fault_plan_empty_is_indistinguishable_from_baseline() {
+        let unmodified = on_fresh_thread(|| {
+            // Baseline: simulator built via `with_seed`, which
+            // installs the default empty FaultPlan.
+            let mut sim = Simulator::with_seed(0xBEEF);
+            sim.run_for(16);
+            sim.trace().records().to_vec()
+        });
+        let with_explicit_empty = on_fresh_thread(|| {
+            let mut cfg = SimulatorConfig::with_seed(0xBEEF);
+            cfg.fault_plan = crate::FaultPlan::new();
+            let mut sim = Simulator::new(0xBEEF, cfg);
+            sim.run_for(16);
+            sim.trace().records().to_vec()
+        });
+        assert_eq!(unmodified, with_explicit_empty);
     }
 
     #[test]
