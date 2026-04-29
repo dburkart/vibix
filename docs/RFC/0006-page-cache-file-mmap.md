@@ -496,6 +496,32 @@ a hard runtime assertion (not debug-only) for the same reason RFC 0004
 makes it hard for the buffer cache: regression here is an immediate
 deadlock on first contention.
 
+Two refinements (added in defense cycle 2):
+
+- **Level 4 is per-inode and does not nest.** Each `PageCache` is a
+  *separate* level-4 lock instance. The discipline forbids holding
+  *two* `PageCache::inner` locks simultaneously — a future helper
+  that walks all inodes (e.g. for `sync(2)`) must release one
+  `cache.inner` before acquiring another's. The writeback daemon
+  already follows this naturally because it iterates inodes in
+  outer-loop order and snapshot-collects from each before moving on.
+  Stated normatively here so an `assert_no_other_pagecache_locked()`
+  debug helper has a fixed contract to enforce.
+- **`writeback_complete_wq` lives at level 6.5** — between the buffer
+  cache (level 6) and the refcount/frame layer (levels 7–8). Its
+  internal mutex is taken only to wake parked reclaimers, never with
+  level-7 or level-8 locks held by the waker. The reclaimer parks
+  with no lock held above level 4, by construction (it's already at
+  the slow-path entry point). The waker (writeback daemon's loop and
+  `CachePage::Drop`) takes the wq mutex with no other lock held.
+  Worker A's IDT/STI rework lands the wq fan-out alongside the
+  page-fault path so this ordering is enforced from day one.
+
+Observers of `PG_DIRTY` (the writeback daemon's snapshot) use
+`state.load(Acquire)`; the AcqRel fetch_or on the writer side is the
+release pair. Stated explicitly so the AcqRel/Acquire pairing is
+symmetric in §State-bit ordering.
+
 ### Page-fault IRQ discipline
 
 The current `arch::x86_64::idt::page_fault` handler runs with IRQs
@@ -533,12 +559,20 @@ The cache's eviction policy returns `ENOMEM` only after a documented
    per-cache waitqueue kicked by the writeback daemon every time it
    completes a `writepage`.
 3. The faulter wakes on either: (a) a writepage completion
-   (`PG_DIRTY`-pinned page may now be evictable), or (b) a soft timeout
-   of **2 seconds** (configurable via the same
-   `writeback_secs=<N>` cmdline knob, with a separate
-   `direct_reclaim_timeout_ms=<N>` override).
-4. On wake, the sweep retries once. A second no-victim outcome
-   surfaces `ENOMEM` to the caller, which the resolver maps to SIGBUS.
+   (`PG_DIRTY`-pinned page may now be evictable), (b) a `CachePage`
+   `Arc::strong_count` reaching 1 in its `Drop` (an `Arc::clone`-pinned
+   page may now be evictable), or (c) a soft timeout of **2 seconds**
+   (configurable via the same `writeback_secs=<N>` cmdline knob, with
+   a separate `direct_reclaim_timeout_ms=<N>` override).
+4. On every wake **before the soft cap**, the sweep retries. A wake
+   may produce a victim or not; non-success keeps the faulter parked
+   for the remainder of the 2 s window. Only after the soft cap
+   expires with no victim found does the cache surface `ENOMEM`,
+   which the resolver maps to SIGBUS.
+
+This is a per-event retry — a writeback daemon issuing N writepages
+in a row gives the parked faulter N retry opportunities, bounded only
+by the soft cap. Closes the OS-engineer cycle-2 advisory clarification.
 
 The 2-second cap exists so a pathological workload cannot park a
 faulting thread for the full 30 s writeback interval. With the cap,
@@ -1324,6 +1358,23 @@ position (OS A4), `mprotect` PROT_EXEC rule (Userspace A3),
 `MAP_ANONYMOUS + fd != -1` Linux compatibility (Userspace A1),
 `mmap` of directory errno (Userspace A2).
 
+**Defense cycle 2** (one residual blocker, five LGTM):
+
+- *OS B1 (lock-order per-inode parallelism)* — §Lock-order section
+  now states normatively that level 4 is per-inode and does not
+  nest; helpers iterating across inodes must release one
+  `cache.inner` before acquiring another's. `writeback_complete_wq`
+  pinned at level 6.5; observers of `PG_DIRTY` use Acquire-load
+  symmetric to the AcqRel writer (OS A2). Direct-reclaim retry
+  semantics clarified: per-event retry on every wake until the 2 s
+  soft cap (OS A1). `Arc::strong_count`-Drop wakes added to the
+  `writeback_complete_wq` kicker set (Performance A2). Empty
+  `mmap` and tail-of-extended-page test cases added to the test
+  plans (Userspace A1, A2). Crash-test inverse (kill mid-truncate
+  → fsck no-orphan-blocks) added (Filesystem A1). Direct-reclaim
+  framed as an availability trade-off in §Eviction liveness
+  (Academic A1).
+
 ### Deferred to follow-up RFCs
 
 - `msync(2)` syscall and the precise `MS_ASYNC`/`MS_SYNC`/
@@ -1351,6 +1402,7 @@ on wave 1; wave 3 blocks on wave 2.
 - [ ] mem: per-inode read-ahead heuristic (`ra_state: { last_pgoff, hit_streak }`) — exponential ramp on sequential, hard reset on non-sequential; cap `RA_MAX_PAGES = 8`
 - [ ] mem: **invariant assertions (runtime, not debug-only)** — `assert_no_spinlocks_held()` at the top of every `AddressSpaceOps` method; `cache.inner` not held across `readpage`/`writepage`
 - [ ] mem: refcount-discipline tests — `Arc::strong_count(CachePage)` vs `mem::refcount::get(phys)` gating eviction independently; verify a cache page held only by an installed PTE is *not* evicted
+- [ ] mem: host-side cold-mmap fault-latency benchmark (microseconds per page) reported by `cargo xtask bench page-cache`; first run establishes a baseline for CI regression detection
 
 ### Workstream B — VFS plumbing (wave 1)
 
@@ -1375,9 +1427,9 @@ on wave 1; wave 3 blocks on wave 2.
 - [ ] block: extend the per-mount writeback daemon to walk every superblock-mounted inode's `mapping` and call `writepage` on every dirty pgoff (snapshot-collect under cache mutex, write outside; the snapshot-then-writepage discipline keeps a concurrent writer's re-dirty observable for the next sweep)
 - [ ] block: writeback ordering — page-cache pages flushed first (`writepage` does its own bitmap → indirect → data ordering internally), then `BlockCache::sync_fs`; matches RFC 0004 §create normative ordering
 - [ ] block: `sync(2)` / `sync_fs(sb)` triggers an immediate page-cache + buffer-cache flush (no waiting for the next interval)
-- [ ] block: writeback-completion waitqueue (`writeback_complete_wq` per cache, kicked after every `writepage` returns); the eviction direct-reclaim path parks on this with the configurable 2 s soft cap
+- [ ] block: writeback-completion waitqueue (`writeback_complete_wq` per cache, kicked after every `writepage` returns and from `CachePage::Drop` when strong-count reaches 1); the eviction direct-reclaim path parks on this with the configurable 2 s soft cap; per-event retry on each wake until the cap expires
 - [ ] block: per-cache `wb_err: AtomicU32` errseq counter; advanced on every `writepage` failure; `OpenFile` snapshots at `open` and re-reads at `fsync` to surface a sticky `EIO`
-- [ ] block: writeback-daemon unit + integration tests (kernel test marker) — one MAP_SHARED writer, kill -9 mid-flight, verify the next mount sees a consistent prefix; truncate-vs-writeback race test verifies no on-disk UAF
+- [ ] block: writeback-daemon unit + integration tests (kernel test marker) — one MAP_SHARED writer, kill -9 mid-flight, verify the next mount sees a consistent prefix; truncate-vs-writeback race test verifies no on-disk UAF; **inverse**: kill mid-truncate (between `truncate_below` evict and FS block-free), verify next-mount fsck reports zero orphan blocks; sparse-then-extend test (mmap-extended file, write *some* pages via MAP_SHARED, verify reads see zeros for unwritten holes); empty-file mmap test (zero-length file + len > 0, expect SIGBUS at fault); tail-page zero test (mmap last partial page of a freshly-extended file, read tail beyond i_size, expect zeros)
 
 ### Workstream E — Demand-paged loader + execve (wave 3, blocks on A + C)
 
