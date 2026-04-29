@@ -123,6 +123,51 @@ jobs:
       - name: RFC 0005 nm-check (no MockClock/MockIrqSource in release)
         run: cargo xtask nm-check --release
 
+  # RFC 0006 / issue #714: host-target buildability of the kernel crate.
+  # Phase 2 (host-side DST simulator) sits on top of `cargo build -p
+  # vibix --lib --target x86_64-unknown-linux-gnu --features sched-mock`
+  # actually compiling — every other Phase-2 issue waits on this gate
+  # holding. If a future PR re-introduces a `target_os = "none"`-only
+  # API into a host-buildable code path, this job fails fast,
+  # independent of the bare-metal build and the nm-check.
+  host-build:
+    name: host build (sched-mock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none, x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-host-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-host-build-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build --target x86_64-unknown-linux-gnu --features sched-mock
+        run: |
+          cargo build -p vibix --lib \
+            --target x86_64-unknown-linux-gnu \
+            --features sched-mock
+
   unit-tests:
     name: host unit tests
     runs-on: ubuntu-latest

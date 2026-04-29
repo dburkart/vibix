@@ -183,6 +183,30 @@ be *sufficient* — softirq ordering (above) is the known suspect. The
 Phase-2 RFC must validate sufficiency before relying on the v1 trait
 surface; this note flags it so the validation is not forgotten.
 
+## Host-buildable arm (RFC 0006 / issue #714)
+
+The seam now has a parallel host-build arm:
+`#[cfg(all(not(target_os = "none"), feature = "sched-mock"))] fn env()`
+in `kernel/src/task/env.rs`. It reads from a `thread_local!`
+`OnceCell<(&'static dyn Clock, &'static dyn TimerIrq)>` that the
+caller installs via `task::env::install_sim_env(clock, irq)` before
+the first kernel call on a worker thread. Per-thread (not global) so
+parallel `cargo test` workers do not serialize on a shared mutex.
+
+The bare-metal arm (`#[cfg(target_os = "none")]`) is unchanged —
+production still hands out `&HW_CLOCK` / `&HW_IRQ` with no `Once`,
+no `Mutex`, no atomic load. The host arm exists only when both
+`target_os != "none"` and `feature = "sched-mock"` are set; release
+builds cannot reach it, and the RFC 0005 nm-check guards the mock
+symbols out of the release ELF independently.
+
+CI gates host buildability with a dedicated job
+(`cargo build -p vibix --lib --target x86_64-unknown-linux-gnu
+--features sched-mock`) so a future PR that re-introduces a
+`target_os = "none"`-only call into a host-buildable code path fails
+fast. See [RFC 0006](../RFC/0006-host-dst-simulator.md)
+§"Host-target buildability of `kernel/`".
+
 ## Cross-references
 
 - [RFC 0005 — Scheduler / IRQ Seam](../RFC/0005-scheduler-irq-seam.md)
