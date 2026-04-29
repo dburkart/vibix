@@ -5,6 +5,13 @@
 //! location, and patches the result into the kernel's `LNTAB_RESERVATION`
 //! section. See `kernel/src/lntab.rs` for the on-wire format.
 
+// xtask is host build tooling — its output is a build artefact, not a
+// kernel trace. The DST-simulator determinism lint (RFC 0006 / issue
+// #714) targets kernel `sched-mock` paths and the `simulator/` crate;
+// the file-offset cache below is a pure lookup table whose iteration
+// order does not feed any seeded run.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};

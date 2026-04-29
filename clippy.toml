@@ -1,0 +1,31 @@
+# RFC 0006 / issue #714 — host-side DST simulator determinism guard.
+#
+# `std::collections::HashMap`'s default `RandomState` reads OS entropy
+# at `HashMap::new()`, which means iteration order varies between
+# `cargo test` runs even when every other input is byte-identical. The
+# host-side DST simulator (RFC 0006) relies on every `cargo test` worker
+# producing the same trace from the same seed; a stray `HashMap`
+# anywhere in the kernel `sched-mock` build path or in the future
+# `simulator/` crate would silently destroy that property.
+#
+# This lint forbids `std::collections::HashMap` (and `HashSet`)
+# workspace-wide. Determinism-sensitive callers should reach for
+# `BTreeMap` (deterministic iteration by key) or, when hashing is
+# genuinely needed, `hashbrown::HashMap` with an explicit seeded
+# hasher (e.g. `FxHasher`).
+#
+# `xtask` is host tooling whose output is the build artefact, not a
+# kernel trace, so a few existing `HashSet`/`HashMap` sites in there
+# carry an `#[allow(clippy::disallowed_types)]` with a brief comment.
+# Determinism-sensitive code in the kernel (under `#[cfg(feature =
+# "sched-mock")]`) and the future `simulator/` crate must not allow
+# the lint without re-justifying it.
+#
+# Toolchain pinning (`rust-toolchain.toml`) and this lint are
+# complementary: the pin nails libcore so `BTreeMap` ordering does not
+# drift across nightlies; the lint stops `HashMap` from being the
+# determinism leak the pin can't fix.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "HashMap's RandomState reads OS entropy and breaks DST simulator determinism (RFC 0006). Use BTreeMap, or hashbrown::HashMap with a seeded hasher." },
+    { path = "std::collections::HashSet", reason = "HashSet inherits HashMap's nondeterministic iteration order. Use BTreeSet, or hashbrown::HashSet with a seeded hasher." },
+]
