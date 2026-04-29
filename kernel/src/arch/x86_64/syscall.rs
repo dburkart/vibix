@@ -363,8 +363,24 @@ pub unsafe extern "C" fn syscall_dispatch(
         let delta = now.saturating_sub(pre);
         crate::serial_println!("irq-post-ring3: ticks={} pre={} delta={}", now, pre, delta);
     }
+    // RFC 0006 / #718: syscall entry emit point. The macro is a no-op
+    // off-feature; under `feature = "sched-mock"` it pushes a record
+    // into the per-thread trace sink so the simulator can correlate
+    // syscall traffic with scheduler transitions. Only the first four
+    // arg registers are recorded — RFC 0006 §"Event emit points"
+    // notes that four covers every syscall the v1 invariant set
+    // models, and truncating keeps the trace JSON small.
+    crate::sched_mock_trace!(crate::task::trace::SchedMockEvent::SyscallEntry {
+        nr,
+        args: [a0, a1, a2, a3],
+    });
+    // `_syscall_nr` is captured for the exit-side trace emit below.
+    // Bare-metal builds discard the macro argument entirely, so the
+    // binding is unused there — the leading underscore silences the
+    // lint without dropping the host-build use.
+    let _syscall_nr = nr;
     use syscall_nr::*;
-    match nr {
+    let _syscall_result = match nr {
         // read(fd, buf, len) — non-blocking; returns -EAGAIN if no data.
         READ => {
             let fd = a0 as u32;
@@ -1140,7 +1156,14 @@ pub unsafe extern "C" fn syscall_dispatch(
         SETGROUPS => super::syscalls::creds::sys_setgroups(a0 as i32, a1),
 
         _ => -38i64, // ENOSYS
-    }
+    };
+    // RFC 0006 / #718: syscall exit emit point. Records the same
+    // syscall number as the entry side; the v1 invariant set does not
+    // need the return value (and capturing it would force everyone
+    // returning out of the match early to thread it through). When a
+    // future invariant requires the rax value, broaden the variant.
+    crate::sched_mock_trace!(crate::task::trace::SchedMockEvent::SyscallExit { nr: _syscall_nr });
+    _syscall_result
 }
 
 /// Atomic execve body: stage the new image into a fresh `AddressSpace`

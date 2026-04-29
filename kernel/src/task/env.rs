@@ -402,12 +402,24 @@ impl Clock for MockClock {
         for (_deadline, ids) in expired {
             out.extend(ids);
         }
+        // Note: no `TaskWoken` emit here. The simulator's run loop
+        // emits `WakeupFired { id }` for every drained id at the
+        // seam call site (`Simulator::step`). Emitting `TaskWoken`
+        // additionally would double-record the same transition.
         out
     }
 
     fn enqueue_wakeup(&self, deadline: Tick, id: TaskId) {
         let mut g = self.inner.lock();
         g.wakeups.entry(deadline.0).or_default().push(id);
+        drop(g);
+        // RFC 0006 / #718: emit a `WakeupEnqueued` event so the
+        // simulator can correlate `sleep_ms` arming with the eventual
+        // drain. The macro is a no-op when `sched-mock` is off.
+        crate::sched_mock_trace!(crate::task::trace::SchedMockEvent::WakeupEnqueued {
+            deadline: deadline.0,
+            id,
+        });
     }
 }
 

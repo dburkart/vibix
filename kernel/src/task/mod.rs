@@ -33,6 +33,7 @@
 //! [`wake`] below.
 
 pub mod env;
+pub mod trace;
 
 // Scheduler-core submodules. These pull in `arch`, `sync`, `x86_64`,
 // and `crate::time` features that don't compile on the host, so they

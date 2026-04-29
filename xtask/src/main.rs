@@ -725,6 +725,22 @@ const NM_CHECK_FORBIDDEN: &[&str] = &[
     "MockIrqSource",
     "MockIrqState",
     "MockTimerIrq",
+    // RFC 0006 / #718 — the kernel-side scheduler-mock trace seam.
+    // The `sched_mock_trace!` macro and its push helper, the host
+    // thread-local sink, and every `SchedMock*` type live behind
+    // `cfg(all(not(target_os = "none"), feature = "sched-mock"))`.
+    // A release build must not contain any of these symbols; the
+    // macro's off-feature arm is `()` precisely so this gate keeps
+    // biting. Substring matches catch monomorphizations and
+    // module-prefixed paths (e.g. `vibix::task::trace::push_event`,
+    // `vibix::task::trace::host_sink::SINK`).
+    "sched_mock_trace",
+    "SchedMockEvent",
+    "SchedMockBlockReason",
+    "SchedMockFaultKind",
+    "task::trace::push_event",
+    "task::trace::take_trace",
+    "task::trace::host_sink",
 ];
 
 /// Pure scan over `nm --demangle` stdout: returns the lines that name a
@@ -2704,6 +2720,44 @@ ffffffff80020100 t core::ptr::drop_in_place::<vibix::task::env::MockIrqState>
             2,
             "both interior state types must match: {hits:?}"
         );
+    }
+
+    /// RFC 0006 / #718: the kernel-side `sched_mock_trace!` macro and
+    /// its sink helpers must also be caught by the release-image gate.
+    /// These fixtures cover the macro-pushed `push_event` symbol, the
+    /// host-only `task::trace::host_sink` module path, and the
+    /// `SchedMockEvent` / `SchedMockBlockReason` / `SchedMockFaultKind`
+    /// types — every name a misconfigured release build could surface.
+    #[test]
+    fn nm_check_catches_sched_mock_trace_symbols() {
+        let stdout = "\
+ffffffff80030000 t vibix::task::trace::push_event
+ffffffff80030100 t vibix::task::trace::host_sink::SINK::__init
+ffffffff80030200 t vibix::task::trace::take_trace
+ffffffff80030300 t core::ptr::drop_in_place::<vibix::task::trace::SchedMockEvent>
+ffffffff80030400 t vibix::task::trace::SchedMockBlockReason
+ffffffff80030500 t vibix::task::trace::SchedMockFaultKind
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(
+            hits.len(),
+            6,
+            "every sched_mock_trace symbol must match: {hits:?}"
+        );
+    }
+
+    /// RFC 0006 / #718: the macro-name itself (`sched_mock_trace`) is
+    /// listed because Rust's name-mangling can surface a generated
+    /// item name in some debug-info paths. A release-mode build with
+    /// the feature flipped on accidentally would produce something
+    /// like the line below; the fixture pins that.
+    #[test]
+    fn nm_check_catches_sched_mock_trace_macro_name() {
+        let stdout = "\
+ffffffff80031000 t vibix::sched_mock_trace::__expanded::push
+";
+        let hits = scan_nm_output_for_mocks(stdout, NM_CHECK_FORBIDDEN);
+        assert_eq!(hits.len(), 1, "macro-name path must match: {hits:?}");
     }
 
     #[test]

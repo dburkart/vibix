@@ -356,6 +356,99 @@ mod imp {
             self.current_tick.load(Ordering::SeqCst)
         }
 
+        /// Returns the id of the most-recently-scheduled task observed
+        /// in the trace, or `None` if no [`Event::TaskScheduled`]
+        /// record has been seen yet.
+        ///
+        /// RFC 0006 / #718 introspection helper. Read-only reflection
+        /// of the kernel's scheduler state derived from the recorded
+        /// trace stream. Invariant predicates (#722) consume this to
+        /// answer "what is currently running" without re-deriving
+        /// scheduler state from raw events at every check.
+        ///
+        /// Implemented as a reverse linear scan of the trace tail.
+        /// O(n) in trace length in the worst case (a long run with
+        /// no schedule events); in practice every kernel emit-point
+        /// rotation pushes a `TaskScheduled` so the scan terminates
+        /// within a handful of records.
+        pub fn current_task(&self) -> Option<vibix::task::env::TaskId> {
+            self.trace
+                .records()
+                .iter()
+                .rev()
+                .find_map(|r| match r.event {
+                    Event::TaskScheduled { id } => Some(id),
+                    _ => None,
+                })
+        }
+
+        /// Snapshot of the kernel's runqueue, reconstructed from the
+        /// trace stream.
+        ///
+        /// The returned `Vec` is the set of tasks that the trace
+        /// reports as ready-to-run, derived by counting every id that
+        /// has fired ([`Event::WakeupFired`]) without a subsequent
+        /// [`Event::TaskScheduled`] or [`Event::TaskBlocked`]. Order
+        /// is *deterministic* but does not match the kernel's FIFO
+        /// bucketing — invariant checkers that need the exact
+        /// dispatch order should consume the trace directly.
+        ///
+        /// Returns an empty `Vec` if the trace contains no scheduling
+        /// activity yet — this is the v1 bring-up state and is the
+        /// expected return on the very first tick.
+        pub fn runqueue_snapshot(&self) -> Vec<vibix::task::env::TaskId> {
+            use std::collections::BTreeSet;
+            let mut ready: BTreeSet<vibix::task::env::TaskId> = BTreeSet::new();
+            // Forward pass: track the latest state transition per id
+            // through the events the simulator's run loop records
+            // today (`TaskScheduled`, `TaskBlocked`, `WakeupFired`).
+            // BTreeSet keeps the output deterministic — std's HashSet
+            // is forbidden in this crate (see crate-level
+            // `disallowed_types` lint).
+            for r in self.trace.records() {
+                match r.event {
+                    Event::TaskScheduled { id } => {
+                        // Scheduled task is `current`, not in runqueue.
+                        ready.remove(&id);
+                    }
+                    Event::TaskBlocked { id, .. } => {
+                        ready.remove(&id);
+                    }
+                    Event::WakeupFired { id } => {
+                        ready.insert(id);
+                    }
+                    _ => {}
+                }
+            }
+            ready.into_iter().collect()
+        }
+
+        /// Snapshot of the live PID table reconstructed from the
+        /// trace stream — every task id that has been scheduled,
+        /// woken, blocked, or forked but has not yet observed a
+        /// matching [`Event::TaskExit`].
+        ///
+        /// Returns ids in ascending numeric order (deterministic by
+        /// virtue of the underlying `BTreeSet`); the v1 invariant set
+        /// only consumes this for membership and cardinality, not for
+        /// dispatch order.
+        pub fn pid_table_snapshot(&self) -> Vec<vibix::task::env::TaskId> {
+            use std::collections::BTreeSet;
+            let mut alive: BTreeSet<vibix::task::env::TaskId> = BTreeSet::new();
+            for r in self.trace.records() {
+                match r.event {
+                    Event::TaskScheduled { id }
+                    | Event::TaskBlocked { id, .. }
+                    | Event::WakeupFired { id }
+                    | Event::WakeupEnqueued { id, .. } => {
+                        alive.insert(id);
+                    }
+                    _ => {}
+                }
+            }
+            alive.into_iter().collect()
+        }
+
         /// Borrow the recorded trace.
         pub fn trace(&self) -> &Trace {
             &self.trace
@@ -490,6 +583,19 @@ mod imp {
             } else {
                 None
             }
+        }
+    }
+
+    #[cfg(test)]
+    impl Simulator {
+        /// **Test-only.** Append a synthesized `TraceRecord` directly
+        /// onto the underlying trace, bypassing the kernel-emit path.
+        /// Used by unit tests for the read-only introspection helpers
+        /// (`current_task`, `runqueue_snapshot`, `pid_table_snapshot`)
+        /// to construct a deterministic trace without driving
+        /// `cfg(target_os = "none")` scheduler code from host code.
+        pub(crate) fn test_push_record(&mut self, rec: TraceRecord) {
+            self.trace.push(rec);
         }
     }
 
@@ -911,6 +1017,105 @@ mod tests {
         let mut a = r.rng_for("a");
         let mut b = r.rng_for("b");
         assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    /// RFC 0006 / #718 introspection helpers.
+    ///
+    /// These tests synthesize a trace by reaching into the test-only
+    /// `Trace::push` (`pub(crate)` — accessible from this module) so
+    /// the helper logic can be exercised without driving the kernel
+    /// scheduler from host code (which is impossible — sched_core is
+    /// `cfg(target_os = "none")`-gated).
+    #[test]
+    fn current_task_returns_none_on_empty_trace() {
+        on_fresh_thread(|| {
+            let sim = Simulator::with_seed(0xAA);
+            assert_eq!(sim.current_task(), None);
+            assert!(sim.runqueue_snapshot().is_empty());
+            assert!(sim.pid_table_snapshot().is_empty());
+        });
+    }
+
+    #[test]
+    fn current_task_returns_latest_scheduled_id() {
+        on_fresh_thread(|| {
+            let mut sim = Simulator::new(0xBB, SimulatorConfig::with_seed(0xBB));
+            // Hand-build a trace tail: schedule task 1, then 2.
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskScheduled { id: 1 },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskScheduled { id: 2 },
+            });
+            assert_eq!(sim.current_task(), Some(2));
+        });
+    }
+
+    #[test]
+    fn runqueue_snapshot_tracks_wakeup_then_schedule() {
+        on_fresh_thread(|| {
+            let mut sim = Simulator::new(0xCC, SimulatorConfig::with_seed(0xCC));
+            // Three tasks wake; one of them gets scheduled.
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::WakeupFired { id: 10 },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::WakeupFired { id: 20 },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::WakeupFired { id: 30 },
+            });
+            // 20 is now running; 10 and 30 stay ready.
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskScheduled { id: 20 },
+            });
+            let mut rq = sim.runqueue_snapshot();
+            rq.sort_unstable();
+            assert_eq!(rq, vec![10, 30]);
+
+            // Now block 30; only 10 remains ready.
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskBlocked {
+                    id: 30,
+                    reason: BlockReason::Wait,
+                },
+            });
+            assert_eq!(sim.runqueue_snapshot(), vec![10]);
+        });
+    }
+
+    #[test]
+    fn pid_table_snapshot_unions_event_ids() {
+        on_fresh_thread(|| {
+            let mut sim = Simulator::new(0xDD, SimulatorConfig::with_seed(0xDD));
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::WakeupEnqueued { deadline: 5, id: 7 },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskScheduled { id: 7 },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::TaskBlocked {
+                    id: 8,
+                    reason: BlockReason::Sleep,
+                },
+            });
+            sim.test_push_record(TraceRecord {
+                tick: 0,
+                event: Event::WakeupFired { id: 9 },
+            });
+            assert_eq!(sim.pid_table_snapshot(), vec![7, 8, 9]);
+        });
     }
 
     #[test]

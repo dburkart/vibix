@@ -9,6 +9,13 @@
 use super::env;
 use super::priority;
 use super::softirq;
+// `SchedMockBlockReason` / `SchedMockEvent` are referenced only
+// inside `sched_mock_trace!` argument expressions; on bare-metal
+// the macro discards its argument before name resolution, so the
+// imports go unused. Allow that — the types are still in scope for
+// the host build path that exercises these emit points.
+#[allow(unused_imports)]
+use super::trace::{SchedMockBlockReason, SchedMockEvent, SchedMockFaultKind};
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -241,6 +248,13 @@ pub fn fork_current_task(
     );
     sched.push_ready(child_box);
     maybe_preempt_current_for_priority(&mut sched, new_prio);
+    // RFC 0006 / #718: record the fork transition. Parent id read
+    // through the snapshot we already took above; on a successful
+    // fork the child's id is what `Task::new_forked` minted.
+    crate::sched_mock_trace!(SchedMockEvent::TaskForked {
+        parent: sched.current.as_ref().map(|t| t.id).unwrap_or(usize::MAX),
+        child: child_id,
+    });
     crate::fork_trace!(
         "fork-trace: [fork_current_task exit] returning child_id={}",
         child_id
@@ -1006,11 +1020,22 @@ pub fn exit() -> ! {
             panic!("task::exit: no ready task to switch to");
         };
         let prev = sched.current.take().expect("task::exit before task::init");
+        // RFC 0006 / #718: record that the previously-running task is
+        // exiting *before* we drop its reference. No-op on production
+        // builds; under `feature = "sched-mock"` the simulator
+        // observes one `TaskExit { id }` per task::exit call.
+        crate::sched_mock_trace!(SchedMockEvent::TaskExit { id: prev.id });
         next.state = TaskState::Running;
         let next_rsp = next.rsp;
         let next_cr3 = next.cr3.start_address().as_u64();
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        // Emit `TaskScheduled` for the incoming task at the same point
+        // `preempt_tick` does — exit is a non-yielding context switch
+        // and feeds the same dispatch event stream.
+        crate::sched_mock_trace!(SchedMockEvent::TaskScheduled {
+            id: sched.current.as_ref().unwrap().id,
+        });
         // Arm SYSCALL/TSS for the incoming task's own per-task kernel
         // stack. Done while still holding SCHED so the Task reference
         // outlives the write.
@@ -1222,6 +1247,12 @@ pub fn preempt_tick() {
     let prev_prio = prev.priority;
     sched.current = Some(next);
     sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+    // RFC 0006 / #718: emit a `TaskScheduled` event for the incoming
+    // task. No-op on production builds; under `feature = "sched-mock"`
+    // the host-side simulator drains these from the per-thread sink.
+    crate::sched_mock_trace!(SchedMockEvent::TaskScheduled {
+        id: sched.current.as_ref().unwrap().id,
+    });
     // Arm SYSCALL/TSS for the incoming task's own per-task kernel
     // stack. Done while still holding SCHED so the Task reference is
     // valid; the helper only performs atomic / live-TSS writes and
@@ -1341,8 +1372,20 @@ pub fn block_current() {
         let prev_id = prev.id;
         let next_rsp = next.rsp;
         let next_cr3 = next.cr3.start_address().as_u64();
+        // RFC 0006 / #718: emit `TaskBlocked` for the parking task and
+        // `TaskScheduled` for its successor. The block reason here is
+        // `Wait` because `block_current` is the WaitQueue / blocking-
+        // primitive park path; tick-deadline parks go through
+        // `sleep_ms` and emit `Sleep` separately before reaching here.
+        crate::sched_mock_trace!(SchedMockEvent::TaskBlocked {
+            id: prev_id,
+            reason: SchedMockBlockReason::Wait,
+        });
         sched.current = Some(next);
         sched.current.as_mut().unwrap().slice_remaining_ms = DEFAULT_SLICE_MS;
+        crate::sched_mock_trace!(SchedMockEvent::TaskScheduled {
+            id: sched.current.as_ref().unwrap().id,
+        });
         // Arm SYSCALL/TSS for the incoming task's own per-task kernel
         // stack under the SCHED lock; see `set_active_syscall_stack`
         // for why this consolidation exists (#505).
@@ -1409,6 +1452,13 @@ fn wake_in_sched(sched: &mut Scheduler, id: usize) {
         let prio = task.priority;
         sched.push_ready(task);
         maybe_preempt_current_for_priority(sched, prio);
+        // RFC 0006 / #718: emit `TaskWoken` only on the parked→ready
+        // transition (the happy-path case). The "wake_pending fast
+        // path" below mutates an atomic flag without changing the
+        // task's run state, so it is not an observable wake from the
+        // simulator's perspective — `block_current` will surface that
+        // race when it consumes the flag.
+        crate::sched_mock_trace!(SchedMockEvent::TaskWoken { id });
         return;
     }
 
@@ -1452,5 +1502,17 @@ pub fn sleep_ms(ms: u64) {
     let deadline = clock.now().saturating_add(ticks_to_wait);
     let id = current_id();
     clock.enqueue_wakeup(deadline, id);
+    // RFC 0006 / #718: tick-deadline park has its own block reason so
+    // invariant predicates can distinguish "asleep on a timer" from
+    // "asleep on a wait-queue". Emit `TaskBlocked { Sleep }` *before*
+    // calling `block_current`, which itself emits `TaskBlocked { Wait }`
+    // — both records land in the trace, in that order, so a downstream
+    // consumer can tell the wait-queue park from the sleep that
+    // brought it there. The wake-before-park race short-circuit
+    // inside `block_current` skips that second emit.
+    crate::sched_mock_trace!(SchedMockEvent::TaskBlocked {
+        id,
+        reason: SchedMockBlockReason::Sleep,
+    });
     block_current();
 }
