@@ -207,18 +207,22 @@ pub struct CachePage {
 
     /// State bits — see the `PG_*` constants above.
     ///
-    /// All transitions with cross-thread visibility obligations are
-    /// performed through the helper methods on this type; reach for
-    /// the raw [`AtomicU8`] only inside this module and under the
-    /// orderings documented at each call site.
-    pub state: AtomicU8,
+    /// `pub(crate)` rather than `pub`: every cross-thread transition
+    /// has a documented Acquire/Release ordering obligation, so
+    /// out-of-crate callers must go through the helper methods on
+    /// this type (which encode the orderings). Inside the crate we
+    /// allow direct atomic operations because the call-sites are
+    /// auditable in one place — but even in-crate, prefer the
+    /// helpers; reach for the raw [`AtomicU8`] only inside this
+    /// module and under the orderings documented at each call site.
+    pub(crate) state: AtomicU8,
 
     /// Wait-queue for the LOCKED-fill and WRITEBACK handshakes. A
     /// second fault on the same page parks here until the original
     /// reader publishes [`PG_UPTODATE`]; `truncate_below` parks here
     /// on [`PG_WRITEBACK`] to wait out an in-flight `writepage` before
     /// the FS is allowed to free the underlying blocks.
-    pub wait: WaitQueue,
+    pub(crate) wait: WaitQueue,
 }
 
 impl CachePage {
@@ -339,7 +343,11 @@ impl CachePage {
     /// writeback daemon's snapshot. RFC 0007 §State-bit ordering,
     /// writer side: `AcqRel` on the bit set, dirty-index update under
     /// the same critical section.
-    pub fn mark_dirty(&self) {
+    ///
+    /// `pub(crate)` so external callers must go through
+    /// [`PageCache::mark_page_dirty`], which holds [`PageCache::inner`]
+    /// across both the bit set and the dirty-index enrollment.
+    pub(crate) fn mark_dirty(&self) {
         self.state.fetch_or(PG_DIRTY, Ordering::AcqRel);
     }
 
@@ -548,15 +556,33 @@ impl PageCache {
     /// eviction lands. Removing the index entry here is what allows
     /// that drop chain to start.
     ///
-    /// Returns `true` if a stub was found at `pgoff` and removed,
-    /// `false` if no entry existed (which would indicate a caller
-    /// bug — the stub the caller is abandoning was theirs to install,
-    /// so it must still be indexed).
-    pub fn abandon_locked_stub(&self, pgoff: u64) -> bool {
+    /// `expected` is the `Arc<CachePage>` that
+    /// [`Self::install_or_get`] handed back as
+    /// [`InstallOutcome::InstalledNew`]; the abandon path verifies
+    /// that the index still holds *that exact* Arc (via
+    /// [`Arc::ptr_eq`]) and that it is still locked before removing.
+    /// This closes a (currently theoretical) race where a stale error
+    /// path on a long-since-recycled `pgoff` would otherwise evict a
+    /// newer stub that a different filler had since installed.
+    ///
+    /// Returns `true` iff the index held the expected stub and it
+    /// was removed and unlocked. `false` covers both "no entry at
+    /// `pgoff`" and "different (newer) stub at `pgoff`".
+    pub fn abandon_locked_stub(&self, expected: &Arc<CachePage>) -> bool {
+        let pgoff = expected.pgoff;
         let removed = {
             let mut inner = self.inner.lock();
-            inner.dirty.remove(&pgoff);
-            inner.pages.remove(&pgoff)
+            match inner.pages.get(&pgoff) {
+                Some(current) if Arc::ptr_eq(current, expected) && current.is_locked() => {
+                    // Same stub, still locked — drop the dirty enrollment
+                    // (defence-in-depth; a freshly installed locked stub
+                    // is never enrolled in the first place) and remove
+                    // the index entry.
+                    inner.dirty.remove(&pgoff);
+                    inner.pages.remove(&pgoff)
+                }
+                _ => None,
+            }
         };
         match removed {
             Some(stub) => {
@@ -798,7 +824,7 @@ mod tests {
         };
         assert!(stub.is_locked());
 
-        let removed = cache.abandon_locked_stub(5);
+        let removed = cache.abandon_locked_stub(&stub);
         assert!(removed);
 
         // Index has been cleared, so subsequent install_or_get wins.
@@ -820,7 +846,63 @@ mod tests {
     #[test]
     fn abandon_unknown_pgoff_returns_false() {
         let cache = fresh_cache();
-        assert!(!cache.abandon_locked_stub(42));
+        // A stub whose pgoff is not indexed at all — abandon must
+        // refuse to remove anything.
+        let orphan = make_stub(42);
+        assert!(!cache.abandon_locked_stub(&orphan));
+    }
+
+    #[test]
+    fn abandon_with_stale_arc_does_not_evict_newer_stub() {
+        // RFC 0007 abandon-discipline: the abandon path must target
+        // the *exact* stub the failed filler installed. A stale
+        // error path that races a successor must not evict the
+        // newer stub at the same pgoff.
+        let cache = fresh_cache();
+
+        // Filler 1 installs and then abandons cleanly.
+        let stub1 = match cache.install_or_get(8, || make_stub(8)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        assert!(cache.abandon_locked_stub(&stub1));
+
+        // Filler 2 installs a fresh stub at the same pgoff.
+        let stub2 = match cache.install_or_get(8, || make_stub(8)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        assert!(!Arc::ptr_eq(&stub1, &stub2));
+
+        // A *stale* abandon call on stub1 (e.g. carried by a slow
+        // error path that didn't notice it had already aborted)
+        // must be a no-op — the index still holds stub2.
+        assert!(!cache.abandon_locked_stub(&stub1));
+        let still_indexed = cache.lookup(8).expect("stub2 must remain indexed");
+        assert!(Arc::ptr_eq(&still_indexed, &stub2));
+        assert!(stub2.is_locked());
+    }
+
+    #[test]
+    fn abandon_refuses_unlocked_indexed_stub() {
+        // The abandon path is for *locked* stubs only. If a stub
+        // has already been published (PG_UPTODATE set, PG_LOCKED
+        // clear), abandon must not silently evict it — that would
+        // race waiters who legitimately observed the unlock and are
+        // about to install PTEs against the frame.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        assert!(!stub.is_locked());
+
+        assert!(!cache.abandon_locked_stub(&stub));
+        // Stub remains indexed and uptodate.
+        let still_indexed = cache.lookup(0).expect("must remain indexed");
+        assert!(Arc::ptr_eq(&still_indexed, &stub));
+        assert!(stub.is_uptodate());
     }
 
     #[test]
