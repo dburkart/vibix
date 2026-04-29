@@ -272,13 +272,13 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             // `set_handler_fn` default), so IF was hardware-cleared on
             // entry and the saved `frame.cpu_flags` retains the
             // pre-fault value untouched.
-            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
             let fault_res = object.fault(offset, access);
             // SAFETY: `cli` only clears IF. We re-disable before the
             // PTE install below so the page-table mutator sees a
             // coherent ring-0/IF=0 environment matching the rest of
             // the kernel paging layer.
-            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
             match fault_res {
                 Ok(phys) => {
                     let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
@@ -315,9 +315,9 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             // before, CLI after, same as the demand-fault path above.
             //
             // SAFETY: see the demand-fault arm.
-            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
             let cow_res = crate::mem::paging::cow_copy_and_remap(active, page, pte_flags);
-            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
             match cow_res {
                 Ok(_) => return,
                 Err(e) => serial_println!(
@@ -353,9 +353,9 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
         // allocator's `BlockingMutex`.
         //
         // SAFETY: see the demand-fault arm.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
         let fault_res = object.fault(offset, Access::Write);
-        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
         match fault_res {
             Ok(phys) => {
                 let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
