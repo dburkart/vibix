@@ -49,6 +49,29 @@ pub enum VmFault {
     /// cache-hit path in [`AnonObject::fault`] when the shared frame is
     /// already maximally-referenced.
     RefcountSaturated,
+    /// `FileObject` write fault on a `Share::Private` mapping. The
+    /// resolver upgrades the PTE through `cow_copy_and_remap` exactly
+    /// the way a fork-induced CoW does today (RFC 0007 §FileObject,
+    /// §Algorithms — `MAP_PRIVATE` on a write fault). Threading this
+    /// sentinel through the page-fault resolver is tracked under
+    /// #739; the variant is added here so `FileObject::fault` can
+    /// return it without depending on the resolver wiring.
+    CoWNeeded,
+    /// The faulter must park on the [`crate::mem::page_cache::CachePage`]
+    /// wait-queue and retry the slow path. Surfaced when the cache
+    /// install-race loser observes a stub whose filler errored — the
+    /// stub is removed from the index and waiters retry against a
+    /// fresh fill (RFC 0007 §Algorithms — `FileObject::fault` slow
+    /// path). Resolver wiring is #739.
+    ParkAndRetry,
+    /// `AddressSpaceOps::readpage` returned an errno. The faulter is
+    /// the one task that observed the failed fill — by contract the
+    /// stub has already been removed from the cache index and other
+    /// waiters have been woken to retry. The errno is the kernel's
+    /// negative-i64 convention (e.g. `crate::fs::EIO`); resolver
+    /// wiring (#739) will translate it to SIGBUS / SIGSEGV per the
+    /// existing error table.
+    ReadFailed(i64),
 }
 
 /// Polymorphic "what backs this VMA" trait. Lives behind
