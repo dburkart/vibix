@@ -88,14 +88,32 @@ impl OpenFile {
     /// up — Linux semantics: `fsync` reports the error exactly once
     /// per file description.
     pub fn do_fsync(&self, data_only: bool) -> Result<(), i64> {
+        // Helper: catch the per-OpenFile errseq snapshot up to the
+        // inode's current wb_err counter. errseq semantics ("consume
+        // once per witness") require this to fire on *every* exit
+        // from `do_fsync` — Ok-success, Err from a flush hook, or
+        // Err from the snapshot comparison — otherwise a single
+        // pending writeback error could be re-reported repeatedly,
+        // or worse, a flush-hook error could mask a sticky EIO that
+        // a *subsequent* `fsync` would then see as fresh.
+        let consume_wb_err = || {
+            let current = self.inode.wb_err();
+            self.wb_err_snapshot.store(current, Ordering::Release);
+        };
+
         // 1. Driver hook. Concrete filesystems may override
         //    FileOps::fsync to flush their inode metadata or to
         //    invoke an inode-private writeback path; the default
         //    body is `Ok(())`. Filler errors here propagate first so
         //    the buffer-cache fence below isn't issued against a
         //    cache that the driver knows is in an inconsistent
-        //    state.
-        self.ops.fsync(self, data_only)?;
+        //    state. The snapshot is caught up before propagation so
+        //    a sticky EIO accumulated by an earlier writeback isn't
+        //    re-reported the next time the caller invokes fsync.
+        if let Err(e) = self.ops.fsync(self, data_only) {
+            consume_wb_err();
+            return Err(e);
+        }
 
         // 2. Per-mount BlockCache::sync_fs (or whatever the FS
         //    layered on top of it). For an in-memory filesystem
@@ -110,14 +128,20 @@ impl OpenFile {
         //    superset (fdatasync is permitted to flush more than
         //    necessary). Splitting is tracked as a follow-up; see
         //    the issue auto-engineer files for the seam shape.
-        self.sb.ops.sync_fs(&self.sb)?;
+        if let Err(e) = self.sb.ops.sync_fs(&self.sb) {
+            consume_wb_err();
+            return Err(e);
+        }
 
         // 3. errseq EIO surfacing. Compare the per-file-description
         //    snapshot against the inode's current wb_err counter; if
         //    the counter advanced since `open` (or since the last
         //    fsync that consumed an error), some writeback in the
         //    interval failed. Catch the snapshot up so the next
-        //    fsync only sees *new* errors.
+        //    fsync only sees *new* errors. Note we deliberately read
+        //    `wb_err()` again here (rather than reusing a value from
+        //    consume_wb_err) so the comparison reflects the freshest
+        //    counter after the flush hooks ran.
         let current = self.inode.wb_err();
         let snapshot = self.wb_err_snapshot.load(Ordering::Acquire);
         if current != snapshot {

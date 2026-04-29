@@ -608,13 +608,16 @@ pub unsafe extern "C" fn syscall_dispatch(
 
         // fsync(fd) — flush page cache + per-mount BlockCache::sync_fs;
         // surface sticky EIO via the per-OpenFile errseq snapshot. RFC
-        // 0007 §Ordering vs fsync/fdatasync.
-        FSYNC => super::syscalls::vfs::sys_fsync_impl(a0 as u32, false),
+        // 0007 §Ordering vs fsync/fdatasync. The raw `a0` (u64) is
+        // passed through; the impl validates the high 32 bits to
+        // reject e.g. `fsync(0x1_0000_0003)` rather than silently
+        // truncating to fd=3.
+        FSYNC => super::syscalls::vfs::sys_fsync_impl(a0, false),
 
         // fdatasync(fd) — same data flush as fsync, may skip the
         // inode-table flush per Linux semantics. See sys_fsync_impl
         // for the data_only-vs-fsync split.
-        FDATASYNC => super::syscalls::vfs::sys_fsync_impl(a0 as u32, true),
+        FDATASYNC => super::syscalls::vfs::sys_fsync_impl(a0, true),
 
         // dup2(oldfd, newfd)
         DUP2 => {

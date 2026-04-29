@@ -1430,7 +1430,15 @@ fn do_chown(inode: &Arc<Inode>, uid: u32, gid: u32, cred: &Credential) -> i64 {
 ///   call only surfaces *new* errors.
 /// - Any errno propagated from `FileOps::fsync` or
 ///   `SuperOps::sync_fs`.
-pub fn sys_fsync_impl(fd: u32, data_only: bool) -> i64 {
+pub fn sys_fsync_impl(fd_raw: u64, data_only: bool) -> i64 {
+    // Reject userspace fds whose high 32 bits are set rather than
+    // silently truncating to a low-32-bit fd. `fsync(0x1_0000_0003)`
+    // must not collapse to `fsync(3)`; mirroring Linux's `EBADF`
+    // behaviour for out-of-range fd arguments.
+    if fd_raw > u32::MAX as u64 {
+        return EBADF;
+    }
+    let fd = fd_raw as u32;
     let tbl = crate::task::current_fd_table();
     let backend = match tbl.lock().get(fd) {
         Ok(b) => b,
