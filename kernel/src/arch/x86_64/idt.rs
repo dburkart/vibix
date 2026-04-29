@@ -154,6 +154,17 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     // entering the `VmObject::fault` slow path.
     let addr_u64 = x86_64::registers::control::Cr2::read_raw();
 
+    // RFC 0006 / #718: page-fault entry emit point. Captured *before*
+    // any handler logic so a panic inside the resolver still leaves a
+    // `Fault { PageFault, rip, cr2 }` record in the trace for the
+    // simulator to bisect against. The macro is a no-op on production
+    // builds (verified by `cargo xtask nm-check`).
+    crate::sched_mock_trace!(crate::task::trace::SchedMockEvent::Fault {
+        kind: crate::task::trace::SchedMockFaultKind::PageFault,
+        rip: frame.instruction_pointer.as_u64(),
+        cr2: addr_u64,
+    });
+
     // Defer `log_first_ring3_fault` to the terminal paths below. A
     // first-touch CoW write fault on a forked user-stack page is a
     // routine, fully-resolved event and must not trip the diagnostic
