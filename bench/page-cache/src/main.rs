@@ -310,7 +310,18 @@ fn cold_fault_one(cache: &PageCache, ops: &dyn AddressSpaceOps, pgoff: u64) {
             // (rustc denies it under
             // `invalid_reference_casting`).
             let buf: &mut [u8; 4096] = unsafe { &mut *stub.data.get() };
-            let _ = ops.readpage(pgoff, buf).expect("stub readpage never fails");
+            let n = ops.readpage(pgoff, buf).expect("stub readpage never fails");
+            // A short successful fill must NOT publish — once this
+            // crate swaps to the real `AddressSpaceOps`, a short
+            // return would mean the page is missing tail bytes, and
+            // marking it `PG_UPTODATE` would expose that to readers.
+            // Hard-fail in the bench so any future filler regression
+            // surfaces here rather than silently skewing latency.
+            assert_eq!(
+                n,
+                buf.len(),
+                "bench-page-cache: readpage returned a short fill ({n} bytes) for pgoff={pgoff}",
+            );
             stub.publish_uptodate_and_unlock();
             black_box(&stub);
         }

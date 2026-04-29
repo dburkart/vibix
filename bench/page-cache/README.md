@@ -12,7 +12,7 @@ fixed-iteration spin loop.
 
 ## Run it
 
-```
+```bash
 cargo xtask bench page-cache
 ```
 
@@ -60,14 +60,35 @@ pages-per-second — is what catches algorithmic regressions.
 
 ## Baseline
 
-Captured on the CI Linux runner, `cargo xtask bench page-cache` on
-the `m743-bench-page-cache` branch (host: GitHub Actions
-ubuntu-latest x86_64, release build). Run-to-run the absolute ns
-counts vary on the order of single-digit percent; the shape is
-stable. **Reviewers comparing a future optimisation PR should
-reproduce this on the same host before drawing a conclusion from a
-delta.** The PR body for #743 records the exact numbers from the
-landing run.
+Captured on the landing run for #743 (release build, single-threaded
+host, `cargo xtask bench page-cache`):
+
+```text
+=== bench-page-cache: cold-mmap fault latency ===
+RFC 0007 §Testing strategy — host-side baseline
+model: install_or_get -> readpage(stub) -> publish_uptodate
+readahead: 0 pages on cold inode (RFC 0007 default)
+
+samples           : 4096
+warmup pages      : 64
+sim_readpage_spins: 256
+
+min   :     6485 ns
+p50   :     9612 ns
+p90   :    11983 ns
+p99   :    21044 ns
+max   :   158941 ns
+mean  :    10503 ns
+total : 43022411 ns
+rate  :    95.21 kpages/s
+```
+
+Run-to-run the absolute ns counts vary on the order of single-digit
+percent; the shape (relative quantiles, pages-per-second) is stable.
+The absolute numbers above are host-specific — CPU model, allocator
+version, and `target-cpu` all move them. **Reviewers comparing a
+future optimisation PR should reproduce this baseline on the same
+host before drawing a conclusion from a delta.**
 
 ## Why mirror the kernel types instead of consuming them?
 

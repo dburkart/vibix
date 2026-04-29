@@ -397,6 +397,19 @@ fn main() -> R<()> {
             let which = rest
                 .first()
                 .ok_or("bench: missing target name (try `xtask bench page-cache`)")?;
+            // Reject trailing positional args up front: a benchmark
+            // command needs reproducible invocation, and silently
+            // dropping `cargo xtask bench page-cache extra` would
+            // let a typo'd flag pass for the wrong reason — exactly
+            // the fail-open behaviour reproducibility forbids.
+            if rest.len() > 1 {
+                return Err(format!(
+                    "bench: unexpected positional arg(s) after '{which}': {:?}; \
+                     `xtask bench {which}` takes no trailing args",
+                    &rest[1..],
+                )
+                .into());
+            }
             match which.as_str() {
                 "page-cache" => bench_page_cache()?,
                 other => {
