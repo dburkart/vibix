@@ -559,9 +559,15 @@ impl VmObject for FileObject {
 // --- Helpers ---------------------------------------------------------------
 
 /// `i_size` snapshot expressed in 4 KiB pages (rounded up).
+///
+/// Uses `saturating_add` for the round-up so a hypothetical
+/// `i_size` near `u64::MAX` cannot wrap to a tiny page count
+/// and silently widen the in-bounds window — practical file sizes
+/// never approach this bound, but the bounds-check arithmetic
+/// must never produce a smaller value than the input pages.
 fn cache_i_size_pages(cache: &PageCache) -> u64 {
     let bytes = cache.i_size();
-    (bytes + FRAME_SIZE - 1) / FRAME_SIZE
+    bytes.saturating_add(FRAME_SIZE - 1) / FRAME_SIZE
 }
 
 /// Stub allocator used by [`FileObject::fault`]'s slow path. Returns a
