@@ -883,8 +883,11 @@ impl PageCache {
             }
             RaMode::Sequential => {
                 inner.ra.last_pgoff = Some(pgoff);
-                // Hint promised: pretend the streak is at the cap so
-                // a follow-on Normal-mode switch starts already-warm.
+                // Pin `hit_streak` at the cap while Sequential mode is
+                // active so any read of `ra_state()` reflects the
+                // honoured hint. `set_ra_mode(RaMode::Normal)` clears
+                // the streak back to 0 — Normal-mode re-warms organically
+                // from the next miss, it does not inherit the priming.
                 inner.ra.hit_streak = RA_MAX_PAGES;
                 RA_MAX_PAGES
             }
