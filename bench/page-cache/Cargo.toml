@@ -1,0 +1,33 @@
+# Host-side page-cache cold-mmap fault-latency benchmark (RFC 0007).
+#
+# This crate is host-only by design: it establishes a baseline for the
+# cold-mmap fault path (microseconds per page) before any optimisation
+# work in the file mmap / page-cache stack lands. The kernel page-fault
+# wiring (#739) does not exist yet, so this benchmark drives a faithful
+# host model of the `PageCache::install_or_get` path through a stub
+# `AddressSpaceOps` rather than running under QEMU.
+#
+# Per RFC 0007 §Testing strategy, `cargo xtask bench page-cache`
+# dispatches to this binary; `bench/page-cache/README.md` records the
+# baseline numbers reviewers compare future PRs against.
+[package]
+name = "bench-page-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Host-side cold-mmap fault-latency benchmark for the vibix page cache (RFC 0007)."
+
+[[bin]]
+name = "bench-page-cache"
+path = "src/main.rs"
+
+# No kernel-crate dependency. This benchmark is deliberately
+# self-contained: it models the `PageCache::install_or_get` shape
+# directly so a) the bench can run on a stock host toolchain (no
+# `-Z build-std`, no kernel feature flags), and b) future kernel
+# refactors don't silently change what the baseline is measuring.
+# When the kernel surface stabilises (#737/#738/#739), a follow-up
+# can switch this crate to consume the real types.
+[dependencies]
