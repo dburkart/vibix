@@ -212,7 +212,7 @@ The parser in `simulator::trace::Trace::from_json` enforces:
 
 For every trace `T`:
 
-```
+```rust
 let json = T.to_json_string();
 let T2 = Trace::from_json(&json).unwrap();
 assert_eq!(T.records(), T2.records());
