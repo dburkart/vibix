@@ -465,7 +465,13 @@ pub struct PageCache {
     /// pointer cheaply into their own task contexts. The cache
     /// itself does not yet invoke `ops.readpage` / `ops.writepage`
     /// — that wiring is the next-wave work.
-    pub ops: Arc<dyn AddressSpaceOps>,
+    ///
+    /// **Encapsulation:** the field is private so external callers
+    /// cannot rebind it after construction (an in-place rebind
+    /// would violate the inode-binding rule above and route I/O
+    /// through the wrong filesystem object). Use [`Self::ops`] to
+    /// borrow a clone of the trait object.
+    ops: Arc<dyn AddressSpaceOps>,
 
     /// The level-4 per-inode mutex. Cache lookups acquire it only
     /// long enough to clone the [`Arc<CachePage>`]; the actual fill

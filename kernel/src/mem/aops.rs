@@ -241,8 +241,10 @@ mod tests {
                 page.copy_from_slice(buf);
                 Ok(())
             } else {
-                // Out-of-range writepage: emulate -ENOSPC.
-                Err(28)
+                // Out-of-range writepage: emulate ENOSPC. vibix's
+                // errno convention is negative i64 (see
+                // `kernel/src/fs/mod.rs` — `pub const ENOSPC: i64 = -28`).
+                Err(crate::fs::ENOSPC)
             }
         }
 
@@ -295,8 +297,10 @@ mod tests {
     fn writepage_out_of_range_returns_errno() {
         let ops: Arc<dyn AddressSpaceOps> = MemoryBackedOps::with_pages(1);
         let payload = [0u8; 4096];
-        // pgoff 99 is past the backing store.
-        assert_eq!(ops.writepage(99, &payload), Err(28));
+        // pgoff 99 is past the backing store. ENOSPC = -28; vibix's
+        // errno convention is negative i64.
+        assert_eq!(ops.writepage(99, &payload), Err(crate::fs::ENOSPC));
+        assert_eq!(crate::fs::ENOSPC, -28);
     }
 
     /// Default `readahead` is a no-op: it does not panic, does not
