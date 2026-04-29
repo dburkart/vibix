@@ -10,6 +10,8 @@
 //!  - `paging` wraps Limine's active PML4 in an `OffsetPageTable` so
 //!    the kernel can own its own `map`/`unmap`/`translate` API.
 
+#[cfg(any(target_os = "none", test))]
+pub mod aops;
 pub mod frame;
 #[cfg(any(target_os = "none", test))]
 pub mod page_cache;
