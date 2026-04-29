@@ -12,7 +12,40 @@
 //! - `FileObject` and the `VmObject` integration (#738).
 //! - The page-fault path wiring (#739).
 //! - Eviction and the writeback-completion waitqueue (#740).
-//! - Read-ahead heuristic and `ra_state` (#741).
+//!
+//! ## Read-ahead heuristic (#741)
+//!
+//! [`PageCache`] now carries the per-inode `ra_state`
+//! ([`PageCacheInner::ra`]) described in RFC 0007 §Performance
+//! Considerations (readahead). The state is a tiny exponential-ramp
+//! tracker keyed on the streak of sequentially-adjacent misses:
+//!
+//! - On a fresh inode the read-ahead window is **0 pages**. RFC 0007
+//!   blocking-finding *Performance B2* — an unconditional 8-page
+//!   read-ahead would *increase* cold-execve latency, since the
+//!   execve fault stream is rarely sequential past the first few
+//!   pages.
+//! - [`PageCache::note_miss`] is the single entry point the page-fault
+//!   slow path calls when it has just lost the install race or
+//!   otherwise observes a miss at `pgoff`. It returns the number of
+//!   *additional* read-ahead pages the FS should issue past `pgoff`,
+//!   based on the streak observed so far. The cache itself still does
+//!   not invoke `ops.readahead` — that wiring is part of #739/#752.
+//! - Sequential streak detection: if `pgoff == ra.last_pgoff + 1`,
+//!   `hit_streak` is incremented; once `hit_streak >= 2`, the next
+//!   miss's read-ahead window is `min(2^hit_streak, RA_MAX_PAGES)`.
+//!   Any non-sequential miss resets `hit_streak` to 1 and the window
+//!   to 0.
+//! - `posix_fadvise(POSIX_FADV_SEQUENTIAL)` and `madvise(MADV_SEQUENTIAL)`
+//!   set the cache's [`RaMode::Sequential`] mode, which jumps the
+//!   read-ahead window straight to [`RA_MAX_PAGES`] without waiting
+//!   for a streak. Their `RANDOM` equivalents ([`RaMode::Random`])
+//!   permanently disable read-ahead for the inode until the mode is
+//!   reset to [`RaMode::Normal`]. See [`PageCache::set_ra_mode`].
+//!
+//! The actual issuance of read-ahead I/O lives in the FS-specific
+//! `AddressSpaceOps::readahead` impl (default is a no-op; ext2's
+//! impl is #752).
 //!
 //! What this PR establishes is therefore a deliberately narrow
 //! foundation:
@@ -391,6 +424,115 @@ impl CachePage {
     }
 }
 
+// --- Read-ahead state ---------------------------------------------------
+
+/// Hard cap on the read-ahead window, in pages, for any one miss.
+///
+/// RFC 0007 §Performance Considerations (readahead) — Linux's
+/// `file_ra_state` uses 32 by default; vibix's miniaturised tracker
+/// caps at 8 pages (32 KiB) to bound the per-miss I/O fan-out and the
+/// buffer-cache pressure RFC 0007 §Performance Considerations
+/// (buffer-cache thrash) discusses.
+pub const RA_MAX_PAGES: u32 = 8;
+
+/// Madvise/fadvise mode that biases the read-ahead heuristic.
+///
+/// The default [`RaMode::Normal`] runs the exponential-ramp tracker.
+/// `posix_fadvise(SEQUENTIAL)` / `madvise(MADV_SEQUENTIAL)` switch the
+/// inode into [`RaMode::Sequential`], which jumps the window straight
+/// to [`RA_MAX_PAGES`] regardless of streak — the application is
+/// promising linear access. The `RANDOM` equivalents switch into
+/// [`RaMode::Random`], which permanently disables read-ahead for the
+/// inode until the mode is reset.
+///
+/// The mode is sticky per-inode (per RFC 0007 §Performance
+/// Considerations: "permanently disable read-ahead for the inode")
+/// and survives until an explicit `RaMode::Normal` is requested.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RaMode {
+    /// Default heuristic: exponential ramp on observed sequential
+    /// streak, hard reset on a non-sequential miss.
+    Normal,
+    /// `MADV_SEQUENTIAL` / `POSIX_FADV_SEQUENTIAL`: jump straight to
+    /// the [`RA_MAX_PAGES`] cap on every miss.
+    Sequential,
+    /// `MADV_RANDOM` / `POSIX_FADV_RANDOM`: read-ahead is disabled
+    /// for the inode regardless of streak.
+    Random,
+}
+
+impl Default for RaMode {
+    fn default() -> Self {
+        RaMode::Normal
+    }
+}
+
+/// Per-inode read-ahead tracker (RFC 0007 §Performance Considerations
+/// (readahead)).
+///
+/// Lives inside [`PageCacheInner`] so [`PageCache::note_miss`] commits
+/// the streak update and the read-ahead-window decision under the
+/// same critical section, and so concurrent slow-path miss handlers
+/// observe a consistent streak rather than racing each other into
+/// re-incrementing `hit_streak`.
+///
+/// The struct is tiny by design (16 bytes on 64-bit): the heuristic
+/// is a *hint*, not a contract, so we keep the metadata cheap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct RaState {
+    /// `Some(pgoff)` of the most recent miss observed by
+    /// [`PageCache::note_miss`]; `None` for a cold inode that has not
+    /// yet seen any miss. Cold = "no prior faults observed" in the
+    /// RFC's wording.
+    pub last_pgoff: Option<u64>,
+    /// Number of consecutive sequentially-adjacent misses observed,
+    /// counted with the just-noted miss inclusive. The exponential
+    /// ramp triggers once `hit_streak >= 2`, i.e. starting on the
+    /// **third** miss in a sequential run, which is what keeps the
+    /// cold execve fault stream at zero read-ahead.
+    pub hit_streak: u32,
+    /// Sticky madvise/fadvise hint. See [`RaMode`].
+    pub mode: RaMode,
+}
+
+impl RaState {
+    /// Construct a fresh cold tracker: no prior miss, no streak,
+    /// default heuristic mode. Used by [`PageCacheInner::new`] and by
+    /// the unit-test helpers.
+    pub const fn cold() -> Self {
+        Self {
+            last_pgoff: None,
+            hit_streak: 0,
+            mode: RaMode::Normal,
+        }
+    }
+
+    /// Compute the read-ahead window for the *next* miss given the
+    /// current `hit_streak`. Returns `min(2 << (hit_streak - 1),
+    /// RA_MAX_PAGES)` once `hit_streak >= 2`, and `0` otherwise.
+    ///
+    /// The "shifted" form (`2 << (streak - 1)`) is equivalent to
+    /// `2_u32.pow(streak)` for `streak >= 1` but avoids the runtime
+    /// pow call and saturates safely at `streak == 31` (well above
+    /// the cap, so the final `min` clamps the result).
+    fn window_for_streak(streak: u32) -> u32 {
+        if streak < 2 {
+            return 0;
+        }
+        // Short-circuit any streak large enough that `2 << (streak - 1)`
+        // would meet or exceed RA_MAX_PAGES: the cap clamps regardless.
+        // This also dodges the `2u32 << 31` wraparound (returns 0, not
+        // u32::MAX) that bit a naive `checked_shl` formulation. With
+        // RA_MAX_PAGES = 8 (1 << 3), any streak >= 4 is at the cap.
+        let bits_for_cap = 32 - RA_MAX_PAGES.leading_zeros();
+        if streak >= bits_for_cap {
+            return RA_MAX_PAGES;
+        }
+        let shifted = 2u32 << (streak - 1);
+        shifted.min(RA_MAX_PAGES)
+    }
+}
+
 // --- PageCache ----------------------------------------------------------
 
 /// Mutable per-inode cache state. Lives behind
@@ -408,6 +550,12 @@ pub struct PageCacheInner {
     /// daemon's snapshot is internally consistent (RFC 0007 §State-bit
     /// ordering, writer side).
     pub dirty: BTreeSet<u64>,
+    /// Per-inode read-ahead heuristic state (RFC 0007 §Performance
+    /// Considerations (readahead)). Updated from
+    /// [`PageCache::note_miss`] under [`PageCache::inner`] so the
+    /// streak update and the read-ahead-window decision commit
+    /// atomically.
+    pub ra: RaState,
 }
 
 impl PageCacheInner {
@@ -415,6 +563,7 @@ impl PageCacheInner {
         Self {
             pages: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            ra: RaState::cold(),
         }
     }
 }
@@ -696,6 +845,99 @@ impl PageCache {
     /// Read the current `i_size` cap.
     pub fn i_size(&self) -> u64 {
         self.i_size.load(Ordering::Acquire)
+    }
+
+    /// Record a cache miss at `pgoff` in the per-inode read-ahead
+    /// tracker and return the read-ahead window the FS should issue
+    /// past `pgoff` (in *additional* pages — the page at `pgoff`
+    /// itself is filled by the install-then-readpage path, not the
+    /// read-ahead path).
+    ///
+    /// RFC 0007 §Performance Considerations (readahead):
+    ///
+    /// - `RaMode::Random` ⇒ always returns 0 (read-ahead disabled).
+    /// - `RaMode::Sequential` ⇒ always returns [`RA_MAX_PAGES`]
+    ///   (application promised linear access — no streak required).
+    /// - `RaMode::Normal` ⇒ exponential ramp: if `pgoff ==
+    ///   ra.last_pgoff + 1`, increment `hit_streak`; once
+    ///   `hit_streak >= 2`, return `min(2^hit_streak, RA_MAX_PAGES)`.
+    ///   Any non-sequential miss resets `hit_streak` to 1 and returns 0.
+    ///   On a cold inode (`last_pgoff == None`) `hit_streak` becomes 1
+    ///   and the returned window is 0 — the canonical "0 pages on
+    ///   cold inode" guarantee that protects cold-execve latency.
+    ///
+    /// The state update commits under [`Self::inner`] so two slow
+    /// paths racing on adjacent misses observe a consistent streak;
+    /// the call itself does no I/O and never sleeps, so holding the
+    /// mutex briefly does not violate the split-lock discipline.
+    pub fn note_miss(&self, pgoff: u64) -> u32 {
+        let mut inner = self.inner.lock();
+        match inner.ra.mode {
+            RaMode::Random => {
+                // Bookkeep last_pgoff so a future RaMode::Normal
+                // doesn't reset the streak based on stale state, but
+                // window stays 0.
+                inner.ra.last_pgoff = Some(pgoff);
+                inner.ra.hit_streak = 0;
+                0
+            }
+            RaMode::Sequential => {
+                inner.ra.last_pgoff = Some(pgoff);
+                // Pin `hit_streak` at the cap while Sequential mode is
+                // active so any read of `ra_state()` reflects the
+                // honoured hint. `set_ra_mode(RaMode::Normal)` clears
+                // the streak back to 0 — Normal-mode re-warms organically
+                // from the next miss, it does not inherit the priming.
+                inner.ra.hit_streak = RA_MAX_PAGES;
+                RA_MAX_PAGES
+            }
+            RaMode::Normal => {
+                let is_sequential = match inner.ra.last_pgoff {
+                    Some(prev) => prev.checked_add(1) == Some(pgoff),
+                    None => false,
+                };
+                if is_sequential {
+                    inner.ra.hit_streak = inner.ra.hit_streak.saturating_add(1);
+                } else {
+                    inner.ra.hit_streak = 1;
+                }
+                inner.ra.last_pgoff = Some(pgoff);
+                RaState::window_for_streak(inner.ra.hit_streak)
+            }
+        }
+    }
+
+    /// Switch the per-inode read-ahead mode (RFC 0007 §Performance
+    /// Considerations (readahead)).
+    ///
+    /// Switching to [`RaMode::Sequential`] also primes `hit_streak`
+    /// to the cap so the very next `note_miss` returns
+    /// [`RA_MAX_PAGES`] without observing a streak first; switching
+    /// to [`RaMode::Random`] zeros the streak so a follow-on
+    /// `RaMode::Normal` starts cold; switching to [`RaMode::Normal`]
+    /// preserves `last_pgoff` but resets the streak so the heuristic
+    /// re-warms organically.
+    ///
+    /// `madvise` and `posix_fadvise` syscall integration (#739/#754)
+    /// is the production caller; today this is exercised by host
+    /// unit tests against the heuristic.
+    pub fn set_ra_mode(&self, mode: RaMode) {
+        let mut inner = self.inner.lock();
+        inner.ra.mode = mode;
+        match mode {
+            RaMode::Sequential => {
+                inner.ra.hit_streak = RA_MAX_PAGES;
+            }
+            RaMode::Random | RaMode::Normal => {
+                inner.ra.hit_streak = 0;
+            }
+        }
+    }
+
+    /// Snapshot the current read-ahead state. Useful for tests and
+    /// for the page-fault path's debug logging.
+    pub fn ra_state(&self) -> RaState {
+        self.inner.lock().ra
     }
 
     /// Atomically replace the `i_size` cap. Caller is responsible
@@ -1096,5 +1338,184 @@ mod tests {
         // Drop the in-flight clone — strong_count returns to 2.
         drop(in_flight);
         assert_eq!(Arc::strong_count(&stub), 2);
+    }
+
+    // --- ra_state heuristic --------------------------------------------
+
+    #[test]
+    fn ra_state_cold_inode_returns_zero_window() {
+        // RFC 0007 §Performance Considerations (readahead): a fresh
+        // inode that has never seen a miss observes 0-page read-ahead
+        // until a streak develops. This is the cold-execve guarantee.
+        let cache = fresh_cache();
+        let initial = cache.ra_state();
+        assert_eq!(initial.last_pgoff, None);
+        assert_eq!(initial.hit_streak, 0);
+        assert_eq!(initial.mode, RaMode::Normal);
+        // First-ever miss: window is 0, streak becomes 1.
+        let window = cache.note_miss(0);
+        assert_eq!(window, 0);
+        let after = cache.ra_state();
+        assert_eq!(after.last_pgoff, Some(0));
+        assert_eq!(after.hit_streak, 1);
+    }
+
+    #[test]
+    fn ra_state_sequential_run_ramps_exponentially() {
+        // First three misses: streak goes 1, 2, 3. Window pattern is
+        // 0, 4, 8. The first miss is cold, the second is the first
+        // observed sequential adjacency (streak == 2 ⇒ 2^2 == 4), the
+        // third tops out at min(2^3, 8) == 8.
+        let cache = fresh_cache();
+        assert_eq!(cache.note_miss(10), 0);
+        assert_eq!(cache.note_miss(11), 4);
+        assert_eq!(cache.note_miss(12), 8);
+        // Subsequent sequential misses stay capped at RA_MAX_PAGES.
+        assert_eq!(cache.note_miss(13), RA_MAX_PAGES);
+        assert_eq!(cache.note_miss(14), RA_MAX_PAGES);
+        assert_eq!(cache.ra_state().hit_streak, 5);
+    }
+
+    #[test]
+    fn ra_state_non_sequential_miss_resets_streak() {
+        // Build up a streak, then jump to a non-adjacent pgoff. The
+        // streak hard-resets to 1 (the just-noted miss) and the
+        // window returns to 0.
+        let cache = fresh_cache();
+        cache.note_miss(0);
+        cache.note_miss(1);
+        cache.note_miss(2);
+        assert!(cache.ra_state().hit_streak >= 3);
+
+        let after_jump = cache.note_miss(100);
+        assert_eq!(after_jump, 0);
+        let st = cache.ra_state();
+        assert_eq!(st.hit_streak, 1);
+        assert_eq!(st.last_pgoff, Some(100));
+
+        // Re-establishing a sequential run from the new position
+        // ramps from scratch (the cold-streak rules apply afresh).
+        assert_eq!(cache.note_miss(101), 4);
+        assert_eq!(cache.note_miss(102), 8);
+    }
+
+    #[test]
+    fn ra_state_backwards_miss_treated_as_non_sequential() {
+        // Reading backwards is *not* the sequential pattern the
+        // heuristic protects. A miss at pgoff < last_pgoff resets the
+        // streak rather than ramping.
+        let cache = fresh_cache();
+        cache.note_miss(10);
+        cache.note_miss(11);
+        cache.note_miss(12);
+        let backwards = cache.note_miss(11);
+        assert_eq!(backwards, 0);
+        assert_eq!(cache.ra_state().hit_streak, 1);
+    }
+
+    #[test]
+    fn ra_state_repeated_pgoff_treated_as_non_sequential() {
+        // Re-faulting the same pgoff (e.g. the abandon-then-retry
+        // path) is not a streak-extending event: it does not satisfy
+        // `pgoff == last_pgoff + 1`. The streak resets.
+        let cache = fresh_cache();
+        cache.note_miss(7);
+        cache.note_miss(8);
+        let repeat = cache.note_miss(8);
+        assert_eq!(repeat, 0);
+        assert_eq!(cache.ra_state().hit_streak, 1);
+    }
+
+    #[test]
+    fn ra_state_advise_sequential_jumps_to_cap() {
+        // POSIX_FADV_SEQUENTIAL / MADV_SEQUENTIAL: the very first
+        // miss observes RA_MAX_PAGES regardless of streak.
+        let cache = fresh_cache();
+        cache.set_ra_mode(RaMode::Sequential);
+        assert_eq!(cache.note_miss(50), RA_MAX_PAGES);
+        // Even a non-sequential follow-up keeps the cap (the hint is
+        // sticky).
+        assert_eq!(cache.note_miss(2_000), RA_MAX_PAGES);
+    }
+
+    #[test]
+    fn ra_state_advise_random_disables_readahead() {
+        // POSIX_FADV_RANDOM / MADV_RANDOM: 0 pages read-ahead
+        // regardless of streak, even for adjacent misses.
+        let cache = fresh_cache();
+        cache.set_ra_mode(RaMode::Random);
+        assert_eq!(cache.note_miss(0), 0);
+        assert_eq!(cache.note_miss(1), 0);
+        assert_eq!(cache.note_miss(2), 0);
+        assert_eq!(cache.note_miss(3), 0);
+        // Sticky — a long sequential run does not flip back to
+        // Normal heuristic on its own.
+        for p in 4..32 {
+            assert_eq!(cache.note_miss(p), 0);
+        }
+    }
+
+    #[test]
+    fn ra_state_mode_round_trips() {
+        // Switching modes preserves the documented streak resets:
+        // Sequential primes streak to cap; Random/Normal zero it.
+        let cache = fresh_cache();
+        cache.note_miss(0);
+        cache.note_miss(1);
+        cache.set_ra_mode(RaMode::Sequential);
+        assert_eq!(cache.ra_state().hit_streak, RA_MAX_PAGES);
+        cache.set_ra_mode(RaMode::Random);
+        assert_eq!(cache.ra_state().hit_streak, 0);
+        cache.set_ra_mode(RaMode::Normal);
+        assert_eq!(cache.ra_state().hit_streak, 0);
+        assert_eq!(cache.ra_state().mode, RaMode::Normal);
+    }
+
+    #[test]
+    fn ra_state_execve_like_fault_stream_observes_no_readahead() {
+        // RFC 0007 blocking-finding *Performance B2*: an execve fault
+        // stream — _start, then a few scattered text pages, then
+        // PLT/GOT pokes — must not pay the 8-page read-ahead tax. We
+        // model that as: page 0 (cold), then a smattering of
+        // non-adjacent pages. Window must stay 0 throughout.
+        let cache = fresh_cache();
+        let stream = [0u64, 7, 12, 5, 64, 2, 9];
+        for p in stream {
+            assert_eq!(
+                cache.note_miss(p),
+                0,
+                "execve-like fault at pgoff {p} must not trigger read-ahead",
+            );
+        }
+    }
+
+    #[test]
+    fn ra_state_window_caps_at_ra_max_pages() {
+        // Synthesise a long sequential run and verify the saturating
+        // shift never exceeds RA_MAX_PAGES. (The cap is the hard
+        // guard the per-miss I/O fan-out depends on.)
+        let cache = fresh_cache();
+        let mut last_window = 0;
+        for p in 0..32u64 {
+            let w = cache.note_miss(p);
+            assert!(w <= RA_MAX_PAGES, "window {w} exceeded cap");
+            last_window = w;
+        }
+        // The tail of a long sequential run is pinned at the cap.
+        assert_eq!(last_window, RA_MAX_PAGES);
+    }
+
+    #[test]
+    fn ra_state_window_for_streak_pure_function() {
+        // The pure helper used by note_miss — direct unit test on the
+        // sequence so a future refactor can't silently change it.
+        assert_eq!(RaState::window_for_streak(0), 0);
+        assert_eq!(RaState::window_for_streak(1), 0);
+        assert_eq!(RaState::window_for_streak(2), 4);
+        assert_eq!(RaState::window_for_streak(3), 8);
+        assert_eq!(RaState::window_for_streak(4), 8);
+        assert_eq!(RaState::window_for_streak(31), RA_MAX_PAGES);
+        // Saturating-shl path covers extreme inputs without panicking.
+        assert_eq!(RaState::window_for_streak(u32::MAX), RA_MAX_PAGES);
     }
 }
