@@ -1400,6 +1400,64 @@ fn do_chown(inode: &Arc<Inode>, uid: u32, gid: u32, cred: &Credential) -> i64 {
     }
 }
 
+/// `fsync(fd)` / `fdatasync(fd)` syscall body. Routed from the dispatch
+/// table at `arch::x86_64::syscall::syscall_dispatch` (numbers 74 and 75
+/// respectively) and kept in `vfs.rs` because the work is purely
+/// VFS-layer plumbing: route the fd to its `OpenFile`, then call
+/// [`OpenFile::do_fsync`] which performs the RFC 0007 two-stage flush
+/// (page cache writeback then `BlockCache::sync_fs`) and the errseq
+/// EIO comparison.
+///
+/// `data_only=true` is `fdatasync(2)`; `data_only=false` is `fsync(2)`.
+/// The full RFC contract (including the `fdatasync` skip-inode-table
+/// rule) lives in [`OpenFile::do_fsync`] and the SuperOps `sync_fs`
+/// trait body. This wrapper only owns the syscall ABI: validate the
+/// fd, fetch the backend, downcast through `as_vfs`, and translate
+/// the `Result<(), i64>` to a syscall return value (negated errno on
+/// error, zero on success).
+///
+/// Errno table (matches Linux `fsync(2)`):
+///
+/// - `EBADF` — `fd` is not an open descriptor in this task's table.
+/// - `EINVAL` — `fd` refers to a non-VFS backend (e.g. `SerialBackend`
+///   for stdin/stdout/stderr before the userspace init has reopened
+///   them through devfs). Linux returns `EINVAL` for `fsync` on a
+///   special file that doesn't support synchronisation; we mirror
+///   that.
+/// - `EIO` — sticky writeback error; the inode's page-cache
+///   `wb_err` counter advanced since this `OpenFile`'s last
+///   snapshot. Once consumed, the snapshot is caught up so the next
+///   call only surfaces *new* errors.
+/// - Any errno propagated from `FileOps::fsync` or
+///   `SuperOps::sync_fs`.
+pub fn sys_fsync_impl(fd_raw: u64, data_only: bool) -> i64 {
+    // Reject userspace fds whose high 32 bits are set rather than
+    // silently truncating to a low-32-bit fd. `fsync(0x1_0000_0003)`
+    // must not collapse to `fsync(3)`; mirroring Linux's `EBADF`
+    // behaviour for out-of-range fd arguments.
+    if fd_raw > u32::MAX as u64 {
+        return EBADF;
+    }
+    let fd = fd_raw as u32;
+    let tbl = crate::task::current_fd_table();
+    let backend = match tbl.lock().get(fd) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let vfs = match backend.as_vfs() {
+        Some(v) => v,
+        // Non-VFS backends (e.g. the legacy SerialBackend hooked up
+        // for early-boot stdin/stdout) have nothing to sync. Linux
+        // returns `EINVAL` for `fsync(2)` on file descriptors that
+        // don't support synchronisation.
+        None => return EINVAL,
+    };
+    match vfs.open_file.do_fsync(data_only) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
 /// Resolve the inode behind an fd for the fchmod/fchown family. Returns
 /// `EBADF` on an out-of-range fd, or on any backend that doesn't expose
 /// a VFS inode (e.g. a pure `SerialBackend`) since there is nothing to

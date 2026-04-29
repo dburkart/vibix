@@ -77,6 +77,23 @@ pub struct Inode {
 }
 
 impl Inode {
+    /// Read the inode's page-cache `wb_err` errseq counter.
+    ///
+    /// Forward-compat seam for RFC 0007: once issue #745 lands an
+    /// `Option<Arc<PageCache>>` `mapping` field on `Inode`, this
+    /// becomes `self.mapping.as_ref().map(|m| m.wb_err()).unwrap_or(0)`.
+    /// Until then, no inode has a mapping and the counter is
+    /// universally zero — `fsync(2)` therefore never surfaces a
+    /// sticky `EIO`, which is correct because there is no writeback
+    /// daemon yet to bump the counter (#755).
+    ///
+    /// Defining the accessor now means the syscall layer can already
+    /// consume the errseq value via `OpenFile::wb_err_snapshot`
+    /// without rewriting any plumbing when the mapping field lands.
+    pub fn wb_err(&self) -> u32 {
+        0
+    }
+
     pub fn new(
         ino: u64,
         sb: Weak<SuperBlock>,

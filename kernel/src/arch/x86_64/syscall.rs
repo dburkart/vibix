@@ -622,6 +622,19 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // fsync(fd) — flush page cache + per-mount BlockCache::sync_fs;
+        // surface sticky EIO via the per-OpenFile errseq snapshot. RFC
+        // 0007 §Ordering vs fsync/fdatasync. The raw `a0` (u64) is
+        // passed through; the impl validates the high 32 bits to
+        // reject e.g. `fsync(0x1_0000_0003)` rather than silently
+        // truncating to fd=3.
+        FSYNC => super::syscalls::vfs::sys_fsync_impl(a0, false),
+
+        // fdatasync(fd) — same data flush as fsync, may skip the
+        // inode-table flush per Linux semantics. See sys_fsync_impl
+        // for the data_only-vs-fsync split.
+        FDATASYNC => super::syscalls::vfs::sys_fsync_impl(a0, true),
+
         // dup2(oldfd, newfd)
         DUP2 => {
             let oldfd = a0 as i32;
@@ -1783,6 +1796,8 @@ pub mod syscall_nr {
     pub const DUP2: u64 = 33;
     pub const DUP3: u64 = 292;
     pub const FCNTL: u64 = 72;
+    pub const FSYNC: u64 = 74;
+    pub const FDATASYNC: u64 = 75;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
@@ -1863,6 +1878,8 @@ mod tests {
         assert_eq!(syscall_nr::DUP2, 33, "SYS_dup2 must be 33");
         assert_eq!(syscall_nr::DUP3, 292, "SYS_dup3 must be 292");
         assert_eq!(syscall_nr::FCNTL, 72, "SYS_fcntl must be 72");
+        assert_eq!(syscall_nr::FSYNC, 74, "SYS_fsync must be 74");
+        assert_eq!(syscall_nr::FDATASYNC, 75, "SYS_fdatasync must be 75");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
         // Memory management
