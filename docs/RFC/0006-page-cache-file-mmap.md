@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Demand-Paged File mmap and Page Cache for ext2
-status: Draft
+status: In Review
 created: 2026-04-28
 ---
 
