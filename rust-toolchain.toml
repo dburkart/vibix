@@ -1,4 +1,10 @@
+# RFC 0006 (issue #714) pins the nightly to a specific date. Without a
+# date pin, a different nightly is a different libcore — and a different
+# libcore can mean a different `BTreeMap` iteration order, which is the
+# single most likely silent-determinism vector for the host-side DST
+# simulator (RFC 0006 §"Reproducibility Envelope"). Bump deliberately,
+# in a dedicated PR that re-runs the full nightly soak.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-04-16"
 components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
-targets = ["x86_64-unknown-none"]
+targets = ["x86_64-unknown-none", "x86_64-unknown-linux-gnu"]
