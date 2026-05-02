@@ -641,7 +641,15 @@ fn ensure_block_allocated(
 /// s_blocks_count)`, not in a metadata range). A malformed pointer
 /// here is the same attacker-forged-image confused-deputy vector the
 /// read walker guards against.
-fn validate_existing_pointer(p: u32, geom: &Geometry, md: &MetadataMap) -> Result<(), i64> {
+///
+/// Exposed at `pub(super)` so the [`super::aops`] writepage path can
+/// reuse the same forgery check before reading or RMW-ing an indirect
+/// pointer slot.
+pub(super) fn validate_existing_pointer(
+    p: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+) -> Result<(), i64> {
     if !geom.in_data_range(p) || md.contains(p) {
         return Err(EIO);
     }
@@ -824,7 +832,10 @@ fn zero_block(super_: &Arc<Ext2Super>, abs: u32) -> Result<(), i64> {
 /// then `write_file_at` is the only site that needs to persist the
 /// fields it mutates (`i_size`, `i_blocks`, `i_mtime`, `i_ctime`,
 /// `i_block[]`). Using a local helper keeps the scope tight.
-fn flush_inode_slot(
+///
+/// Exposed at `pub(super)` so the [`super::aops`] writepage path
+/// reuses the same RMW discipline for its own metadata flush.
+pub(super) fn flush_inode_slot(
     super_: &Arc<Ext2Super>,
     ino: u32,
     meta: &super::inode::Ext2InodeMeta,

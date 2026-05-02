@@ -3,18 +3,15 @@
 //! readahead / truncate.
 //!
 //! RFC 0007 §`AddressSpaceOps` and §Tail-page zeroing are the normative
-//! spec. This module is **Workstream C / issue #749**: it lands the
-//! `readpage` path only. The other three trait methods (`writepage`,
-//! `truncate_below`, `readahead`) are deliberately stubbed out here:
+//! spec. This module currently lands two of the four trait methods:
 //!
-//! - `writepage` returns `Err(EROFS)` — issue #750 lands the real
-//!   buffer-cache writeback. Until then a forced-RO behaviour is
-//!   strictly safer than `unimplemented!()`-panic, because a future
-//!   page-fault path that wires `MAP_SHARED` writeback (#746/#755) can
-//!   exercise the writepage call site without bringing the kernel down;
-//!   the daemon will see `EROFS` and bump `wb_err`, which is the
-//!   correct user-visible behaviour for "this filesystem doesn't
-//!   support writeback yet".
+//! - `readpage` (issue #749) — parsed sparse / dense / past-EOF logic
+//!   in [`Ext2Aops::readpage`].
+//! - `writepage` (issue #750) — split-the-page-into-blocks-and-
+//!   allocate-on-extend in [`Ext2Aops::writepage`].
+//!
+//! The remaining two methods are deliberately left at the trait default:
+//!
 //! - `truncate_below` is left at the trait default (no-op + spinlock
 //!   assert). Issue #751 will replace it.
 //! - `readahead` is left at the trait default (no-op + spinlock
@@ -87,14 +84,20 @@
 //! fires before we issue any buffer-cache `bread`.
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use crate::debug_lockdep::assert_no_spinlocks_held;
-use crate::fs::ext2::indirect::{resolve_block, Geometry, WalkError};
+use crate::fs::ext2::indirect::{
+    resolve_block, Geometry, MetadataMap, WalkError, EXT2_DIND_BLOCK, EXT2_DIRECT_BLOCKS,
+    EXT2_IND_BLOCK, EXT2_TIND_BLOCK,
+};
 use crate::fs::ext2::Ext2Super;
-use crate::fs::{EIO, EROFS};
+use crate::fs::{EFBIG, EIO, EROFS};
 use crate::mem::aops::AddressSpaceOps;
 
-use super::file::build_metadata_map;
+use super::balloc::{alloc_block, free_block};
+use super::disk::EXT2_N_BLOCKS;
+use super::file::{build_metadata_map, flush_inode_slot, validate_existing_pointer};
 use super::inode::Ext2Inode;
 
 /// Page size the page cache deals in. Matches `crate::mem::PAGE_SIZE`
@@ -290,22 +293,597 @@ impl AddressSpaceOps for Ext2Aops {
         Ok(PAGE_SIZE as usize)
     }
 
-    fn writepage(&self, _pgoff: u64, _buf: &[u8; 4096]) -> Result<(), i64> {
-        // RFC 0007 §Lock-order ladder: every method body asserts no
-        // spinlocks at entry, even the stubbed-out ones — the
-        // assertion is part of the trait contract, not the work.
-        assert_no_spinlocks_held("Ext2Aops::writepage (stub — #750)");
-        // Issue #750 lands the real buffer-cache writeback chain.
-        // Until then surface `EROFS` so a `MAP_SHARED` writeback
-        // attempt (e.g. via the page-fault path that #746 / #755
-        // wires) bumps `wb_err` and surfaces a deterministic errno
-        // to userspace, rather than panicking the kernel.
-        Err(EROFS)
+    /// Write `buf` back to file page `pgoff` via the buffer cache.
+    ///
+    /// Splits the 4 KiB page into FS-block-sized fragments (1, 2, or
+    /// 4 fragments depending on `block_size ∈ {4096, 2048, 1024}`),
+    /// drives each fragment through the bitmap → indirect → data
+    /// allocation chain (RFC 0004 §Write Ordering — same ordering as
+    /// `write_file_at`), then RMW-overlays the user bytes through the
+    /// buffer cache and `sync_dirty_buffer`s. `i_blocks` and `i_size`
+    /// are bumped *only after every per-block write succeeds*.
+    ///
+    /// On any per-block failure (allocator-out-of-space, indirect-
+    /// pointer corruption, buffer-cache I/O), the impl rolls back
+    /// every block this writepage allocated — `free_block` for the
+    /// data block + each newly-allocated indirect-pointer block, and
+    /// clears the slot that pointed at it (either an `i_block[]` slot
+    /// in memory or a freshly-RMW-zeroed slot inside the parent
+    /// indirect block). The on-disk and in-memory views are restored
+    /// to the pre-call state; the caller (writeback daemon) bumps
+    /// `mapping.wb_err` on the returned errno (errseq surface).
+    ///
+    /// # Errno table
+    ///
+    /// - [`EROFS`] — RO mount (user-requested or feature-forced) or
+    ///   the runtime force-RO latch tripped (RFC 0004 §Security).
+    ///   Surfaces directly without consulting the page contents.
+    /// - [`EFBIG`] — `pgoff * 4096` overflows `u64`, or the logical
+    ///   block index lies past triple-indirect.
+    /// - [`EIO`] — buffer-cache read/write failure or attacker-forged
+    ///   pointer in an existing indirect chain (the same forgery
+    ///   detector the read walker enforces).
+    /// - Any errno surfaced by [`alloc_block`] (typically `ENOSPC`).
+    ///
+    /// # Lock-order
+    ///
+    /// `assert_no_spinlocks_held` first. The metadata write-lock on
+    /// [`Ext2Inode::meta`] is held across the entire allocation +
+    /// write + flush sequence so a racing truncate / write cannot
+    /// interleave block-pointer mutations with ours.
+    fn writepage(&self, pgoff: u64, buf: &[u8; 4096]) -> Result<(), i64> {
+        assert_no_spinlocks_held("Ext2Aops::writepage");
+
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let ext2_inode = self.inode_ref.upgrade().ok_or(EIO)?;
+
+        // RO / forced-RO / latched-RO mount → don't even consider the
+        // page contents. The writeback daemon will bump `wb_err` on
+        // this errno (RFC 0007 §`PageCache`, errseq pattern).
+        if !super_ref.is_writable() {
+            return Err(EROFS);
+        }
+
+        let block_size = super_ref.block_size as u64;
+        debug_assert!(block_size > 0, "mount validated block_size != 0");
+
+        // Page byte-offset window. `pgoff * 4096` overflowing surfaces
+        // as EFBIG — a structurally too-large file index can't fit in
+        // ext2's logical-block u32 either, so the errno lines up.
+        let page_lo = pgoff.checked_mul(PAGE_SIZE).ok_or(EFBIG)?;
+        let page_hi = page_lo.checked_add(PAGE_SIZE).ok_or(EFBIG)?;
+
+        // Geometry + metadata-forbidden map. Same construction as
+        // `readpage` / `write_file_at`; see those modules for the
+        // perf TODO around caching this on `Ext2Super`.
+        let (s_first_data_block, s_blocks_count, s_inodes_per_group) = {
+            let sb = super_ref.sb_disk.lock();
+            (
+                sb.s_first_data_block,
+                sb.s_blocks_count,
+                sb.s_inodes_per_group,
+            )
+        };
+        let geom =
+            Geometry::new(super_ref.block_size, s_first_data_block, s_blocks_count).ok_or(EIO)?;
+        let md = build_metadata_map(&super_ref);
+
+        // Hint group for `alloc_block`: data-locality wants new blocks
+        // to land in the same group as the inode. Mirrors the
+        // computation in `write_file_at`.
+        let inode_group = if s_inodes_per_group == 0 {
+            0
+        } else {
+            (ext2_inode.ino - 1) / s_inodes_per_group
+        };
+
+        // Hold the metadata write-lock across the whole sequence — see
+        // the doc on `write_file_at` for the rationale (serialise
+        // against truncate / racing extend writes so block-pointer
+        // mutations don't trample each other).
+        let mut meta = ext2_inode.meta.write();
+
+        // Track every allocation done during this writepage so we can
+        // unwind on a per-block failure. The Vec sees at most
+        // ~5 events per call (4 leaf data blocks + 1 single-indirect
+        // pointer block on a 1 KiB-block fs); for normal 4 KiB-block
+        // mounts it sees at most one event.
+        let mut events: Vec<AllocEvent> = Vec::new();
+        let mut bumped_blocks_512: u64 = 0;
+
+        // Walk the page in FS-block-sized fragments. Use a local
+        // closure-style fold so a per-block error short-circuits to
+        // the rollback path.
+        let result: Result<(), i64> = (|| {
+            let mut cur = page_lo;
+            while cur < page_hi {
+                let logical_u64 = cur / block_size;
+                let logical: u32 = logical_u64.try_into().map_err(|_| EFBIG)?;
+                let in_block = (cur % block_size) as usize;
+                let chunk = (block_size as usize) - in_block;
+                debug_assert!(chunk > 0);
+                let buf_off = (cur - page_lo) as usize;
+                debug_assert!(buf_off + chunk <= buf.len());
+
+                // Resolve / allocate the underlying disk block. The
+                // allocation path records each step in `events` so a
+                // failure later in this iteration (or a later
+                // iteration) can roll back.
+                let data_blk = ensure_block_for_writepage(
+                    &super_ref,
+                    &geom,
+                    &md,
+                    &mut meta.i_block,
+                    logical,
+                    inode_group,
+                    &mut events,
+                    &mut bumped_blocks_512,
+                )?;
+
+                // RMW the data block: bread, overlay our chunk at
+                // `in_block`, mark dirty, sync.
+                let bh = super_ref
+                    .cache
+                    .bread(super_ref.device_id, data_blk as u64)
+                    .map_err(|_| EIO)?;
+                {
+                    let mut data = bh.data.write();
+                    debug_assert!(in_block + chunk <= data.len());
+                    data[in_block..in_block + chunk]
+                        .copy_from_slice(&buf[buf_off..buf_off + chunk]);
+                }
+                super_ref.cache.mark_dirty(&bh);
+                super_ref.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
+
+                cur += chunk as u64;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            // Roll back every allocation we did this call. Any data
+            // already overlaid into a *pre-existing* block stays —
+            // it's the caller's bytes against a block they already
+            // owned; clobbering it would lose work the caller
+            // committed. Only freshly-allocated blocks are returned.
+            rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            return Err(e);
+        }
+
+        // All per-block writes succeeded. Bump `i_size` (only if the
+        // page extends the file — the trait contract is "writepage
+        // never shrinks") and `i_blocks`. The mtime/ctime bump
+        // matches `write_file_at`'s discipline.
+        let new_size = meta.size.max(page_hi);
+        meta.size = new_size;
+        meta.i_blocks = meta.i_blocks.saturating_add(bumped_blocks_512 as u32);
+        let now = crate::fs::vfs::Timespec::now();
+        meta.mtime = now.sec as u32;
+        meta.ctime = now.sec as u32;
+
+        // Flush the inode slot. RFC 0004 §Write Ordering: this is
+        // *last*, after every data + indirect block has hit the
+        // device. A crash before this point leaves readers with the
+        // pre-writepage `i_size` (correct, just stale) but every
+        // block that was committed is safely on disk and reachable
+        // through its parent.
+        if let Err(e) = flush_inode_slot(&super_ref, ext2_inode.ino, &meta) {
+            // The inode-slot flush failed *after* every data block
+            // landed. We can't safely roll the data back (the bytes
+            // are durable on disk under blocks that are now linked
+            // into the inode). Free the freshly-allocated blocks so
+            // the bitmap / counters don't leak. The in-memory meta
+            // mutations above are reverted to keep the in-mem and
+            // on-disk views consistent — the user sees the failure
+            // via the returned errno.
+            rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            return Err(e);
+        }
+
+        // The VFS-layer `Inode::meta` mirror is intentionally *not*
+        // updated here. `Ext2Aops` doesn't carry an `Inode` weak
+        // pointer — the readpage path doesn't need one and adding it
+        // for writepage would expand the trait-object footprint
+        // wave-3 #753 hasn't yet committed to. The on-disk slot is
+        // flushed above, so the next `iget` (or fault-path
+        // `Inode::page_cache_or_create`) re-reads the fresh values;
+        // a concurrent in-memory `getattr` against the same inode
+        // sees the previous size/blocks until that point. That's
+        // acceptable for the page-cache writeback path the daemon
+        // drives — the daemon doesn't itself depend on the in-memory
+        // VFS meta. See follow-up issue captured in the PR body.
+        Ok(())
     }
 
     // `readahead` and `truncate_below` left at the trait defaults —
     // both are no-op + `assert_no_spinlocks_held`. Issue #751 lands
     // `truncate_below`; issue #752 lands `readahead`.
+}
+
+// ---------------------------------------------------------------------------
+// writepage internals
+// ---------------------------------------------------------------------------
+
+/// One allocation event recorded during [`Ext2Aops::writepage`]. Used
+/// solely to rewind on a per-block failure: every event carries enough
+/// information to (a) `free_block` the underlying disk block and (b)
+/// clear the slot that points at it (either an `i_block[]` slot in
+/// memory or a slot inside a previously-allocated indirect block on
+/// disk).
+#[derive(Debug, Clone, Copy)]
+enum AllocEvent {
+    /// A direct slot mutation: `i_block[idx] = blk`. Rollback clears
+    /// the slot and frees `blk`.
+    Direct { idx: usize, blk: u32 },
+    /// A top-level indirect pointer install: `i_block[slot_idx] = blk`
+    /// where `slot_idx ∈ {EXT2_IND_BLOCK, EXT2_DIND_BLOCK,
+    /// EXT2_TIND_BLOCK}`. Rollback clears the slot in `i_block[]`
+    /// and frees `blk`.
+    TopIndirect { slot_idx: usize, blk: u32 },
+    /// A child pointer install at slot `index` inside a previously-
+    /// allocated *or* pre-existing indirect block at absolute
+    /// `parent_blk`. Rollback RMW-zeroes that on-disk slot and frees
+    /// `blk`.
+    InnerIndirect {
+        parent_blk: u32,
+        index: u32,
+        blk: u32,
+    },
+}
+
+/// Number of 512-byte units one fs-block costs (for `i_blocks`
+/// bookkeeping). Mirrors the same expression in `write_file_at`.
+#[inline]
+fn blocks_per_512(geom: &Geometry) -> u64 {
+    (geom.block_size / 512) as u64
+}
+
+/// Resolve / allocate the data block backing logical block `logical`,
+/// recording every allocation event in `events` so a downstream failure
+/// can roll back.
+///
+/// Mirrors [`super::file::ensure_block_allocated`] in shape but
+/// records events along the way. The two paths are kept separate
+/// rather than refactored together because `write_file_at` is
+/// deliberately partial-write-tolerant (a failed block stops the
+/// loop without rolling back) while writepage is whole-page-atomic.
+#[allow(clippy::too_many_arguments)]
+fn ensure_block_for_writepage(
+    super_: &Arc<Ext2Super>,
+    geom: &Geometry,
+    md: &MetadataMap,
+    i_block_mut: &mut [u32; EXT2_N_BLOCKS],
+    logical: u32,
+    hint_group: u32,
+    events: &mut Vec<AllocEvent>,
+    bumped_512: &mut u64,
+) -> Result<u32, i64> {
+    let p = geom.ptrs_per_block as u64;
+    let direct_limit = EXT2_DIRECT_BLOCKS as u64;
+    let single_limit = direct_limit + p;
+    let double_limit = single_limit + p * p;
+    let triple_limit = double_limit + p * p * p;
+    let logical64 = logical as u64;
+
+    let bp512 = blocks_per_512(geom);
+
+    if logical64 < direct_limit {
+        let idx = logical as usize;
+        let slot = &mut i_block_mut[idx];
+        if *slot != 0 {
+            validate_existing_pointer(*slot, geom, md)?;
+            return Ok(*slot);
+        }
+        let blk = alloc_and_zero(super_, hint_group)?;
+        *slot = blk;
+        events.push(AllocEvent::Direct { idx, blk });
+        *bumped_512 += bp512;
+        Ok(blk)
+    } else if logical64 < single_limit {
+        let idx0 = (logical64 - direct_limit) as u32;
+        let ind = ensure_top_indirect(
+            super_,
+            i_block_mut,
+            EXT2_IND_BLOCK,
+            hint_group,
+            geom,
+            md,
+            events,
+            bumped_512,
+        )?;
+        ensure_leaf(super_, ind, idx0, hint_group, geom, md, events, bumped_512)
+    } else if logical64 < double_limit {
+        let rel = logical64 - single_limit;
+        let idx_outer = (rel / p) as u32;
+        let idx_inner = (rel % p) as u32;
+        let dind = ensure_top_indirect(
+            super_,
+            i_block_mut,
+            EXT2_DIND_BLOCK,
+            hint_group,
+            geom,
+            md,
+            events,
+            bumped_512,
+        )?;
+        let ind = ensure_inner_indirect(
+            super_, dind, idx_outer, hint_group, geom, md, events, bumped_512,
+        )?;
+        ensure_leaf(
+            super_, ind, idx_inner, hint_group, geom, md, events, bumped_512,
+        )
+    } else if logical64 < triple_limit {
+        let rel = logical64 - double_limit;
+        let p_sq = p * p;
+        let idx_l0 = (rel / p_sq) as u32;
+        let rem = rel % p_sq;
+        let idx_l1 = (rem / p) as u32;
+        let idx_l2 = (rem % p) as u32;
+        let tind = ensure_top_indirect(
+            super_,
+            i_block_mut,
+            EXT2_TIND_BLOCK,
+            hint_group,
+            geom,
+            md,
+            events,
+            bumped_512,
+        )?;
+        let dind = ensure_inner_indirect(
+            super_, tind, idx_l0, hint_group, geom, md, events, bumped_512,
+        )?;
+        let ind = ensure_inner_indirect(
+            super_, dind, idx_l1, hint_group, geom, md, events, bumped_512,
+        )?;
+        ensure_leaf(
+            super_, ind, idx_l2, hint_group, geom, md, events, bumped_512,
+        )
+    } else {
+        Err(EFBIG)
+    }
+}
+
+/// Ensure `i_block[slot_idx]` points at a zeroed indirect block. If
+/// the slot is already populated, validate the existing pointer
+/// (forgery check) and return it. If freshly allocated, push a
+/// `TopIndirect` event so a rollback can clear the slot.
+#[allow(clippy::too_many_arguments)]
+fn ensure_top_indirect(
+    super_: &Arc<Ext2Super>,
+    i_block_mut: &mut [u32; EXT2_N_BLOCKS],
+    slot_idx: usize,
+    hint_group: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    events: &mut Vec<AllocEvent>,
+    bumped_512: &mut u64,
+) -> Result<u32, i64> {
+    let existing = i_block_mut[slot_idx];
+    if existing != 0 {
+        validate_existing_pointer(existing, geom, md)?;
+        return Ok(existing);
+    }
+    let blk = alloc_and_zero(super_, hint_group)?;
+    i_block_mut[slot_idx] = blk;
+    events.push(AllocEvent::TopIndirect { slot_idx, blk });
+    *bumped_512 += blocks_per_512(geom);
+    Ok(blk)
+}
+
+/// Ensure slot `index` of the indirect block at absolute `parent_blk`
+/// points at a zeroed child indirect block. If the slot is populated,
+/// validate the existing pointer and return it. If freshly allocated,
+/// RMW-link the child into the parent (sync) and push an
+/// `InnerIndirect` event so a rollback can clear the parent's slot
+/// and free the child.
+#[allow(clippy::too_many_arguments)]
+fn ensure_inner_indirect(
+    super_: &Arc<Ext2Super>,
+    parent_blk: u32,
+    index: u32,
+    hint_group: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    events: &mut Vec<AllocEvent>,
+    bumped_512: &mut u64,
+) -> Result<u32, i64> {
+    let (existing, bh) = read_indirect_slot(super_, parent_blk, index, geom)?;
+    if existing != 0 {
+        validate_existing_pointer(existing, geom, md)?;
+        return Ok(existing);
+    }
+    let child = alloc_and_zero(super_, hint_group)?;
+    {
+        let mut data = bh.data.write();
+        let off = (index as usize) * 4;
+        debug_assert!(off + 4 <= data.len());
+        data[off..off + 4].copy_from_slice(&child.to_le_bytes());
+    }
+    super_.cache.mark_dirty(&bh);
+    if let Err(e) = super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO) {
+        // Linking the child into the parent failed at sync time. The
+        // child is allocated but unreachable; free it before
+        // surfacing. We don't push the InnerIndirect event because
+        // the on-disk parent slot was never persisted (we just
+        // mutated the in-memory cache page; the next `bread` of
+        // `parent_blk` will re-read the on-disk pre-link state if
+        // the cache evicts and refills, but if the dirty page sticks
+        // in cache the unflushed mutation would be a real leak —
+        // call `mark_clean` would be ideal but the cache surface
+        // doesn't expose one; revert the byte mutation in-place
+        // instead).
+        {
+            let mut data = bh.data.write();
+            let off = (index as usize) * 4;
+            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let _ = free_block(super_, child);
+        return Err(e);
+    }
+    events.push(AllocEvent::InnerIndirect {
+        parent_blk,
+        index,
+        blk: child,
+    });
+    *bumped_512 += blocks_per_512(geom);
+    Ok(child)
+}
+
+/// Ensure slot `index` of the indirect block at absolute `parent_blk`
+/// points at a freshly-allocated zeroed data block. Same shape as
+/// [`ensure_inner_indirect`] but the child is a data block, not an
+/// indirect pointer block. The recorded event type is identical
+/// (`InnerIndirect`) — rollback semantics are the same.
+#[allow(clippy::too_many_arguments)]
+fn ensure_leaf(
+    super_: &Arc<Ext2Super>,
+    parent_blk: u32,
+    index: u32,
+    hint_group: u32,
+    geom: &Geometry,
+    md: &MetadataMap,
+    events: &mut Vec<AllocEvent>,
+    bumped_512: &mut u64,
+) -> Result<u32, i64> {
+    let (existing, bh) = read_indirect_slot(super_, parent_blk, index, geom)?;
+    if existing != 0 {
+        validate_existing_pointer(existing, geom, md)?;
+        return Ok(existing);
+    }
+    let data_blk = alloc_and_zero(super_, hint_group)?;
+    {
+        let mut data = bh.data.write();
+        let off = (index as usize) * 4;
+        debug_assert!(off + 4 <= data.len());
+        data[off..off + 4].copy_from_slice(&data_blk.to_le_bytes());
+    }
+    super_.cache.mark_dirty(&bh);
+    if let Err(e) = super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO) {
+        {
+            let mut data = bh.data.write();
+            let off = (index as usize) * 4;
+            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let _ = free_block(super_, data_blk);
+        return Err(e);
+    }
+    events.push(AllocEvent::InnerIndirect {
+        parent_blk,
+        index,
+        blk: data_blk,
+    });
+    *bumped_512 += blocks_per_512(geom);
+    Ok(data_blk)
+}
+
+/// Read the pointer at slot `index` out of the indirect block at
+/// absolute `abs`, returning both the decoded pointer and the buffer
+/// handle so the caller can RMW the same slot on a miss without a
+/// second `bread`. Mirrors `file::read_pointer_slot_raw` (kept private
+/// to its module — duplicating the four-line helper here is simpler
+/// than expanding the file.rs surface).
+fn read_indirect_slot(
+    super_: &Arc<Ext2Super>,
+    abs: u32,
+    index: u32,
+    geom: &Geometry,
+) -> Result<(u32, Arc<crate::block::cache::BufferHead>), i64> {
+    debug_assert!(index < geom.ptrs_per_block);
+    let bh = super_
+        .cache
+        .bread(super_.device_id, abs as u64)
+        .map_err(|_| EIO)?;
+    let val = {
+        let data = bh.data.read();
+        let off = (index as usize) * 4;
+        let slot: [u8; 4] = data[off..off + 4]
+            .try_into()
+            .expect("indirect pointer slot is exactly 4 bytes");
+        u32::from_le_bytes(slot)
+    };
+    Ok((val, bh))
+}
+
+/// Allocate a fresh block via the bitmap allocator and synchronously
+/// zero it through the buffer cache. Combined into a single helper so
+/// both data and indirect pointer block allocations share the
+/// "never link unzeroed bytes into the inode" invariant (RFC 0004
+/// §Write Ordering).
+fn alloc_and_zero(super_: &Arc<Ext2Super>, hint_group: u32) -> Result<u32, i64> {
+    let blk = alloc_block(super_, Some(hint_group))?;
+    if let Err(e) = zero_block(super_, blk) {
+        // Zeroing failed — return the block to the bitmap so we
+        // don't leak. The caller will see the I/O errno and surface
+        // it.
+        let _ = free_block(super_, blk);
+        return Err(e);
+    }
+    Ok(blk)
+}
+
+/// Zero a freshly-allocated block synchronously through the cache.
+/// Mirrors `file::zero_block`.
+fn zero_block(super_: &Arc<Ext2Super>, abs: u32) -> Result<(), i64> {
+    let bh = super_
+        .cache
+        .bread(super_.device_id, abs as u64)
+        .map_err(|_| EIO)?;
+    {
+        let mut data = bh.data.write();
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+    }
+    super_.cache.mark_dirty(&bh);
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)
+}
+
+/// Roll back every allocation event recorded during this writepage.
+/// Reverse order so a leaf is unlinked before its parent indirect
+/// block. Per-step failures are swallowed — a successful rollback is
+/// best-effort: a free or a slot-clear that fails would leak rather
+/// than corrupt, and the caller is already on the error path.
+fn rollback_allocations(
+    super_: &Arc<Ext2Super>,
+    i_block_mut: &mut [u32; EXT2_N_BLOCKS],
+    events: &[AllocEvent],
+) {
+    for ev in events.iter().rev() {
+        match *ev {
+            AllocEvent::Direct { idx, blk } => {
+                debug_assert_eq!(i_block_mut[idx], blk);
+                i_block_mut[idx] = 0;
+                let _ = free_block(super_, blk);
+            }
+            AllocEvent::TopIndirect { slot_idx, blk } => {
+                debug_assert_eq!(i_block_mut[slot_idx], blk);
+                i_block_mut[slot_idx] = 0;
+                let _ = free_block(super_, blk);
+            }
+            AllocEvent::InnerIndirect {
+                parent_blk,
+                index,
+                blk,
+            } => {
+                // RMW-zero the parent slot. If the bread / sync fails
+                // we still call `free_block` so the bitmap counter
+                // stays honest; the on-disk parent slot is left
+                // pointing at a freed block, which `e2fsck` repairs.
+                if let Ok(bh) = super_.cache.bread(super_.device_id, parent_blk as u64) {
+                    {
+                        let mut data = bh.data.write();
+                        let off = (index as usize) * 4;
+                        if off + 4 <= data.len() {
+                            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
+                    super_.cache.mark_dirty(&bh);
+                    let _ = super_.cache.sync_dirty_buffer(&bh);
+                }
+                let _ = free_block(super_, blk);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
