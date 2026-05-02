@@ -433,6 +433,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_mmap"
+harness = false
+required-features = ["ext2", "page_cache"]
+
+[[test]]
 name = "ext2_orphan_chain"
 harness = false
 required-features = ["ext2"]
