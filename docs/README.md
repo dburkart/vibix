@@ -18,6 +18,7 @@ sequence, and public API for its subsystem.
 | [input.md](input.md) | PS/2 keyboard and ring buffer | `kernel/src/input.rs` |
 | [tasks.md](tasks.md) | Preemptive scheduler + blocking primitives | `kernel/src/task/`, `kernel/src/sync/` |
 | [design/scheduler-seam.md](design/scheduler-seam.md) | Scheduler / IRQ seam (RFC 0005) — quick reference | `kernel/src/task/env.rs` |
+| [design/simulator.md](design/simulator.md) | Host-side DST simulator (RFC 0006) — quick reference | `simulator/` |
 | [diagnostics.md](diagnostics.md) | klog ring, ksymtab, backtrace unwinder | `kernel/src/klog.rs`, `kernel/src/ksymtab.rs`, `kernel/src/arch/x86_64/backtrace.rs` |
 | *(see below)* | Virtual filesystem + per-process fd table | `kernel/src/fs/vfs/`, `kernel/src/fs/mod.rs` |
 
