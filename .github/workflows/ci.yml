@@ -183,10 +183,24 @@ jobs:
       # `BTreeMap` drain order, or the ChaCha8 sub-stream derivation
       # would surface as a diff between the two invocations rather
       # than a flaky failure on one of them.
+      #
+      # RFC 0006 / issue #723: this same `cargo test -p simulator`
+      # invocation also runs the fast-suite integration tests under
+      # `simulator/tests/` — `fast_suite.rs` (the bounded-seed
+      # regression corpus per RFC §"CI perf budget") and
+      # `regression_501.rs` (the captured-repro guard for #501). The
+      # per-PR wall-clock budget for the simulator test surface is
+      # **≤ 90 s** including build time on a warm cache; the
+      # `timeout-minutes: 2` on each step is the hard ceiling. A
+      # regression here surfaces as a step-level timeout failure,
+      # not as a flaky test, so a runaway loop fails fast instead of
+      # eating the job's 15-min cap.
       - name: cargo test -p simulator (deterministic — first pass)
         run: cargo test -p simulator
+        timeout-minutes: 2
       - name: cargo test -p simulator (deterministic — second pass)
         run: cargo test -p simulator
+        timeout-minutes: 2
 
   unit-tests:
     name: host unit tests
