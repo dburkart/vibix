@@ -1412,8 +1412,8 @@ fn prot_pte_from_prot_user(prot: u32) -> u64 {
 /// | `off + len_rounded` overflows `i64` (`off_t`) | `EOVERFLOW` |
 /// | `off + len` past `i_size` | succeeds (SIGBUS at fault per POSIX) |
 unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
-    use crate::fs::{EBADF, EEXIST, EINVAL, ENODEV, ENOMEM};
     use crate::fs::vfs::inode::InodeKind;
+    use crate::fs::{EBADF, EEXIST, EINVAL, ENODEV, ENOMEM};
     use crate::mem::pf::{
         validate_user_range, AddrAlign, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
         MAP_GROWSDOWN, MAP_PRIVATE, MAP_SHARED, MAP_STACK, PROT_EXEC, PROT_READ, PROT_WRITE,
@@ -1539,23 +1539,16 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
         // memory location — `fcntl(F_SETFL)` cannot mutate access-mode
         // bits per POSIX, so the snapshot is effectively a constant
         // for the OpenFile's lifetime.
-        let open_mode_acc = of
-            .flags
-            .load(core::sync::atomic::Ordering::Relaxed)
-            & crate::fs::flags::O_ACCMODE;
+        let open_mode_acc =
+            of.flags.load(core::sync::atomic::Ordering::Relaxed) & crate::fs::flags::O_ACCMODE;
 
         // Run the pure errno gate. Returns the page-aligned `(off, len)`
         // on success or the negative errno on rejection.
-        let (off_aligned, len_pages) = match crate::mem::pf::validate_file_mmap_args(
-            prot,
-            share,
-            off,
-            len,
-            open_mode_acc,
-        ) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+        let (off_aligned, len_pages) =
+            match crate::mem::pf::validate_file_mmap_args(prot, share, off, len, open_mode_acc) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
 
         // Dispatch to the per-FS hook. The default `FileOps::mmap`
         // returns `ENODEV` so non-mmappable file types (and ext2 until
@@ -1611,7 +1604,6 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
     guard.insert(vma);
     start as i64
 }
-
 
 /// `munmap(addr, len)` — POSIX-conformant: returns 0 on success and on
 /// holes (partly-or-wholly unmapped ranges). `-EINVAL` only for the

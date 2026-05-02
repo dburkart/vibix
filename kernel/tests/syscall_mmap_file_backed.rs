@@ -35,12 +35,8 @@ use vibix::fs::vfs::open_file::OpenFile;
 use vibix::fs::vfs::ops::{FileOps, InodeOps, SetAttr, Stat, StatFs, SuperOps};
 use vibix::fs::vfs::super_block::{SbActiveGuard, SbFlags, SuperBlock};
 use vibix::fs::vfs::{FsId, VfsBackend};
-use vibix::fs::{
-    EACCES, EBADF, EINVAL, ENODEV, EOVERFLOW, FileBackend, FileDescription,
-};
-use vibix::mem::pf::{
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE,
-};
+use vibix::fs::{FileBackend, FileDescription, EACCES, EBADF, EINVAL, ENODEV, EOVERFLOW};
+use vibix::mem::pf::{MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE};
 use vibix::mem::vmatree::{ProtUser, Share};
 use vibix::mem::vmobject::{AnonObject, VmObject};
 use vibix::{
@@ -184,12 +180,7 @@ impl FileOps for DefaultFileOps {}
 /// Build a fresh `OpenFile` against an inode of the requested kind
 /// using the requested `FileOps`. Inserts the resulting `VfsBackend`
 /// into the current task's fd table and returns the allocated fd.
-fn install_fd(
-    kind: InodeKind,
-    file_ops: Arc<dyn FileOps>,
-    open_flags: u32,
-    file_size: u64,
-) -> u32 {
+fn install_fd(kind: InodeKind, file_ops: Arc<dyn FileOps>, open_flags: u32, file_size: u64) -> u32 {
     let sb = Arc::new(SuperBlock::new(
         FsId(746),
         Arc::new(StubSuperOps),
@@ -246,12 +237,7 @@ fn file_mmap_dir_inode_enodev() {
     // A directory inode is not mmappable per RFC 0007 §Errno table —
     // sys_mmap pre-empts FileOps::mmap with ENODEV regardless of what
     // the FS impl returns.
-    let fd = install_fd(
-        InodeKind::Dir,
-        Arc::new(MmapableOps),
-        flags::O_RDWR,
-        0,
-    );
+    let fd = install_fd(InodeKind::Dir, Arc::new(MmapableOps), flags::O_RDWR, 0);
     let r = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i64, 0);
     assert_eq!(
         r, ENODEV,
@@ -281,34 +267,19 @@ fn file_mmap_default_fileops_propagates_enodev() {
 // ── Tests: EINVAL / EOVERFLOW gates ───────────────────────────────────
 
 fn file_mmap_unaligned_off_einval() {
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDWR,
-        4096,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDWR, 4096);
     let r = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i64, 0x100);
     assert_eq!(r, EINVAL, "non-aligned off must trip EINVAL, got {}", r);
 }
 
 fn file_mmap_zero_len_einval() {
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDWR,
-        4096,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDWR, 4096);
     let r = mmap(0, 0, PROT_READ, MAP_PRIVATE, fd as i64, 0);
     assert_eq!(r, EINVAL, "len=0 must trip EINVAL, got {}", r);
 }
 
 fn file_mmap_off_plus_len_overflow_eoverflow() {
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDWR,
-        4096,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDWR, 4096);
     // off near i64::MAX + a multi-page len overflows i64 → EOVERFLOW.
     let near_max = (i64::MAX as u64) & !0xFFF;
     let r = mmap(0, 8192, PROT_READ, MAP_PRIVATE, fd as i64, near_max);
@@ -323,20 +294,8 @@ fn file_mmap_off_plus_len_overflow_eoverflow() {
 
 fn file_mmap_shared_write_on_rdonly_eacces() {
     // MAP_SHARED + PROT_WRITE requires O_RDWR. O_RDONLY → EACCES.
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDONLY,
-        4096,
-    );
-    let r = mmap(
-        0,
-        4096,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        fd as i64,
-        0,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDONLY, 4096);
+    let r = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i64, 0);
     assert_eq!(
         r, EACCES,
         "MAP_SHARED+PROT_WRITE on O_RDONLY must trip EACCES, got {}",
@@ -347,20 +306,8 @@ fn file_mmap_shared_write_on_rdonly_eacces() {
 fn file_mmap_shared_write_on_wronly_eacces() {
     // MAP_SHARED + PROT_WRITE on O_WRONLY → EACCES (write-fault path
     // can't service the read-on-miss).
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_WRONLY,
-        4096,
-    );
-    let r = mmap(
-        0,
-        4096,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        fd as i64,
-        0,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_WRONLY, 4096);
+    let r = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i64, 0);
     assert_eq!(
         r, EACCES,
         "MAP_SHARED+PROT_WRITE on O_WRONLY must trip EACCES, got {}",
@@ -371,20 +318,8 @@ fn file_mmap_shared_write_on_wronly_eacces() {
 fn file_mmap_private_write_on_wronly_eacces() {
     // MAP_PRIVATE + PROT_WRITE on O_WRONLY → EACCES (CoW needs to
     // read the master page first).
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_WRONLY,
-        4096,
-    );
-    let r = mmap(
-        0,
-        4096,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE,
-        fd as i64,
-        0,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_WRONLY, 4096);
+    let r = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd as i64, 0);
     assert_eq!(
         r, EACCES,
         "MAP_PRIVATE+PROT_WRITE on O_WRONLY must trip EACCES, got {}",
@@ -398,14 +333,13 @@ fn file_mmap_private_read_succeeds() {
     // MAP_PRIVATE + PROT_READ on a Reg file with a custom FileOps::mmap
     // impl: sys_mmap calls the impl, gets back an `Arc<dyn VmObject>`,
     // and lands a VMA at the chosen VA.
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDONLY,
-        4096,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDONLY, 4096);
     let r = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i64, 0);
-    assert!(r > 0, "file-backed MAP_PRIVATE+PROT_READ must succeed, got {}", r);
+    assert!(
+        r > 0,
+        "file-backed MAP_PRIVATE+PROT_READ must succeed, got {}",
+        r
+    );
     let va = r as u64;
     assert_eq!(va & 0xFFF, 0, "returned VA must be page-aligned: {:#x}", va);
     // VMA must be visible in the current address space.
@@ -421,20 +355,8 @@ fn file_mmap_private_read_succeeds() {
 fn file_mmap_shared_rdwr_succeeds() {
     // MAP_SHARED + PROT_WRITE on O_RDWR — the only combination the
     // EACCES gate permits with PROT_WRITE.
-    let fd = install_fd(
-        InodeKind::Reg,
-        Arc::new(MmapableOps),
-        flags::O_RDWR,
-        8192,
-    );
-    let r = mmap(
-        0,
-        8192,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        fd as i64,
-        0,
-    );
+    let fd = install_fd(InodeKind::Reg, Arc::new(MmapableOps), flags::O_RDWR, 8192);
+    let r = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i64, 0);
     assert!(r > 0, "MAP_SHARED+RW on O_RDWR must succeed, got {}", r);
     let va = r as u64;
     let aspace = vibix::task::current_address_space();

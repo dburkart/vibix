@@ -691,34 +691,16 @@ mod tests {
             // path must read the page on miss before mutating, so O_WRONLY
             // cannot service the read.
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Shared,
-                    0,
-                    4096,
-                    O_RDONLY,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Shared, 0, 4096, O_RDONLY,),
                 Err(EACCES),
             );
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Shared,
-                    0,
-                    4096,
-                    O_WRONLY,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Shared, 0, 4096, O_WRONLY,),
                 Err(EACCES),
             );
             // O_RDWR succeeds.
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Shared,
-                    0,
-                    4096,
-                    O_RDWR,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Shared, 0, 4096, O_RDWR,),
                 Ok((0, 1)),
             );
         }
@@ -728,33 +710,15 @@ mod tests {
             // MAP_PRIVATE + PROT_WRITE: O_WRONLY rejected (CoW needs to
             // read master page first); O_RDONLY *and* O_RDWR succeed.
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Private,
-                    0,
-                    4096,
-                    O_WRONLY,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Private, 0, 4096, O_WRONLY,),
                 Err(EACCES),
             );
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Private,
-                    0,
-                    4096,
-                    O_RDONLY,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Private, 0, 4096, O_RDONLY,),
                 Ok((0, 1)),
             );
             assert_eq!(
-                validate_file_mmap_args(
-                    PROT_READ | PROT_WRITE,
-                    Share::Private,
-                    0,
-                    4096,
-                    O_RDWR,
-                ),
+                validate_file_mmap_args(PROT_READ | PROT_WRITE, Share::Private, 0, 4096, O_RDWR,),
                 Ok((0, 1)),
             );
         }
