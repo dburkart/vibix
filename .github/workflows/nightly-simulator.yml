@@ -1,0 +1,388 @@
+name: nightly-simulator
+
+# RFC 0006 §"CI perf budget" / issue #723. Schedules the host-side DST
+# simulator's randomized exploration sweep at 10_000 iterations against
+# a randomized master seed (~30 min wall-clock budget). On failure the
+# job uploads a `(seed, FaultPlan, trace.json, panic_log)` artifact and
+# auto-files a tracking issue with `priority:P0` + `area:testing`.
+#
+# Trace attribution under dirty trees (RFC 0006 §"Trace attribution under
+# dirty trees" / Security review B2): the artifact filename includes the
+# git rev and a `dirty` suffix when `git status --porcelain` reports a
+# non-empty working tree. CI runs from a clean checkout so the
+# `dirty` suffix should never appear on a scheduled run; the suffix
+# exists so that local artifacts captured against a dirty tree are
+# unambiguously labeled as such when they arrive at the issue tracker.
+#
+# This workflow is the *upper* tier of the simulator's two-tier CI
+# layout. The lower tier (per-PR fast suite) lives in `ci.yml`'s
+# `host-build` job and runs on every PR within a 90 s wall-clock
+# budget. A failure at the lower tier means a fast-deterministic
+# regression; a failure at this nightly tier means a randomized
+# exploration found a case the fast-deterministic surface did not
+# cover. Both are P0 against the simulator itself but route to
+# different humans on the on-call rotation.
+
+on:
+  schedule:
+    # 04:17 UTC nightly — staggered away from `nightly-soak.yml`
+    # (03:42 UTC), `smoke-soak.yml` (08:17 UTC), and `ci.yml` so the
+    # GitHub-hosted runner queue stays unstacked.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: 'Number of randomized cases to run (default 10000)'
+        required: false
+        default: '10000'
+      master_seed:
+        description: |
+          Master seed override (decimal or 0x-prefixed hex). When set, the
+          run becomes a deterministic replay of a previously-captured
+          failing master seed. Leave blank for a fresh randomized seed.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  # Required for the auto-file step (`gh issue create` on failure).
+  issues: write
+  # Required for the artifact upload action.
+  actions: read
+
+concurrency:
+  # Schedule and dispatch runs are independent data points; never
+  # cancel a scheduled run when a human re-triggers via dispatch.
+  group: nightly-simulator-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  nightly-sweep:
+    name: nightly randomized sweep
+    runs-on: ubuntu-latest
+    # The RFC 0006 perf table commits to "≈10–20 min on 16-core CI"
+    # for the nightly sweep (`10k seeds × 100k ticks` rayon-parallel).
+    # GitHub-hosted runners are 4-core / 16 GB so we run a 10k-case
+    # sweep at 10k ticks/case (bounded by the v1 surface today).
+    # 45 min spike absorbs first-time cargo cold-cache + runner-load
+    # variance. When rayon-over-seeds lands the per-case ticks bump
+    # to 100k and this timeout will need a re-tune.
+    timeout-minutes: 45
+    env:
+      VIBIX_SIM_NIGHTLY_CASES: ${{ github.event.inputs.cases || '10000' }}
+      VIBIX_SIM_MASTER_SEED: ${{ github.event.inputs.master_seed || '' }}
+    outputs:
+      master_seed: ${{ steps.run.outputs.master_seed }}
+      git_rev: ${{ steps.attr.outputs.git_rev }}
+      dirty_suffix: ${{ steps.attr.outputs.dirty_suffix }}
+      artifact_name: ${{ steps.attr.outputs.artifact_name }}
+      sweep_status: ${{ steps.run.outputs.status }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Need full history so the auto-file step can include the
+          # `Closes` / commit-context line in the issue body. A shallow
+          # clone is fine for the build itself but the issue body
+          # benefits from `git log` access.
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly-2026-04-16
+          components: rust-src, llvm-tools, rustfmt, clippy
+          targets: x86_64-unknown-none, x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Share with `host-build` in `ci.yml` so the simulator
+          # binary is warm on first run.
+          key: ${{ runner.os }}-cargo-host-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-host-build-
+            ${{ runner.os }}-cargo-
+
+      # Capture trace-attribution metadata up front so it is
+      # available to every subsequent step regardless of pass/fail.
+      # RFC 0006 §"Trace attribution under dirty trees" pins this:
+      # every artifact must carry `git-rev` and a `dirty` suffix when
+      # the working tree is dirty.
+      - name: Capture trace attribution (git rev + dirty status)
+        id: attr
+        run: |
+          set -euo pipefail
+          git_rev=$(git rev-parse --short=12 HEAD)
+          # `git status --porcelain` reports nothing when the tree is
+          # clean. A scheduled CI run on a fresh checkout should always
+          # be clean; the `dirty_suffix` field lets a manual
+          # `workflow_dispatch` from a working branch still surface
+          # honestly when it isn't.
+          if [ -n "$(git status --porcelain)" ]; then
+            dirty_suffix="-dirty"
+            echo "::warning::working tree is dirty — artifact will be marked"
+          else
+            dirty_suffix=""
+          fi
+          # Artifact name format: `sim-trace-<rev>[-dirty]`. Cargo's
+          # ext2-image and pjdfstest workflows use the same `<artifact>-
+          # <kind>` shape; we follow that convention so an investigator
+          # familiar with one knows the others.
+          artifact_name="sim-trace-${git_rev}${dirty_suffix}"
+          echo "git_rev=${git_rev}" >> "${GITHUB_OUTPUT}"
+          echo "dirty_suffix=${dirty_suffix}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+          echo "Trace attribution: rev=${git_rev}${dirty_suffix}, artifact=${artifact_name}"
+
+      # Build the simulator test binary up front so the timing of the
+      # actual sweep step is mostly seed work, not compilation. The
+      # cache restore above keeps this fast on warm runs.
+      - name: Build simulator test binaries
+        run: |
+          cargo test -p simulator --no-run \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Run nightly randomized sweep
+        id: run
+        env:
+          # The fault directory contains failure artifacts the sweep
+          # may write before exiting non-zero. Path is relative to
+          # the workspace root; the upload step picks it up below.
+          VIBIX_SIM_FAULT_DIR: ${{ github.workspace }}/sim-faults
+        run: |
+          set -uo pipefail
+          mkdir -p "${VIBIX_SIM_FAULT_DIR}"
+
+          # Capture the panic-hook output (stderr) so the artifact
+          # bundle can include `panic_log` even when the test runner
+          # has already torn down stdio by the time the upload step
+          # executes.
+          panic_log="${VIBIX_SIM_FAULT_DIR}/panic_log.txt"
+
+          # Run the sweep. The test name pin (`-- --ignored
+          # nightly_randomized_exploration_sweep`) is exact so future
+          # `#[ignore]`-marked tests in the same crate don't get
+          # accidentally promoted into the nightly gate.
+          set +e
+          cargo test -p simulator \
+              --target x86_64-unknown-linux-gnu \
+              --test nightly_sweep \
+              -- --ignored --nocapture \
+              nightly_randomized_exploration_sweep \
+              2> >(tee "${panic_log}" >&2)
+          rc=$?
+          set -e
+
+          # The sweep's stdout/stderr both contain the
+          # `nightly_sweep: master_seed=0x... cases=...` summary
+          # line. Extract the master seed from it for downstream
+          # steps so the auto-file body can cite it precisely.
+          master_seed=$(grep -m1 -oE 'master_seed=0x[0-9a-fA-F]+' "${panic_log}" \
+                        | head -1 | cut -d= -f2 \
+                        || echo "unknown")
+          if [ -z "${master_seed}" ]; then
+            master_seed="unknown"
+          fi
+          echo "master_seed=${master_seed}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${rc}" -eq 0 ]; then
+            echo "status=passed" >> "${GITHUB_OUTPUT}"
+            # Even on green we always upload an artifact (per the
+            # issue body: "One nightly sweep run completes and
+            # uploads its artifact even on green"). Write a
+            # green-status marker so the artifact is non-empty.
+            cat > "${VIBIX_SIM_FAULT_DIR}/SUMMARY.txt" <<EOF
+nightly-simulator: GREEN
+master_seed=${master_seed}
+cases=${VIBIX_SIM_NIGHTLY_CASES}
+git_rev=${{ steps.attr.outputs.git_rev }}${{ steps.attr.outputs.dirty_suffix }}
+EOF
+            exit 0
+          fi
+
+          # Failure path: capture the failing seed if the panic-hook
+          # surfaced one, plus the master seed and case count for
+          # context. The panic-hook line format is pinned in
+          # `simulator/src/lib.rs::install_panic_hook`:
+          #   `SIMULATOR PANIC seed=<u64> tick=<u64>`
+          failing_seed=$(grep -m1 -oE 'SIMULATOR PANIC seed=[0-9]+' "${panic_log}" \
+                         | head -1 | cut -d= -f2 \
+                         || echo "unknown")
+          failing_tick=$(grep -m1 -oE 'tick=[0-9]+' "${panic_log}" \
+                         | head -1 | cut -d= -f2 \
+                         || echo "unknown")
+
+          # Write the FaultPlan JSON for the failing case. The v1
+          # nightly sweep uses the empty FaultPlan (issue #723's
+          # "exploration pass" / RFC §"v1 invariant catalogue"),
+          # so the recorded plan is `{}` — but we still emit the file
+          # so downstream tooling that consumes the artifact has a
+          # canonical path to read.
+          cat > "${VIBIX_SIM_FAULT_DIR}/fault_plan.json" <<EOF
+{"fault_plan_schema_version": 1, "entries": []}
+EOF
+
+          # Write a small trace.json placeholder describing the
+          # failing case. The full trace would require re-running
+          # the failing seed under `replay --trace-out`; the v1
+          # artifact records the (seed, FaultPlan, panic_log)
+          # triple plus this placeholder so the auto-issue link is
+          # actionable. RFC 0006 §"Failing-seed-to-repro path"
+          # commits to upgrading this to a full trace once the
+          # `replay` binary's `--trace-out` lands (#717 follow-up).
+          cat > "${VIBIX_SIM_FAULT_DIR}/trace.json" <<EOF
+{
+  "vibix_simulator_version": 1,
+  "schema_version": 1,
+  "master_seed": "${master_seed}",
+  "failing_seed": "${failing_seed}",
+  "failing_tick": "${failing_tick}",
+  "git_rev": "${{ steps.attr.outputs.git_rev }}",
+  "tree_dirty": ${{ steps.attr.outputs.dirty_suffix == '-dirty' && 'true' || 'false' }},
+  "rust_toolchain": "nightly-2026-04-16",
+  "feature_set": ["sched-mock"],
+  "trace": [],
+  "note": "v1 artifact carries (seed, FaultPlan, panic_log); full trace replay requires `replay --seed=${failing_seed} --trace-out=trace.json` once #717's `--trace-out` body lands."
+}
+EOF
+
+          cat > "${VIBIX_SIM_FAULT_DIR}/SUMMARY.txt" <<EOF
+nightly-simulator: RED
+master_seed=${master_seed}
+failing_seed=${failing_seed}
+failing_tick=${failing_tick}
+cases=${VIBIX_SIM_NIGHTLY_CASES}
+git_rev=${{ steps.attr.outputs.git_rev }}${{ steps.attr.outputs.dirty_suffix }}
+
+Repro:
+  VIBIX_SIM_MASTER_SEED=${master_seed} \\
+      cargo test -p simulator --test nightly_sweep -- \\
+      --ignored nightly_randomized_exploration_sweep
+EOF
+
+          echo "status=failed" >> "${GITHUB_OUTPUT}"
+          echo "failing_seed=${failing_seed}" >> "${GITHUB_OUTPUT}"
+          echo "failing_tick=${failing_tick}" >> "${GITHUB_OUTPUT}"
+          # Re-fail the step so the workflow surfaces red and the
+          # auto-file step below fires.
+          exit "${rc}"
+
+      # Always upload, per the issue body's "One nightly sweep run
+      # completes and uploads its artifact even on green" requirement.
+      # The artifact filename is derived from `git_rev` + `dirty_suffix`
+      # so an investigator can cross-reference it against the kernel
+      # commit it tested.
+      - name: Upload sweep artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.attr.outputs.artifact_name }}
+          path: sim-faults/
+          if-no-files-found: warn
+          # 30-day retention per RFC 0006 §"Failing-seed-to-repro
+          # path" — long enough to handle a vacation-window-sized
+          # gap between failure and human investigation.
+          retention-days: 30
+
+  auto-file-failure:
+    name: auto-file P0 issue on failure
+    needs: nightly-sweep
+    if: always() && needs.nightly-sweep.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: File P0 tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GIT_REV: ${{ needs.nightly-sweep.outputs.git_rev }}
+          DIRTY_SUFFIX: ${{ needs.nightly-sweep.outputs.dirty_suffix }}
+          ARTIFACT_NAME: ${{ needs.nightly-sweep.outputs.artifact_name }}
+          MASTER_SEED: ${{ needs.nightly-sweep.outputs.master_seed }}
+        run: |
+          set -euo pipefail
+
+          # Title pins the master seed so duplicate detection can
+          # de-dupe within a streak: a recurring identical-master-seed
+          # failure shouldn't re-file every night.
+          title="nightly-simulator: randomized sweep failed at master_seed=${MASTER_SEED}"
+
+          # De-dup: if an open issue with this title prefix already
+          # exists, comment instead. Matches the `nightly-soak.yml`
+          # auto-file shape so an investigator who's familiar with
+          # one knows the other.
+          existing=$(gh issue list \
+            --repo "${OWNER}/${REPO}" \
+            --search "in:title \"nightly-simulator: randomized sweep failed at master_seed=${MASTER_SEED}\" state:open" \
+            --json number,title \
+            --jq '.[0].number // empty')
+
+          # Body uses heredoc-by-printf to keep every line within the
+          # YAML block-scalar indent (a column-0 EOF would terminate
+          # the surrounding `run: |`).
+          body_file="$(mktemp)"
+          {
+            printf '%s\n' '`nightly-simulator` failed: a randomized seed in the host-side DST'
+            printf '%s\n' 'simulator (RFC 0006) sweep tripped a v1 invariant.'
+            printf '\n'
+            printf '%s\n' '## Run'
+            printf '\n'
+            printf -- '- Workflow: %s\n' "${RUN_URL}"
+            printf -- '- Master seed: `%s`\n' "${MASTER_SEED}"
+            printf -- '- Git rev: `%s%s`\n' "${GIT_REV}" "${DIRTY_SUFFIX}"
+            printf -- '- Artifact: `%s` (30-day retention)\n' "${ARTIFACT_NAME}"
+            printf '\n'
+            printf '%s\n' '## Repro'
+            printf '\n'
+            printf '%s\n' '```sh'
+            printf -- 'VIBIX_SIM_MASTER_SEED=%s \\\n' "${MASTER_SEED}"
+            printf '%s\n' '    cargo test -p simulator --test nightly_sweep -- \'
+            printf '%s\n' '    --ignored nightly_randomized_exploration_sweep'
+            printf '%s\n' '```'
+            printf '\n'
+            printf '%s\n' '## Investigation'
+            printf '\n'
+            printf '%s\n' '1. Download the `'"${ARTIFACT_NAME}"'` artifact from the workflow run above.'
+            printf '%s\n' '2. Inspect `SUMMARY.txt`, `panic_log.txt`, and `trace.json` for the'
+            printf '%s\n' '   failing seed + tick.'
+            printf '%s\n' '3. Run `replay --seed <failing_seed>` to capture a full trace; feed'
+            printf '%s\n' '   `replay minimize` to reduce the FaultPlan if non-empty.'
+            printf '%s\n' '4. Bisect against the `'"${GIT_REV}"'` commit if a recent kernel-side'
+            printf '%s\n' '   `task::` / `sync::` change is suspect.'
+            printf '\n'
+            printf '%s\n' 'Auto-filed by `.github/workflows/nightly-simulator.yml` per RFC 0006'
+            printf '%s\n' '§"CI perf budget" / issue #723.'
+          } > "${body_file}"
+
+          if [ -n "${existing}" ]; then
+            echo "Existing tracking issue #${existing} is open — appending streak comment."
+            gh issue comment "${existing}" \
+              --repo "${OWNER}/${REPO}" \
+              --body "$(printf 'Streak continues. Latest red: %s (master_seed=%s, git_rev=%s%s).' \
+                "${RUN_URL}" "${MASTER_SEED}" "${GIT_REV}" "${DIRTY_SUFFIX}")"
+          else
+            echo "Filing new tracking issue."
+            gh issue create \
+              --repo "${OWNER}/${REPO}" \
+              --title "${title}" \
+              --label "priority:P0,area:testing" \
+              --body-file "${body_file}"
+          fi

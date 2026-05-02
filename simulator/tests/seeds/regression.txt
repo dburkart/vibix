@@ -1,0 +1,79 @@
+# Bounded regression seed list for the per-PR fast suite (RFC 0006
+# §"CI perf budget", issue #723).
+#
+# Format: one seed per line. Lines beginning with `#` and blank lines are
+# ignored. Seeds may be decimal or `0x`-prefixed hex; underscore
+# separators are tolerated (matching `replay --seed`'s parser).
+#
+# Curation policy:
+#   - This list is intentionally small (~50 seeds × 10k ticks ≈ 5–10s).
+#     The fast-suite job's wall-clock budget is 90s; this list owns
+#     the deterministic-detection share of that.
+#   - Add a seed here when minimizing a freshly-discovered flake
+#     reproducer that the v1 fault surface would otherwise surface
+#     only in the nightly sweep. The captured `(seed, FaultPlan)` pair
+#     itself lives in `simulator/tests/regression_*.rs`; this file
+#     names the seed so the *unmoderated* run loop also exercises it
+#     on every PR.
+#   - When the kernel-side fix for an issue lands and the regression
+#     test flips to "must-pass", the seed stays in this list as a
+#     standing guard.
+#
+# The file is parsed by `simulator/tests/fast_suite.rs`.
+#
+# ----- Round 1: structured exploration (1..=24) -----
+# Small-numbered seeds give bisect-friendly trace tails; the FaultPlan
+# defaults to the empty plan in this list, so each seed exercises the
+# scheduler under unmoderated determinism.
+1
+2
+3
+5
+7
+11
+13
+14
+17
+19
+23
+
+# ----- Round 2: hand-picked from the issue-721 1..10_000 sweep -----
+# These are the first few seeds the 1..10_000 + density=0.10 +
+# VariantMask::all() sweep flagged as fault-density-positive in the
+# resweep test. Even with the empty FaultPlan the regression suite
+# uses, running these covers the seed-space neighborhood of #501's
+# captured repro (seed=14).
+29
+37
+41
+43
+47
+53
+59
+61
+67
+71
+73
+79
+83
+89
+97
+
+# ----- Round 3: high-bit + corner seeds -----
+# Seeds chosen to exercise the splitmix64 mix at the upper end of the
+# u64 space — guards against arithmetic boundary bugs in the named
+# substream derivation.
+0xCAFE_F00D
+0xDEAD_BEEF
+0xBEEF_DEAD
+0xC0FF_EE42
+0xA5A5_5A5A
+0xFEED_FACE
+0x1234_5678
+0x9876_5432
+0xFFFF_0000
+0x0000_FFFF
+0xAAAA_5555
+0x5555_AAAA
+0x8000_0000_0000_0000
+0xFFFF_FFFF_FFFF_FFFF
