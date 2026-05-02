@@ -367,6 +367,109 @@ pub fn validate_user_range(addr: u64, len: u64, align: AddrAlign) -> Result<User
     })
 }
 
+// ── File-mmap errno gate (RFC 0007 §Errno table, issue #746) ────────────
+
+/// Pure errno-gate for the file-backed leg of `sys_mmap` (RFC 0007
+/// §Errno table). Extracted from `arch::x86_64::syscall::sys_mmap` so
+/// host unit tests can exercise every rejection branch without the
+/// `current_fd_table` / `current_address_space` / IDT plumbing the
+/// syscall wrapper carries.
+///
+/// `prot` is the raw `PROT_*` bitmask. `share` distinguishes
+/// `MAP_PRIVATE` from `MAP_SHARED`. `off` and `len` are the userspace
+/// arguments **before** any rounding; the helper enforces the EINVAL
+/// alignment rules and returns the page-aligned `(off, len_pages)` pair
+/// on success. `open_mode_acc` is the result of
+/// `OpenFile.flags & O_ACCMODE` (one of `O_RDONLY=0`, `O_WRONLY=1`,
+/// `O_RDWR=2` — pinned by the static asserts in `crate::fs::flags`).
+///
+/// Errors (matching RFC 0007 §Errno table verbatim):
+///
+/// - `EINVAL`  — `off` not page-aligned, or `len == 0`.
+/// - `EOVERFLOW` — `off + page-rounded(len)` overflows `i64` (`off_t`).
+/// - `EACCES`  — `MAP_SHARED + PROT_WRITE` with `open_mode != O_RDWR`,
+///   or `MAP_PRIVATE + PROT_WRITE` with `open_mode == O_WRONLY`.
+///
+/// `EBADF` (fd not open) and `ENODEV` (non-mmappable inode kind / non-VFS
+/// backend) are *upstream* of this gate — `sys_mmap` rejects them before
+/// it can even build the `(open_mode_acc, share, prot, off, len)`
+/// argument set.
+pub fn validate_file_mmap_args(
+    prot: u32,
+    share: crate::mem::vmatree::Share,
+    off: u64,
+    len: u64,
+    open_mode_acc: u32,
+) -> Result<(u64, usize), i64> {
+    use crate::mem::vmatree::Share;
+    use crate::mem::FRAME_SIZE;
+
+    // Errno values inlined as numeric literals (mirroring `crate::fs::*`)
+    // because `crate::fs` is gated to `#[cfg(any(test, target_os =
+    // "none"))]` while `mem::pf` is unconditional. The static asserts in
+    // `crate::fs` pin these values to the Linux x86_64 ABI; the same
+    // values appear in `crate::fs::{EACCES, EINVAL, EOVERFLOW}` and
+    // arrive here unchanged. The constants below are scoped to this fn
+    // so they cannot leak into the rest of the module.
+    const EACCES: i64 = -13;
+    const EINVAL: i64 = -22;
+    const EOVERFLOW: i64 = -75;
+    // `O_RDONLY = 0`, `O_WRONLY = 1`, `O_RDWR = 2` (pinned by the
+    // static asserts in `crate::fs::flags`).
+    const O_WRONLY: u32 = 1;
+    const O_RDWR: u32 = 2;
+
+    // EINVAL: len == 0.
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    // EINVAL: off not page-aligned.
+    if off % FRAME_SIZE != 0 {
+        return Err(EINVAL);
+    }
+
+    // Page-round `len` up.
+    let len_rounded = match len.checked_add(FRAME_SIZE - 1) {
+        Some(v) => v & !(FRAME_SIZE - 1),
+        None => return Err(EOVERFLOW),
+    };
+
+    // EOVERFLOW: off + len_rounded must fit in i64 (off_t).
+    let end = match off.checked_add(len_rounded) {
+        Some(v) => v,
+        None => return Err(EOVERFLOW),
+    };
+    if end > i64::MAX as u64 {
+        return Err(EOVERFLOW);
+    }
+
+    // EACCES: write-permission gates.
+    let want_write = prot & PROT_WRITE != 0;
+    if want_write {
+        match share {
+            Share::Shared => {
+                // MAP_SHARED + PROT_WRITE requires O_RDWR. The
+                // write-fault path must read the page on miss before
+                // mutating it; an O_WRONLY-opened file cannot service
+                // that read (RFC 0007 §Kernel-Userspace Interface).
+                if open_mode_acc != O_RDWR {
+                    return Err(EACCES);
+                }
+            }
+            Share::Private => {
+                // MAP_PRIVATE + PROT_WRITE rejects O_WRONLY for the
+                // same reason: CoW needs the master page readable.
+                if open_mode_acc == O_WRONLY {
+                    return Err(EACCES);
+                }
+            }
+        }
+    }
+
+    let len_pages = (len_rounded / FRAME_SIZE) as usize;
+    Ok((off, len_pages))
+}
+
 #[cfg(test)]
 mod validate_range_tests {
     use super::*;
@@ -527,5 +630,201 @@ mod tests {
         assert!(is_present_fault(ERR_P | ERR_WR | ERR_US));
         assert!(!is_present_fault(ERR_US));
         assert!(!is_present_fault(0));
+    }
+
+    // ── validate_file_mmap_args (issue #746, RFC 0007 §Errno table) ──
+
+    mod file_mmap_errno {
+        use super::*;
+        use crate::mem::vmatree::Share;
+
+        // Mirror the numeric pins used inside `validate_file_mmap_args`.
+        const O_RDONLY: u32 = 0;
+        const O_WRONLY: u32 = 1;
+        const O_RDWR: u32 = 2;
+        const EACCES: i64 = -13;
+        const EINVAL: i64 = -22;
+        const EOVERFLOW: i64 = -75;
+
+        #[test]
+        fn zero_len_einval() {
+            // RFC 0007: `len == 0` → EINVAL regardless of share / prot / off.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 0, O_RDWR),
+                Err(EINVAL),
+            );
+        }
+
+        #[test]
+        fn unaligned_off_einval() {
+            // 0x100 is not page-aligned → EINVAL.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0x100, 4096, O_RDWR),
+                Err(EINVAL),
+            );
+            // 0x1FFF: just below a page boundary.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Private, 0x1FFF, 4096, O_RDONLY),
+                Err(EINVAL),
+            );
+        }
+
+        #[test]
+        fn off_plus_len_overflow_eoverflow() {
+            // `off + page-rounded(len)` must fit in i64. A near-i64::MAX
+            // off plus a multi-page len overflows → EOVERFLOW.
+            let near_max = (i64::MAX as u64) & !0xFFF; // page-aligned, near max
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, near_max, 8192, O_RDWR),
+                Err(EOVERFLOW),
+            );
+            // `len` itself near u64::MAX overflows during the page-round.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, u64::MAX, O_RDWR),
+                Err(EOVERFLOW),
+            );
+        }
+
+        #[test]
+        fn shared_write_requires_o_rdwr() {
+            // MAP_SHARED + PROT_WRITE: only O_RDWR succeeds. The write-fault
+            // path must read the page on miss before mutating, so O_WRONLY
+            // cannot service the read.
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Shared,
+                    0,
+                    4096,
+                    O_RDONLY,
+                ),
+                Err(EACCES),
+            );
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Shared,
+                    0,
+                    4096,
+                    O_WRONLY,
+                ),
+                Err(EACCES),
+            );
+            // O_RDWR succeeds.
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Shared,
+                    0,
+                    4096,
+                    O_RDWR,
+                ),
+                Ok((0, 1)),
+            );
+        }
+
+        #[test]
+        fn private_write_rejects_o_wronly() {
+            // MAP_PRIVATE + PROT_WRITE: O_WRONLY rejected (CoW needs to
+            // read master page first); O_RDONLY *and* O_RDWR succeed.
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Private,
+                    0,
+                    4096,
+                    O_WRONLY,
+                ),
+                Err(EACCES),
+            );
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Private,
+                    0,
+                    4096,
+                    O_RDONLY,
+                ),
+                Ok((0, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(
+                    PROT_READ | PROT_WRITE,
+                    Share::Private,
+                    0,
+                    4096,
+                    O_RDWR,
+                ),
+                Ok((0, 1)),
+            );
+        }
+
+        #[test]
+        fn read_only_prot_no_eacces() {
+            // PROT_WRITE clear: no permission gate fires regardless of
+            // share/open_mode (PROT_EXEC and PROT_READ alone are fine on a
+            // read-only open).
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 4096, O_RDONLY),
+                Ok((0, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_EXEC, Share::Shared, 0, 4096, O_RDONLY),
+                Ok((0, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Private, 0, 4096, O_WRONLY),
+                Ok((0, 1)),
+            );
+        }
+
+        #[test]
+        fn len_rounds_up_to_page_count() {
+            // 1 byte → 1 page, 4096 → 1 page, 4097 → 2 pages, 8192 → 2.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 1, O_RDWR),
+                Ok((0, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 4096, O_RDWR),
+                Ok((0, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 4097, O_RDWR),
+                Ok((0, 2)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0, 8192, O_RDWR),
+                Ok((0, 2)),
+            );
+        }
+
+        #[test]
+        fn off_passes_through_unchanged() {
+            // The page-aligned `off` is returned verbatim — sys_mmap then
+            // forwards it as the byte offset to `FileOps::mmap`.
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 4096, 4096, O_RDWR),
+                Ok((4096, 1)),
+            );
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, 0x1_0000, 8192, O_RDWR),
+                Ok((0x1_0000, 2)),
+            );
+        }
+
+        #[test]
+        fn off_plus_len_at_i64_max_succeeds() {
+            // Boundary case: end == i64::MAX rounded to page (0x7fff_ffff_ffff_f000).
+            // Actually with len_rounded == FRAME_SIZE and an off such
+            // that end == i64::MAX as u64 + 1, EOVERFLOW fires; check
+            // the strictly-less-than case still passes.
+            let off = 0u64;
+            let len = 4096u64;
+            assert_eq!(
+                validate_file_mmap_args(PROT_READ, Share::Shared, off, len, O_RDWR),
+                Ok((0, 1)),
+            );
+        }
     }
 }
