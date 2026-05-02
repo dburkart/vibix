@@ -348,21 +348,26 @@ fn readahead_sparse_holes_dont_warm_phantom_blocks() {
     );
 
     // Page 1: all holes — readahead must complete without panicking
-    // and without trying to bread any made-up block. We can't probe
-    // "no phantom block was warmed" directly (we don't know what
-    // absolute block a phantom would have been), so the contract is
-    // expressed by the impl's `Ok(None)` arm: no bread is issued.
-    // The smoke check is "the call returns" + "the cache len didn't
-    // grow more than a small constant" (it can grow by metadata-map
-    // breads on the indirect walk, but those would have happened
-    // anyway).
-    let _len_before = super_arc.cache.len();
+    // and without bread'ing any phantom block. By this point the
+    // setup has already walked `resolve_block` over logical 4..=7
+    // (which warmed the indirect-pointer block servicing those
+    // logical indices) plus `aops.readahead(0, 1)` (which warmed
+    // the indirect block again — same `bread` cache hit — and
+    // installed the page-0 data block). So the indirect block
+    // covering page 1's logicals is already resident; an
+    // `Ok(None)`-only walk over those holes performs no further
+    // `bread` and the cache size must be stable across the call.
+    //
+    // This is the external observable that catches a regression
+    // where a future `Ok(None)` arm accidentally tries to `bread`
+    // a phantom block.
+    let len_before = super_arc.cache.len();
     aops.readahead(1, 1);
-    // No assertion on `len_after` — the indirect walker may bread
-    // the indirect-pointer block as it traverses. The contract is
-    // that `Ok(None)` (sparse) does not turn into a `bread` of
-    // some phantom data block — and that's enforced by code review
-    // of the impl, not by an external observable.
+    assert_eq!(
+        len_before,
+        super_arc.cache.len(),
+        "sparse-hole readahead must not warm any new buffer-cache blocks"
+    );
 
     drop(ext2_inode);
     drop(_inode);

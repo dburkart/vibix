@@ -690,13 +690,30 @@ impl AddressSpaceOps for Ext2Aops {
                 ) {
                     Ok(Some(abs)) => {
                         // Best-effort warm: discard the returned
-                        // `Arc<BufferHead>` immediately. The cache's
-                        // `clock_ref` bit is what keeps the entry
-                        // resident across the eviction sweep; we don't
-                        // need to pin the strong reference here, the
-                        // upcoming `readpage` will re-`bread` and
-                        // observe the cache hit.
-                        let _ = super_ref.cache.bread(super_ref.device_id, abs as u64);
+                        // `Arc<BufferHead>` on success. The cache's
+                        // `clock_ref` bit keeps the entry resident
+                        // across the eviction sweep; we don't need to
+                        // pin the strong reference here, the upcoming
+                        // `readpage` re-`bread`s and observes the
+                        // cache hit.
+                        //
+                        // On `bread` failure (transient device error,
+                        // out-of-memory cache slot), bail the entire
+                        // window: the device just told us I/O is
+                        // unhealthy, so spending more `bread`s on the
+                        // remaining pages would only amplify the
+                        // failure. The fault path's `readpage` will
+                        // surface a faithful errno when the user
+                        // actually demands the byte. This matches the
+                        // `WalkError::Io | Corrupt` arm below — both
+                        // are "stop the walk on I/O trouble".
+                        if super_ref
+                            .cache
+                            .bread(super_ref.device_id, abs as u64)
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     Ok(None) => {
                         // Sparse hole — `readpage` zero-fills inline,
