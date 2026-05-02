@@ -3,19 +3,20 @@
 //! readahead / truncate.
 //!
 //! RFC 0007 §`AddressSpaceOps` and §Tail-page zeroing are the normative
-//! spec. This module currently lands two of the four trait methods:
+//! spec. This module currently lands three of the four trait methods:
 //!
 //! - `readpage` (issue #749) — parsed sparse / dense / past-EOF logic
 //!   in [`Ext2Aops::readpage`].
 //! - `writepage` (issue #750) — split-the-page-into-blocks-and-
 //!   allocate-on-extend in [`Ext2Aops::writepage`].
+//! - `readahead` (issue #752) — speculative buffer-cache prefetch over
+//!   `[start, start + nr_pages)` driven by the page cache's per-inode
+//!   `ra_state` heuristic (#741); see [`Ext2Aops::readahead`].
 //!
-//! The remaining two methods are deliberately left at the trait default:
+//! The remaining method is deliberately left at the trait default:
 //!
 //! - `truncate_below` is left at the trait default (no-op + spinlock
 //!   assert). Issue #751 will replace it.
-//! - `readahead` is left at the trait default (no-op + spinlock
-//!   assert). Issue #752 will replace it.
 //!
 //! # Pipeline (`readpage`)
 //!
@@ -518,9 +519,209 @@ impl AddressSpaceOps for Ext2Aops {
         Ok(())
     }
 
-    // `readahead` and `truncate_below` left at the trait defaults —
-    // both are no-op + `assert_no_spinlocks_held`. Issue #751 lands
-    // `truncate_below`; issue #752 lands `readahead`.
+    /// Speculative buffer-cache prefetch for pages
+    /// `[start, start + nr_pages)`.
+    ///
+    /// RFC 0007 §Performance Considerations (readahead) is the normative
+    /// spec. The page cache's per-inode `ra_state` (#741) is what
+    /// decides `nr_pages`; this impl is the FS-side mechanism that
+    /// turns "we expect the next `nr_pages` to fault soon" into "the
+    /// data blocks for those pages are resident in the buffer cache by
+    /// the time the fault arrives".
+    ///
+    /// # Strategy: warm the buffer cache, not the page cache
+    ///
+    /// We `bread` each fs-block underlying every page in the window.
+    /// We deliberately do **not** install pages into the per-inode
+    /// page cache here:
+    ///
+    /// 1. The page cache install is the fault path's job (it owns the
+    ///    install-once race protocol via [`PG_LOCKED`]). Doing it from
+    ///    readahead would either duplicate that protocol or race
+    ///    against it.
+    /// 2. `Ext2Aops` carries no [`Weak<crate::mem::page_cache::PageCache>`]
+    ///    — adding one would expand the trait-object footprint and the
+    ///    inode-binding contract beyond what the issue's predecessors
+    ///    settled.
+    /// 3. Buffer-cache residency is the I/O the fault path actually
+    ///    cares about: a `readpage` whose block is already resident
+    ///    skips the device read entirely (cache.bread fast path —
+    ///    `block::cache`). The user-visible win is the same with much
+    ///    less mechanism.
+    ///
+    /// # Bounds and clamping
+    ///
+    /// - Pages entirely past `i_size` are skipped. The buffer cache
+    ///   doesn't need warming for blocks the fault path won't read.
+    /// - `start` is interpreted as the **first** page to prefetch —
+    ///   the page cache caller passes `pgoff + 1` for the page that
+    ///   triggered the miss (see `note_miss` doc on the "additional
+    ///   pages" semantics).
+    /// - `nr_pages == 0` is a fast no-op after the spinlock assert.
+    ///
+    /// # Errors
+    ///
+    /// **Best-effort.** This is a hint, not a contract. Any errno
+    /// observed mid-walk (corrupt indirect pointer, `bread` failure,
+    /// torn-down mount) stops the prefetch *for that page* and we move
+    /// on; the caller fault — which will happen later, on demand —
+    /// gets a faithful errno through `readpage`. We never panic and we
+    /// never propagate.
+    ///
+    /// # Lock-order
+    ///
+    /// Per RFC 0007 §Lock-order ladder, the impl asserts no spinlock
+    /// is held at entry. The page cache caller has dropped its level-4
+    /// `PageCache::inner` mutex before invoking us — that's the
+    /// "never holds the cache mutex" invariant the issue's tracking
+    /// description calls out. We acquire only the inode metadata
+    /// `RwLock` (briefly, to snapshot `(size, i_block)`) and then the
+    /// buffer cache's `inner` mutex one block at a time inside `bread`.
+    fn readahead(&self, start: u64, nr_pages: u32) {
+        // RFC 0007 §Lock-order ladder: every method on this trait
+        // calls `assert_no_spinlocks_held` as its very first
+        // statement. Done even on the `nr_pages == 0` fast path so a
+        // caller that holds a spinlock around a "skip" call still
+        // trips the contract.
+        assert_no_spinlocks_held("Ext2Aops::readahead");
+
+        if nr_pages == 0 {
+            return;
+        }
+
+        // Best-effort: a torn-down mount or inode is the same shape
+        // as a `bread` failure here — readahead is a hint and the
+        // upcoming `readpage` will produce the faithful errno when
+        // the fault actually arrives. Just bail.
+        let Some(super_ref) = self.super_ref.upgrade() else {
+            return;
+        };
+        let Some(ext2_inode) = self.inode_ref.upgrade() else {
+            return;
+        };
+
+        // Snapshot under the metadata read-guard, then drop. Same
+        // pattern as `readpage`: holding `meta` across `bread` would
+        // serialise every concurrent `stat(2)` against the slowest
+        // readahead.
+        let (size, i_block) = {
+            let meta = ext2_inode.meta.read();
+            (meta.size, meta.i_block)
+        };
+
+        // Clamp the window to in-file pages. A `start` already past
+        // EOF makes the whole window past EOF — nothing to warm.
+        let Some(start_byte) = start.checked_mul(PAGE_SIZE) else {
+            return;
+        };
+        if start_byte >= size {
+            return;
+        }
+
+        // Geometry + metadata-forbidden map. Same construction as
+        // `readpage` — see that body for the perf TODO around caching
+        // this on `Ext2Super`.
+        let (s_first_data_block, s_blocks_count) = {
+            let sb = super_ref.sb_disk.lock();
+            (sb.s_first_data_block, sb.s_blocks_count)
+        };
+        let Some(geom) = Geometry::new(super_ref.block_size, s_first_data_block, s_blocks_count)
+        else {
+            return;
+        };
+        let md = build_metadata_map(&super_ref);
+
+        let block_size = super_ref.block_size as u64;
+        debug_assert!(block_size > 0, "mount validated block_size != 0");
+
+        // Walk page-by-page across `[start, start + nr_pages)`. For
+        // each page, walk fs-block-sized fragments inside the page's
+        // in-file window and `bread` each resolved block. Sparse
+        // holes (`Ok(None)`) need no warming — the fault path's
+        // `readpage` zero-fills them inline without touching the
+        // buffer cache.
+        for i in 0..nr_pages {
+            // `start + i` overflowing means the fault stream has
+            // walked off the end of u64 pgoff space; nothing
+            // sensible to prefetch.
+            let Some(pgoff) = start.checked_add(i as u64) else {
+                return;
+            };
+            let Some(page_lo) = pgoff.checked_mul(PAGE_SIZE) else {
+                return;
+            };
+            if page_lo >= size {
+                // Past EOF — every subsequent page is also past EOF
+                // (size is a non-decreasing snapshot here). Stop.
+                return;
+            }
+            let page_hi_full = page_lo.saturating_add(PAGE_SIZE);
+            let page_hi_in_file = core::cmp::min(page_hi_full, size);
+
+            let mut cur = page_lo;
+            while cur < page_hi_in_file {
+                let logical_u64 = cur / block_size;
+                // Logical-block index past `u32::MAX` is a corrupted
+                // geometry; the readpage path treats it as `EIO`. For
+                // best-effort prefetch we just stop walking — the
+                // fault that follows will surface the errno.
+                let Ok(logical) = u32::try_from(logical_u64) else {
+                    return;
+                };
+
+                // In-block / window arithmetic mirrors `readpage`.
+                // We don't need the `chunk`-relative copy logic, only
+                // the advance: a `bread` warms the *whole* fs-block
+                // regardless of which bytes inside it we ultimately
+                // care about.
+                let in_block = (cur % block_size) as usize;
+                let block_remaining = block_size as usize - in_block;
+                let window_remaining = (page_hi_in_file - cur) as usize;
+                let advance = core::cmp::min(block_remaining, window_remaining);
+
+                match resolve_block(
+                    &super_ref.cache,
+                    super_ref.device_id,
+                    &geom,
+                    &md,
+                    &i_block,
+                    logical,
+                    None,
+                ) {
+                    Ok(Some(abs)) => {
+                        // Best-effort warm: discard the returned
+                        // `Arc<BufferHead>` immediately. The cache's
+                        // `clock_ref` bit is what keeps the entry
+                        // resident across the eviction sweep; we don't
+                        // need to pin the strong reference here, the
+                        // upcoming `readpage` will re-`bread` and
+                        // observe the cache hit.
+                        let _ = super_ref.cache.bread(super_ref.device_id, abs as u64);
+                    }
+                    Ok(None) => {
+                        // Sparse hole — `readpage` zero-fills inline,
+                        // nothing on disk to warm.
+                    }
+                    Err(WalkError::Io) | Err(WalkError::Corrupt) => {
+                        // Corrupt or unreachable indirect pointer.
+                        // Stop the walk; the fault path's `readpage`
+                        // surfaces the errno faithfully when the user
+                        // actually demands the byte.
+                        return;
+                    }
+                }
+
+                // `advance` is at least 1 byte for any `block_size >= 1`
+                // and any non-empty in-file window; the loop is
+                // guaranteed to make progress.
+                debug_assert!(advance > 0);
+                cur += advance as u64;
+            }
+        }
+    }
+
+    // `truncate_below` left at the trait default — no-op +
+    // `assert_no_spinlocks_held`. Issue #751 will replace it.
 }
 
 // ---------------------------------------------------------------------------
