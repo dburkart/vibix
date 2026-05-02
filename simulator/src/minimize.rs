@@ -215,7 +215,7 @@ pub fn minimize<R: Reproducer + ?Sized>(
     })
 }
 
-/// Find the smallest `hi` in `[1, tick_window.hi]` such that
+/// Find the smallest `hi` in `[0, tick_window.hi]` such that
 /// `(seed, plan, TickWindow { lo, hi })` still reproduces.
 fn bisect_tick_hi<R: Reproducer + ?Sized>(
     counted: &mut Counted<'_, R>,
@@ -223,14 +223,26 @@ fn bisect_tick_hi<R: Reproducer + ?Sized>(
     plan: &FaultPlan,
     tick_window: TickWindow,
 ) -> Result<u64, String> {
+    // Probe the zero-tick window first. A failure that does not depend
+    // on the simulator advancing at all (seed-only repros, or repros
+    // that surface during simulator construction) reproduces with
+    // `hi = 0`; without this probe the binary search below would force
+    // the reported minimum to `hi = 1` and overstate the window.
+    let zero = TickWindow {
+        lo: tick_window.lo,
+        hi: 0,
+    };
+    if counted.check(seed, plan, zero) {
+        return Ok(0);
+    }
     if tick_window.hi <= 1 {
         return Ok(tick_window.hi);
     }
     // Invariant: `lo` does not reproduce, `hi` reproduces. Both bounds
-    // refer to the `hi` field of `TickWindow`. Start `lo = 0` (zero
-    // ticks: the simulator never advances; cannot reproduce a fault
-    // injected at any tick > 0) and `hi = tick_window.hi` (the
-    // entry-sanity check already proved this reproduces).
+    // refer to the `hi` field of `TickWindow`. Start `lo = 0` (the
+    // zero-tick probe above proved this does not reproduce) and
+    // `hi = tick_window.hi` (the entry-sanity check already proved
+    // this reproduces).
     let mut lo = 0u64;
     let mut hi = tick_window.hi;
     while hi - lo > 1 {
@@ -262,20 +274,24 @@ fn bisect_tick_lo<R: Reproducer + ?Sized>(
     // sanity check proved this reproduces) and `hi = tick_window.hi + 1`
     // (clipping every entry trivially defeats reproduction unless the
     // failure does not depend on the plan at all — handled below).
+    // `max_valid_lo` caps the returned lower bound to a value that
+    // keeps the resulting `[lo, hi)` interval well-formed, since the
+    // `hi` sentinel itself is one past the last valid tick.
     let mut lo = tick_window.lo;
     let mut hi = tick_window.hi.saturating_add(1);
+    let max_valid_lo = tick_window.hi;
 
     // Quick top-out check: if dropping every plan entry still
     // reproduces, the failure is independent of the plan; the lower
     // bound can be set right at `tick_window.hi` (no plan entries
     // remain in scope) and stage 2 will reduce the plan to empty.
     let drop_all = TickWindow {
-        lo: hi,
+        lo: max_valid_lo,
         hi: tick_window.hi,
     };
     let drop_all_plan = clip_plan_lo(plan, drop_all.lo);
     if counted.check(seed, &drop_all_plan, drop_all) {
-        return Ok(hi);
+        return Ok(max_valid_lo);
     }
 
     while hi - lo > 1 {
@@ -555,6 +571,44 @@ mod tests {
         let out = minimize(&mut rep, 42, plan, TickWindow::full(1024)).expect("minimize");
         assert!(out.plan.is_empty());
         assert_eq!(out.tick_window.hi, 1);
+    }
+
+    #[test]
+    fn bisect_tick_hi_returns_zero_when_failure_reproduces_at_zero_ticks() {
+        // A predicate that reproduces regardless of `tick_window.hi`
+        // (e.g. a panic during simulator construction). Without the
+        // zero-tick probe in `bisect_tick_hi`, the bisect would bottom
+        // out at `hi = 1` and overstate the minimal window.
+        let plan = FaultPlan::new();
+        let mut rep = closure_reproducer(|_seed, _plan, _w| true);
+        let out = minimize(&mut rep, 7, plan, TickWindow::full(1024)).expect("minimize");
+        assert_eq!(out.tick_window.hi, 0);
+        assert_eq!(out.tick_window.lo, 0);
+        assert!(out.plan.is_empty());
+    }
+
+    #[test]
+    fn bisect_tick_lo_fast_path_returns_well_formed_window() {
+        // Plan-independent failure: the `bisect_tick_lo` fast path
+        // takes the "drop every entry, still reproduces" branch.
+        // The returned window must remain a valid half-open interval
+        // (`lo <= hi`) — a regression here used to return `lo = hi + 1`.
+        let plan = FaultPlan::from_entries(vec![
+            (1, FaultEvent::SpuriousTimerIrq),
+            (5, FaultEvent::TimerDrift { ticks: 1 }),
+            (10, FaultEvent::WakeupReorder { within_tick: 2 }),
+        ]);
+        // Reproduces once `hi >= 3`, regardless of plan contents.
+        let mut rep = closure_reproducer(|_seed, _plan, w| w.hi >= 3);
+        let out = minimize(&mut rep, 0, plan, TickWindow::full(64)).expect("minimize");
+        assert!(
+            out.tick_window.lo <= out.tick_window.hi,
+            "tick window must be well-formed: got [{}, {})",
+            out.tick_window.lo,
+            out.tick_window.hi,
+        );
+        assert_eq!(out.tick_window.hi, 3);
+        assert_eq!(out.tick_window.lo, 3);
     }
 
     #[test]
