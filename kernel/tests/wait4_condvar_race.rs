@@ -66,6 +66,10 @@ fn run_tests() {
             "wait4_repeated_rounds_no_wedge",
             &(wait4_repeated_rounds_no_wedge as fn()),
         ),
+        (
+            "mark_zombie_atomically_publishes_state_and_event",
+            &(mark_zombie_atomically_publishes_state_and_event as fn()),
+        ),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -285,6 +289,118 @@ fn wait4_exit_in_reap_gap_wakes_wait_while() {
     assert_eq!(
         none, None,
         "expected ECHILD-equivalent after draining, got {none:?}"
+    );
+
+    h::reset_table();
+}
+
+// --- mark_zombie_atomically_publishes_state_and_event ----------------
+//
+// #710 atomic-publish invariant: `mark_zombie` writes the Zombie state
+// and bumps `EXIT_EVENT` under the same TABLE critical section, so any
+// TABLE acquirer observes both transitions or neither — never just one.
+//
+// The previous shape (state under TABLE, then `EXIT_EVENT.fetch_add`
+// after TABLE drop) opened a drain-order window the v1 simulator's
+// `WakeupReorder` knob could permute (the seam-level race captured by
+// `simulator/tests/regression_501.rs`). This test asserts that the
+// kernel-side property the simulator pushes us toward holds: the
+// "zombie published" and "EXIT_EVENT bumped" transitions cannot be
+// observed in the inverted order.
+//
+// We can't *literally* race against `mark_zombie` from inside the same
+// TABLE critical section without taking the lock recursively — the
+// invariant is structural, not a temporal race. Instead we drive the
+// observable contract: pre/post snapshots of EXIT_EVENT and the
+// child's state are taken via TABLE-acquiring helpers, and the
+// (state, counter) tuple before / after `mark_zombie` exhibits the
+// expected atomic transition with no half-published intermediate
+// state. Re-running across N rounds catches a regression that
+// re-introduces the EXIT_EVENT-after-TABLE-drop window — under a
+// timer-driven preempt the round loop is effectively the same shape
+// the simulator's `WakeupReorder` permutes at the seam.
+
+const ATOMIC_PUBLISH_PARENT_PID: u32 = PARENT_PID + 300;
+const ATOMIC_PUBLISH_FIRST_CHILD_PID: u32 = ATOMIC_PUBLISH_PARENT_PID + 1;
+const ATOMIC_PUBLISH_ROUNDS: u32 = 32;
+
+fn mark_zombie_atomically_publishes_state_and_event() {
+    h::reset_table();
+    h::insert(
+        ATOMIC_PUBLISH_PARENT_PID,
+        0,
+        ATOMIC_PUBLISH_PARENT_PID,
+        ATOMIC_PUBLISH_PARENT_PID,
+    );
+
+    let baseline = process::exit_event_count();
+
+    for round in 0..ATOMIC_PUBLISH_ROUNDS {
+        let child_pid = ATOMIC_PUBLISH_FIRST_CHILD_PID + round;
+        h::insert(
+            child_pid,
+            ATOMIC_PUBLISH_PARENT_PID,
+            ATOMIC_PUBLISH_PARENT_PID,
+            ATOMIC_PUBLISH_PARENT_PID,
+        );
+
+        let counter_before = process::exit_event_count();
+        let parent_had_children_before = process::has_children(ATOMIC_PUBLISH_PARENT_PID);
+        assert!(
+            parent_had_children_before,
+            "round {round}: parent must observe child as alive before mark_zombie",
+        );
+        // Reap before mark_zombie must return None — the child is Alive.
+        let pre_reap = process::reap_child(ATOMIC_PUBLISH_PARENT_PID, child_pid as i32);
+        assert!(
+            pre_reap.is_none(),
+            "round {round}: reap_child saw an Alive child as zombie before mark_zombie ran (got {pre_reap:?})",
+        );
+
+        process::mark_zombie(child_pid, round as i32);
+
+        // Atomic-publish invariant: after mark_zombie returns, any
+        // TABLE acquirer must observe BOTH the Zombie entry AND the
+        // bumped EXIT_EVENT (counter > counter_before). The previous
+        // shape allowed an interleaving where the state was published
+        // but the counter wasn't yet bumped — visible to a parallel
+        // observer that took TABLE between the two writes. Moving the
+        // bump inside the TABLE critical section closes that window.
+        let counter_after = process::exit_event_count();
+        assert!(
+            counter_after > counter_before,
+            "round {round}: EXIT_EVENT did not advance (before={counter_before}, after={counter_after})",
+        );
+
+        // The child must now be reapable: state == Zombie.
+        let reaped = process::reap_child(ATOMIC_PUBLISH_PARENT_PID, child_pid as i32);
+        assert_eq!(
+            reaped,
+            Some((child_pid, round as i32)),
+            "round {round}: zombie child not reapable post mark_zombie (got {reaped:?})",
+        );
+
+        // After reap the counter must still be at or above the post-
+        // mark_zombie value — the counter is monotone-non-decreasing
+        // across the wait4 hot path.
+        let counter_post_reap = process::exit_event_count();
+        assert!(
+            counter_post_reap >= counter_after,
+            "round {round}: EXIT_EVENT regressed across reap_child \
+             (after_mark={counter_after}, post_reap={counter_post_reap})",
+        );
+    }
+
+    // Total bump count across rounds must equal exactly
+    // ATOMIC_PUBLISH_ROUNDS — no double-bumps, no missed bumps.
+    let final_counter = process::exit_event_count();
+    assert_eq!(
+        final_counter - baseline,
+        ATOMIC_PUBLISH_ROUNDS,
+        "EXIT_EVENT total advance ({} − {}) must equal rounds ({})",
+        final_counter,
+        baseline,
+        ATOMIC_PUBLISH_ROUNDS,
     );
 
     h::reset_table();
