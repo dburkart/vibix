@@ -208,13 +208,18 @@ fn readpage_dense_file_page_zero() {
 
 /// Page 3 of `large.bin` covers logical blocks 12..15 — entirely
 /// reached through the single-indirect block (the direct slots stop
-/// at logical 11). Confirms the indirect path lights up end-to-end
-/// inside readpage and the per-block markers line up.
+/// at logical 11). Page 67 of the same file covers logical blocks
+/// 268..271 — entirely on the **double-indirect** path
+/// (single-indirect runs out at logical 267 on this 1 KiB-block
+/// fixture: `12 + ptrs_per_block(256) = 268`). The two together
+/// confirm both indirect levels of the RFC 0004 walker light up
+/// end-to-end inside `readpage` and the per-block markers line up.
 fn readpage_dense_file_indirect_page() {
     let (sb, _fs, super_arc) = mount_ro();
     let (_inode, ext2_inode) = iget_with_ext2(&super_arc, &sb, INO_LARGE);
     let aops = Ext2Aops::new(&super_arc, &ext2_inode);
 
+    // --- single-indirect: page 3 → logical blocks 12..15 ---
     let mut buf = [0xffu8; 4096];
     let n = readpage(&aops, 3, &mut buf).expect("readpage page 3");
     assert_eq!(n, 4096);
@@ -233,6 +238,33 @@ fn readpage_dense_file_indirect_page() {
             assert_eq!(
                 byte, expected,
                 "indirect logical block {logical} body byte {i}"
+            );
+        }
+    }
+
+    // --- double-indirect: page 67 → logical blocks 268..271 ---
+    // 1 KiB-block ext2: ptrs_per_block = 256, so the single-indirect
+    // range spans logical [12, 268). Page byte-offset 67 * 4096 =
+    // 274432 = logical 268 on a 1024-byte block — first page entirely
+    // past the single-indirect boundary.
+    let mut buf2 = [0xffu8; 4096];
+    let n = readpage(&aops, 67, &mut buf2).expect("readpage page 67 (double-indirect)");
+    assert_eq!(n, 4096);
+
+    for b in 0..4usize {
+        let logical = 268 + b;
+        let head = format_block_head(logical);
+        let off = b * 1024;
+        assert_eq!(
+            &buf2[off..off + head.len()],
+            head.as_slice(),
+            "double-indirect logical block {logical} marker"
+        );
+        for (i, &byte) in buf2[off + head.len()..off + 1024].iter().enumerate() {
+            let expected = ((logical * 131 + i) & 0xff) as u8;
+            assert_eq!(
+                byte, expected,
+                "double-indirect logical block {logical} body byte {i}"
             );
         }
     }
