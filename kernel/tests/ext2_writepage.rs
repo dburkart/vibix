@@ -195,7 +195,7 @@ fn s_free_blocks(super_arc: &Arc<Ext2Super>) -> u32 {
 /// page; a subsequent `read_file_at` round-trips the user bytes.
 fn writepage_dense_first_page() {
     let (sb, _fs, super_arc) = mount_rw();
-    let (_ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
+    let (ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
     let aops = Ext2Aops::new(&super_arc, &ext2_inode);
 
     // Build a deterministic 4 KiB payload — one byte-per-position with
@@ -247,9 +247,33 @@ fn writepage_dense_first_page() {
     assert_eq!(n, 4096);
     assert_eq!(readback, payload, "writepage data must round-trip");
 
+    // Persistence check (CodeRabbit #803 nit): drop every strong ref
+    // to the inode so the cache's `Weak` decays, then re-`iget` the
+    // same `ino`. The fresh `Ext2Inode` is constructed straight from
+    // the on-disk slot, so an `i_size` / `i_blocks` mismatch here
+    // would prove `flush_inode_slot` never landed.
     drop(aops);
     drop(ext2_inode);
     drop(inode);
+
+    let inode2 = iget(&super_arc, &sb, ino).expect("iget after writepage");
+    {
+        use alloc::sync::Weak;
+        let ext2_inode2 = {
+            let ecache = super_arc.ext2_inode_cache.lock();
+            ecache
+                .get(&ino)
+                .and_then(Weak::upgrade)
+                .expect("ext2_inode_cache repopulated by iget")
+        };
+        let m = ext2_inode2.meta.read();
+        assert_eq!(m.size, 4096, "i_size persisted across iget");
+        assert_eq!(m.i_blocks, 8, "i_blocks persisted across iget");
+        for i in 0..4 {
+            assert!(m.i_block[i] != 0, "i_block[{i}] persisted across iget");
+        }
+    }
+    drop(inode2);
     sb.ops.unmount();
     drop(super_arc);
 }
@@ -260,7 +284,7 @@ fn writepage_dense_first_page() {
 /// the user bytes.
 fn writepage_sparse_then_extend() {
     let (sb, _fs, super_arc) = mount_rw();
-    let (_ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
+    let (ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
     let aops = Ext2Aops::new(&super_arc, &ext2_inode);
 
     let mut payload = [0u8; 4096];
@@ -324,9 +348,35 @@ fn writepage_sparse_then_extend() {
     assert_eq!(r, 4096);
     assert_eq!(readback, payload, "sparse writepage data must round-trip");
 
+    // Persistence check (CodeRabbit #803 nit): drop strong refs and
+    // re-`iget`. The single-indirect pointer block + size +
+    // i_blocks must all be reflected in the freshly-decoded slot.
     drop(aops);
     drop(ext2_inode);
     drop(inode);
+
+    let inode2 = iget(&super_arc, &sb, ino).expect("iget after sparse writepage");
+    {
+        use alloc::sync::Weak;
+        let ext2_inode2 = {
+            let ecache = super_arc.ext2_inode_cache.lock();
+            ecache
+                .get(&ino)
+                .and_then(Weak::upgrade)
+                .expect("ext2_inode_cache repopulated by iget")
+        };
+        let m = ext2_inode2.meta.read();
+        assert_eq!(m.size, page_hi, "sparse i_size persisted across iget");
+        assert_eq!(m.i_blocks, 10, "sparse i_blocks persisted across iget");
+        for i in 0..12 {
+            assert_eq!(m.i_block[i], 0, "direct slot {i} hole persisted");
+        }
+        assert!(
+            m.i_block[12] != 0,
+            "single-indirect slot persisted across iget"
+        );
+    }
+    drop(inode2);
     sb.ops.unmount();
     drop(super_arc);
 }

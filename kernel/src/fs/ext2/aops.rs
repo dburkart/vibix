@@ -454,6 +454,18 @@ impl AddressSpaceOps for Ext2Aops {
         // page extends the file — the trait contract is "writepage
         // never shrinks") and `i_blocks`. The mtime/ctime bump
         // matches `write_file_at`'s discipline.
+        //
+        // Snapshot the pre-mutation values so a `flush_inode_slot`
+        // failure can restore the in-memory meta wholesale (CodeRabbit
+        // #803: a partial restore that only touched `i_block[]` would
+        // leave `size` / `i_blocks` / mtime / ctime visibly enlarged
+        // after a flush failure even though the underlying blocks
+        // were unwound).
+        let old_size = meta.size;
+        let old_i_blocks = meta.i_blocks;
+        let old_mtime = meta.mtime;
+        let old_ctime = meta.ctime;
+
         let new_size = meta.size.max(page_hi);
         meta.size = new_size;
         meta.i_blocks = meta.i_blocks.saturating_add(bumped_blocks_512 as u32);
@@ -469,14 +481,25 @@ impl AddressSpaceOps for Ext2Aops {
         // through its parent.
         if let Err(e) = flush_inode_slot(&super_ref, ext2_inode.ino, &meta) {
             // The inode-slot flush failed *after* every data block
-            // landed. We can't safely roll the data back (the bytes
-            // are durable on disk under blocks that are now linked
-            // into the inode). Free the freshly-allocated blocks so
-            // the bitmap / counters don't leak. The in-memory meta
-            // mutations above are reverted to keep the in-mem and
-            // on-disk views consistent — the user sees the failure
-            // via the returned errno.
+            // landed. Free the freshly-allocated blocks so the
+            // bitmap / counters don't leak, and revert every field we
+            // bumped above so the in-memory meta matches the pre-call
+            // state — the user sees the failure via the returned
+            // errno; subsequent `getattr` against this inode must not
+            // observe phantom-extended size/blocks.
+            //
+            // (Caveat: `sync_dirty_buffer` returning Err does not
+            // strictly prove the on-disk inode slot is unchanged. The
+            // codebase-wide convention — `write_file_at`,
+            // `setattr`, `link`, `create` — is the same "free + restore"
+            // posture; tightening to a force-RO latch on uncertain-
+            // durability is tracked as a follow-up rather than fixed
+            // piecemeal here.)
             rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            meta.size = old_size;
+            meta.i_blocks = old_i_blocks;
+            meta.mtime = old_mtime;
+            meta.ctime = old_ctime;
             return Err(e);
         }
 
