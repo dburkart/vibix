@@ -609,7 +609,10 @@ fn run_layered_scenario(seed: u64, plan: FaultPlan) -> (i64, u32, Vec<TraceRecor
 
     // T_FORK: parent dispatches sys_fork.
     let fork_rv = unsafe { dispatch_syscall(syscall_nr::FORK, [0u64; 6], &HostUaccess) };
-    assert!(fork_rv >= 2, "fork should return child pid >= 2; got {fork_rv}");
+    assert!(
+        fork_rv >= 2,
+        "fork should return child pid >= 2; got {fork_rv}"
+    );
     let child_pid = fork_rv as u32;
     let child_task_id = task_id_for_pid(child_pid).expect("child task id registered");
     assert!(
@@ -625,7 +628,10 @@ fn run_layered_scenario(seed: u64, plan: FaultPlan) -> (i64, u32, Vec<TraceRecor
     // T_EXEC: switch context to child, dispatch sys_execve.
     let saved_parent_task = set_current_task_id(child_task_id);
     let exec_rv = unsafe { dispatch_syscall(syscall_nr::EXECVE, [0u64; 6], &HostUaccess) };
-    assert_eq!(exec_rv, 0, "host execve stub should return 0; got {exec_rv}");
+    assert_eq!(
+        exec_rv, 0,
+        "host execve stub should return 0; got {exec_rv}"
+    );
 
     // Step to T_EXIT.
     sim.run_for(T_EXIT - T_EXEC); // → tick 6
@@ -639,7 +645,7 @@ fn run_layered_scenario(seed: u64, plan: FaultPlan) -> (i64, u32, Vec<TraceRecor
     set_current_task_id(saved_parent_task);
     let mut wstatus_buf: u32 = 0;
     let wait4_args = [
-        -1i64 as u64,                       // pid = any child
+        -1i64 as u64,                          // pid = any child
         (&mut wstatus_buf as *mut u32) as u64, // wstatus user pointer
         0,
         0,
@@ -693,9 +699,10 @@ fn layered_repro_baseline_no_faults_also_passes() {
     // works in isolation, independent of #710's fix interaction with
     // the WakeupReorder lever.
     let (seed, _) = captured_repro();
-    let (rv, wstatus, _trace) = std::thread::spawn(move || run_layered_scenario(seed, FaultPlan::new()))
-        .join()
-        .expect("baseline layered scenario thread");
+    let (rv, wstatus, _trace) =
+        std::thread::spawn(move || run_layered_scenario(seed, FaultPlan::new()))
+            .join()
+            .expect("baseline layered scenario thread");
 
     assert_eq!(rv, 2, "baseline wait4 returned wrong pid: {rv}");
     let expected = (7u32 & 0xFF) << 8;

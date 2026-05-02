@@ -179,11 +179,7 @@ impl UaccessAdapter for HostUaccess {
 /// `wstatus_ptr` (`a1`) reads/writes user memory, and only when
 /// non-zero — see [`dispatch_wait4`] for the precise read/write
 /// shape.
-pub unsafe fn dispatch_syscall(
-    nr: u64,
-    args: [u64; 6],
-    uaccess: &dyn UaccessAdapter,
-) -> i64 {
+pub unsafe fn dispatch_syscall(nr: u64, args: [u64; 6], uaccess: &dyn UaccessAdapter) -> i64 {
     match nr {
         syscall_nr::FORK => dispatch_fork(),
         syscall_nr::EXECVE => dispatch_execve(args[0], args[1], args[2]),
@@ -314,11 +310,7 @@ fn dispatch_exit(status: i32) -> i64 {
 /// # Safety
 /// `wstatus_ptr` must point to at least 4 bytes of valid host memory
 /// when non-zero (the encoded status is a `u32`).
-unsafe fn dispatch_wait4(
-    target_pid: i32,
-    wstatus_ptr: usize,
-    uaccess: &dyn UaccessAdapter,
-) -> i64 {
+unsafe fn dispatch_wait4(target_pid: i32, wstatus_ptr: usize, uaccess: &dyn UaccessAdapter) -> i64 {
     let parent_pid = process::current_pid();
     if parent_pid == 0 {
         return ECHILD;
