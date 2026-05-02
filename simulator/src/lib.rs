@@ -93,6 +93,9 @@ pub mod minimize;
 mod proptest_model;
 
 #[cfg(not(target_os = "none"))]
+pub mod syscall_seam;
+
+#[cfg(not(target_os = "none"))]
 pub mod trace;
 
 #[cfg(not(target_os = "none"))]
@@ -898,6 +901,12 @@ pub use imp::{
     MonotonicPids, NoStrandedWakeups, Reproducer, SafetyInvariant, Seed, SimRng, Simulator,
     SimulatorConfig, SingleRunningPerCpu, TickWindow, Trace, TraceRecord, VariantMask, Violation,
     FAULT_PLAN_SCHEMA_VERSION, SCHEMA_VERSION,
+};
+
+#[cfg(not(target_os = "none"))]
+pub use syscall_seam::{
+    dispatch_syscall, install_init_process, set_current_task_id, task_id_for_pid, HostUaccess,
+    UaccessAdapter, ECHILD, EFAULT, ENOSYS, EPERM, SYNTHETIC_TASK_ID_BASE,
 };
 
 // On `target_os = "none"` (the bare-metal kernel image), the simulator

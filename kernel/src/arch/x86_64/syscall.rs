@@ -43,22 +43,17 @@ use x86_64::registers::model_specific::Msr;
 use super::gdt::{set_tss_rsp0, STAR_KERNEL_CS_BASE, STAR_USER_CS_BASE};
 use super::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
-/// Diagnostic instrumentation along the fork(2) syscall path (epic #501 /
-/// issue #502). Expands to `serial_println!` when the `fork-trace` feature
-/// is enabled at build time; otherwise compiles to nothing. Paired entry/
-/// exit probes let the last surviving print pinpoint where the kernel
-/// wedges in the fork path.
-#[cfg(feature = "fork-trace")]
-#[macro_export]
-macro_rules! fork_trace {
-    ($($arg:tt)*) => ($crate::serial_println!($($arg)*));
-}
-
-#[cfg(not(feature = "fork-trace"))]
-#[macro_export]
-macro_rules! fork_trace {
-    ($($arg:tt)*) => {};
-}
+// `fork_trace!` is defined in `kernel/src/lib.rs` so the host build of
+// `process` (RFC 0008 / #790) can reach for it without dragging the
+// arch/x86_64 module in. Original definition site preserved as a
+// comment for grep-ability:
+//
+//   #[cfg(feature = "fork-trace")]
+//   #[macro_export]
+//   macro_rules! fork_trace { ($($arg:tt)*) => ($crate::serial_println!($($arg)*)); }
+//   #[cfg(not(feature = "fork-trace"))]
+//   #[macro_export]
+//   macro_rules! fork_trace { ($($arg:tt)*) => {}; }
 
 /// MSR addresses.
 const MSR_EFER: u32 = 0xC000_0080;

@@ -81,17 +81,34 @@
 //! Nothing acquires `WaitQueue.inner` while already holding a data
 //! lock or `SCHED`, so the graph is a DAG.
 
-pub mod irqlock;
-pub mod mpmc;
-pub mod mutex;
-pub mod rwlock;
-pub mod semaphore;
-pub mod spsc;
+// `WaitQueue` is host-buildable under `feature = "sched-mock"` because
+// `process::CHILD_WAIT` (the wait4 rendezvous) needs to be reachable
+// from the host-side simulator (RFC 0008 / #790). The other primitives
+// (`BlockingMutex`, `BlockingRwLock`, `Semaphore`, `spsc`, `mpmc`,
+// `IrqLock`) stay bare-metal-only — no host caller has materialized
+// for them yet, so they keep their original gate.
 pub mod waitqueue;
 
+#[cfg(target_os = "none")]
+pub mod irqlock;
+#[cfg(target_os = "none")]
+pub mod mpmc;
+#[cfg(target_os = "none")]
+pub mod mutex;
+#[cfg(target_os = "none")]
+pub mod rwlock;
+#[cfg(target_os = "none")]
+pub mod semaphore;
+#[cfg(target_os = "none")]
+pub mod spsc;
+
+#[cfg(target_os = "none")]
 pub use irqlock::{IrqLock, IrqLockGuard};
+#[cfg(target_os = "none")]
 pub use mutex::{BlockingMutex, MutexGuard};
+#[cfg(target_os = "none")]
 pub use rwlock::{BlockingRwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(target_os = "none")]
 pub use semaphore::Semaphore;
 pub use waitqueue::WaitQueue;
 

@@ -22,6 +22,27 @@
 
 extern crate alloc;
 
+/// Diagnostic instrumentation along the fork(2) syscall path (epic #501 /
+/// issue #502). Expands to `serial_println!` when the `fork-trace` feature
+/// is enabled at build time; otherwise compiles to nothing. Paired entry/
+/// exit probes let the last surviving print pinpoint where the kernel
+/// wedges in the fork path.
+///
+/// Defined at crate root (rather than in `arch::x86_64::syscall`) so the
+/// host arm of `process::register` (RFC 0008 / #790) can reach the macro
+/// without the bare-metal `arch` module being in scope.
+#[cfg(all(target_os = "none", feature = "fork-trace"))]
+#[macro_export]
+macro_rules! fork_trace {
+    ($($arg:tt)*) => ($crate::serial_println!($($arg)*));
+}
+
+#[cfg(not(all(target_os = "none", feature = "fork-trace")))]
+#[macro_export]
+macro_rules! fork_trace {
+    ($($arg:tt)*) => {};
+}
+
 #[cfg(any(test, target_os = "none"))]
 pub mod abi;
 #[cfg(any(test, target_os = "none"))]
@@ -65,15 +86,29 @@ pub mod ksymtab;
 pub mod lntab;
 #[cfg(any(test, target_os = "none"))]
 pub mod poll;
-#[cfg(target_os = "none")]
+// `process` is host-buildable under `feature = "sched-mock"` for the
+// host-side DST simulator (RFC 0008 / #790). The host arm of the
+// `process` module gates its tty/signal-coupled methods to bare metal
+// so it can run without dragging the full arch / signal / tty graph
+// in. Kernel bare-metal builds see the unchanged surface.
+#[cfg(any(target_os = "none", feature = "sched-mock"))]
 pub mod process;
 #[cfg(target_os = "none")]
 pub mod serial;
 #[cfg(any(test, target_os = "none"))]
 pub mod shell;
-#[cfg(target_os = "none")]
+// `signal` exposes the host-buildable `SignalState` slot (the per-process
+// signal-mask + pending bitmap data structure) so `process::ProcessEntry`
+// has a uniform layout on host and bare metal. The full signal/syscall
+// glue (sigaction, signal frame writeback, etc.) stays bare-metal-only
+// inside the module.
+#[cfg(any(target_os = "none", feature = "sched-mock"))]
 pub mod signal;
-#[cfg(target_os = "none")]
+// `sync` exposes `WaitQueue` host-side under `feature = "sched-mock"`
+// because `process::CHILD_WAIT` is part of the host-buildable wait4
+// rendezvous. Other sync primitives stay bare-metal-only — gated
+// inside `sync/mod.rs`.
+#[cfg(any(target_os = "none", feature = "sched-mock"))]
 pub mod sync;
 // `pub mod task` is normally bare-metal-only — the scheduler core
 // touches `arch`, `sync`, and `x86_64` which are all `target_os =

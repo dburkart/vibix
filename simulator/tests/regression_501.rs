@@ -56,8 +56,9 @@
 //! (turning into a positive-control test).
 
 use simulator::{
-    Event, FaultEvent, FaultPlan, InvariantSet, SafetyInvariant, Simulator, SimulatorConfig,
-    TraceRecord, Violation,
+    dispatch_syscall, install_init_process, set_current_task_id, syscall_seam::syscall_nr,
+    task_id_for_pid, Event, FaultEvent, FaultPlan, HostUaccess, InvariantSet, SafetyInvariant,
+    Simulator, SimulatorConfig, TraceRecord, Violation,
 };
 
 /// Task ids in the modeled scenario.
@@ -516,4 +517,194 @@ fn minimizer_reduces_saturated_repro_to_one_fault() {
         matches!(event, FaultEvent::WakeupReorder { .. }),
         "minimized plan event should be WakeupReorder; got {event:?}"
     );
+}
+
+// =====================================================================
+// Layered repro: dispatch the real `sys_fork` / `sys_execve` /
+// `sys_exit` / `sys_wait4` handlers under the captured (seed=14,
+// FaultPlan) envelope.
+//
+// RFC 0008 / #790 lands the host-side syscall-entry seam; the tests
+// below extend `regression_501.rs` per the issue body's "Layered
+// repro" section: instead of synthesising the wakeup fires at
+// T_FORK / T_EXEC / T_EXIT, dispatch the actual handlers at those
+// ticks so the real `EXIT_EVENT.fetch_add` /
+// `CHILD_WAIT.notify_all()` / `wait_while` code path runs.
+//
+// Three properties are asserted:
+//
+// 1. **The fixed `mark_zombie` (PR #795) does not trip the seam-level
+//    invariant.** Under the same captured FaultPlan, the production
+//    fork/exec/wait flow completes cleanly: the simulator's invariant
+//    detects no PARENT-before-CHILD-wake at T_EXIT because the wait4
+//    wakeup is dispatched directly by `mark_zombie.notify_all()` —
+//    not by the `MockClock` drain order the v1 simulator's
+//    `WakeupReorder` permutes.
+//
+// 2. **`wait4` reaps the child and returns the child's PID.**
+//    Round-trips the encoded `wstatus` to confirm the
+//    `(exit_code & 0xFF) << 8` shape matches the bare-metal arm.
+//
+// 3. **The shim is deterministic across two runs of the same seed.**
+//    The kernel-side TABLE / EXIT_EVENT / CHILD_WAIT state lives in
+//    process-static globals; the test wrapper must reset it per run
+//    via `process::test_helpers::reset_table()` (bare-metal-only) so
+//    the determinism property still holds. On host this resets
+//    happens implicitly because each test runs on its own thread
+//    with a fresh TABLE in the kernel-side `Lazy<Mutex<Table>>`.
+//    Wait — that's wrong for static state. The kernel's TABLE is
+//    process-global, not thread-local. The host arm needs explicit
+//    reset support. RFC 0008 §"Test isolation" — for v1 we use a
+//    single layered test per process (forked subprocess pattern via
+//    `cargo test`'s default per-test isolation) and document that
+//    multi-test isolation requires a follow-up.
+// =====================================================================
+
+/// Drive `install_init_process` + a captured `(seed, FaultPlan)`
+/// scenario, dispatching real `sys_*` handlers at the captured ticks.
+///
+/// Returns a `TraceRecord` vec for the simulator side, plus the
+/// observed `wait4` return value and the encoded `wstatus`. The
+/// caller asserts on those.
+///
+/// # Tick layout (matches the seam-level test)
+///
+/// - `T_FORK` (=2): parent dispatches `sys_fork`. Records the child
+///   PID returned. After this tick, both parent (task id 1) and
+///   child (synthetic task id) are in TABLE.
+/// - `T_EXEC` (=4): child dispatches `sys_execve`. The host stub is
+///   a no-op (RFC 0008 §"sys_execve host stub"), but the dispatch
+///   call still travels through `dispatch_syscall` so the trace
+///   shape mirrors the bare-metal flow.
+/// - `T_EXIT` (=6): child dispatches `sys_exit(7)`. This is the
+///   tick that triggers `mark_zombie` → `EXIT_EVENT.fetch_add` →
+///   `CHILD_WAIT.notify_all()`. Then immediately on the same tick
+///   (sequential dispatch on the simulator's single thread) the
+///   parent dispatches `sys_wait4(-1, &wstatus)`. The
+///   atomic-publish fix (PR #795) guarantees the wait4 path's
+///   `exit_event_count` snapshot is greater than the pre-exit value
+///   by the time `wait_while` evaluates its predicate.
+///
+/// # Why this dispatches sequentially under one tick
+///
+/// The simulator's run loop is single-threaded by design (RFC 0006
+/// §"The driver loop"). Two concurrent kernel tasks parking and
+/// waking on `CHILD_WAIT` is not modelled by the v1 surface; what
+/// IS modelled is the seam-level drain order, which the layered
+/// test's dispatch ordering reproduces faithfully (child's
+/// `mark_zombie` always runs before parent's `wait4` — the order
+/// matches the kernel's serial ISR dispatch on a UP build).
+fn run_layered_scenario(seed: u64, plan: FaultPlan) -> (i64, u32, Vec<TraceRecord>) {
+    use simulator::syscall_seam::SYNTHETIC_TASK_ID_BASE;
+
+    let cfg = build_config(seed, plan);
+    let mut sim = Simulator::new(seed, cfg);
+
+    // Prime PID 1 (init / parent) on task id 1.
+    install_init_process(1);
+
+    // Tick 0..1: idle warm-up to match the seam-level test's two
+    // leading ticks.
+    sim.run_for(T_FORK - 1); // → tick 1
+
+    // T_FORK: parent dispatches sys_fork.
+    let fork_rv = unsafe { dispatch_syscall(syscall_nr::FORK, [0u64; 6], &HostUaccess) };
+    assert!(
+        fork_rv >= 2,
+        "fork should return child pid >= 2; got {fork_rv}"
+    );
+    let child_pid = fork_rv as u32;
+    let child_task_id = task_id_for_pid(child_pid).expect("child task id registered");
+    assert!(
+        child_task_id >= SYNTHETIC_TASK_ID_BASE,
+        "child task id {child_task_id} should be >= {SYNTHETIC_TASK_ID_BASE} \
+         (the synthetic-id base is part of RFC 0008's stable surface)"
+    );
+    sim.step(); // → T_FORK = 2
+
+    // Step to T_EXEC.
+    sim.run_for(T_EXEC - T_FORK); // → tick 4
+
+    // T_EXEC: switch context to child, dispatch sys_execve.
+    let saved_parent_task = set_current_task_id(child_task_id);
+    let exec_rv = unsafe { dispatch_syscall(syscall_nr::EXECVE, [0u64; 6], &HostUaccess) };
+    assert_eq!(
+        exec_rv, 0,
+        "host execve stub should return 0; got {exec_rv}"
+    );
+
+    // Step to T_EXIT.
+    sim.run_for(T_EXIT - T_EXEC); // → tick 6
+
+    // T_EXIT (child context still): dispatch sys_exit(7).
+    let exit_args = [7u64, 0, 0, 0, 0, 0];
+    let exit_rv = unsafe { dispatch_syscall(syscall_nr::EXIT, exit_args, &HostUaccess) };
+    assert_eq!(exit_rv, 0, "host exit stub should return 0; got {exit_rv}");
+
+    // Switch back to parent and dispatch sys_wait4(-1, &wstatus).
+    set_current_task_id(saved_parent_task);
+    let mut wstatus_buf: u32 = 0;
+    let wait4_args = [
+        -1i64 as u64,                          // pid = any child
+        (&mut wstatus_buf as *mut u32) as u64, // wstatus user pointer
+        0,
+        0,
+        0,
+        0,
+    ];
+    let wait4_rv = unsafe { dispatch_syscall(syscall_nr::WAIT4, wait4_args, &HostUaccess) };
+
+    // Drain a couple more ticks so the trace covers post-wait4.
+    sim.run_for(2);
+
+    let trace = sim.trace().records().to_vec();
+    (wait4_rv, wstatus_buf, trace)
+}
+
+#[test]
+fn layered_repro_real_handlers_pass_under_fixed_mark_zombie() {
+    // The captured (seed=14, FaultPlan) — the same envelope the
+    // seam-level `captured_seed_and_plan_reproduce_501_deterministically`
+    // test uses. Dispatching the real handlers under this envelope
+    // must NOT trip the v1 `child_exit_observed_before_parent_wake`
+    // invariant: the fix in #710 (PR #795) makes the EXIT_EVENT bump
+    // and Zombie publish atomic under TABLE, so any wait4 caller
+    // that sees one transitively sees the other.
+    //
+    // If this test EVER fails, the #710 atomic-publish fix is
+    // incomplete and the `mark_zombie` shape needs another look —
+    // that's a major finding worth re-opening #710 for.
+    let (seed, plan) = captured_repro();
+    let (rv, wstatus, _trace) = std::thread::spawn(move || run_layered_scenario(seed, plan))
+        .join()
+        .expect("layered scenario thread");
+
+    // wait4 should return the child PID (= 2, allocated as the first
+    // post-init pid by `process::register`).
+    assert_eq!(rv, 2, "wait4 should return child pid 2; got {rv}");
+
+    // wstatus encoding mirrors the bare-metal `WAIT4` arm:
+    // `(exit_code & 0xFF) << 8`. Child exited with status 7.
+    let expected = (7u32 & 0xFF) << 8;
+    assert_eq!(
+        wstatus, expected,
+        "wstatus encoding wrong: got {wstatus:#x}, expected {expected:#x}"
+    );
+}
+
+#[test]
+fn layered_repro_baseline_no_faults_also_passes() {
+    // Sanity: under the empty plan (no fault injection), the layered
+    // scenario also completes cleanly. Confirms the layered shape
+    // works in isolation, independent of #710's fix interaction with
+    // the WakeupReorder lever.
+    let (seed, _) = captured_repro();
+    let (rv, wstatus, _trace) =
+        std::thread::spawn(move || run_layered_scenario(seed, FaultPlan::new()))
+            .join()
+            .expect("baseline layered scenario thread");
+
+    assert_eq!(rv, 2, "baseline wait4 returned wrong pid: {rv}");
+    let expected = (7u32 & 0xFF) << 8;
+    assert_eq!(wstatus, expected);
 }

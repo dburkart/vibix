@@ -32,7 +32,19 @@ use spin::{Lazy, Mutex};
 
 use crate::signal::SignalState;
 use crate::sync::WaitQueue;
+// `tty` is bare-metal-only (it touches `arch::x86_64::*` for the PS/2
+// + serial drivers), so its types are gated for the host arm. RFC 0008
+// §"Slim host arm" — the host `ProcessEntry` carries `session_id` /
+// `pgrp_id` as plain u32, with the `controlling_tty: Option<Arc<Tty>>`
+// field elided. The wait4 rendezvous (#710 / mark_zombie / reap_child)
+// does not touch any of those fields, so the host arm reproduces the
+// same fork/exec/wait code path bit-for-bit.
+#[cfg(target_os = "none")]
 use crate::tty::{ProcessGroupId, SessionId, Tty};
+#[cfg(not(target_os = "none"))]
+type SessionId = u32;
+#[cfg(not(target_os = "none"))]
+type ProcessGroupId = u32;
 
 /// Scheduling / lifecycle state of a process entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,6 +77,11 @@ pub struct ProcessEntry {
     /// (#376) acquires one; shared by every member of a session via
     /// `Arc` so the tty outlives the session leader until every
     /// referring process has dropped it.
+    ///
+    /// Bare-metal only — the host arm of this struct (RFC 0008 / #790)
+    /// elides this field because the wait4 rendezvous never touches it
+    /// and `Tty` is itself coupled to bare-metal driver state.
+    #[cfg(target_os = "none")]
     pub controlling_tty: Option<Arc<Tty>>,
 }
 
@@ -126,6 +143,7 @@ pub fn register_init(task_id: usize) {
             signals: Arc::new(Mutex::new(SignalState::new())),
             session_id: 1,
             pgrp_id: 1,
+            #[cfg(target_os = "none")]
             controlling_tty: None,
         },
     );
@@ -152,11 +170,18 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
     );
     let mut t = lock_table_with_soak_check("register");
     crate::fork_trace!("fork-trace: [process::register] TABLE locked");
+    #[cfg(target_os = "none")]
     let (session_id, pgrp_id, controlling_tty) = t
         .by_pid
         .get(&parent_pid)
         .map(|p| (p.session_id, p.pgrp_id, p.controlling_tty.clone()))
         .unwrap_or((pid, pid, None));
+    #[cfg(not(target_os = "none"))]
+    let (session_id, pgrp_id) = t
+        .by_pid
+        .get(&parent_pid)
+        .map(|p| (p.session_id, p.pgrp_id))
+        .unwrap_or((pid, pid));
     t.by_pid.insert(
         pid,
         ProcessEntry {
@@ -168,6 +193,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
             signals: Arc::new(Mutex::new(SignalState::new())),
             session_id,
             pgrp_id,
+            #[cfg(target_os = "none")]
             controlling_tty,
         },
     );
@@ -419,6 +445,21 @@ pub fn update_task_id(pid: u32, new_task_id: usize) {
     t.pid_of.insert(new_task_id, pid);
 }
 
+// Bare-metal-only block: tty/session helpers, the signal-mask
+// fast-paths, and the session/pgrp syscalls below all reach into
+// `crate::tty::*` or the bare-metal arms of `crate::signal::*`. The
+// host arm under `feature = "sched-mock"` (RFC 0008 / #790) exposes
+// only the wait4 rendezvous (`register` / `mark_zombie` /
+// `reap_child` / `has_children` / `reparent_children` /
+// `exit_event_count`) plus the `with_signal_state_for_task` helper
+// (a closure-based accessor that does not touch tty fields). Wrap
+// everything below in a `cfg(target_os = "none")` macro so the host
+// arm doesn't try to compile the bare-metal-only items.
+#[allow(unused_macros)]
+macro_rules! bare_metal_only {
+    ($($body:item)*) => { $( #[cfg(target_os = "none")] $body )* };
+}
+
 // ── Signal helpers ────────────────────────────────────────────────────────
 
 /// Look up the `SignalState` for the process that owns `task_id` and call
@@ -448,6 +489,8 @@ pub fn task_id_for_pid(pid: u32) -> Option<usize> {
     let t = TABLE.lock();
     t.by_pid.get(&pid).map(|e| e.task_id)
 }
+
+bare_metal_only! {
 
 // ── Session / process-group syscalls ──────────────────────────────────────
 //
@@ -806,11 +849,14 @@ pub fn pgrp_is_orphaned(pgid: u32) -> bool {
         .any(|e| e.pgrp_id == pgid && matches!(e.state, ProcessState::Alive))
 }
 
+} // end bare_metal_only!
+
 /// Session/pgrp test helpers, exposed so the `session_syscalls` kernel
 /// integration test can drive the table without the scheduler. Not
 /// gated on `cfg(test)` because the integration test is a separate
 /// crate that imports `vibix` as a normal dependency.
 #[doc(hidden)]
+#[cfg(target_os = "none")]
 pub mod test_helpers {
     use super::*;
 
