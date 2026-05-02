@@ -400,9 +400,34 @@ pub struct Ext2FileOps;
 impl FileOps for Ext2FileOps {}
 
 impl FileOps for Ext2Inode {
-    /// Regular-file read through the buffer cache. See
-    /// [`super::file::read_file_at`] for the normative pipeline.
+    /// Regular-file read.
+    ///
+    /// When the inode has an installed [`crate::mem::page_cache::PageCache`]
+    /// (`mapping = Some(_)`), route through the cache via
+    /// [`super::file::read_via_page_cache`] so a `read(2)` and a
+    /// concurrent `mmap(2)` of the same file observe the same backing
+    /// copy (RFC 0007 §`FileOps::read` / Workstream C, issue #754).
+    /// When `mapping` is `None` (no FS-side `AddressSpaceOps` installed,
+    /// or the lazy install in
+    /// [`crate::fs::vfs::inode::Inode::page_cache_or_create`] hasn't
+    /// been triggered yet), fall back to the existing direct buffer-
+    /// cache pipeline in [`super::file::read_file_at`].
+    ///
+    /// The cache-routing path is feature-gated on `page_cache` so the
+    /// migration window's default-feature build (no `mapping` field
+    /// at all) compiles cleanly.
     fn read(&self, f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
+        #[cfg(feature = "page_cache")]
+        {
+            // Take only the read guard on `mapping` — `Inode::page_cache_or_create`
+            // is the install-once writer; once installed the slot is
+            // stable for the inode's lifetime, so the read-guard clone
+            // of the `Arc` is safe to consult outside the lock.
+            let cache_opt = f.inode.mapping.read().as_ref().map(Arc::clone);
+            if let Some(cache) = cache_opt {
+                return super::file::read_via_page_cache(&cache, buf, off);
+            }
+        }
         super::file::read_file_at(&f.inode, self, buf, off)
     }
 
