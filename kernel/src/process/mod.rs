@@ -277,6 +277,25 @@ fn is_if_set() -> bool {
 /// Mark `pid` as a zombie with `exit_status`, then wake any parents
 /// sleeping in `waitpid`. TABLE is released before notify to satisfy
 /// the lock-ordering rule described in the module docs.
+///
+/// ## Atomic publish (#710)
+///
+/// The Zombie state write and the `EXIT_EVENT` bump happen **under the
+/// same TABLE critical section** so a waiter that observes either
+/// `EXIT_EVENT > snap` or a zombie entry with the right parent
+/// transitively observes the other. The previous shape (state under
+/// TABLE, then `EXIT_EVENT.fetch_add` after TABLE drop) opened a
+/// drain-order window the v1 simulator's `WakeupReorder` could
+/// permute — see the seam-level analogue in
+/// `simulator/tests/regression_501.rs`. Moving the bump inside TABLE
+/// makes the reap path order-independent: any predicate evaluation
+/// that takes TABLE and sees the zombie *also* observes the bumped
+/// counter (and vice versa), regardless of which lock the caller
+/// took first.
+///
+/// `notify_all` still happens after TABLE drop — the TABLE → inner
+/// ordering rule documented in the module header forbids holding
+/// TABLE across `WaitQueue::notify_all`'s `inner.lock()` acquire.
 pub fn mark_zombie(pid: u32, status: i32) {
     debug_assert!(
         is_if_set(),
@@ -290,10 +309,16 @@ pub fn mark_zombie(pid: u32, status: i32) {
             entry.state = ProcessState::Zombie;
             entry.exit_status = Some(status);
         }
+        // Bump the event counter inside the TABLE critical section so
+        // the Zombie publish and the counter publish are atomically
+        // observable to any other TABLE acquirer. A waiter that takes
+        // TABLE (e.g. via `reap_child` / `has_children`) and sees the
+        // pre-bump state will also see the pre-bump counter; a waiter
+        // that sees the post-bump counter will, on the next TABLE
+        // acquire, see the Zombie entry. Closes the seam-level
+        // drain-order window from #710 / `regression_501`.
+        EXIT_EVENT.fetch_add(1, Ordering::Release);
     }
-    // Bump the event counter so wait_while predicates can check it
-    // atomically without taking TABLE.
-    EXIT_EVENT.fetch_add(1, Ordering::Release);
     CHILD_WAIT.notify_all();
 }
 
