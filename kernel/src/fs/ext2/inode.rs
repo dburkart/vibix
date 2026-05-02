@@ -416,7 +416,22 @@ impl FileOps for Ext2Inode {
     /// The cache-routing path is feature-gated on `page_cache` so the
     /// migration window's default-feature build (no `mapping` field
     /// at all) compiles cleanly.
+    ///
+    /// The `InodeKind::Reg` gate at the top is essential: `read_file_at`
+    /// returns `EISDIR` / `EINVAL` for non-regular kinds, and the
+    /// page-cache route would silently bypass that errno surface for
+    /// any non-regular inode that ever gets a `mapping` slot
+    /// installed (today only `iget` for `Reg` inodes installs aops, but
+    /// the gate is defence-in-depth against a future caller that
+    /// installs aops on a different kind).
     fn read(&self, f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
+        // Non-regular inodes always go through `read_file_at` so the
+        // dispatch table for `Dir` / `Link` / `Chr` / `Blk` / `Fifo` /
+        // `Sock` (each producing a specific errno) stays authoritative.
+        // The page-cache route is for `InodeKind::Reg` only.
+        if !matches!(f.inode.kind, InodeKind::Reg) {
+            return super::file::read_file_at(&f.inode, self, buf, off);
+        }
         #[cfg(feature = "page_cache")]
         {
             // Take only the read guard on `mapping` — `Inode::page_cache_or_create`
