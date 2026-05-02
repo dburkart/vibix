@@ -168,3 +168,17 @@ pub use orphan_finalize::finalize as finalize_orphan;
 // §Cross-directory loop check.
 #[cfg(all(feature = "ext2", target_os = "none"))]
 pub mod rename;
+
+// Address-space ops (#749 readpage; #750 writepage; #751 truncate_below;
+// #752 readahead). The `Ext2Aops` struct itself implements the
+// `AddressSpaceOps` trait the page cache calls on miss / writeback /
+// truncate. Same feature gate as the rest of the driver — it consumes
+// `Ext2Super` + `Ext2Inode` and routes through the buffer cache. The
+// `page_cache` feature is what gates whether the consumer ever wires
+// it up (via `Inode::set_aops`); the impl itself is reachable
+// independently for direct unit testing.
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub mod aops;
+
+#[cfg(all(feature = "ext2", target_os = "none"))]
+pub use aops::Ext2Aops;

@@ -418,6 +418,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_readpage"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "ext2_orphan_chain"
 harness = false
 required-features = ["ext2"]
