@@ -421,10 +421,169 @@ mod daemon {
                 );
             }
 
+            // RFC 0007 §MAP_SHARED writeback (issue #755): after the
+            // buffer-cache flush, walk every superblock-mounted inode's
+            // `mapping` and call `writepage` on each dirty `pgoff`.
+            // Snapshot-then-writepage discipline: dirty pgoffs are
+            // collected under `cache.inner.lock()` (via
+            // [`PageCache::snapshot_dirty`]), the lock is dropped, and
+            // then `writepage` runs against the snapshot.
+            //
+            // Skip-on-shutdown: re-check `sb.draining` between inodes
+            // so a `sys_umount` racing the sweep observes a prompt
+            // exit rather than serving the entire inode list. The bare
+            // hook here is what the issue calls for; #760 will harden
+            // the predicate (e.g. by promoting the check into a real
+            // `SbActiveGuard::is_draining` query path).
+            sweep_inode_mappings(state);
+
             state.bump_sweeps();
             drop(guard);
         }
     }
+
+    /// Page-cache walk half of one writeback sweep. Iterates every
+    /// inode the superblock's [`SuperOps::for_each_mapped_inode`] hook
+    /// surfaces, snapshots each inode's dirty pgoff set under the
+    /// page-cache mutex, and runs `writepage` on the snapshot with the
+    /// mutex dropped. Errors are logged and the dirty bit is left set
+    /// so the next sweep retries — matches the buffer-cache `sync_fs`
+    /// best-effort contract (RFC 0004 §Buffer cache, normative invariant
+    /// #4: a flush failure does not lose enrolment).
+    ///
+    /// `feature = "page_cache"` gates the body so a kernel built without
+    /// the page-cache wave-2 surface still compiles cleanly. With the
+    /// feature off, the function is an empty no-op — the buffer-cache
+    /// flush above is the daemon's only effect, which is the
+    /// pre-#755 behaviour.
+    #[cfg(feature = "page_cache")]
+    fn sweep_inode_mappings(state: &Arc<WritebackState>) {
+        use crate::mem::page_cache::{CachePage, PG_DIRTY};
+        use crate::mem::paging;
+        use alloc::vec::Vec;
+        use core::sync::atomic::Ordering;
+
+        // Collect inodes-with-mappings into a `Vec` so the walk runs
+        // outside whatever lock the FS driver's registry uses to back
+        // `for_each_mapped_inode`. RFC 0007 §Lock-order ladder forbids
+        // calling `writepage` while holding any spinlock; the
+        // collected `Arc<Inode>`s are independent strong refs that we
+        // can iterate freely.
+        let mut inodes: Vec<Arc<crate::fs::vfs::Inode>> = Vec::new();
+        state.sb.ops.for_each_mapped_inode(&mut |inode| {
+            inodes.push(Arc::clone(inode));
+        });
+
+        for inode in inodes {
+            // Skip-on-shutdown: bail out promptly if `sys_umount` set
+            // `sb.draining` between snapshots. Issue #760 hardens this
+            // predicate further; the bare check here is sufficient
+            // for the per-sweep correctness contract.
+            if state.sb.draining.load(Ordering::SeqCst) {
+                return;
+            }
+            if state.stop.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Acquire the per-inode mapping read-side. `mapping` is
+            // the install-once slot; if it's `None` the inode never
+            // participated in the page cache and there is nothing to
+            // sweep.
+            let pc = match inode.mapping.read().as_ref() {
+                Some(pc) => Arc::clone(pc),
+                None => continue,
+            };
+
+            // Snapshot under `cache.inner`. Returned vector clones the
+            // per-pgoff `Arc<CachePage>` strong refs so the walk that
+            // follows does not alias the BTreeMap behind the mutex.
+            let snapshot: Vec<(u64, Arc<CachePage>)> = pc.snapshot_dirty();
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            let ops = pc.ops();
+            for (pgoff, page) in snapshot {
+                // Re-check shutdown between pages too — a many-page
+                // dirty inode is the worst-case wait an unmount might
+                // see if we only re-checked between inodes.
+                if state.sb.draining.load(Ordering::SeqCst) || state.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                // Mark `PG_WRITEBACK` so a concurrent
+                // `mark_page_dirty` keeps the page on the dirty index
+                // (RFC 0007 §MAP_SHARED writeback). The bit is cleared
+                // unconditionally after `writepage` returns — error or
+                // success — via [`CachePage::end_writeback`].
+                page.begin_writeback();
+
+                // Copy the cached page bytes out of the HHDM-mapped
+                // backing frame into a stack-resident `[u8; 4096]`.
+                // The trait method takes a fixed-shape buffer (RFC
+                // 0007 §AddressSpaceOps page-buffer shape); the copy
+                // is what lets writepage run against an immutable
+                // snapshot while the page is logically released for
+                // concurrent writers.
+                let mut buf = [0u8; 4096];
+                // SAFETY: `page.phys` is a 4 KiB-aligned physical
+                // frame address held alive by `page` (which we own a
+                // strong Arc to). Limine's HHDM linearly maps every
+                // physical frame as RW kernel memory; the read is
+                // bounded to the 4 KiB frame and the source pointer
+                // stays valid for the duration of the copy because
+                // `page`'s drop runs after this scope.
+                unsafe {
+                    let hhdm = paging::hhdm_offset();
+                    let src = (hhdm.as_u64() + page.phys) as *const u8;
+                    core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), 4096);
+                }
+
+                match ops.writepage(pgoff, &buf) {
+                    Ok(()) => {
+                        // Successful flush: clear the per-page
+                        // `PG_DIRTY` bit and remove the pgoff from the
+                        // mapping's dirty index. `clear_page_dirty`
+                        // does both atomically under `cache.inner`.
+                        pc.clear_page_dirty(pgoff);
+                    }
+                    Err(errno) => {
+                        // Errseq-style sticky-EIO: bump the wb_err
+                        // counter (consumed by `OpenFile::fsync`).
+                        // The dirty bit is *left set* so the next
+                        // sweep retries — matches RFC 0007 §writepage
+                        // failure semantics. Per-page state.fetch_or
+                        // is unnecessary because `mark_page_dirty`'s
+                        // invariant already keeps the bit set.
+                        pc.bump_wb_err();
+                        // Defence-in-depth: explicitly preserve
+                        // `PG_DIRTY` in case some racy clearer cleared
+                        // it during the unlocked copy/writepage
+                        // window.
+                        page.state.fetch_or(PG_DIRTY, Ordering::Release);
+                        crate::serial_println!(
+                            "writeback: writepage(fs_id={} ino={} pgoff={}) failed: {}",
+                            state.sb.fs_id.0,
+                            inode.ino,
+                            pgoff,
+                            errno,
+                        );
+                    }
+                }
+
+                // Conclude writeback. `end_writeback` clears
+                // `PG_WRITEBACK` with `Release` and notifies any
+                // truncate parked on the page's waitqueue.
+                page.end_writeback();
+            }
+        }
+    }
+
+    /// Compile-out stub when `feature = "page_cache"` is off — the
+    /// daemon's pre-#755 buffer-cache-only behaviour.
+    #[cfg(not(feature = "page_cache"))]
+    fn sweep_inode_mappings(_state: &Arc<WritebackState>) {}
 
     /// Park the current task for up to `ms` milliseconds, returning
     /// early if `state.stop` is set and the daemon's sleep waitqueue

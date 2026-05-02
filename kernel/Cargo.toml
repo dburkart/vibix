@@ -526,3 +526,8 @@ harness = false
 [[test]]
 name = "syscall_fsync"
 harness = false
+
+[[test]]
+name = "block_writeback_inode_walk"
+harness = false
+required-features = ["page_cache"]

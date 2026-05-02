@@ -209,6 +209,35 @@ pub trait SuperOps: Send + Sync {
     /// no-op.  Drivers backed by persistent storage should flush dirty data
     /// here and log errors via the kernel's serial log.
     fn unmount(&self);
+
+    /// Iterate the live `Arc<Inode>`s tracked by this superblock, invoking
+    /// `cb` once per inode. The callback is **not** called under any
+    /// driver-internal spinlock — RFC 0007 §Lock-order ladder requires the
+    /// page-cache walk that consumes this hook to be free to take the
+    /// page-cache `cache.inner` mutex on each visited inode.
+    ///
+    /// Used by the per-mount writeback daemon (RFC 0007 §MAP_SHARED
+    /// writeback, issue #755) to walk every superblock-mounted inode's
+    /// `mapping` and call `writepage` on each dirty `pgoff`. The default
+    /// implementation visits nothing — the only cost is the missed flush
+    /// opportunity, which is acceptable for filesystems that either do not
+    /// participate in the page cache (ramfs, devfs, tarfs) or have not yet
+    /// been migrated to the wave-2 mapping API.
+    ///
+    /// Drivers that **do** keep an inode registry (today: ramfs's
+    /// `inode_table`, eventually ext2's icache via #750) override this to
+    /// snapshot the registry's `Weak<Inode>` list under the registry's own
+    /// lock, drop that lock, then upgrade and invoke `cb` for each
+    /// successfully upgraded `Arc<Inode>`. Performing the upgrade-and-call
+    /// outside the registry mutex is what keeps the writeback walk from
+    /// inverting against the registry's level (typically level 5, above
+    /// the page cache's level 4 mutex).
+    ///
+    /// Hardening of the skip-on-shutdown predicate against `SbActiveGuard`
+    /// is sibling issue #760; this hook only enumerates inodes — the
+    /// caller is responsible for re-checking `sb.draining` between
+    /// invocations.
+    fn for_each_mapped_inode(&self, _cb: &mut dyn FnMut(&Arc<Inode>)) {}
 }
 
 /// Per-inode operations: namespace mutation, metadata, permission.
