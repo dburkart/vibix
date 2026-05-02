@@ -993,7 +993,9 @@ mod tests {
 
         let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2);
         // Drive a fault — winner path runs `readpage`.
-        let phys = obj.fault(0, Access::Read).expect("first fault must resolve");
+        let phys = obj
+            .fault(0, Access::Read)
+            .expect("first fault must resolve");
         assert_ne!(phys, 0);
         assert!(
             probe

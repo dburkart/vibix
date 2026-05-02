@@ -1848,7 +1848,10 @@ mod tests {
             Arc::strong_count(p)
         };
         // outer `stub` + index = 2 (we still hold `stub`).
-        assert_eq!(strong_borrow, 2, "frame-refcount bumps must not affect strong");
+        assert_eq!(
+            strong_borrow, 2,
+            "frame-refcount bumps must not affect strong"
+        );
         assert_eq!(
             crate::mem::refcount::page_refcount_in(&slots, phys)
                 .load(core::sync::atomic::Ordering::Relaxed),
@@ -1873,7 +1876,10 @@ mod tests {
         // block forever (host stub uses spin::Mutex; `try_lock` is
         // the deadlock-safe probe).
         let guard = cache.inner.try_lock();
-        assert!(guard.is_some(), "cache.inner must be free post install_or_get");
+        assert!(
+            guard.is_some(),
+            "cache.inner must be free post install_or_get"
+        );
     }
 
     #[test]
