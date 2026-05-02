@@ -45,8 +45,17 @@
 //! - Multi-threaded signal delivery is not implemented (single-CPU, single-
 //!   threaded for now).
 
+// `frame.rs` and the SYSCALL-trampoline / iret-frame plumbing are
+// bare-metal-only because they touch `arch::x86_64::*`. The host-build
+// arm under `feature = "sched-mock"` exposes only `SignalState` — the
+// per-process signal-mask + pending-bitmap data structure that
+// `process::ProcessEntry` carries — so the host-side simulator
+// (RFC 0008 / #790) can construct an entry without the full delivery
+// path being host-buildable.
+#[cfg(target_os = "none")]
 pub mod frame;
 
+#[cfg(target_os = "none")]
 use crate::arch::x86_64::uaccess;
 
 // ── Signal numbers (Linux x86_64) ────────────────────────────────────────
@@ -104,6 +113,12 @@ pub enum Disposition {
 }
 
 impl Disposition {
+    // Host-buildable accessors are only used by the bare-metal
+    // sigaction syscall arms; the host arm of `signal::*`
+    // (RFC 0008 / #790) carries `SignalState` only and never reaches
+    // these helpers. Gate to bare metal to silence the dead-code
+    // warning under `feature = "sched-mock"`.
+    #[cfg(target_os = "none")]
     fn from_handler_ptr(ptr: u64) -> Self {
         match ptr {
             SIG_DFL => Disposition::Default,
@@ -112,6 +127,7 @@ impl Disposition {
         }
     }
 
+    #[cfg(target_os = "none")]
     fn to_handler_ptr(self) -> u64 {
         match self {
             Disposition::Default => SIG_DFL,
@@ -246,6 +262,24 @@ impl SignalState {
         old
     }
 }
+
+// Everything below depends on bare-metal-only modules
+// (`arch::x86_64`, `task::wake`, `task::exit`, `tty::KERN_ERESTARTSYS`,
+// `serial_println`, the `frame` submodule, etc.) and is gated to
+// `target_os = "none"` via the `bare_metal_only!` macro below. The
+// host arm under `feature = "sched-mock"` exposes only the
+// `SignalState`-facing surface above. RFC 0008 §"Slim host arm"
+// documents the tradeoff.
+
+/// `cfg(target_os = "none")` wrapper around a section of code.
+/// Used below to gate the bare-metal signal-delivery glue without
+/// indenting it under a module (which would change item paths).
+#[allow(unused_macros)]
+macro_rules! bare_metal_only {
+    ($($body:item)*) => { $( #[cfg(target_os = "none")] $body )* };
+}
+
+bare_metal_only! {
 
 // ── Process-level helpers ─────────────────────────────────────────────────
 
@@ -972,9 +1006,19 @@ pub struct SigReturnRegs {
     pub restart_pending: bool,
 }
 
-// ── Host-side unit tests ──────────────────────────────────────────────────
+} // end bare_metal_only!
 
-#[cfg(test)]
+// ── Host-side unit tests ──────────────────────────────────────────────────
+//
+// These tests reference `restart_decision` / the bare-metal
+// signal-delivery glue, all of which is gated to `target_os = "none"`
+// inside the `bare_metal_only!` block above. Under
+// `cargo test --lib --features sched-mock` (host build) those items
+// don't exist, so the tests can't compile — gate the module
+// accordingly. The tests still run on bare-metal builds via
+// `cargo xtask test`; this gate doesn't reduce coverage.
+
+#[cfg(all(test, target_os = "none"))]
 mod tests {
     use super::*;
 

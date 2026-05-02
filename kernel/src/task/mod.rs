@@ -60,3 +60,25 @@ mod task;
 mod sched_core;
 #[cfg(target_os = "none")]
 pub use sched_core::*;
+
+// Host-only stubs for the three scheduler primitives that the
+// `WaitQueue` / `process` modules need at function granularity:
+// `current_id`, `wake`, `block_current`. The bare-metal scheduler
+// owns these in `sched_core.rs`; on the host triple under
+// `feature = "sched-mock"` we provide a thread-local-backed analogue
+// so `simulator/` can drive `process::register` / `mark_zombie` /
+// `reap_child` / the `wait4` snapshot loop on host (RFC 0008 / #790).
+//
+// Discipline (mirrors RFC 0005's seam contract): host stubs cover the
+// **shape** of the bare-metal scheduler, not its semantics. Production
+// `block_current` parks the task; the host stub is a no-op because the
+// simulator drives the run sequentially and the only `wait_while`
+// caller in scope (`wait4`) re-checks its condition under the same
+// `WaitQueue.inner` mutex that `notify_all` takes — meaning a
+// host-side `wait_while` whose condition is already false on entry
+// returns immediately without ever needing to park (RFC 0008
+// §"Single-thread parking semantics").
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+mod host_stub;
+#[cfg(all(not(target_os = "none"), feature = "sched-mock"))]
+pub use host_stub::{block_current, current_id, set_current_id_for_test, wake, wake_pending};
