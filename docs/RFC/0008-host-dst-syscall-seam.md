@@ -38,6 +38,7 @@ Three deliverables make up the seam, all in
 
 ```rust
 pub trait UaccessAdapter: Send + Sync {
+    fn check_user_write(&self, dst: usize, len: usize) -> Result<(), i64>;
     unsafe fn copy_from_user(&self, dst: &mut [u8], src: usize) -> Result<(), i64>;
     unsafe fn copy_to_user(&self, dst: usize, src: &[u8]) -> Result<(), i64>;
 }
@@ -50,6 +51,14 @@ pub unsafe fn dispatch_syscall(nr: u64, args: [u64; 6], ua: &dyn UaccessAdapter)
 pub fn install_init_process(task_id: usize);
 pub fn set_current_task_id(task_id: usize) -> usize;
 ```
+
+`check_user_write` is the **preflight validator** the bare-metal
+`WAIT4` arm already has at its entry (`uaccess::check_user_range(wstatus_ptr, 4)`).
+The host arm needs the same shape so a custom `UaccessAdapter` that
+returns `-EFAULT` on a bad pointer cannot lose the zombie:
+without the preflight, the dispatch shim would call `reap_child()`
+first, consume the exit status, then fail at `copy_to_user`, leaving
+a phantom-collected child.
 
 Recognised numbers: `FORK` (57), `EXECVE` (59), `EXIT` (60), `WAIT4`
 (61). Anything else returns `-ENOSYS` (`-38`).
@@ -243,6 +252,18 @@ itself still detects drain-order-dependence at `T_EXIT`.
   off, the layered tests will start cross-contaminating; an explicit
   `simulator::reset_kernel_state_for_test()` accessor is the
   follow-up that closes that hole.
+
+  **Defence in depth: `seam_lock`.** Independently of
+  `panic-abort-tests`, the seam takes a process-global
+  `OnceLock<Mutex<()>>` at every entry through `install_init_process` /
+  `dispatch_syscall` / `set_current_task_id`. Two concurrent host
+  threads serialize through that lock rather than racing on the
+  kernel-static TABLE. The lock answers CodeRabbit's pre-merge
+  concern about "host runs aliasing each other in `process::pid_of` /
+  `current_pid`" — parallel runs will still observe each other's
+  TABLE entries (the lock alone doesn't reset state), but they will
+  not race; combined with `panic-abort-tests` providing per-test
+  subprocess isolation, deterministic per-run state holds.
 
 ## References
 

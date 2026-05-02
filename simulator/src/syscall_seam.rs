@@ -45,7 +45,39 @@
 
 #![allow(unsafe_code)]
 
+use std::sync::{Mutex, MutexGuard};
+
 use vibix::process;
+
+/// Process-global serialization lock for the host syscall seam.
+///
+/// The kernel-side `process::TABLE` / `NEXT_PID` / `EXIT_EVENT` /
+/// `CHILD_WAIT` are process-global statics — there's only one of each
+/// no matter how many simulator threads `install_init_process` is
+/// called from. Two parallel runs that each install PID 1 and then
+/// fork would race on `NEXT_PID`, observe each other's TABLE entries
+/// in `current_pid` lookups, and generally produce undefined results
+/// (RFC 0008 §"Out of scope"; CodeRabbit pre-merge review).
+///
+/// This lock serializes host runs at the seam: every entry through
+/// [`install_init_process`] / [`dispatch_syscall`] /
+/// [`set_current_task_id`] takes the lock for the duration of the
+/// call. Parallel `cargo test` workers therefore queue rather than
+/// alias.
+///
+/// **Why a re-entrant lock isn't needed.** The seam's public API is
+/// flat: callers from a regression test do not call back into
+/// [`dispatch_syscall`] from inside their own `dispatch_syscall`.
+/// `wait4` does call into `process::CHILD_WAIT.wait_while`, but the
+/// host stub for `task::block_current` returns immediately (RFC 0008
+/// §"Single-thread parking semantics") — no nested seam entry.
+fn seam_lock() -> MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// Linux x86_64 syscall numbers — pinned alongside the bare-metal
 /// `arch::x86_64::syscall::syscall_nr` table. Re-declared here (rather
@@ -101,6 +133,18 @@ pub const EPERM: i64 = -1;
 /// accessors would each need their own variants on the trait, which
 /// the v1 surface doesn't justify.
 pub trait UaccessAdapter: Send + Sync {
+    /// Validate that `[dst, dst + len)` is a valid host write range.
+    /// Returns `Err(EFAULT)` if `dst == 0` (and `len > 0`) or the
+    /// adapter rejects the range for any other reason.
+    ///
+    /// Used by [`dispatch_wait4`] as a preflight check before
+    /// `reap_child()`: if the user pointer is bad, we want `-EFAULT`
+    /// **before** consuming the zombie, not after. The bare-metal
+    /// `WAIT4` arm has the same shape (validate via
+    /// `uaccess::check_user_range` before the reap loop); the trait
+    /// method is the host-arm analogue.
+    fn check_user_write(&self, dst: usize, len: usize) -> Result<(), i64>;
+
     /// Copy `dst.len()` bytes from user VA `src` into `dst`. Returns
     /// `Err(EFAULT)` if `src == 0` or the length is zero (the
     /// bare-metal `copy_from_user` accepts zero-length but the host
@@ -132,6 +176,16 @@ pub trait UaccessAdapter: Send + Sync {
 pub struct HostUaccess;
 
 impl UaccessAdapter for HostUaccess {
+    fn check_user_write(&self, dst: usize, len: usize) -> Result<(), i64> {
+        if len == 0 {
+            return Ok(());
+        }
+        if dst == 0 {
+            return Err(EFAULT);
+        }
+        Ok(())
+    }
+
     unsafe fn copy_from_user(&self, dst: &mut [u8], src: usize) -> Result<(), i64> {
         if src == 0 {
             return Err(EFAULT);
@@ -180,6 +234,7 @@ impl UaccessAdapter for HostUaccess {
 /// non-zero — see [`dispatch_wait4`] for the precise read/write
 /// shape.
 pub unsafe fn dispatch_syscall(nr: u64, args: [u64; 6], uaccess: &dyn UaccessAdapter) -> i64 {
+    let _guard = seam_lock();
     match nr {
         syscall_nr::FORK => dispatch_fork(),
         syscall_nr::EXECVE => dispatch_execve(args[0], args[1], args[2]),
@@ -319,6 +374,20 @@ unsafe fn dispatch_wait4(target_pid: i32, wstatus_ptr: usize, uaccess: &dyn Uacc
         return ECHILD;
     }
 
+    // Preflight: validate the wstatus user pointer BEFORE reaping the
+    // child. The bare-metal `WAIT4` arm rejects a bad status pointer
+    // up front (`uaccess::check_user_range(wstatus_ptr, 4)`); this
+    // matches that shape so a custom `UaccessAdapter` that returns
+    // `EFAULT` cannot lose the zombie. Without the preflight, a bad
+    // pointer discovered only after `reap_child()` succeeds would
+    // consume the zombie's exit status and return `EFAULT`, leaving
+    // a phantom-collected child with no caller able to observe it.
+    if wstatus_ptr != 0 {
+        if let Err(e) = uaccess.check_user_write(wstatus_ptr, core::mem::size_of::<u32>()) {
+            return e;
+        }
+    }
+
     loop {
         let snap = process::exit_event_count();
         if let Some((child_pid, exit_status)) = process::reap_child(parent_pid, target_pid) {
@@ -349,6 +418,7 @@ unsafe fn dispatch_wait4(target_pid: i32, wstatus_ptr: usize, uaccess: &dyn Uacc
 /// `task::host_stub::set_current_id_for_test` if the caller's contract
 /// has been violated.
 pub fn install_init_process(task_id: usize) {
+    let _guard = seam_lock();
     process::register_init(task_id);
     let _ = vibix::task::set_current_id_for_test(task_id);
 }
@@ -362,6 +432,7 @@ pub fn install_init_process(task_id: usize) {
 /// before each dispatch, since both run on the simulator's single
 /// thread.
 pub fn set_current_task_id(task_id: usize) -> usize {
+    let _guard = seam_lock();
     vibix::task::set_current_id_for_test(task_id)
 }
 
@@ -418,6 +489,23 @@ mod tests {
             assert_eq!(ua.copy_from_user(&mut buf, 0).unwrap_err(), EFAULT);
             assert_eq!(ua.copy_to_user(0, &[1]).unwrap_err(), EFAULT);
         }
+    }
+
+    #[test]
+    fn host_uaccess_check_user_write_validates_range() {
+        let ua = HostUaccess;
+        // Zero-length write at any pointer (including null) is fine —
+        // matches the bare-metal `check_user_range(_, 0)` early-return.
+        assert!(ua.check_user_write(0, 0).is_ok());
+        assert!(ua.check_user_write(0xDEAD_BEEF, 0).is_ok());
+        // Non-zero length at null pointer is `-EFAULT` so the wait4
+        // preflight rejects bad pointers before consuming the zombie.
+        assert_eq!(ua.check_user_write(0, 4).unwrap_err(), EFAULT);
+        // Non-null pointer with positive length: ok (the host arm
+        // doesn't validate further; that's by design — the host has
+        // no SMAP / kernel-half boundary to enforce).
+        let scratch = [0u8; 4];
+        assert!(ua.check_user_write(scratch.as_ptr() as usize, 4).is_ok());
     }
 
     #[test]

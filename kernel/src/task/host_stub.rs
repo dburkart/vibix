@@ -76,13 +76,33 @@ pub fn set_current_id_for_test(id: usize) -> usize {
 ///
 /// On bare metal this calls into the scheduler and a context switch
 /// happens. On host with `sched-mock` we model "park" as "consume the
-/// wake_pending flag and return"; if no wake has arrived, we still
-/// return — the `wait_while` loop above us re-checks its condition
-/// under the queue mutex and will re-enqueue on the next iteration if
-/// progress hasn't happened, which is the simulator's single-thread
-/// safety net (RFC 0008 §"Single-thread parking semantics").
+/// wake_pending flag and return"; if no wake has arrived, the host
+/// stub still returns — the `wait_while` loop above us re-checks its
+/// condition under the queue mutex on the next iteration. RFC 0008
+/// §"Single-thread parking semantics" enumerates the cases.
+///
+/// **Debug-only fail-fast.** A `block_current` call with no
+/// `wake_pending` set can only be progress-making in cases where the
+/// caller's predicate has flipped via a side-effect of the wake
+/// itself (e.g. `mark_zombie`'s `EXIT_EVENT.fetch_add` happened
+/// already, but `wake_pending` was set on a different task id and
+/// got filtered by `wake`'s id check). In the v1 layered repro the
+/// predicate is satisfied on entry, so the host stub is never called;
+/// in any other future caller, hitting this branch is the symptom of
+/// "host stub asked to perform a real park" (CodeRabbit pre-merge
+/// review). Surface it loudly under debug builds.
 pub fn block_current() {
-    WAKE_PENDING.with(|c| c.set(false));
+    let had_wake = WAKE_PENDING.with(|c| {
+        let prev = c.get();
+        c.set(false);
+        prev
+    });
+    debug_assert!(
+        had_wake,
+        "task::host_stub::block_current reached an unsupported real park \
+         (no wake_pending set, no other host thread can fire the wake) — \
+         RFC 0008 §\"Single-thread parking semantics\""
+    );
 }
 
 /// Wake task `id`. On host this just sets the wake_pending flag if
