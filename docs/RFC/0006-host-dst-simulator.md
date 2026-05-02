@@ -1256,11 +1256,18 @@ properties; items 9–11 are documentation and follow-up.
       `cpu_id`-aware seam), softirq `post_ack_hook` (foreshadowed
       in RFC 0005). Each is its own RFC, prioritized when the next
       flake demands it.
-- [ ] **(12) Document the simulator in `docs/design/simulator.md`.**
+- [x] **(12) Document the simulator in `docs/design/simulator.md`.**
       One-page quick reference parallel to
       `docs/design/scheduler-seam.md`: how to write a new repro,
       how to read a trace, how to add a new event variant, how to
       add a new fault knob, the host-substitute table for
       sync primitives, the reproducibility-envelope contract
       verbatim, and the panic-hook `VIBIX_SIM_SEED=` format
-      string as a stable interface.
+      string as a stable interface. Landed via issue #726.
+
+## Cross-references
+
+- [`docs/design/simulator.md`](../design/simulator.md) — as-shipped quick reference (writing a scenario, the trace JSON schema, FaultPlan vocabulary, seed/RNG-stream rules, the `replay` / `minimize` CLI, the determinism envelope, host-substitute table). Read this first when actually working with the simulator; this RFC carries the design rationale, the as-shipped doc carries the API surface.
+- [RFC 0005 — Scheduler / IRQ Seam](0005-scheduler-irq-seam.md) — the trait surface this simulator consumes.
+- [`docs/design/scheduler-seam.md`](../design/scheduler-seam.md) — as-shipped companion to RFC 0005.
+- [`simulator/docs/trace-schema.md`](../../simulator/docs/trace-schema.md) — authoritative `schema_version = 1` JSON contract.
