@@ -1582,7 +1582,8 @@ fn test_unit() -> R<()> {
     // host unit tests (`fs::ext2::fs::tests` — mount-sequence
     // arithmetic and feature-flag constants) are picked up *and* the
     // RFC 0007 page-cache surface (`mem::page_cache`, `Inode::mapping`,
-    // writeback-daemon inode-walk) is built. The on-disk type tests in
+    // writeback-daemon inode-walk, plus the FileObject scaffolding —
+    // issue #745 / #753) is built. The on-disk type tests in
     // `fs::ext2::disk::tests` compile unconditionally and are included
     // either way.
     println!("→ host unit tests");
@@ -1623,12 +1624,14 @@ fn test_integration(shard: Option<Shard>) -> R<()> {
     //     later wave).
     //
     //   - any test gated on the RFC 0007 page-cache surface
-    //     (`required-features = ["page_cache"]`) is picked up. This
-    //     is the wave-2 mapping API — `Inode::mapping`, the
-    //     writeback-daemon inode walk (#755), and per-inode wb_err
-    //     errseq plumbing. The feature stays compile-time-only on
-    //     production boot until the wave-2 callers land; the
-    //     integration tests force it on so the surface is exercised.
+    //     (`required-features = ["page_cache"]`, e.g. issue #753's
+    //     `ext2_mmap`) is picked up. This is the wave-2 mapping API —
+    //     `Inode::mapping`, the writeback-daemon inode walk (#755),
+    //     per-inode wb_err errseq plumbing, and the FileObject
+    //     scaffolding for `FileOps::mmap`. The feature stays
+    //     compile-time-only on production boot until the wave-2
+    //     callers land; the integration tests force it on so the
+    //     surface is exercised.
     let all = integration_test_names()?;
     let tests: Vec<String> = match shard {
         None => all,
