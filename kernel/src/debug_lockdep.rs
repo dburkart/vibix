@@ -345,6 +345,178 @@ mod tests {
         assert_eq!(*m.lock(), 42);
     }
 
+    // --- RFC 0007 §Lock-order — AddressSpaceOps method-entry tripwire
+    //
+    // RFC 0007 mandates that **every** `AddressSpaceOps` method body
+    // calls `assert_no_spinlocks_held` as its first instruction. The
+    // tests below exercise that contract from the *caller* side: a
+    // host caller that holds a `SpinLock` across an `Arc<dyn
+    // AddressSpaceOps>` invocation must trip the assert and panic.
+    // This is the regression gate that catches a future drive-by edit
+    // to a trait-impl body that drops the assert.
+    //
+    // We cover the four trait methods (`readpage`, `writepage`,
+    // `readahead`, `truncate_below`) including the two with default
+    // bodies (the defaults are also required to call the assert). All
+    // tests serialise on the shared `TEST_LOCK` so the panicked
+    // `HELD_SPINLOCKS` mutation does not poison sibling tests.
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "MemoryBackedOps::readpage")]
+    fn readpage_trips_when_caller_holds_spinlock() {
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        let mut buf = [0u8; 4096];
+        // Holding `_g` across this call MUST panic.
+        let _ = ops.readpage(0, &mut buf);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "MemoryBackedOps::writepage")]
+    fn writepage_trips_when_caller_holds_spinlock() {
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        let buf = [0u8; 4096];
+        let _ = ops.writepage(0, &buf);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "MemoryBackedOps::readahead")]
+    fn readahead_trips_when_caller_holds_spinlock() {
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        ops.readahead(0, 4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "MemoryBackedOps::truncate_below")]
+    fn truncate_below_trips_when_caller_holds_spinlock() {
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        ops.truncate_below(0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "default no-op")]
+    fn default_readahead_trips_when_caller_holds_spinlock() {
+        // The trait's default-method bodies are also required to call
+        // the assert (RFC 0007 §Lock-order ladder; aops module doc).
+        // A driver that only implements `readpage`/`writepage` and
+        // inherits the default `readahead`/`truncate_below` must
+        // still trip on a held SpinLock. Use a fresh impl that does
+        // NOT override the defaults.
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        struct DefaultOnly;
+        impl AddressSpaceOps for DefaultOnly {
+            fn readpage(&self, _: u64, _: &mut [u8; 4096]) -> Result<usize, i64> {
+                Ok(0)
+            }
+            fn writepage(&self, _: u64, _: &[u8; 4096]) -> Result<(), i64> {
+                Ok(())
+            }
+        }
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = Arc::new(DefaultOnly);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        ops.readahead(0, 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "default no-op")]
+    fn default_truncate_below_trips_when_caller_holds_spinlock() {
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        struct DefaultOnly;
+        impl AddressSpaceOps for DefaultOnly {
+            fn readpage(&self, _: u64, _: &mut [u8; 4096]) -> Result<usize, i64> {
+                Ok(0)
+            }
+            fn writepage(&self, _: u64, _: &[u8; 4096]) -> Result<(), i64> {
+                Ok(())
+            }
+        }
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = Arc::new(DefaultOnly);
+        let m = SpinLock::new(0u8);
+        let _g = m.lock();
+        ops.truncate_below(0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn aops_methods_pass_when_no_spinlock_held() {
+        // Companion to the panic tests: if no SpinLock is held, the
+        // exact same dispatch must succeed. Catches a regression
+        // where a future trait-impl edit accidentally hard-fires the
+        // assert (e.g. by passing a non-zero counter).
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let mut buf = [0u8; 4096];
+        ops.readpage(0, &mut buf).unwrap();
+        ops.writepage(0, &buf).unwrap();
+        ops.readahead(0, 4);
+        ops.truncate_below(0);
+        // Counter back to zero post each call.
+        assert_eq!(held_spinlocks(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn assert_passes_after_lock_released() {
+        // RFC 0007 §Lock-order: the cache slow path drops
+        // `cache.inner` *before* invoking `ops.readpage`. Model that
+        // here as: take a lock, drop it, then call into ops. Must
+        // not panic.
+        use crate::mem::aops::AddressSpaceOps;
+        use alloc::sync::Arc;
+
+        let _t = test_guard();
+        let ops: Arc<dyn AddressSpaceOps> = crate::mem::aops::MemoryBackedOps::with_pages(2);
+        let m = SpinLock::new(0u8);
+        {
+            let _g = m.lock();
+            assert_eq!(held_spinlocks(), 1);
+        }
+        // Lock released; subsequent ops dispatch must succeed.
+        let mut buf = [0u8; 4096];
+        ops.readpage(0, &mut buf).unwrap();
+    }
+
     /// Release-build sanity: with `debug_assertions` off the
     /// counter is gone and the assertion is a no-op. We can only
     /// observe this indirectly — the inc/dec/held APIs all return

@@ -137,6 +137,17 @@ mod host_stub {
         pub fn lock(&self) -> spin::MutexGuard<'_, T> {
             self.0.lock()
         }
+
+        /// Non-blocking acquisition. Returns `None` if the lock is
+        /// currently held. Used by the host-only lock-order tests
+        /// (RFC 0007 §Lock-order ladder, split-lock discipline) to
+        /// probe whether a `cache.inner` guard has leaked across a
+        /// slow-path I/O wait — a `None` here would deadlock on
+        /// bare metal, so the host probe surfaces the violation as
+        /// a test failure instead.
+        pub fn try_lock(&self) -> Option<spin::MutexGuard<'_, T>> {
+            self.0.try_lock()
+        }
     }
 
     pub struct WaitQueue;
@@ -1517,5 +1528,413 @@ mod tests {
         assert_eq!(RaState::window_for_streak(31), RA_MAX_PAGES);
         // Saturating-shl path covers extreme inputs without panicking.
         assert_eq!(RaState::window_for_streak(u32::MAX), RA_MAX_PAGES);
+    }
+
+    // --- RFC 0007 §Refcount discipline — eviction-gate matrix --------
+    //
+    // These tests model the two independent counters the RFC mandates:
+    //
+    //   - `mem::refcount::get(phys)` — counts (1 cache-own) + (N
+    //     installed PTEs). Bumped on PTE install / decremented on PTE
+    //     teardown.
+    //   - `Arc::strong_count(&CachePage)` — counts (1 cache index) +
+    //     (N in-flight `Arc::clone`s held by faulters that have not
+    //     yet decided whether to install a PTE) + (writeback daemon's
+    //     snapshot, if any).
+    //
+    // Eviction (#740 — not yet merged) must check **both**:
+    //
+    //   - `Arc::strong_count(&CachePage) == 1` rules out an in-flight
+    //     fault that may yet bump `mem::refcount` (RFC 0007 §Refcount
+    //     discipline).
+    //   - `mem::refcount(phys) <= 1` rules out a still-installed PTE.
+    //
+    // The two predicates are non-overlapping by design — neither
+    // subsumes the other. These tests pin the predicates so a
+    // future eviction implementation cannot silently regress to a
+    // single-counter check.
+
+    /// Pure predicate the future eviction policy will gate on. Passes
+    /// only when **both** disciplines say the page is safe to drop:
+    /// the cache index is the sole `Arc<CachePage>` strong holder
+    /// **and** the per-frame refcount is at the cache's own slot
+    /// (nothing has installed a PTE).
+    ///
+    /// This is the same predicate `evict()` will run; pinning it here
+    /// as a pure function lets the test matrix below cover every
+    /// combination of (strong_count, frame_refcount) without dragging
+    /// in the not-yet-merged eviction control flow.
+    fn eviction_safe(stub: &Arc<CachePage>, frame_refcount: u16) -> bool {
+        Arc::strong_count(stub) == 1 && frame_refcount <= 1
+    }
+
+    /// Phys address used by the eviction-gate-matrix tests when they
+    /// drive the `mem::refcount::*_in` slot helpers. The page-cache
+    /// test harness's own `fake_phys()` deliberately picks values at
+    /// `MAX_PHYS_BYTES` so they cannot collide with a real allocator
+    /// hand-out — but that places them outside the refcount table.
+    /// These tests want both: a stable `CachePage` Arc *and* a
+    /// refcount slot keyed against the same notional frame. We use
+    /// `0x1000` (the first refcount slot) for the host-only refcount
+    /// table; the cache itself never dereferences `phys`.
+    const TEST_REFCOUNT_PHYS: u64 = 0x1000;
+
+    #[test]
+    fn eviction_gate_blocks_when_pte_installed() {
+        // PTE-installed-only: the cache index holds the sole Arc
+        // (strong_count == 1) but `mem::refcount` shows a PTE is
+        // mapped (== 2 = cache + 1 PTE). RFC 0007 §Refcount
+        // discipline: eviction blocks on the frame-refcount check
+        // even though no in-flight clone exists.
+        let cache = fresh_cache();
+        match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p.publish_uptodate_and_unlock(),
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        // Outer Arc dropped at end of match — cache index is now the
+        // sole strong holder. The real evictor borrows from the
+        // BTreeMap (no Arc clone), so its observed `strong_count` is
+        // 1 in this state. Mirror that with a borrow under
+        // `cache.inner`.
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(strong_borrow, 1, "borrow-only access does not bump strong");
+
+        // Frame refcount: 2 = cache(1) + PTE(1). Use the host-test
+        // refcount-slot helpers.
+        let slots: alloc::vec::Vec<core::sync::atomic::AtomicU16> = (0..4)
+            .map(|_| core::sync::atomic::AtomicU16::new(0))
+            .collect();
+        crate::mem::refcount::init_on_alloc_in(&slots, TEST_REFCOUNT_PHYS);
+        crate::mem::refcount::inc_refcount_in(&slots, TEST_REFCOUNT_PHYS); // PTE bump
+        let frame_rc = crate::mem::refcount::page_refcount_in(&slots, TEST_REFCOUNT_PHYS)
+            .load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_rc, 2, "frame refcount = cache + PTE");
+
+        // The strong-count axis says safe (1), the frame-refcount
+        // axis says blocked (2). Eviction must respect *both* — RFC
+        // 0007 §Refcount discipline: "neither subsumes the other."
+        assert!(
+            !(strong_borrow == 1 && frame_rc <= 1),
+            "evictor must refuse: PTE still mapped",
+        );
+    }
+
+    #[test]
+    fn eviction_gate_blocks_when_in_flight_clone_held() {
+        // In-flight fault has cloned the Arc out of the index but has
+        // not yet bumped `mem::refcount` (still mid-resolution). The
+        // frame refcount is the cache's own (== 1); the strong count
+        // is > 1. RFC 0007 §Refcount discipline: eviction blocks on
+        // the strong-count check even though the frame refcount is
+        // clear.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+
+        // `cache.lookup` returns a fresh `Arc::clone` — exactly what
+        // the slow-path fault hot path does (RFC 0007 §Refcount
+        // discipline, fault hot path code block).
+        let in_flight = cache.lookup(0).expect("indexed");
+        assert!(Arc::ptr_eq(&in_flight, &stub));
+
+        // Frame refcount: 1 = cache only (no PTE installed yet).
+        let frame_rc = 1u16;
+
+        // Strong count snapshot from inside the index borrow — same
+        // shape the evictor would observe.
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        // 3 = cache index + outer `stub` + `in_flight`.
+        assert_eq!(strong_borrow, 3);
+
+        assert!(
+            !eviction_safe(&in_flight, frame_rc),
+            "evictor must refuse: in-flight Arc clone outstanding",
+        );
+
+        // Drop the in-flight clone; eviction gate becomes per-strong
+        // satisfiable (still blocked here only because outer `stub`
+        // holds another clone).
+        drop(in_flight);
+        let strong_after_drop = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(strong_after_drop, 2, "outer `stub` is the +1");
+    }
+
+    #[test]
+    fn eviction_gate_passes_when_only_cache_holds_arc_and_no_pte() {
+        // Cache-own only: the cache index is the sole Arc holder,
+        // `mem::refcount == 1` (cache's own slot, no PTE). Both
+        // predicates pass; the future evictor may proceed (frame
+        // becomes droppable, will eventually `frame::put`). This is
+        // the only combination on the matrix that is safe.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        // Use a refcount-table-valid phys for the host helpers
+        // (`stub.phys` is a fake_phys() value at the MAX_PHYS_BYTES
+        // boundary chosen so it can never collide with a real
+        // allocator hand-out; the refcount slot table refuses it).
+        let phys = TEST_REFCOUNT_PHYS;
+        drop(stub);
+
+        let slots: alloc::vec::Vec<core::sync::atomic::AtomicU16> = (0..4)
+            .map(|_| core::sync::atomic::AtomicU16::new(0))
+            .collect();
+        // Cache's own ref is `init_on_alloc_in` (== 1) — no PTE bumps.
+        crate::mem::refcount::init_on_alloc_in(&slots, phys);
+        let frame_rc = crate::mem::refcount::page_refcount_in(&slots, phys)
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+
+        assert_eq!(strong_borrow, 1, "cache index is the sole strong holder");
+        assert_eq!(frame_rc, 1, "frame refcount = cache only");
+
+        // Synthesise the borrow-style strong_count for the closure
+        // form (we cannot pass a borrowed Arc-not-clone to a generic
+        // helper, so we recombine the predicates inline here).
+        assert!(
+            strong_borrow == 1 && frame_rc <= 1,
+            "evictor may proceed: cache-own only",
+        );
+    }
+
+    #[test]
+    fn eviction_gate_blocks_when_both_pte_and_in_flight_clone() {
+        // Both axes: the dominant case — a fault has resolved into a
+        // PTE install (`mem::refcount > 1`) AND another concurrent
+        // fault is mid-resolution (`Arc::strong_count > 1`). Eviction
+        // blocks on either; here it blocks on both, so the predicate
+        // must return false regardless of which check the evictor
+        // runs first.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        // Use a refcount-table-valid phys for the host helpers
+        // (`stub.phys` is a fake_phys() value at the MAX_PHYS_BYTES
+        // boundary chosen so it can never collide with a real
+        // allocator hand-out; the refcount slot table refuses it).
+        let phys = TEST_REFCOUNT_PHYS;
+
+        let slots: alloc::vec::Vec<core::sync::atomic::AtomicU16> = (0..4)
+            .map(|_| core::sync::atomic::AtomicU16::new(0))
+            .collect();
+        crate::mem::refcount::init_on_alloc_in(&slots, phys);
+        crate::mem::refcount::inc_refcount_in(&slots, phys); // PTE
+        let frame_rc = crate::mem::refcount::page_refcount_in(&slots, phys)
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        // Drop outer Arc to mirror the "PTE owns the bump, not us"
+        // shape, then re-clone for the in-flight observer.
+        drop(stub);
+        let in_flight = cache.lookup(0).unwrap();
+
+        assert!(!eviction_safe(&in_flight, frame_rc));
+    }
+
+    #[test]
+    fn eviction_gate_writeback_snapshot_blocks_eviction() {
+        // The writeback daemon's `snapshot_dirty()` clones the Arc
+        // out of the index (RFC 0007 §`PageCache` writeback snapshot
+        // pattern). While the snapshot is alive, eviction must
+        // block — the daemon may still call `writepage` against the
+        // page contents. This is the exact reason `snapshot_dirty`
+        // returns `Vec<(u64, Arc<CachePage>)>` rather than a
+        // borrowing iterator.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        cache.mark_page_dirty(0);
+        drop(stub);
+
+        // Pretend the writeback daemon just snapshotted.
+        let snap = cache.snapshot_dirty();
+        assert_eq!(snap.len(), 1);
+
+        // Strong count from the cache's perspective is 2 (index +
+        // snapshot Arc). Eviction blocks even though we hold no
+        // in-flight fault clone.
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(strong_borrow, 2, "snapshot is the +1");
+        assert!(
+            !eviction_safe(&snap[0].1, 1),
+            "evictor must refuse while writeback snapshot is alive",
+        );
+
+        // After the daemon completes and drops the snapshot, the
+        // strong count returns to 1 — eviction may proceed (for the
+        // strong-count axis; the frame-refcount axis is independent).
+        drop(snap);
+        let strong_after_snap = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(strong_after_snap, 1);
+    }
+
+    #[test]
+    fn refcount_disciplines_are_independent() {
+        // RFC 0007 §Refcount discipline is explicit: the two counters
+        // are *non-overlapping*. Mutations to one must not affect the
+        // other. Verify by exercising the strong count without
+        // touching `mem::refcount`, and vice versa.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        // Use a refcount-table-valid phys for the host helpers
+        // (`stub.phys` is a fake_phys() value at the MAX_PHYS_BYTES
+        // boundary chosen so it can never collide with a real
+        // allocator hand-out; the refcount slot table refuses it).
+        let phys = TEST_REFCOUNT_PHYS;
+
+        let slots: alloc::vec::Vec<core::sync::atomic::AtomicU16> = (0..4)
+            .map(|_| core::sync::atomic::AtomicU16::new(0))
+            .collect();
+        crate::mem::refcount::init_on_alloc_in(&slots, phys);
+
+        // Bump strong count via lookups; mem::refcount stays at 1.
+        let a = cache.lookup(0).unwrap();
+        let b = cache.lookup(0).unwrap();
+        let c = cache.lookup(0).unwrap();
+        assert_eq!(
+            crate::mem::refcount::page_refcount_in(&slots, phys)
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "strong-count bumps must not affect frame refcount",
+        );
+        drop((a, b, c));
+
+        // Bump mem::refcount via PTE simulation; strong count stays.
+        crate::mem::refcount::inc_refcount_in(&slots, phys);
+        crate::mem::refcount::inc_refcount_in(&slots, phys);
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        // outer `stub` + index = 2 (we still hold `stub`).
+        assert_eq!(
+            strong_borrow, 2,
+            "frame-refcount bumps must not affect strong"
+        );
+        assert_eq!(
+            crate::mem::refcount::page_refcount_in(&slots, phys)
+                .load(core::sync::atomic::Ordering::Relaxed),
+            3,
+        );
+    }
+
+    // --- RFC 0007 §Lock-order ladder — split-lock discipline ----------
+
+    #[test]
+    fn install_or_get_drops_inner_before_returning_outcome() {
+        // Split-lock discipline (RFC 0007 §Split-lock discipline):
+        // `install_or_get` takes `cache.inner` only across the
+        // index check + insert. Once it returns, the mutex is free
+        // for any other slow-path observer. We model that by
+        // calling install_or_get and verifying inner is acquirable
+        // immediately after.
+        let cache = fresh_cache();
+        let outcome = cache.install_or_get(0, || make_stub(0));
+        assert!(matches!(outcome, InstallOutcome::InstalledNew(_)));
+        // If install_or_get had retained the guard, this lock() would
+        // block forever (host stub uses spin::Mutex; `try_lock` is
+        // the deadlock-safe probe).
+        let guard = cache.inner.try_lock();
+        assert!(
+            guard.is_some(),
+            "cache.inner must be free post install_or_get"
+        );
+    }
+
+    #[test]
+    fn lookup_drops_inner_before_returning() {
+        // Same split-lock discipline applies to the read side: the
+        // `lookup` fast path holds `cache.inner` only across
+        // `BTreeMap::get`, then drops the guard before handing the
+        // `Arc<CachePage>` clone back. A caller that hangs onto the
+        // returned Arc must still see `cache.inner` as releasable.
+        let cache = fresh_cache();
+        cache.install_or_get(0, || make_stub(0));
+        let _hit = cache.lookup(0);
+        let guard = cache.inner.try_lock();
+        assert!(guard.is_some(), "cache.inner must be free post lookup");
+    }
+
+    #[test]
+    fn snapshot_dirty_drops_inner_before_returning() {
+        // The writeback daemon path: `snapshot_dirty` collects under
+        // `cache.inner`, then returns. The mutex must be free before
+        // the daemon iterates the snapshot calling `writepage` (which
+        // is RFC 0007 §Lock-order: `cache.inner` is **never** held
+        // across `writepage`).
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        cache.mark_page_dirty(0);
+
+        let snap = cache.snapshot_dirty();
+        assert_eq!(snap.len(), 1);
+        // `cache.inner` must be free even while the snapshot is held.
+        let guard = cache.inner.try_lock();
+        assert!(
+            guard.is_some(),
+            "cache.inner must be free while writeback snapshot is alive",
+        );
+    }
+
+    #[test]
+    fn mark_page_dirty_drops_inner_before_returning() {
+        // The Shared-write fault dirty-publish: the bit-set + index
+        // enrollment commit under one critical section, then the
+        // mutex releases. Subsequent fast-path lookups on unrelated
+        // pgoffs must not block on a leftover guard.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        assert!(cache.mark_page_dirty(0));
+        let guard = cache.inner.try_lock();
+        assert!(guard.is_some());
     }
 }

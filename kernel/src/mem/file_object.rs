@@ -894,4 +894,157 @@ mod tests {
         // and wins.
         assert!(cache.lookup(0).is_none());
     }
+
+    // --- RFC 0007 §Lock-order — slow-path split-lock discipline -----
+    //
+    // The page-fault slow path holds `cache.inner` only across the
+    // index-mutating helpers (`install_or_get`, `mark_page_dirty`,
+    // `lookup`). It is **never** held across `ops.readpage`. RFC 0007
+    // §Lock-order ladder: cache mutex (level 4) is acquired before
+    // and released before the buffer cache (level 6) the FS impl
+    // takes internally; holding it across the call would invert the
+    // ladder on first contention.
+    //
+    // The tests below drive a real `FileObject::fault` and verify
+    // that during `ops.readpage`:
+    //
+    //   1. The caller did not hold `cache.inner` (we try_lock from
+    //      inside `readpage` and assert success).
+    //   2. The lockdep counter reads zero (no spinlock held).
+    //
+    // Together these prove the split-lock discipline holds end-to-end
+    // through the slow path the cache primitives expose today.
+
+    /// Custom AddressSpaceOps that, on `readpage`, asserts the
+    /// caller's `cache.inner` is *not* currently held.
+    ///
+    /// The probe stores its own back-reference to the
+    /// `Arc<PageCache>` so the readpage body can `try_lock` the cache
+    /// mutex from inside the dispatch. If the slow path is holding
+    /// `cache.inner` across the call (RFC 0007 §Lock-order
+    /// violation) the try_lock returns `None` and the test observes
+    /// `observed_unlocked == false`.
+    struct LockOrderProbe {
+        cache: spin::Mutex<Option<Arc<PageCache>>>,
+        observed_unlocked: core::sync::atomic::AtomicBool,
+    }
+
+    impl LockOrderProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cache: spin::Mutex::new(None),
+                observed_unlocked: core::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn install_cache(&self, cache: Arc<PageCache>) {
+            *self.cache.lock() = Some(cache);
+        }
+    }
+
+    impl crate::mem::aops::AddressSpaceOps for LockOrderProbe {
+        fn readpage(&self, _pgoff: u64, buf: &mut [u8; 4096]) -> Result<usize, i64> {
+            // Method-entry invariant: `assert_no_spinlocks_held` is
+            // RFC 0007 §Lock-order ladder's hard contract. If the
+            // slow path had retained any `SpinLock` guard across
+            // this dispatch, this call panics — and the host test
+            // sees a `should_panic`-style failure (libtest reports
+            // it as "panicked at: …"). We therefore exercise *both*
+            // the spinlock invariant (via the assert) and the
+            // BlockingMutex invariant (via the `try_lock` below) in
+            // the same body.
+            crate::debug_lockdep::assert_no_spinlocks_held("LockOrderProbe::readpage");
+
+            // Probe: try to acquire `cache.inner`. If the caller had
+            // retained the guard across this dispatch we would
+            // deadlock here on bare metal; on host the underlying
+            // `spin::Mutex::try_lock` returns `None` instead.
+            let cache_guard = self.cache.lock();
+            if let Some(c) = cache_guard.as_ref() {
+                let inner_guard = c.inner.try_lock();
+                if inner_guard.is_some() {
+                    self.observed_unlocked
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
+            // Default-fill the page so the cache publishes UPTODATE.
+            buf[0] = 0xa5;
+            Ok(4096)
+        }
+
+        fn writepage(&self, _pgoff: u64, _buf: &[u8; 4096]) -> Result<(), i64> {
+            crate::debug_lockdep::assert_no_spinlocks_held("LockOrderProbe::writepage");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn slow_path_drops_cache_inner_before_readpage() {
+        // RFC 0007 §Lock-order ladder: the slow path enters
+        // `ops.readpage` with no level-4 cache lock held. We probe
+        // this from inside `readpage` itself.
+        let probe = LockOrderProbe::new();
+        let cache = Arc::new(PageCache::new(
+            fake_inode_id(),
+            8 * FRAME_SIZE,
+            probe.clone(),
+        ));
+        probe.install_cache(cache.clone());
+
+        let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2);
+        // Drive a fault — winner path runs `readpage`.
+        let phys = obj
+            .fault(0, Access::Read)
+            .expect("first fault must resolve");
+        assert_ne!(phys, 0);
+        assert!(
+            probe
+                .observed_unlocked
+                .load(core::sync::atomic::Ordering::Acquire),
+            "readpage observed cache.inner as locked — RFC 0007 §Lock-order violation",
+        );
+    }
+
+    #[test]
+    fn fault_strong_count_returns_to_one_post_resolution() {
+        // RFC 0007 §Refcount discipline (fault hot path): the slow
+        // path clones the `Arc<CachePage>` to stack-local during the
+        // resolution, then drops it before returning. Eviction
+        // observes `Arc::strong_count == 1` on the cache index post
+        // resolution; if a leak in the fault path holds an extra
+        // clone, eviction would block forever.
+        let obj = fresh_object(Share::Shared);
+        let _ = obj.fault(0, Access::Read).unwrap();
+        // Borrow the index entry without bumping strong (mirrors the
+        // evictor's BTreeMap::get pattern).
+        let cache = obj.cache();
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(
+            strong_borrow, 1,
+            "fault hot path leaked an Arc<CachePage> clone — eviction would block",
+        );
+    }
+
+    #[test]
+    fn fault_then_drop_addrspace_returns_strong_count_to_one() {
+        // Drop the FileObject after a successful fault. The cache
+        // index still owns the only Arc; strong_count stays at 1.
+        // Catches a regression where FileObject ends up holding
+        // `Arc<CachePage>` clones on success (it should not — the
+        // page is consumed for its `phys` field only).
+        let obj = fresh_object(Share::Shared);
+        let _ = obj.fault(0, Access::Read).unwrap();
+        let cache = obj.cache();
+        drop(obj);
+        let strong_borrow = {
+            let inner = cache.inner.lock();
+            let p = inner.pages.get(&0).expect("indexed");
+            Arc::strong_count(p)
+        };
+        assert_eq!(strong_borrow, 1);
+    }
 }
