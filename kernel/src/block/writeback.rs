@@ -508,9 +508,7 @@ mod daemon {
                 // Re-check shutdown between pages too — a many-page
                 // dirty inode is the worst-case wait an unmount might
                 // see if we only re-checked between inodes.
-                if state.sb.draining.load(Ordering::SeqCst)
-                    || state.stop.load(Ordering::SeqCst)
-                {
+                if state.sb.draining.load(Ordering::SeqCst) || state.stop.load(Ordering::SeqCst) {
                     return;
                 }
 

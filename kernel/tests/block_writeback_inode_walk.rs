@@ -244,11 +244,7 @@ fn make_inode(sb: &Arc<SuperBlock>, ino: u64, aops: Arc<dyn AddressSpaceOps>) ->
     // resolves. We do this manually instead of via
     // `page_cache_or_create` because the test populates the cache
     // index directly.
-    let pc = Arc::new(PageCache::new(
-        InodeId::new(0xc0de, ino),
-        16 * 4096,
-        aops,
-    ));
+    let pc = Arc::new(PageCache::new(InodeId::new(0xc0de, ino), 16 * 4096, aops));
     *inode.mapping.write() = Some(pc);
     inode
 }
