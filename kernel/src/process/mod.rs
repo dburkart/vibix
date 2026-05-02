@@ -220,8 +220,8 @@ pub const CURRENT_PID_SOAK_THRESHOLD: u64 = 100_000_000;
 ///
 /// Used by every TABLE acquirer reachable from a userspace syscall —
 /// in particular the wait4 wakeup path (`reap_child`, `has_children`,
-/// `mark_zombie`, `reparent_children`) — so a #478/#710-class wedged
-/// holder is caught loudly rather than as a silent serial-marker
+/// `mark_zombie`, `reparent_children`) — so a #478/#710/#709-class
+/// wedged holder is caught loudly rather than as a silent serial-marker
 /// dropout. Integration tests that exercise the helper directly are
 /// permitted to call with IF=0 (the soak threshold still bounds any
 /// genuine spin); the IF=1 invariant is enforced at the userspace-
@@ -240,7 +240,7 @@ fn lock_table_with_soak_check(caller: &'static str) -> spin::MutexGuard<'static,
                 panic!(
                     "process::TABLE: {caller}() spin exceeded soak threshold \
                      ({CURRENT_PID_SOAK_THRESHOLD} iters) — holder appears wedged \
-                     (likely lock-ordering violation; see #478/#647/#710)"
+                     (likely lock-ordering violation; see #478/#647/#709/#710)"
                 );
             }
             core::hint::spin_loop();
@@ -278,7 +278,7 @@ fn is_if_set() -> bool {
 /// sleeping in `waitpid`. TABLE is released before notify to satisfy
 /// the lock-ordering rule described in the module docs.
 ///
-/// ## Atomic publish (#710)
+/// ## Atomic publish (#710 / #709)
 ///
 /// The Zombie state write and the `EXIT_EVENT` bump happen **under the
 /// same TABLE critical section** so a waiter that observes either
@@ -293,6 +293,14 @@ fn is_if_set() -> bool {
 /// counter (and vice versa), regardless of which lock the caller
 /// took first.
 ///
+/// The same drain-order race produced two distinct soak symptoms —
+/// the post-`wait4` stall tracked in #710 (~0.9%) and the post-fork
+/// child-never-runs stall tracked in #709 (~14% before the fix) —
+/// because the bump-gap could be preempt-permuted at either lifecycle
+/// point. Closing the gap collapses both modes into one repaired
+/// race; see `docs/design/dst-709-rebaseline.md` for the empirical
+/// re-baseline that confirms the #709 rate moved with this fix.
+///
 /// `notify_all` still happens after TABLE drop — the TABLE → inner
 /// ordering rule documented in the module header forbids holding
 /// TABLE across `WaitQueue::notify_all`'s `inner.lock()` acquire.
@@ -301,7 +309,7 @@ pub fn mark_zombie(pid: u32, status: i32) {
         is_if_set(),
         "mark_zombie() called with interrupts disabled — \
          this is the wait4 wakeup path; spinning on TABLE/CHILD_WAIT \
-         with IF=0 starves the timer ISR (#478/#647/#710)"
+         with IF=0 starves the timer ISR (#478/#647/#709/#710)"
     );
     {
         let mut t = lock_table_with_soak_check("mark_zombie");
@@ -316,7 +324,9 @@ pub fn mark_zombie(pid: u32, status: i32) {
         // pre-bump state will also see the pre-bump counter; a waiter
         // that sees the post-bump counter will, on the next TABLE
         // acquire, see the Zombie entry. Closes the seam-level
-        // drain-order window from #710 / `regression_501`.
+        // drain-order window from #710 / #709 / `regression_501`
+        // (see `docs/design/dst-709-rebaseline.md` for the empirical
+        // re-baseline tying both symptoms to the same race).
         EXIT_EVENT.fetch_add(1, Ordering::Release);
     }
     CHILD_WAIT.notify_all();
@@ -338,7 +348,7 @@ pub fn reap_child(parent_pid: u32, target_pid: i32) -> Option<(u32, i32)> {
     debug_assert!(
         is_if_set(),
         "reap_child() called with interrupts disabled — \
-         this is the wait4 hot path (#710); spinning on TABLE with IF=0 \
+         this is the wait4 hot path (#709/#710); spinning on TABLE with IF=0 \
          starves the timer ISR (#478/#647)"
     );
     let mut t = lock_table_with_soak_check("reap_child");
