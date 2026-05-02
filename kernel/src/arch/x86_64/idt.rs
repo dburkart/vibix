@@ -251,6 +251,7 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
     if let Some((object, offset, prot_pte, _share)) =
         crate::task::current_vma_lookup(addr_u64 as usize)
     {
+        use crate::mem::pf::{classify_vm_fault_result, should_park_and_retry, FaultResolution};
         use crate::mem::vmobject::Access;
         use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
         use x86_64::{PhysAddr, VirtAddr};
@@ -268,48 +269,213 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, code: PageF
             } else {
                 Access::Read
             };
-            // RFC 0007 §Page-fault IRQ discipline steps 2–4: with the
-            // pure-logic verdict already produced under IF=0, reopen
-            // interrupts before entering the `VmObject::fault` slow
-            // path. `obj.fault` can take a `BlockingMutex` (every
-            // `FileObject::fault` does) and would deadlock against any
-            // task already holding the same mutex if we left IRQs
-            // disabled. Disable them again before the PTE install +
-            // TLB flush below so IRET returns to the faulter with a
-            // coherent IF=1 / IF=0 state per the saved RFLAGS.
-            //
-            // SAFETY: `sti` only sets IF in RFLAGS; the page-fault
-            // gate is an interrupt gate (the `x86_64` crate's
-            // `set_handler_fn` default), so IF was hardware-cleared on
-            // entry and the saved `frame.cpu_flags` retains the
-            // pre-fault value untouched.
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
-            let fault_res = object.fault(offset, access);
-            // SAFETY: `cli` only clears IF. We re-disable before the
-            // PTE install below so the page-table mutator sees a
-            // coherent ring-0/IF=0 environment matching the rest of
-            // the kernel paging layer.
-            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-            match fault_res {
-                Ok(phys) => {
-                    let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
-                        .expect("#PF: VmObject returned unaligned phys");
-                    match crate::mem::paging::map_existing_in_pml4(active, page, frame, pte_flags) {
-                        Ok(()) => return,
-                        Err(e) => {
-                            // map_existing_in_pml4 failed (OOM allocating page-table
-                            // frames). AnonObject::fault already called inc_refcount
-                            // for the PTE we won't install; roll it back so the
-                            // refcount stays balanced and AddressSpace::drop does not
-                            // see a phantom PTE reference.
-                            #[cfg(target_os = "none")]
-                            crate::mem::refcount::dec_refcount(phys);
-                            serial_println!("#PF demand map failed addr={:#x}: {:?}", addr_u64, e)
+
+            // RFC 0007 §Page-fault path (#739): drive the
+            // `VmObject::fault` slow path through the pure-logic
+            // classifier in `mem::pf`. `ParkAndRetry` re-enters the
+            // dispatch up to `PARK_AND_RETRY_BUDGET` times — every
+            // retry costs one slow-path round trip through
+            // `FileObject::fault`, but the bounded-recursion property
+            // inside that method guarantees forward progress per call,
+            // so the outer bound exists only to prevent livelock if a
+            // misbehaving filler abandons its stub repeatedly.
+            let mut retry_count: u32 = 0;
+            'resolve: loop {
+                // RFC 0007 §Page-fault IRQ discipline steps 2–4: with the
+                // pure-logic verdict already produced under IF=0, reopen
+                // interrupts before entering the `VmObject::fault` slow
+                // path. `obj.fault` can take a `BlockingMutex` (every
+                // `FileObject::fault` does) and would deadlock against any
+                // task already holding the same mutex if we left IRQs
+                // disabled. Disable them again before the PTE install +
+                // TLB flush below so IRET returns to the faulter with a
+                // coherent IF=1 / IF=0 state per the saved RFLAGS.
+                //
+                // SAFETY: `sti` only sets IF in RFLAGS; the page-fault
+                // gate is an interrupt gate (the `x86_64` crate's
+                // `set_handler_fn` default), so IF was hardware-cleared on
+                // entry and the saved `frame.cpu_flags` retains the
+                // pre-fault value untouched.
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+                let fault_res = object.fault(offset, access);
+                // SAFETY: `cli` only clears IF. We re-disable before the
+                // PTE install below so the page-table mutator sees a
+                // coherent ring-0/IF=0 environment matching the rest of
+                // the kernel paging layer.
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+
+                // Capture the original error before classification so
+                // the SIGBUS arm can log it for post-mortem (the
+                // classifier collapses every SIGBUS-equivalent variant
+                // into one resolution).
+                let dbg_err = match fault_res {
+                    Ok(_) => None,
+                    Err(e) => Some(e),
+                };
+                match classify_vm_fault_result(fault_res) {
+                    FaultResolution::Mapped(phys) => {
+                        let frame = PhysFrame::from_start_address(PhysAddr::new(phys))
+                            .expect("#PF: VmObject returned unaligned phys");
+                        match crate::mem::paging::map_existing_in_pml4(
+                            active, page, frame, pte_flags,
+                        ) {
+                            Ok(()) => return,
+                            Err(e) => {
+                                // map_existing_in_pml4 failed (OOM allocating page-table
+                                // frames). AnonObject::fault already called inc_refcount
+                                // for the PTE we won't install; roll it back so the
+                                // refcount stays balanced and AddressSpace::drop does not
+                                // see a phantom PTE reference.
+                                #[cfg(target_os = "none")]
+                                crate::mem::refcount::dec_refcount(phys);
+                                serial_println!(
+                                    "#PF demand map failed addr={:#x}: {:?}",
+                                    addr_u64,
+                                    e
+                                );
+                                break 'resolve;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    serial_println!("#PF VmObject::fault failed addr={:#x}: {:?}", addr_u64, e)
+                    FaultResolution::CoW => {
+                        // RFC 0007 §Algorithms — `MAP_PRIVATE` write
+                        // fault on a file-backed VMA. `FileObject::fault`
+                        // returned `CoWNeeded` from the fast-path
+                        // replay: the cache page is resident
+                        // (`PG_UPTODATE`) but no PTE references it yet.
+                        // To match the existing CoW protocol exactly
+                        // (and reuse `cow_copy_and_remap` unchanged per
+                        // the issue acceptance criteria), install the
+                        // cache frame as a *transient* read-only PTE,
+                        // then immediately invoke
+                        // `cow_copy_and_remap` to allocate the private
+                        // copy and remap writable. The transient PTE
+                        // exists only inside this function — userspace
+                        // never observes it because we hold IRQs
+                        // disabled and the `cow_copy_and_remap` call
+                        // overwrites it before IRETQ.
+                        let cache_phys = match object.frame_at(offset) {
+                            Some(p) => p,
+                            None => {
+                                serial_println!(
+                                    "#PF CoW: object.frame_at({:#x}) returned None despite CoWNeeded",
+                                    offset,
+                                );
+                                break 'resolve;
+                            }
+                        };
+                        let cache_frame = PhysFrame::from_start_address(PhysAddr::new(cache_phys))
+                            .expect("#PF CoW: cache phys is not 4 KiB-aligned");
+                        // The transient R/O install introduces a new PTE
+                        // reference to `cache_phys`. `cow_copy_and_remap`
+                        // will `frame::put` that reference inside its
+                        // unmap arm, so the bookkeeping stays balanced.
+                        #[cfg(target_os = "none")]
+                        if crate::mem::refcount::try_inc_refcount(cache_phys).is_err() {
+                            serial_println!(
+                                "#PF CoW: refcount saturated for cache phys {:#x}",
+                                cache_phys,
+                            );
+                            unsafe {
+                                crate::signal::deliver_fault_signal_iret(
+                                    crate::signal::SIGBUS,
+                                    &mut frame,
+                                    addr_u64,
+                                );
+                            }
+                            return;
+                        }
+                        // Strip WRITABLE for the transient install —
+                        // `cow_copy_and_remap` requires the PTE to be
+                        // present, then unmaps it before installing the
+                        // private writable frame.
+                        let ro_flags = pte_flags & !PageTableFlags::WRITABLE;
+                        if let Err(e) = crate::mem::paging::map_existing_in_pml4(
+                            active,
+                            page,
+                            cache_frame,
+                            ro_flags,
+                        ) {
+                            #[cfg(target_os = "none")]
+                            crate::mem::refcount::dec_refcount(cache_phys);
+                            serial_println!(
+                                "#PF CoW transient install failed addr={:#x}: {:?}",
+                                addr_u64,
+                                e
+                            );
+                            break 'resolve;
+                        }
+                        match crate::mem::paging::cow_copy_and_remap(active, page, pte_flags) {
+                            Ok(_) => return,
+                            Err(e) => {
+                                serial_println!(
+                                    "#PF CoW copy-and-remap failed addr={:#x}: {:?}",
+                                    addr_u64,
+                                    e
+                                );
+                                break 'resolve;
+                            }
+                        }
+                    }
+                    FaultResolution::Retry => {
+                        // RFC 0007 §FileObject — install-race loser
+                        // observed the winner abandon its stub.
+                        // `FileObject::fault` already parked on the
+                        // cache-page wait-queue once before returning;
+                        // re-enter the dispatch so a fresh stub gets
+                        // installed and filled. Bounded by
+                        // `PARK_AND_RETRY_BUDGET` to avoid livelock.
+                        if should_park_and_retry(retry_count) {
+                            retry_count += 1;
+                            continue 'resolve;
+                        }
+                        serial_println!(
+                            "#PF ParkAndRetry budget exhausted addr={:#x} — SIGBUS",
+                            addr_u64,
+                        );
+                        unsafe {
+                            crate::signal::deliver_fault_signal_iret(
+                                crate::signal::SIGBUS,
+                                &mut frame,
+                                addr_u64,
+                            );
+                        }
+                        return;
+                    }
+                    FaultResolution::Sigbus => {
+                        // ReadFailed / OutOfRange / OutOfMemory /
+                        // RefcountSaturated all collapse here. POSIX
+                        // mandates SIGBUS for "fault past i_size on a
+                        // file-backed mmap"; the other two are kernel-
+                        // resource-exhaustion failures with no better
+                        // portable signal.
+                        serial_println!("#PF SIGBUS addr={:#x} cause={:?}", addr_u64, dbg_err);
+                        // SAFETY: `frame` is the live hardware-pushed
+                        // `InterruptStackFrame`; the helper rewrites
+                        // RIP/RSP for handler delivery or calls
+                        // `task::exit()` (`-> !`) for Default/Ignore.
+                        unsafe {
+                            crate::signal::deliver_fault_signal_iret(
+                                crate::signal::SIGBUS,
+                                &mut frame,
+                                addr_u64,
+                            );
+                        }
+                        return;
+                    }
+                    FaultResolution::AccessViolation => {
+                        // ProtectionViolation falls through to the
+                        // generic ring-3 access-violation arm below,
+                        // which delivers SIGSEGV (distinct user signal
+                        // from SIGBUS). Logged here so the
+                        // EXCEPTION-line trail is preserved.
+                        serial_println!(
+                            "#PF access violation addr={:#x} cause={:?}",
+                            addr_u64,
+                            dbg_err
+                        );
+                        break 'resolve;
+                    }
                 }
             }
         } else if is_write && pte_flags.contains(PageTableFlags::WRITABLE) {
