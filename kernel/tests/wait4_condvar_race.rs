@@ -296,9 +296,12 @@ fn wait4_exit_in_reap_gap_wakes_wait_while() {
 
 // --- mark_zombie_atomically_publishes_state_and_event ----------------
 //
-// #710 atomic-publish invariant: `mark_zombie` writes the Zombie state
-// and bumps `EXIT_EVENT` under the same TABLE critical section, so any
-// TABLE acquirer observes both transitions or neither — never just one.
+// #710 / #709 atomic-publish invariant: `mark_zombie` writes the Zombie
+// state and bumps `EXIT_EVENT` under the same TABLE critical section, so
+// any TABLE acquirer observes both transitions or neither — never just
+// one. (`docs/design/dst-709-rebaseline.md` traces both soak symptoms —
+// post-`wait4` stall ~0.9% and post-fork child-stall ~14% — to the same
+// drain-order race this invariant repairs.)
 //
 // The previous shape (state under TABLE, then `EXIT_EVENT.fetch_add`
 // after TABLE drop) opened a drain-order window the v1 simulator's
