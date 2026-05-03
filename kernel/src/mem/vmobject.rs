@@ -126,6 +126,31 @@ pub trait VmObject: Send + Sync {
     /// zero-filled frame instead of the one previously cached. Default
     /// is a no-op; `AnonObject` overrides to evict the range.
     fn evict_range(&self, _first: usize, _last: usize) {}
+
+    // ---- mprotect permission gates (RFC 0007 §Security B1) ---------------
+
+    /// Return the snapshot of the `OpenFile` access-mode bits
+    /// (`O_RDONLY` / `O_WRONLY` / `O_RDWR`) captured at `mmap` time, if
+    /// this object is backed by a file. `mprotect` consults this to
+    /// reject `PROT_WRITE` upgrades on `MAP_SHARED` file-backed VMAs
+    /// whose open_mode was not `O_RDWR` (RFC 0007 §Errno table).
+    ///
+    /// Default: `None` — non-file-backed objects (anon, etc.) impose no
+    /// open-mode constraint on `mprotect`.
+    fn mprotect_open_mode(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether the backing inode had execute permission at `mmap` time.
+    /// Snapshotted once so `mprotect` does not re-check a live inode
+    /// whose permissions may have changed. `mprotect` rejects
+    /// `PROT_EXEC` upgrades when this returns `Some(false)`.
+    ///
+    /// Default: `None` — non-file-backed objects impose no exec-permission
+    /// constraint on `mprotect`.
+    fn mprotect_exec_allowed(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Clone a `VmObject` trait-object for `fork`. The default behavior is

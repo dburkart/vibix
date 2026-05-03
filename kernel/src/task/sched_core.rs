@@ -420,11 +420,19 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::fs::FileDescTab
 /// # Panics
 /// Panics if called before [`init`] (no running task yet).
 pub fn current_credentials() -> alloc::sync::Arc<crate::fs::vfs::Credential> {
+    try_current_credentials().expect("current_credentials: no running task")
+}
+
+/// Non-panicking variant of [`current_credentials`].
+///
+/// Returns `None` when the scheduler has not been initialised or no
+/// task is running yet (e.g. during early boot or integration tests
+/// that drive kernel subsystems without a task context). Callers
+/// that must always have a credential should use
+/// [`current_credentials`] instead.
+pub fn try_current_credentials() -> Option<alloc::sync::Arc<crate::fs::vfs::Credential>> {
     let sched = SCHED.lock();
-    let cur = sched
-        .current
-        .as_ref()
-        .expect("current_credentials: no running task");
+    let cur = sched.current.as_ref()?;
     // Inner scope forces the `RwLockReadGuard` to drop before the
     // outer `sched` (`IrqLockGuard`) does. Without it Rust drops the
     // inline temporary after `sched` and the borrow checker rejects
@@ -435,7 +443,7 @@ pub fn current_credentials() -> alloc::sync::Arc<crate::fs::vfs::Credential> {
         alloc::sync::Arc::clone(&*guard)
     };
     drop(sched);
-    snapshot
+    Some(snapshot)
 }
 
 /// Atomically replace the currently-running task's credentials with

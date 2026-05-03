@@ -470,6 +470,55 @@ pub fn validate_file_mmap_args(
     Ok((off, len_pages))
 }
 
+// ── mprotect file-backed permission gates (RFC 0007 §Security B1) ───────
+
+/// Pure errno-gate for `mprotect` on a single file-backed VMA.
+///
+/// Extracted from the `sys_mprotect` VMA walk so host unit tests can
+/// exercise every rejection branch without the full `AddressSpace` /
+/// VMA-tree / IDT plumbing.
+///
+/// Returns `Ok(())` when the requested `prot` is permissible, or
+/// `Err(EACCES)` when either:
+///
+/// - `PROT_WRITE` is requested on a `MAP_SHARED` VMA whose
+///   `open_mode` snapshot is not `O_RDWR`.
+/// - `PROT_EXEC` is requested on a VMA whose backing inode lacked
+///   execute permission at `mmap` time (`exec_allowed == false`).
+///
+/// Non-file-backed VMAs (anon, etc.) pass `None` for both
+/// `open_mode` and `exec_allowed`; the function returns `Ok(())`
+/// unconditionally for those.
+pub fn validate_mprotect_file_perm(
+    prot: u32,
+    share: crate::mem::vmatree::Share,
+    open_mode: Option<u32>,
+    exec_allowed: Option<bool>,
+) -> Result<(), i64> {
+    use crate::mem::vmatree::Share;
+    const EACCES: i64 = -13;
+    const O_RDWR: u32 = 2;
+
+    // PROT_WRITE on MAP_SHARED + file-backed: open_mode must be O_RDWR.
+    if prot & PROT_WRITE != 0 && share == Share::Shared {
+        if let Some(mode) = open_mode {
+            if mode != O_RDWR {
+                return Err(EACCES);
+            }
+        }
+    }
+
+    // PROT_EXEC on file-backed: inode must have had execute permission
+    // at mmap time.
+    if prot & PROT_EXEC != 0 {
+        if let Some(false) = exec_allowed {
+            return Err(EACCES);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod validate_range_tests {
     use super::*;
@@ -1107,5 +1156,153 @@ mod tests {
             route_through_classifier(Ok(0x4000)),
             FaultResolution::Mapped(0x4000),
         );
+    }
+
+    // ── validate_mprotect_file_perm (issue #747, RFC 0007 §Security B1) ─
+
+    mod mprotect_file_perm {
+        use super::*;
+        use crate::mem::vmatree::Share;
+
+        const O_RDONLY: u32 = 0;
+        const O_WRONLY: u32 = 1;
+        const O_RDWR: u32 = 2;
+        const EACCES: i64 = -13;
+
+        // --- PROT_WRITE on MAP_SHARED ---
+
+        #[test]
+        fn shared_write_rdwr_ok() {
+            // MAP_SHARED + PROT_WRITE with O_RDWR: allowed.
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_WRITE, Share::Shared, Some(O_RDWR), Some(true)),
+                Ok(()),
+            );
+        }
+
+        #[test]
+        fn shared_write_rdonly_eacces() {
+            // MAP_SHARED + PROT_WRITE with O_RDONLY: rejected.
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_WRITE, Share::Shared, Some(O_RDONLY), Some(true)),
+                Err(EACCES),
+            );
+        }
+
+        #[test]
+        fn shared_write_wronly_eacces() {
+            // MAP_SHARED + PROT_WRITE with O_WRONLY: rejected (need
+            // O_RDWR for read-on-miss before mutating).
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_WRITE, Share::Shared, Some(O_WRONLY), Some(true)),
+                Err(EACCES),
+            );
+        }
+
+        #[test]
+        fn private_write_rdonly_ok() {
+            // MAP_PRIVATE + PROT_WRITE with O_RDONLY: no open_mode
+            // gate on private mappings (CoW handles the write).
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_WRITE, Share::Private, Some(O_RDONLY), Some(true)),
+                Ok(()),
+            );
+        }
+
+        #[test]
+        fn shared_read_rdonly_ok() {
+            // MAP_SHARED + PROT_READ (no WRITE): O_RDONLY is fine.
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_READ, Share::Shared, Some(O_RDONLY), Some(true)),
+                Ok(()),
+            );
+        }
+
+        // --- PROT_EXEC on non-executable inode ---
+
+        #[test]
+        fn exec_on_executable_inode_ok() {
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_EXEC, Share::Private, Some(O_RDONLY), Some(true)),
+                Ok(()),
+            );
+        }
+
+        #[test]
+        fn exec_on_non_executable_inode_eacces() {
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_EXEC, Share::Private, Some(O_RDONLY), Some(false)),
+                Err(EACCES),
+            );
+        }
+
+        #[test]
+        fn exec_on_shared_non_executable_eacces() {
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_EXEC, Share::Shared, Some(O_RDWR), Some(false)),
+                Err(EACCES),
+            );
+        }
+
+        #[test]
+        fn read_write_exec_shared_rdwr_exec_ok() {
+            // All bits + O_RDWR + exec_allowed: passes.
+            assert_eq!(
+                validate_mprotect_file_perm(
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    Share::Shared,
+                    Some(O_RDWR),
+                    Some(true)
+                ),
+                Ok(()),
+            );
+        }
+
+        #[test]
+        fn read_write_exec_shared_rdonly_eacces() {
+            // WRITE+EXEC on shared + O_RDONLY: EACCES for WRITE rule.
+            assert_eq!(
+                validate_mprotect_file_perm(
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    Share::Shared,
+                    Some(O_RDONLY),
+                    Some(true)
+                ),
+                Err(EACCES),
+            );
+        }
+
+        #[test]
+        fn read_write_exec_shared_noexec_eacces() {
+            // WRITE+EXEC on shared + O_RDWR + no exec: EACCES for EXEC rule.
+            assert_eq!(
+                validate_mprotect_file_perm(
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    Share::Shared,
+                    Some(O_RDWR),
+                    Some(false)
+                ),
+                Err(EACCES),
+            );
+        }
+
+        // --- Non-file-backed (anon) objects ---
+
+        #[test]
+        fn anon_write_shared_ok() {
+            // Non-file-backed (None): no constraint.
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_WRITE, Share::Shared, None, None),
+                Ok(()),
+            );
+        }
+
+        #[test]
+        fn anon_exec_ok() {
+            assert_eq!(
+                validate_mprotect_file_perm(PROT_EXEC, Share::Private, None, None),
+                Ok(()),
+            );
+        }
     }
 }
