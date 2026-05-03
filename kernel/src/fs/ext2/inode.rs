@@ -76,7 +76,7 @@ use crate::fs::vfs::inode::{Inode, InodeKind, InodeMeta};
 use crate::fs::vfs::open_file::OpenFile;
 use crate::fs::vfs::ops::{FileOps, InodeOps, Stat};
 use crate::fs::vfs::{SbFlags, SuperBlock, Timespec};
-use crate::fs::{EINVAL, EIO, ENODEV};
+use crate::fs::{EINVAL, EIO, ENODEV, ENOTDIR};
 use crate::sync::BlockingRwLock;
 
 /// Parsed, driver-owned view of an on-disk inode's mutable fields. Sits
@@ -455,6 +455,14 @@ impl FileOps for Ext2Inode {
     /// ordering rules (RFC 0004 §Write extend + §Write Ordering).
     fn write(&self, f: &OpenFile, buf: &[u8], off: u64) -> Result<usize, i64> {
         super::file::write_file_at(&f.inode, self, buf, off)
+    }
+
+    fn getdents(&self, f: &OpenFile, buf: &mut [u8], cookie: &mut u64) -> Result<usize, i64> {
+        if f.inode.kind != InodeKind::Dir {
+            return Err(ENOTDIR);
+        }
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        super::dir::getdents64(&super_ref, self, buf, cookie)
     }
 
     /// Bump the driver-side outstanding-opens refcount. Paired with
