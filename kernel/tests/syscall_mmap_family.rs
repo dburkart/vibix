@@ -22,7 +22,7 @@ use core::panic::PanicInfo;
 
 use vibix::arch::x86_64::syscall::syscall_dispatch;
 use vibix::arch::x86_64::uaccess;
-use vibix::fs::{EEXIST, EINVAL, ENODEV, ENOMEM};
+use vibix::fs::{EEXIST, EINVAL, ENOMEM};
 use vibix::mem::pf::{
     MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
     PROT_READ, PROT_WRITE,
@@ -176,10 +176,15 @@ fn anon_rw(len: u64) -> u64 {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 fn mmap_fd_nonneg_enodev() {
-    // File-backed mappings are not implemented: fd != -1 must yield ENODEV
-    // (not EINVAL) per RFC 0001.
+    // RFC 0007 §Kernel-Userspace Interface (#746): MAP_ANONYMOUS ignores
+    // `fd` per Linux semantics, so passing a non-negative fd alongside
+    // MAP_ANONYMOUS no longer trips the file-backed errno table — the
+    // mapping succeeds. Pre-746, vibix short-circuited every `fd != -1`
+    // to ENODEV; the new errno table runs only when MAP_ANONYMOUS is
+    // clear. The test name is preserved as a regression anchor for the
+    // Linux-compat semantics flip.
     let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
-    assert_eq!(r, ENODEV, "expected ENODEV for fd=0, got {}", r);
+    assert!(r > 0, "MAP_ANONYMOUS must ignore fd, got errno {}", r);
 }
 
 fn mmap_requires_exactly_one_share() {

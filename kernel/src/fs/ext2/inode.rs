@@ -76,7 +76,7 @@ use crate::fs::vfs::inode::{Inode, InodeKind, InodeMeta};
 use crate::fs::vfs::open_file::OpenFile;
 use crate::fs::vfs::ops::{FileOps, InodeOps, Stat};
 use crate::fs::vfs::{SbFlags, SuperBlock, Timespec};
-use crate::fs::{EINVAL, EIO, ENOENT};
+use crate::fs::{EINVAL, EIO, ENODEV, ENOENT};
 use crate::sync::BlockingRwLock;
 
 /// Parsed, driver-owned view of an on-disk inode's mutable fields. Sits
@@ -400,9 +400,49 @@ pub struct Ext2FileOps;
 impl FileOps for Ext2FileOps {}
 
 impl FileOps for Ext2Inode {
-    /// Regular-file read through the buffer cache. See
-    /// [`super::file::read_file_at`] for the normative pipeline.
+    /// Regular-file read.
+    ///
+    /// When the inode has an installed [`crate::mem::page_cache::PageCache`]
+    /// (`mapping = Some(_)`), route through the cache via
+    /// [`super::file::read_via_page_cache`] so a `read(2)` and a
+    /// concurrent `mmap(2)` of the same file observe the same backing
+    /// copy (RFC 0007 §`FileOps::read` / Workstream C, issue #754).
+    /// When `mapping` is `None` (no FS-side `AddressSpaceOps` installed,
+    /// or the lazy install in
+    /// [`crate::fs::vfs::inode::Inode::page_cache_or_create`] hasn't
+    /// been triggered yet), fall back to the existing direct buffer-
+    /// cache pipeline in [`super::file::read_file_at`].
+    ///
+    /// The cache-routing path is feature-gated on `page_cache` so the
+    /// migration window's default-feature build (no `mapping` field
+    /// at all) compiles cleanly.
+    ///
+    /// The `InodeKind::Reg` gate at the top is essential: `read_file_at`
+    /// returns `EISDIR` / `EINVAL` for non-regular kinds, and the
+    /// page-cache route would silently bypass that errno surface for
+    /// any non-regular inode that ever gets a `mapping` slot
+    /// installed (today only `iget` for `Reg` inodes installs aops, but
+    /// the gate is defence-in-depth against a future caller that
+    /// installs aops on a different kind).
     fn read(&self, f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
+        // Non-regular inodes always go through `read_file_at` so the
+        // dispatch table for `Dir` / `Link` / `Chr` / `Blk` / `Fifo` /
+        // `Sock` (each producing a specific errno) stays authoritative.
+        // The page-cache route is for `InodeKind::Reg` only.
+        if !matches!(f.inode.kind, InodeKind::Reg) {
+            return super::file::read_file_at(&f.inode, self, buf, off);
+        }
+        #[cfg(feature = "page_cache")]
+        {
+            // Take only the read guard on `mapping` — `Inode::page_cache_or_create`
+            // is the install-once writer; once installed the slot is
+            // stable for the inode's lifetime, so the read-guard clone
+            // of the `Arc` is safe to consult outside the lock.
+            let cache_opt = f.inode.mapping.read().as_ref().map(Arc::clone);
+            if let Some(cache) = cache_opt {
+                return super::file::read_via_page_cache(&cache, buf, off);
+            }
+        }
         super::file::read_file_at(&f.inode, self, buf, off)
     }
 
@@ -472,6 +512,105 @@ impl FileOps for Ext2Inode {
                 e,
             );
         }
+    }
+
+    /// Build a [`FileObject`] (RFC 0007 §FileObject) for an `mmap(2)`
+    /// of this regular file, lazily constructing the inode's
+    /// [`PageCache`] on first call.
+    ///
+    /// Implements RFC 0007 §`FileOps::mmap` for ext2 (issue #753):
+    ///
+    /// 1. Reject any non-regular kind with `ENODEV` — directories,
+    ///    symlinks, FIFOs, sockets, and device nodes do not participate
+    ///    in the page cache. The trait's default already returns
+    ///    `ENODEV`; mirroring it here keeps the surface uniform if a
+    ///    future caller ever invokes the impl on a non-`Reg` inode that
+    ///    happens to share `Ext2Inode` ops by mistake.
+    /// 2. [`Inode::page_cache_or_create`] returns the install-once
+    ///    `Arc<PageCache>` bound at first-touch to the [`Ext2Aops`] the
+    ///    `iget` path installed via [`Inode::set_aops`]. Returning
+    ///    `None` here would mean `iget` did not install the ops — a
+    ///    construction-time bug — so we surface `ENODEV` rather than
+    ///    panic.
+    /// 3. Snapshot the [`OpenFile`]'s access mode (`O_RDONLY` /
+    ///    `O_WRONLY` / `O_RDWR`, masked with `O_ACCMODE`) into the
+    ///    [`FileObject`]. RFC 0007 §FileObject `open_mode` snapshot:
+    ///    closes the TOCTOU surface raised in §Security B1 — `mprotect`
+    ///    consults the snapshot to decide whether `PROT_WRITE` may be
+    ///    added later, never re-reading the (mutable) `OpenFile.flags`.
+    /// 4. The `Arc<PageCache>` is captured by value into the new
+    ///    [`FileObject`]; per RFC 0007 §Inode-binding rule the cache
+    ///    pointer is then immutable for the FileObject's lifetime, so a
+    ///    re-execve that resolves to a different inode constructs an
+    ///    independent `FileObject` against an independent cache.
+    ///
+    /// `_prot` is accepted but not consulted here; argument validation
+    /// — including the `MAP_SHARED + PROT_WRITE` vs. `O_RDWR` rule —
+    /// happens in `sys_mmap` (issue #746) before this hook fires per
+    /// RFC 0007 §Errno table.
+    ///
+    /// `MAP_SHARED` writeback through this surface is gated on issue
+    /// #750 (`Ext2Aops::writepage`); until that lands, a write fault on
+    /// a `Share::Shared` mapping enters [`Ext2Aops::writepage`]'s
+    /// `Err(EROFS)` stub and the daemon bumps `wb_err`. Read faults
+    /// (`MAP_PRIVATE`-only is the validated wave-2 surface) and
+    /// `MAP_PRIVATE` CoW remain fully usable today.
+    #[cfg(feature = "page_cache")]
+    fn mmap(
+        &self,
+        f: &OpenFile,
+        file_offset: u64,
+        len_pages: usize,
+        share: crate::mem::vmatree::Share,
+        _prot: crate::mem::vmatree::ProtUser,
+    ) -> Result<alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>, i64> {
+        use core::sync::atomic::Ordering;
+
+        // Only regular files participate in the page cache. The hook
+        // is dispatched off `Inode.file_ops`, which on `Ext2Inode` is
+        // shared across every kind iget produces; surface ENODEV for
+        // anything that isn't `Reg` to match the trait default.
+        if f.inode.kind != InodeKind::Reg {
+            return Err(ENODEV);
+        }
+
+        // RFC 0007 §`mmap` semantics — `file_offset` is page-aligned
+        // (sys_mmap rejects unaligned values with EINVAL before this
+        // hook fires). Convert to a page index for the FileObject's
+        // half-open `[file_offset_pages, file_offset_pages+len_pages)`
+        // window. We re-check page alignment here as a defense-in-depth
+        // assert — a misaligned value reaching this code is a bug at
+        // the syscall layer.
+        debug_assert!(
+            file_offset % (crate::mem::FRAME_SIZE) == 0,
+            "Ext2Inode::mmap: file_offset {file_offset:#x} must be page-aligned",
+        );
+        let file_offset_pages = file_offset / crate::mem::FRAME_SIZE;
+
+        // Lazily construct the inode's PageCache. `iget` already
+        // installed the per-inode `Ext2Aops` via `Inode::set_aops`, so
+        // the helper returns `Some` for any regular file iget produced
+        // (the ENODEV branch covers a future hook that calls mmap
+        // before `iget` has run — defensive only).
+        let cache = f.inode.page_cache_or_create().ok_or(ENODEV)?;
+
+        // RFC 0007 §FileObject `open_mode` snapshot — closes Security
+        // B1's TOCTOU surface. The snapshot is masked to the access
+        // bits only (`O_RDONLY` / `O_WRONLY` / `O_RDWR`) so a future
+        // `fcntl(F_SETFL)` flipping `O_NONBLOCK` / `O_APPEND` cannot
+        // affect mprotect's decision. Read with `Relaxed` because
+        // mmap-time is already serialised by sys_mmap's argument
+        // walk; the access mode itself is install-once at open(2).
+        let open_mode = f.flags.load(Ordering::Relaxed) & crate::fs::flags::O_ACCMODE;
+
+        let fo = crate::mem::file_object::FileObject::new(
+            cache,
+            file_offset_pages,
+            len_pages,
+            share,
+            open_mode,
+        );
+        Ok(fo as alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>)
     }
 }
 
@@ -674,6 +813,22 @@ pub fn iget(super_ref: &Arc<Ext2Super>, sb: &Arc<SuperBlock>, ino: u32) -> Resul
         kind,
         vfs_meta,
     ));
+
+    // RFC 0007 §Inode-binding rule (issue #753 / #745): install the
+    // per-inode `Ext2Aops` *before* publishing the inode caches so the
+    // ops Arc is reachable the first time anyone calls
+    // `Inode::page_cache_or_create`. Only regular files participate in
+    // the page cache — directories use the dirent walker, symlinks the
+    // readlink fast path, and special files fall through to a non-FS
+    // dispatch in `FileOps`. Set-once is enforced by `Inode::set_aops`;
+    // the discard of its bool result is intentional (the Inode is
+    // freshly constructed, no caller has had a chance to install ops
+    // out from under us).
+    #[cfg(feature = "page_cache")]
+    if kind == InodeKind::Reg {
+        let aops = super::aops::Ext2Aops::new(super_ref, &ext2_inode);
+        let _ = inode.set_aops(aops as Arc<dyn crate::mem::aops::AddressSpaceOps>);
+    }
 
     // 5. Install the Weak in the cache under the cache lock. Re-check
     //    residency: another thread may have raced us through the miss

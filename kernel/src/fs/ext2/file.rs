@@ -212,6 +212,307 @@ pub fn read_file_at(
     Ok(copied)
 }
 
+/// Read at most `buf.len()` bytes from `inode` starting at `off` by
+/// walking the inode's [`PageCache`], faulting in any missing pages
+/// through [`crate::mem::aops::AddressSpaceOps::readpage`] and copying
+/// out from the cache frames.
+///
+/// This is the page-cache routing path for `read(2)` (RFC 0007 §
+/// `FileOps::read`, issue #754). When an inode has a non-`None`
+/// `mapping` slot, [`super::inode::Ext2Inode`]'s [`crate::fs::vfs::ops::FileOps::read`]
+/// dispatches here instead of [`read_file_at`] so a `read(2)` and a
+/// concurrent `mmap(2)` of the same file see the **same** backing
+/// copy — both consult the same `Arc<PageCache>` and observe the
+/// same per-page frame.
+///
+/// The walk mirrors the slow-path filler discipline in
+/// [`crate::mem::file_object::FileObject::fault`] minus the PTE /
+/// CoW / dirty-publish concerns:
+///
+/// 1. Bound the read by `i_size` (POSIX EOF rule); reads at or past
+///    `i_size` return `Ok(0)`.
+/// 2. For each 4 KiB page covering `[off, off + to_read)`:
+///    a. Fast path: cache hit on a `PG_UPTODATE` / `!PG_LOCKED`
+///       entry. memcpy out.
+///    b. Slow path: install a fresh stub via
+///       [`crate::mem::page_cache::PageCache::install_or_get`],
+///       drive [`crate::mem::aops::AddressSpaceOps::readpage`] with
+///       no cache lock held, then either
+///       [`crate::mem::page_cache::CachePage::publish_uptodate_and_unlock`]
+///       on success or
+///       [`crate::mem::page_cache::PageCache::abandon_locked_stub`]
+///       on filler error.
+///    c. Loser of the install race parks on the existing stub via
+///       [`crate::mem::page_cache::CachePage::wait_until_unlocked`],
+///       then re-enters the fast path.
+/// 3. Copy `[in_page_off, in_page_off + chunk)` out of the cached
+///    page's HHDM-mapped frame into the caller's buffer.
+///
+/// `readpage` returning `Ok(0)` on a page entirely past `i_size` is
+/// not surfaced here — the outer loop already clamps to `i_size`,
+/// so we never fault a page that lies entirely past EOF.
+///
+/// On `target_os = "none"` (real kernel) the copy goes through the
+/// HHDM mapping. On host (`cfg(test)`) the cache page's `phys` is
+/// fictitious and the helper falls back to invoking `readpage`
+/// directly into a stack buffer per page rather than dereferencing
+/// the frame; the cache index still tracks the page so a subsequent
+/// `read(2)` observes the install-once shape.
+///
+/// # Errno table (RFC 0007 §Errno table)
+///
+/// - `EIO` — propagated from `readpage` (buffer-cache I/O failure,
+///   indirect-walker corruption, mount tear-down). Surfaced
+///   *immediately* on a per-page filler error; partial copy from
+///   earlier pages is not discarded.
+///
+/// # Lock-order
+///
+/// `assert_no_spinlocks_held` is asserted at entry — every
+/// page-cache surface this method touches (`install_or_get`,
+/// `mark_page_dirty`, `lookup`, `clear_page_dirty`) takes the
+/// level-4 cache mutex internally; calling under any spin would
+/// invert the lock-order ladder.
+#[cfg(feature = "page_cache")]
+pub fn read_via_page_cache(
+    cache: &Arc<crate::mem::page_cache::PageCache>,
+    buf: &mut [u8],
+    off: u64,
+) -> Result<usize, i64> {
+    use crate::debug_lockdep::assert_no_spinlocks_held;
+    use crate::mem::FRAME_SIZE;
+
+    assert_no_spinlocks_held("ext2::read_via_page_cache");
+
+    if buf.is_empty() {
+        return Ok(0);
+    }
+
+    // Snapshot i_size off the cache; the cache mirrors the inode's
+    // size and is the source of truth for the in-flight read window
+    // (RFC 0007 §`PageCache.i_size`). A truncate that races with our
+    // walk shrinks this snapshot; later faults will observe the
+    // smaller value via the per-page recheck the filler performs.
+    let i_size = cache.i_size();
+    if off >= i_size {
+        return Ok(0);
+    }
+    let remaining_in_file = (i_size - off) as usize;
+    let to_read = core::cmp::min(buf.len(), remaining_in_file);
+    if to_read == 0 {
+        return Ok(0);
+    }
+
+    let mut copied = 0usize;
+    while copied < to_read {
+        let cur = off + copied as u64;
+        let pgoff = cur / FRAME_SIZE;
+        let in_page = (cur % FRAME_SIZE) as usize;
+        let page_remaining = (FRAME_SIZE as usize) - in_page;
+        let chunk = core::cmp::min(page_remaining, to_read - copied);
+
+        // Fault in / look up the cache page for `pgoff`.
+        let page = fault_in_cache_page(cache, pgoff)?;
+
+        // Copy out from the cache frame. On bare metal the frame is
+        // HHDM-mapped and we read the bytes directly. On host the
+        // frame is fictitious — the cache page exists for the
+        // index/state-bit invariants but cannot be dereferenced. The
+        // host fallback re-invokes `readpage` into a stack buffer
+        // and copies from there; the install-once shape (lookup hits,
+        // PG_UPTODATE set) is preserved, but byte content for host
+        // tests is sourced from the FS hook rather than the frame.
+        copy_out_of_cache_page(
+            cache,
+            &page,
+            pgoff,
+            in_page,
+            chunk,
+            &mut buf[copied..copied + chunk],
+        )?;
+
+        copied += chunk;
+    }
+
+    Ok(copied)
+}
+
+/// Fault in a single page of `cache` at `pgoff`, returning the
+/// `Arc<CachePage>` once it is `PG_UPTODATE` and unlocked. Mirrors
+/// the slow-path discipline in
+/// [`crate::mem::file_object::FileObject::fault`].
+#[cfg(feature = "page_cache")]
+fn fault_in_cache_page(
+    cache: &Arc<crate::mem::page_cache::PageCache>,
+    pgoff: u64,
+) -> Result<Arc<crate::mem::page_cache::CachePage>, i64> {
+    use crate::mem::page_cache::{InstallOutcome, PG_LOCKED, PG_UPTODATE};
+
+    // Bounded re-entry: at most two passes. After a winner publishes
+    // PG_UPTODATE the loser's wait_until_unlocked returns and the
+    // second pass is a fast-path hit. A spurious re-eviction between
+    // the wake and the lookup surfaces as one extra retry; the loop
+    // terminates on the first UPTODATE / !LOCKED observation.
+    loop {
+        // Fast path: cache hit on UPTODATE / unlocked entry.
+        if let Some(page) = cache.lookup(pgoff) {
+            let st = page.state.load(core::sync::atomic::Ordering::Acquire);
+            if st & PG_UPTODATE != 0 && st & PG_LOCKED == 0 {
+                return Ok(page);
+            }
+            // Hit-but-locked: park on the existing stub's wait queue
+            // rather than installing a fresh one. After the wake we
+            // re-enter the fast-path branch above.
+            page.wait_until_unlocked();
+            continue;
+        }
+
+        // Slow path: install-race + filler protocol.
+        let stub = alloc_locked_cache_stub(pgoff)?;
+        let stub_for_closure = stub.clone();
+        let outcome = cache.install_or_get(pgoff, move || stub_for_closure);
+        match outcome {
+            InstallOutcome::InstalledNew(page) => {
+                // We won. Drop the outer clone so the cache index is
+                // the sole strong-ref owner once filler completes.
+                drop(stub);
+                let mut buf = [0u8; 4096];
+                page.mark_in_flight();
+                let ops = cache.ops();
+                let read_res = ops.readpage(pgoff, &mut buf);
+                page.clear_in_flight();
+                match read_res {
+                    Ok(_n) => {
+                        // Copy the bytes through the HHDM into the
+                        // stub's physical frame. On host the frame is
+                        // fictitious — skip the memcpy; the host
+                        // fallback in `copy_out_of_cache_page`
+                        // re-invokes `readpage` for content.
+                        #[cfg(target_os = "none")]
+                        copy_into_cache_frame(page.phys, &buf);
+                        #[cfg(not(target_os = "none"))]
+                        let _ = buf;
+                        page.publish_uptodate_and_unlock();
+                        return Ok(page);
+                    }
+                    Err(e) => {
+                        cache.abandon_locked_stub(&page);
+                        return Err(e);
+                    }
+                }
+            }
+            InstallOutcome::AlreadyPresent(page) => {
+                // Lost the install race: `make_stub` never fired, so
+                // the closure clone was dropped silently. Reclaim the
+                // outer stub's frame before dropping it on the floor.
+                release_unused_cache_stub(&stub);
+                drop(stub);
+                // Park on the existing stub's wait queue then re-enter
+                // the fast path.
+                page.wait_until_unlocked();
+                continue;
+            }
+        }
+    }
+}
+
+/// Copy `chunk` bytes out of `page`'s frame at `[in_page_off,
+/// in_page_off + chunk)` into `dst`. Bare-metal goes through the
+/// HHDM; host falls back to a per-page `readpage` invocation since
+/// the host's `phys` is fictitious.
+#[cfg(feature = "page_cache")]
+fn copy_out_of_cache_page(
+    cache: &Arc<crate::mem::page_cache::PageCache>,
+    page: &Arc<crate::mem::page_cache::CachePage>,
+    pgoff: u64,
+    in_page_off: usize,
+    chunk: usize,
+    dst: &mut [u8],
+) -> Result<(), i64> {
+    debug_assert_eq!(dst.len(), chunk);
+    debug_assert!(in_page_off + chunk <= 4096);
+
+    #[cfg(target_os = "none")]
+    {
+        let _ = (cache, pgoff);
+        let hhdm = crate::mem::paging::hhdm_offset().as_u64();
+        // SAFETY: `page.phys` is a HHDM-mapped frame whose strong-ref
+        // we hold via the `Arc<CachePage>`. The page is `PG_UPTODATE`
+        // and `!PG_LOCKED` so no concurrent filler is writing it; a
+        // concurrent `writepage` only reads the frame. The HHDM
+        // mapping covers all USABLE phys.
+        unsafe {
+            let src = (hhdm + page.phys + in_page_off as u64) as *const u8;
+            core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), chunk);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        // Host: `phys` is a deterministic non-dereferenceable stand-in.
+        // Re-invoke `readpage` to source the bytes; the cache index
+        // still records the page so the install-once shape holds.
+        let _ = page;
+        let mut buf = [0u8; 4096];
+        let ops = cache.ops();
+        let n = ops.readpage(pgoff, &mut buf)?;
+        if n == 0 {
+            // Past-EOF surface — the outer loop already clamped to
+            // i_size, so this path is unreachable in normal usage.
+            // Return all-zero from the buf which was zeroed at decl.
+        }
+        dst.copy_from_slice(&buf[in_page_off..in_page_off + chunk]);
+        Ok(())
+    }
+}
+
+/// Allocate a freshly locked cache stub for the read path. Mirrors
+/// the same-named helper in `mem::file_object`. Bare-metal allocates
+/// + zero-fills a real frame; host hands back a deterministic
+/// non-dereferenceable stand-in `phys`.
+#[cfg(all(feature = "page_cache", target_os = "none"))]
+fn alloc_locked_cache_stub(pgoff: u64) -> Result<Arc<crate::mem::page_cache::CachePage>, i64> {
+    let phys = crate::mem::frame::alloc().ok_or(EIO)?;
+    let hhdm = crate::mem::paging::hhdm_offset().as_u64();
+    // SAFETY: `phys` was just allocated for us, is 4 KiB-aligned, and
+    // is covered by the HHDM mapping. We hold exclusive ownership
+    // until insertion into the cache index.
+    unsafe {
+        core::ptr::write_bytes((hhdm + phys) as *mut u8, 0, 4096);
+    }
+    Ok(crate::mem::page_cache::CachePage::new_locked(phys, pgoff))
+}
+
+#[cfg(all(feature = "page_cache", not(target_os = "none")))]
+fn alloc_locked_cache_stub(pgoff: u64) -> Result<Arc<crate::mem::page_cache::CachePage>, i64> {
+    let phys = 0x4_0000_0000 + pgoff * 4096;
+    Ok(crate::mem::page_cache::CachePage::new_locked(phys, pgoff))
+}
+
+/// Return a cache stub's frame to the global allocator when the
+/// install race is lost. Bare-metal-only; on host the frame is
+/// fictitious.
+#[cfg(all(feature = "page_cache", target_os = "none"))]
+fn release_unused_cache_stub(stub: &Arc<crate::mem::page_cache::CachePage>) {
+    crate::mem::frame::free(stub.phys);
+}
+
+#[cfg(all(feature = "page_cache", not(target_os = "none")))]
+fn release_unused_cache_stub(_stub: &Arc<crate::mem::page_cache::CachePage>) {}
+
+/// Copy `buf` into a cache stub's physical frame through the HHDM.
+/// Bare-metal-only.
+#[cfg(all(feature = "page_cache", target_os = "none"))]
+fn copy_into_cache_frame(phys: u64, buf: &[u8; 4096]) {
+    let hhdm = crate::mem::paging::hhdm_offset().as_u64();
+    // SAFETY: `phys` is the just-installed cache stub's frame; the
+    // filler holds PG_LOCKED so no other observer can be reading it.
+    // The HHDM mapping covers all USABLE phys.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), (hhdm + phys) as *mut u8, 4096);
+    }
+}
+
 /// Build the metadata-forbidden [`MetadataMap`] for `super_` from the
 /// parsed superblock + BGDT.
 ///

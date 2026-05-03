@@ -72,8 +72,8 @@ fn run_tests() {
             &(mmap_requires_anon_private as fn()),
         ),
         (
-            "mmap_rejects_non_neg_fd",
-            &(mmap_rejects_non_neg_fd as fn()),
+            "mmap_anonymous_ignores_fd",
+            &(mmap_anonymous_ignores_fd as fn()),
         ),
         (
             "mmap_rejects_nonzero_off",
@@ -269,22 +269,28 @@ fn mmap_zero_len_einval() {
 }
 
 fn mmap_requires_anon_private() {
-    // Missing MAP_ANONYMOUS with fd=-1 → file-backed path is attempted
-    // and returns ENODEV (no VFS yet) per RFC 0001.
+    // Missing MAP_ANONYMOUS with fd=-1 → file-backed path is attempted.
+    // Under RFC 0007 (#746) the file-backed leg first looks up the fd;
+    // -1 is not a valid fd, so the gate trips with EBADF (the "fd not
+    // open" branch of the errno table). Pre-746, fd != -1 short-circuited
+    // to ENODEV; the new errno table is single-source.
     let r = mmap(0, 4096, PROT_READ, MAP_PRIVATE, -1, 0);
     assert_eq!(
-        r, ENODEV,
-        "MAP_PRIVATE without MAP_ANONYMOUS routes to file-backed path: ENODEV"
+        r, EBADF,
+        "MAP_PRIVATE without MAP_ANONYMOUS at fd=-1 must trip EBADF (RFC 0007 §Errno table)"
     );
     // Neither MAP_PRIVATE nor MAP_SHARED → EINVAL.
     let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS, -1, 0);
     assert_eq!(r, EINVAL);
 }
 
-fn mmap_rejects_non_neg_fd() {
-    // fd != -1 routes to the (unsupported) file-backed path → ENODEV.
+fn mmap_anonymous_ignores_fd() {
+    // RFC 0007 §Kernel-Userspace Interface: MAP_ANONYMOUS ignores `fd`
+    // per Linux semantics. The file-backed errno table does not apply
+    // when MAP_ANONYMOUS is set, so passing a non-negative fd does NOT
+    // fail with ENODEV/EBADF — the syscall succeeds.
     let r = mmap(0, 4096, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
-    assert_eq!(r, ENODEV);
+    assert!(r > 0, "MAP_ANONYMOUS|MAP_PRIVATE must ignore fd, got {}", r);
 }
 
 fn mmap_rejects_nonzero_off() {

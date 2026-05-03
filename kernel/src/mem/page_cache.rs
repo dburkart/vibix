@@ -94,6 +94,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 
+use spin::Once;
+
 use crate::mem::aops::AddressSpaceOps;
 
 // Sync primitives.
@@ -150,13 +152,36 @@ mod host_stub {
         }
     }
 
-    pub struct WaitQueue;
+    /// Host stand-in for [`crate::sync::WaitQueue`].
+    ///
+    /// `notify_all` does not actually wake any task (host tests don't
+    /// run under the kernel scheduler), but it bumps an internal
+    /// counter so issue #757's host tests can verify that
+    /// `CachePage::end_writeback` and `CachePage::Drop` *do* fire the
+    /// wake — even though the wake itself has no observable effect on
+    /// host because there is no parked task to wake.
+    pub struct WaitQueue {
+        notify_count: core::sync::atomic::AtomicU64,
+    }
 
     impl WaitQueue {
         pub const fn new() -> Self {
-            Self
+            Self {
+                notify_count: core::sync::atomic::AtomicU64::new(0),
+            }
         }
-        pub fn notify_all(&self) {}
+        pub fn notify_all(&self) {
+            self.notify_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        /// Number of times `notify_all` has fired against this queue.
+        /// Test-only; the bare-metal queue does not expose a
+        /// notification counter.
+        #[allow(dead_code)]
+        pub fn notify_count(&self) -> u64 {
+            self.notify_count
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }
         /// Host stand-in for the bare-metal park loop. Returns
         /// immediately; host unit tests do not cross-thread block on
         /// `PG_LOCKED`. If a future host test does need to exercise
@@ -271,6 +296,21 @@ pub struct CachePage {
     /// on [`PG_WRITEBACK`] to wait out an in-flight `writepage` before
     /// the FS is allowed to free the underlying blocks.
     pub(crate) wait: WaitQueue,
+
+    /// Owning [`PageCache`]'s `writeback_complete_wq`. Set exactly
+    /// once when the stub is installed into a [`PageCache`] via
+    /// [`PageCache::install_or_get`]; remains [`Once::get`] = `None`
+    /// for free-standing stubs (e.g. host unit tests that exercise
+    /// individual [`CachePage`] state transitions without ever
+    /// installing into a cache).
+    ///
+    /// RFC 0007 §Eviction liveness: kicked from
+    /// [`Self::end_writeback`] (the writeback-completion side) and
+    /// from [`Drop`] (the strong-count-reaches-1 side, so that a page
+    /// dropped without an explicit `end_writeback` still wakes
+    /// direct-reclaim parkers — closes the lost-wakeup window when a
+    /// `WritebackHandle` is dropped without `end_writeback`).
+    pub(crate) parent_wb_wq: Once<Arc<WaitQueue>>,
 }
 
 impl CachePage {
@@ -290,6 +330,7 @@ impl CachePage {
             pgoff,
             state: AtomicU8::new(PG_LOCKED),
             wait: WaitQueue::new(),
+            parent_wb_wq: Once::new(),
         })
     }
 
@@ -428,12 +469,22 @@ impl CachePage {
         self.state.fetch_or(PG_WRITEBACK, Ordering::AcqRel);
     }
 
-    /// Conclude writeback. Clears [`PG_WRITEBACK`] with `Release` and
-    /// wakes every parked waiter (truncate parks here while
-    /// `PG_WRITEBACK` is set).
+    /// Conclude writeback. Clears [`PG_WRITEBACK`] with `Release`,
+    /// wakes every parked waiter on the page-local queue (truncate
+    /// parks here while `PG_WRITEBACK` is set), and — if this stub
+    /// is installed in a [`PageCache`] — kicks the owning cache's
+    /// `writeback_complete_wq` so direct-reclaim parkers retry their
+    /// CLOCK-Pro sweep.
+    ///
+    /// RFC 0007 §Eviction liveness: a per-event retry — every
+    /// `writepage` completion gives the parked faulter one retry
+    /// opportunity bounded by the `direct_reclaim_timeout_ms` soft cap.
     pub fn end_writeback(&self) {
         self.state.fetch_and(!PG_WRITEBACK, Ordering::Release);
         self.wait.notify_all();
+        if let Some(wq) = self.parent_wb_wq.get() {
+            wq.notify_all();
+        }
     }
 
     /// Filler-abandon path: clear [`PG_LOCKED`] with `Release` and
@@ -453,6 +504,34 @@ impl CachePage {
     pub fn unlock_for_abandon(&self) {
         self.state.fetch_and(!PG_LOCKED, Ordering::Release);
         self.wait.notify_all();
+    }
+}
+
+impl Drop for CachePage {
+    /// Strong-count-reaches-zero kick for direct-reclaim waiters.
+    ///
+    /// `Drop` runs once the last `Arc<CachePage>` strong reference
+    /// goes away. RFC 0007 §Eviction liveness names this as one of
+    /// the two wake sources for `writeback_complete_wq`: a parked
+    /// reclaimer may be blocked because every CLOCK-Pro candidate
+    /// was *Arc-pinned* by an in-flight fault; once that in-flight
+    /// fault drops its clone and the strong count reaches 1 (cache
+    /// index only), then 0 (cache index also gone), the parker should
+    /// retry. Without this kick, a `WritebackHandle` that gets dropped
+    /// without an explicit `end_writeback` would leave reclaimers
+    /// parked until the next writepage or the soft-cap timeout —
+    /// the lost-wakeup case the issue body calls out.
+    ///
+    /// Cheap and unconditional: if `parent_wb_wq` was never attached
+    /// (free-standing stub), `Once::get()` returns `None` and the
+    /// notify is skipped. The wq is held via `Arc` so this notify is
+    /// safe even if the parent [`PageCache`] has itself been dropped —
+    /// the wq outlives the cache by exactly the strong-count of the
+    /// `Arc<WaitQueue>`s the surviving `CachePage`s hold.
+    fn drop(&mut self) {
+        if let Some(wq) = self.parent_wb_wq.get() {
+            wq.notify_all();
+        }
     }
 }
 
@@ -631,9 +710,10 @@ pub enum InstallOutcome {
 /// Per-inode page cache.
 ///
 /// Owned by the inode (the `mapping` field added by #745 wave-2
-/// VFS plumbing). The `ra_state` (#741) and `writeback_complete_wq`
-/// (#740) fields are still deferred to their respective sibling
-/// issues; the `ops` per-FS hook lands here (#737).
+/// VFS plumbing). The `ra_state` (#741) field is still deferred to
+/// its sibling issue; the `ops` per-FS hook lands here (#737); the
+/// `writeback_complete_wq` (#757) is the per-cache wake source
+/// CLOCK-Pro eviction (#740) parks on for direct reclaim.
 pub struct PageCache {
     /// Per-FS hook for backing I/O. Captured at construction and
     /// **never rebound** for the lifetime of this cache (RFC 0007
@@ -681,6 +761,33 @@ pub struct PageCache {
     /// counter into an `EIO` decision is wired up by the writeback
     /// workstream (#740/#742).
     pub wb_err: AtomicU32,
+
+    /// Per-cache writeback-completion waitqueue (RFC 0007 §Eviction
+    /// liveness). Direct-reclaim parks here when a CLOCK-Pro sweep
+    /// finds zero victims; wakes are produced by:
+    ///
+    /// 1. [`CachePage::end_writeback`] — every `writepage` completion,
+    ///    success or error, kicks the queue (a `PG_DIRTY`-pinned
+    ///    page may now be evictable).
+    /// 2. [`CachePage`]'s `Drop` — the last `Arc<CachePage>` strong
+    ///    reference dropping kicks the queue (an `Arc::clone`-pinned
+    ///    page may now be evictable). This closes the lost-wakeup
+    ///    window where a writeback handle is dropped without
+    ///    `end_writeback`.
+    ///
+    /// Held via `Arc` so each [`CachePage`] in this cache can clone a
+    /// strong reference into its `parent_wb_wq` slot — the wq then
+    /// outlives the [`PageCache`] itself by exactly the strong-count
+    /// the surviving pages hold (a `Drop`-side notify on a
+    /// long-since-decommissioned cache is a harmless no-op against an
+    /// empty waitqueue).
+    ///
+    /// Lock-order: level 6.5 in the RFC 0007 ladder — between the
+    /// buffer cache (level 6) and the refcount/frame layer (levels
+    /// 7–8). The wq's internal mutex is taken only to enqueue
+    /// (waiters) or dequeue (wakers); it does not nest under any
+    /// other cache lock.
+    writeback_complete_wq: Arc<WaitQueue>,
 }
 
 impl PageCache {
@@ -699,6 +806,7 @@ impl PageCache {
             i_size: AtomicU64::new(i_size),
             inode_id,
             wb_err: AtomicU32::new(0),
+            writeback_complete_wq: Arc::new(WaitQueue::new()),
         }
     }
 
@@ -753,6 +861,14 @@ impl PageCache {
             stub.is_locked() && !stub.is_uptodate(),
             "page_cache: fresh stub must be PG_LOCKED and !PG_UPTODATE",
         );
+        // Attach this cache's `writeback_complete_wq` to the stub so
+        // `CachePage::end_writeback` and `CachePage::Drop` both kick
+        // direct-reclaim parkers. `Once::call_once` is idempotent: a
+        // closure that hands back a previously-built stub (e.g. via
+        // a future test harness that recycles entries) gets the same
+        // wq attached and the second call is a cheap no-op.
+        stub.parent_wb_wq
+            .call_once(|| Arc::clone(&self.writeback_complete_wq));
         inner.pages.insert(pgoff, stub.clone());
         InstallOutcome::InstalledNew(stub)
     }
@@ -1058,6 +1174,32 @@ impl PageCache {
         self.i_size.store(new_size, Ordering::Release);
 
         snapshot
+    }
+
+    /// Borrow the per-cache writeback-completion waitqueue.
+    ///
+    /// Returned as an `Arc` clone so callers (CLOCK-Pro direct
+    /// reclaim — #740) can move it into a deadline park without
+    /// holding any reference into `self`. Public so the eviction
+    /// path's `wait_while` can call `wq.wait_while(|| !sweep_found_victim)`
+    /// directly; the wakers (`end_writeback` and `Drop`) reach the
+    /// same Arc through each [`CachePage`]'s `parent_wb_wq` slot.
+    pub fn writeback_complete_wq(&self) -> Arc<WaitQueue> {
+        Arc::clone(&self.writeback_complete_wq)
+    }
+
+    /// Convenience park: blocks the current task on the per-cache
+    /// `writeback_complete_wq` while `cond()` returns `true`, with
+    /// the same lost-wakeup guarantees as [`WaitQueue::wait_while`].
+    ///
+    /// The intended consumer is the CLOCK-Pro direct-reclaim path
+    /// (#740), which calls this with `cond = || sweep_found_no_victim()`.
+    /// Each `end_writeback` / `CachePage::Drop` kick re-runs the sweep;
+    /// the soft-cap timeout that bounds total wait time lives at the
+    /// caller (issue #740) so the primitive itself stays free of
+    /// timeout-policy.
+    pub fn wait_writeback_complete<F: FnMut() -> bool>(&self, cond: F) {
+        self.writeback_complete_wq.wait_while(cond);
     }
 }
 
@@ -2211,5 +2353,180 @@ mod tests {
         assert!(cache.mark_page_dirty(0));
         let guard = cache.inner.try_lock();
         assert!(guard.is_some());
+    }
+
+    // --- writeback_complete_wq plumbing (issue #757) -------------------
+    //
+    // These tests verify the structural plumbing of the new per-cache
+    // wait queue: the wq exists on the cache, it is attached to every
+    // installed `CachePage`, `end_writeback` and `Drop` both kick it.
+    // The host stub's `WaitQueue::notify_count()` lets us see the
+    // wakes even though the host has no real parked tasks; the
+    // bare-metal park-and-wake protocol is exercised by the QEMU
+    // integration test `writeback_complete_wq.rs`.
+
+    #[test]
+    fn cache_owns_writeback_complete_wq() {
+        let cache = fresh_cache();
+        let wq = cache.writeback_complete_wq();
+        // Identical Arc on every call (no fresh allocation per
+        // accessor) — RFC 0007 §Eviction liveness: a single per-cache
+        // queue is the wake fan-in for direct reclaim.
+        let wq2 = cache.writeback_complete_wq();
+        assert!(Arc::ptr_eq(&wq, &wq2));
+    }
+
+    #[test]
+    fn install_or_get_attaches_writeback_wq_to_stub() {
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        let attached = stub
+            .parent_wb_wq
+            .get()
+            .expect("install_or_get must attach the cache's wb wq");
+        assert!(Arc::ptr_eq(attached, &cache.writeback_complete_wq()));
+    }
+
+    #[test]
+    fn freestanding_stub_has_no_wb_wq() {
+        // A stub built with `CachePage::new_locked` directly (without
+        // going through `install_or_get`) has no parent wq. This is
+        // the path host unit tests for the per-page state machine
+        // take; the absence of an attached wq must keep their
+        // `end_writeback` / `Drop` paths working as no-ops.
+        let stub = make_stub(0);
+        assert!(stub.parent_wb_wq.get().is_none());
+        // Calling end_writeback / dropping is a non-panicking no-op.
+        stub.publish_uptodate_and_unlock();
+        stub.begin_writeback();
+        stub.end_writeback();
+        drop(stub); // exercises the Drop kick on a freestanding page
+    }
+
+    #[test]
+    fn end_writeback_kicks_cache_wq() {
+        // PG_WRITEBACK clear must wake the per-cache wq. Host stub
+        // counts the wake; the real bare-metal queue's `notify_all`
+        // does the same plus actually waking parkers.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        let wq = cache.writeback_complete_wq();
+        let before = wq.notify_count();
+        stub.begin_writeback();
+        // begin_writeback does NOT kick the wq (the wake is reserved
+        // for completion).
+        assert_eq!(wq.notify_count(), before);
+        stub.end_writeback();
+        // end_writeback must have fired exactly one wake on the wq.
+        assert_eq!(
+            wq.notify_count(),
+            before + 1,
+            "end_writeback must kick the cache's writeback_complete_wq",
+        );
+    }
+
+    #[test]
+    fn cachepage_drop_kicks_cache_wq() {
+        // Drop kick: the lost-wakeup defence — a writeback handle
+        // dropped without `end_writeback` must still wake direct
+        // reclaim. We model this by removing the cache's index entry
+        // and dropping our own outer Arc, taking strong_count to 0.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        let wq = cache.writeback_complete_wq();
+        let before = wq.notify_count();
+        // Drop the index strong-ref so our outer `stub` is the sole
+        // holder; then drop `stub` and observe the wake.
+        cache.inner.lock().pages.remove(&0);
+        // strong_count is now 1 (just our `stub`). Dropping fires Drop.
+        drop(stub);
+        assert_eq!(
+            wq.notify_count(),
+            before + 1,
+            "CachePage::Drop must kick the cache's writeback_complete_wq",
+        );
+    }
+
+    #[test]
+    fn end_writeback_and_drop_each_fire_independent_kicks() {
+        // The two wake sources are independent: a page that
+        // *completes* writeback (one kick) and is later evicted from
+        // the cache and dropped (second kick) produces two
+        // notifications, not one. RFC 0007 §Eviction liveness item 4
+        // — "per-event retry": each wake gives the parked faulter
+        // one CLOCK-Pro retry opportunity.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        let wq = cache.writeback_complete_wq();
+        let before = wq.notify_count();
+
+        stub.begin_writeback();
+        stub.end_writeback();
+        cache.inner.lock().pages.remove(&0);
+        drop(stub);
+
+        assert_eq!(
+            wq.notify_count(),
+            before + 2,
+            "end_writeback and Drop must each kick the wq once",
+        );
+    }
+
+    #[test]
+    fn writeback_wq_outlives_cache_for_alive_pages() {
+        // The `writeback_complete_wq` is held via `Arc`, so a
+        // surviving `CachePage` clone keeps the wq alive even after
+        // the parent `PageCache` itself drops. The Drop notify on
+        // such a clone is a harmless no-op against an empty queue —
+        // there is no parked task on it because the only consumer
+        // (CLOCK-Pro reclaim) parks via `cache.wait_writeback_complete`
+        // and cannot park if the cache itself is gone.
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        stub.publish_uptodate_and_unlock();
+        // Snapshot the wq Arc *before* dropping the cache so we can
+        // observe its notify_count after the cache is gone.
+        let wq = cache.writeback_complete_wq();
+        let before = wq.notify_count();
+        drop(cache); // index entry's strong-ref goes away.
+                     // `stub` still holds an Arc on the wq via parent_wb_wq.
+        drop(stub);
+        // The Drop kick fires against the surviving wq.
+        assert_eq!(
+            wq.notify_count(),
+            before + 1,
+            "Drop kick must fire even after the parent cache is gone",
+        );
+    }
+
+    #[test]
+    fn wait_writeback_complete_invokes_predicate() {
+        // The convenience park: just verifies the predicate is
+        // called. The real park/wake handshake is QEMU-only.
+        let cache = fresh_cache();
+        let mut calls = 0;
+        cache.wait_writeback_complete(|| {
+            calls += 1;
+            false // returns immediately on host stub
+        });
+        assert!(calls >= 1);
     }
 }

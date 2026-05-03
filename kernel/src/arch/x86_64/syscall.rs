@@ -1380,14 +1380,35 @@ fn prot_pte_from_prot_user(prot: u32) -> u64 {
     pte.bits()
 }
 
-/// `mmap(addr, len, prot, flags, fd, off)` — anon-private + anon-shared.
+/// `mmap(addr, len, prot, flags, fd, off)` — anonymous + file-backed.
 ///
 /// Supports `MAP_PRIVATE` / `MAP_SHARED` (mutually exclusive) with
-/// `MAP_ANONYMOUS`; honours `MAP_FIXED`, `MAP_FIXED_NOREPLACE`,
-/// `MAP_GROWSDOWN`, and `MAP_STACK`. `fd != -1` returns `-ENODEV`
-/// (file-backed path not implemented). Validation follows RFC 0001.
+/// optional `MAP_ANONYMOUS`; honours `MAP_FIXED`, `MAP_FIXED_NOREPLACE`,
+/// `MAP_GROWSDOWN`, and `MAP_STACK`.
+///
+/// File-backed (`MAP_ANONYMOUS` clear, `fd != -1`) is wired per RFC 0007
+/// (issue #746): `sys_mmap` looks up the [`OpenFile`], validates per the
+/// new errno table, dispatches to [`FileOps::mmap`], and plugs the
+/// returned [`VmObject`] into the VMA tree. Per-FS `FileOps::mmap`
+/// overrides are landed in follow-up issues (#747 ext2 / #751 ramfs/tarfs);
+/// until then the default `Err(ENODEV)` impl propagates verbatim.
+///
+/// `MAP_ANONYMOUS` ignores `fd` per Linux semantics. The file-backed
+/// errno gate (RFC 0007 §Errno table) covers:
+///
+/// | Condition | Errno |
+/// |---|---|
+/// | `fd` not open | `EBADF` |
+/// | File type not mmappable (socket, FIFO, directory, …) | `ENODEV` |
+/// | `MAP_SHARED + PROT_WRITE` and `OpenFile.f_mode` is not `O_RDWR` | `EACCES` |
+/// | `MAP_PRIVATE + PROT_WRITE` on `O_WRONLY` | `EACCES` |
+/// | `off` not page-aligned | `EINVAL` |
+/// | `len == 0` | `EINVAL` |
+/// | `off + len_rounded` overflows `i64` (`off_t`) | `EOVERFLOW` |
+/// | `off + len` past `i_size` | succeeds (SIGBUS at fault per POSIX) |
 unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
-    use crate::fs::{EEXIST, EINVAL, ENODEV, ENOMEM};
+    use crate::fs::vfs::inode::InodeKind;
+    use crate::fs::{EBADF, EEXIST, EINVAL, ENODEV, ENOMEM};
     use crate::mem::pf::{
         validate_user_range, AddrAlign, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
         MAP_GROWSDOWN, MAP_PRIVATE, MAP_SHARED, MAP_STACK, PROT_EXEC, PROT_READ, PROT_WRITE,
@@ -1404,16 +1425,7 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
         return EINVAL;
     }
 
-    // File-backed path not implemented — Linux returns ENODEV for
-    // "file type not supported by mmap", matching RFC 0001.
-    if fd as i64 != -1 {
-        return ENODEV;
-    }
-    if off != 0 {
-        return EINVAL;
-    }
-
-    // Every supported bit must be one of the RFC set.
+    // Every supported flag bit must be one of the RFC set.
     let known = MAP_SHARED
         | MAP_PRIVATE
         | MAP_FIXED
@@ -1423,11 +1435,6 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
         | MAP_STACK;
     if flags & !known != 0 {
         return EINVAL;
-    }
-
-    // Anonymous-only for now.
-    if flags & MAP_ANONYMOUS == 0 {
-        return ENODEV;
     }
 
     // Exactly one of MAP_PRIVATE / MAP_SHARED must be set.
@@ -1442,6 +1449,13 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
         Share::Shared
     };
 
+    // RFC 0007 §Errno table: `len == 0` is EINVAL regardless of path.
+    // `validate_user_range` would also catch this, but enforcing it
+    // here keeps the errno path stable across align modes.
+    if len == 0 {
+        return EINVAL;
+    }
+
     // MAP_FIXED_NOREPLACE implies MAP_FIXED semantics for address handling.
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
 
@@ -1454,6 +1468,99 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
     let range = match validate_user_range(addr, len, align) {
         Ok(r) => r,
         Err(_) => return EINVAL,
+    };
+
+    // ── File-backed vs anonymous split ─────────────────────────────────
+    //
+    // `MAP_ANONYMOUS` ignores `fd` and the file-backed errno table per
+    // Linux semantics (RFC 0007 §Kernel-Userspace Interface). The file
+    // path captures an `Arc<dyn VmObject>` (a `FileObject` constructed
+    // by the per-FS impl) before the VMA-insert critical section so the
+    // address-space lock is held only across the address-resolve and
+    // insert.
+    let anonymous = flags & MAP_ANONYMOUS != 0;
+    let (obj, object_offset): (Arc<dyn VmObject>, usize) = if anonymous {
+        // Preserve existing vibix invariant: anon callers pass `off == 0`.
+        // (Linux ignores `off` when `MAP_ANONYMOUS` is set; vibix
+        // historically returns `EINVAL` and `kernel/tests/syscall_open_mmap.rs`
+        // pins it as a regression anchor. Keep the stricter contract.)
+        if off != 0 {
+            return EINVAL;
+        }
+        let pages = range.len / 4096;
+        (AnonObject::new(Some(pages)) as Arc<dyn VmObject>, 0)
+    } else {
+        // RFC 0007 §Errno table — file-backed path.
+        //
+        // 1. EBADF: fd must be currently open.
+        // 2. ENODEV: backend must expose a VFS open file (sockets,
+        //    pipes, the legacy SerialBackend all return None from
+        //    `as_vfs`).
+        // 3. ENODEV: only regular files are mmappable; directories,
+        //    sockets, FIFOs, character/block devices keep the default
+        //    `FileOps::mmap` (which itself returns `ENODEV`), but
+        //    sys_mmap pre-empts that dispatch with the same errno so
+        //    the gate is single-source.
+        // 4. EINVAL: `off` must be page-aligned.
+        // 5. EOVERFLOW: `off + len_rounded` must fit in i64 (off_t).
+        // 6. EACCES: `MAP_SHARED + PROT_WRITE` requires `O_RDWR`;
+        //            `MAP_PRIVATE + PROT_WRITE` rejects `O_WRONLY`.
+        // The OOM check on the VMA insert below stays an `ENOMEM`.
+        if fd > u32::MAX as u64 {
+            return EBADF;
+        }
+        let fd = fd as u32;
+        let backend = {
+            let tbl = crate::task::current_fd_table();
+            let x = match tbl.lock().get(fd) {
+                Ok(b) => b,
+                Err(_) => return EBADF,
+            };
+            x
+        };
+        let of = match backend.as_vfs() {
+            Some(v) => v.open_file.clone(),
+            None => return ENODEV,
+        };
+        // Inode kind gate. Only regular files are mmappable today;
+        // future block/char-device mappings would override
+        // `FileOps::mmap` and need this gate widened in the same PR.
+        if of.inode.kind != InodeKind::Reg {
+            return ENODEV;
+        }
+
+        // Snapshot the OpenFile access mode for the EACCES gate. Use
+        // `Relaxed`: this read does not synchronise with any other
+        // memory location — `fcntl(F_SETFL)` cannot mutate access-mode
+        // bits per POSIX, so the snapshot is effectively a constant
+        // for the OpenFile's lifetime.
+        let open_mode_acc =
+            of.flags.load(core::sync::atomic::Ordering::Relaxed) & crate::fs::flags::O_ACCMODE;
+
+        // Run the pure errno gate. Returns the page-aligned `(off, len)`
+        // on success or the negative errno on rejection.
+        let (off_aligned, len_pages) =
+            match crate::mem::pf::validate_file_mmap_args(prot, share, off, len, open_mode_acc) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+
+        // Dispatch to the per-FS hook. The default `FileOps::mmap`
+        // returns `ENODEV` so non-mmappable file types (and ext2 until
+        // #753 lands) still propagate the correct errno verbatim.
+        let vmobj = match of
+            .ops
+            .clone()
+            .mmap(&of, off_aligned, len_pages, share, prot)
+        {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        // The returned `Arc<dyn VmObject>` (a `FileObject`) already
+        // captures `file_offset_pages` internally — the VMA carries
+        // `object_offset = 0` so VMA-local fault offsets map directly
+        // to the FileObject's window (RFC 0007 §FileObject).
+        (vmobj, 0)
     };
 
     let aspace = crate::task::current_address_space();
@@ -1476,8 +1583,6 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
     };
 
     let pte_bits = prot_pte_from_prot_user(prot);
-    let pages = range.len / 4096;
-    let obj = AnonObject::new(Some(pages));
 
     let mut vma = Vma::new(
         start,
@@ -1485,8 +1590,8 @@ unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64
         prot,
         pte_bits,
         share,
-        obj as Arc<dyn VmObject>,
-        0,
+        obj,
+        object_offset,
     );
     if flags & MAP_GROWSDOWN != 0 {
         vma.vma_flags |= VMA_GROWSDOWN;

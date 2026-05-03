@@ -274,6 +274,10 @@ name = "syscall_mmap_family"
 harness = false
 
 [[test]]
+name = "syscall_mmap_file_backed"
+harness = false
+
+[[test]]
 name = "vfs_backend"
 harness = false
 
@@ -418,6 +422,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_file_read_cache"
+harness = false
+required-features = ["ext2", "page_cache"]
+
+[[test]]
 name = "ext2_readpage"
 harness = false
 required-features = ["ext2"]
@@ -431,6 +440,11 @@ required-features = ["ext2"]
 name = "ext2_readahead"
 harness = false
 required-features = ["ext2"]
+
+[[test]]
+name = "ext2_mmap"
+harness = false
+required-features = ["ext2", "page_cache"]
 
 [[test]]
 name = "ext2_orphan_chain"
@@ -539,5 +553,10 @@ harness = false
 
 [[test]]
 name = "block_writeback_inode_walk"
+harness = false
+required-features = ["page_cache"]
+
+[[test]]
+name = "writeback_complete_wq"
 harness = false
 required-features = ["page_cache"]
