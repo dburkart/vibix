@@ -92,14 +92,16 @@ const SMOKE_MARKERS: &[&str] = &[
     "timer: 100 Hz",
     "rtc:",
     "block: virtio-blk ready",
-    "block: lba0[0..16]=[56, 49, 42, 49, 58, 42, 4c, 4b, 30",
-    "block: write+readback ok at lba 2047",
+    // ext2 rootfs image: first sector is the boot record (all zeros).
+    "block: lba0[0..16]=[00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]",
+    "block: write+readback ok at lba 131000",
     // VFS init in `_start` (issue #631) consumes the cmdline-parsed
     // RootArgs and brings up `/`, `/dev`, `/tmp`. The init_with
     // confirmation line proves `_start` actually invoked it; the per-
     // mount lines below prove the namespace is populated. Without #631,
     // none of these would fire on the prod boot path.
-    "vfs: mounted",
+    // Issue #823: smoke now boots with ext2 on virtio-blk as root.
+    "vfs: mounted ext2 (virtio-blk) at /",
     "vfs: mounted devfs at /dev",
     "vfs: mounted ramfs at /tmp",
     "vfs: init_with consumed cmdline RootArgs",
@@ -113,7 +115,9 @@ const SMOKE_MARKERS: &[&str] = &[
     // stamps into the banner at build time.
     concat!("banner: vibix ", env!("CARGO_PKG_VERSION")),
     "userspace module ELF entry=",
-    "userspace: loader mapping image",
+    // Issue #823: the primary path loads /init from the mounted ext2
+    // root via VFS; the Limine module is a fallback.
+    "userspace: loaded /init from VFS",
     "syscall: SYSCALL/SYSRET enabled",
     // Kernel emits this immediately before IRETQ. If it fires but
     // "init: hello from pid 1" doesn't, the regression is in the ring-3
@@ -1395,7 +1399,8 @@ fn run(opts: &BuildOpts, root_flag: Option<&str>) -> R<()> {
 fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&str]) -> R<()> {
     let (disk, mut extra_cmdline): (PathBuf, Vec<String>) = match root_flag {
         Some("ext2") => {
-            let img = ext2_image::build(&workspace_root(), None, false)?;
+            let init_bin = build_userspace_init()?;
+            let img = ext2_image::build(&workspace_root(), Some(&init_bin), true)?;
             println!("→ root=ext2: booting {}", img.display());
             (img, vec!["root=/dev/vda".to_string()])
         }
@@ -1735,8 +1740,16 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     use std::collections::HashSet;
     use std::time::Instant;
 
-    let iso = iso(opts)?;
-    let disk = ensure_test_disk()?;
+    // Issue #823: smoke now boots with the deterministic ext2 rootfs
+    // image so `/init` is loaded from the mounted filesystem via the
+    // demand-paged ELF loader (the real boot path), not from the Limine
+    // module fallback. The ext2 image is rebuilt with the current init
+    // binary to keep the smoke lane in sync with code changes.
+    let kernel = build(opts)?;
+    let userspace_init = build_userspace_init()?;
+    let disk = ext2_image::build(&workspace_root(), Some(&userspace_init), true)?;
+    let iso = workspace_root().join("target").join("vibix.iso");
+    make_iso_with_cmdline(&kernel, &iso, "iso_root", "root=/dev/vda")?;
 
     // #478 diagnostic step 1: capture QEMU's port-0xE9 debug console to a
     // file alongside serial. The kernel emits single-byte markers on 0xE9

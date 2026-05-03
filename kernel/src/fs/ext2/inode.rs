@@ -76,7 +76,7 @@ use crate::fs::vfs::inode::{Inode, InodeKind, InodeMeta};
 use crate::fs::vfs::open_file::OpenFile;
 use crate::fs::vfs::ops::{FileOps, InodeOps, Stat};
 use crate::fs::vfs::{SbFlags, SuperBlock, Timespec};
-use crate::fs::{EINVAL, EIO, ENODEV, ENOENT};
+use crate::fs::{EINVAL, EIO, ENODEV};
 use crate::sync::BlockingRwLock;
 
 /// Parsed, driver-owned view of an on-disk inode's mutable fields. Sits
@@ -247,12 +247,16 @@ impl InodeOps for Ext2Inode {
 
     /// Directory-entry search for a single name.
     ///
-    /// Wave 2 returns `ENOENT` unconditionally — the dir-entry walker
-    /// is #562 (Workstream D6). The shape is here so callers through
-    /// `path_walk` compile against the final trait surface and #562 can
-    /// drop the iteration body in without rewriting callers.
-    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, i64> {
-        Err(ENOENT)
+    /// Scans the directory's data blocks for a `dirent` matching `name`
+    /// via [`super::dir::lookup`], then loads the target inode through
+    /// [`iget`]. Bridges the ext2 on-disk directory walker (issue #562)
+    /// with the VFS `path_walk` trait surface so `open("/init")` and
+    /// friends resolve through the mounted ext2 root (issue #823).
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, i64> {
+        let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+        let sb = dir.sb.upgrade().ok_or(EIO)?;
+        let child_ino = super::dir::lookup(&super_ref, self, name)?;
+        iget(&super_ref, &sb, child_ino)
     }
 
     /// Remove a non-directory name from this directory. See
