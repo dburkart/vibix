@@ -24,7 +24,11 @@
 //! - The daemon exits cleanly on the next loop iteration after
 //!   observing `stop = true` (either via an explicit join, or because
 //!   [`SbActiveGuard::try_acquire`] returned `ENOENT` — the superblock
-//!   has gone `draining` out from under us).
+//!   has gone `draining` out from under us). Issue #760 additionally
+//!   acquires a short-lived per-inode `SbActiveGuard` before each
+//!   cache walk inside `sweep_inode_mappings`, so a `sys_umount`
+//!   racing the page-cache sweep observes a prompt exit between
+//!   inodes rather than waiting for the full inode list to drain.
 //!
 //! The guard is released across the sleep. Linux's `pdflush`/`flusher`
 //! does the same for the same reason: holding an SB pin while parked
@@ -545,13 +549,25 @@ mod daemon {
         });
 
         for inode in inodes {
-            // Skip-on-shutdown: bail out promptly if `sys_umount` set
-            // `sb.draining` between snapshots. Issue #760 hardens this
-            // predicate further; the bare check here is sufficient
-            // for the per-sweep correctness contract.
-            if state.sb.draining.load(Ordering::SeqCst) {
-                return;
-            }
+            // Skip-on-shutdown (issue #760): acquire a short-lived
+            // `SbActiveGuard` before each per-inode cache walk. This
+            // replaces the bare `sb.draining` atomic with the canonical
+            // guard API — `try_acquire` returns `ENOENT` when `draining`
+            // is set, giving `sys_umount` a prompt exit point between
+            // inodes rather than waiting for the entire inode list to
+            // drain. The per-inode guard is *nested* inside the outer
+            // sweep guard held by `writeback_loop`; that's fine because
+            // `SbActiveGuard` is a counter-based pin, not a mutex.
+            let _inode_guard = match SbActiveGuard::try_acquire(&state.sb) {
+                Ok(g) => g,
+                Err(_) => {
+                    // Superblock is draining — exit the inner loop
+                    // cleanly without calling `writepage` on any
+                    // remaining inodes. The unmount path's explicit
+                    // `sync_fs` will pick up any pages we skipped.
+                    return;
+                }
+            };
             if state.stop.load(Ordering::SeqCst) {
                 return;
             }
@@ -577,7 +593,10 @@ mod daemon {
             for (pgoff, page) in snapshot {
                 // Re-check shutdown between pages too — a many-page
                 // dirty inode is the worst-case wait an unmount might
-                // see if we only re-checked between inodes.
+                // see if we only re-checked between inodes. The
+                // per-inode `SbActiveGuard` pins the SB for this
+                // inode's page walk; the `stop` flag is the
+                // lightweight early-exit for `join`-driven shutdown.
                 if state.sb.draining.load(Ordering::SeqCst) || state.stop.load(Ordering::SeqCst) {
                     return;
                 }

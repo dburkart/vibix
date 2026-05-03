@@ -43,7 +43,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use spin::Mutex;
 
@@ -84,6 +84,10 @@ fn run_tests() {
         (
             "draining_sb_skips_inode_walk",
             &(draining_skips_walk as fn()),
+        ),
+        (
+            "umount_mid_loop_drains_and_joins",
+            &(umount_mid_loop_drains_and_joins as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -468,5 +472,153 @@ fn draining_skips_walk() {
     // `writeback_loop` and `writeback_entry` then publishes
     // `done = true`. `join` is therefore a no-op observer here —
     // call it for symmetry with the other tests.
+    handle.join();
+}
+
+// --- Issue #760 test ---------------------------------------------------------
+
+/// A `writepage` implementation that sets `sb.draining = true` on its
+/// first invocation — simulating `sys_umount` racing the page-cache
+/// sweep. Also records call counts so the assertion can verify partial
+/// progress.
+struct DrainOnFirstWriteOps {
+    sb: Arc<SuperBlock>,
+    drained: AtomicBool,
+    writepage_calls: AtomicU32,
+}
+
+impl DrainOnFirstWriteOps {
+    fn new(sb: Arc<SuperBlock>) -> Arc<Self> {
+        Arc::new(Self {
+            sb,
+            drained: AtomicBool::new(false),
+            writepage_calls: AtomicU32::new(0),
+        })
+    }
+
+    fn calls(&self) -> u32 {
+        self.writepage_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl AddressSpaceOps for DrainOnFirstWriteOps {
+    fn readpage(&self, _pgoff: u64, _buf: &mut [u8; 4096]) -> Result<usize, i64> {
+        Ok(0)
+    }
+
+    fn writepage(&self, _pgoff: u64, _buf: &[u8; 4096]) -> Result<(), i64> {
+        self.writepage_calls.fetch_add(1, Ordering::Relaxed);
+        // On the very first call, set draining — the daemon's next
+        // per-inode `SbActiveGuard::try_acquire` (issue #760) will
+        // observe `ENOENT` and exit the inner loop cleanly.
+        if !self.drained.swap(true, Ordering::SeqCst) {
+            self.sb.draining.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Issue #760: `sb.draining` set *mid-sweep* (via a `writepage` side-
+/// effect on inode 0) causes the daemon to exit the inner loop between
+/// inodes — the per-inode `SbActiveGuard::try_acquire` returns `ENOENT`
+/// and no further `writepage` calls are issued for subsequent inodes.
+/// After `join`, the daemon has exited cleanly and the handle is safe
+/// to drop.
+///
+/// The test builds 4 inodes each with 1 dirty page; inode 0 uses
+/// `DrainOnFirstWriteOps` which sets `draining` on first writepage.
+/// Inodes 1..3 use plain `RecordOps`. The assertion: inode 0's
+/// writepage fires (it ran before draining was set); at least one of
+/// inodes 1..3 must see zero writepage calls (the daemon exited before
+/// reaching it).
+const DRAIN_NUM_INODES: usize = 4;
+
+fn umount_mid_loop_drains_and_joins() {
+    reset_configured_for_tests();
+    writeback::set_configured_secs(1);
+
+    let disk = RamDisk::zeroed(512, 16);
+    let cache = BlockCache::new(disk.clone() as Arc<dyn BlockDevice>, 512, 8);
+    let dev = cache.register_device();
+
+    let super_ops = InodeWalkSuper::new();
+    let sb = make_sb(super_ops.clone() as Arc<dyn SuperOps>, SbFlags::default());
+
+    // Inode 0: sets draining on first writepage.
+    let drain_ops = DrainOnFirstWriteOps::new(sb.clone());
+    let drain_aops: Arc<dyn AddressSpaceOps> = drain_ops.clone();
+    let inode0 = make_inode(&sb, 300, drain_aops);
+    let pc0 = inode0
+        .mapping
+        .read()
+        .as_ref()
+        .map(Arc::clone)
+        .expect("seeded mapping");
+    seed_dirty_page(&pc0, 0);
+    super_ops.push(inode0);
+
+    // Inodes 1..3: plain recorders.
+    let mut recorders: Vec<Arc<RecordOps>> = Vec::with_capacity(DRAIN_NUM_INODES - 1);
+    for i in 1..DRAIN_NUM_INODES {
+        let rec = RecordOps::new();
+        let aops: Arc<dyn AddressSpaceOps> = rec.clone();
+        let inode = make_inode(&sb, 300 + i as u64, aops);
+        let pc = inode
+            .mapping
+            .read()
+            .as_ref()
+            .map(Arc::clone)
+            .expect("seeded mapping");
+        seed_dirty_page(&pc, 0);
+        super_ops.push(inode);
+        recorders.push(rec);
+    }
+
+    let handle =
+        writeback::start(sb.clone(), cache.clone(), dev).expect("daemon must start for RW mount");
+
+    // Wait for the daemon to run; it will process inode 0 (setting
+    // draining), then exit the inner loop when the next per-inode
+    // SbActiveGuard::try_acquire fails.
+    let (clock, _irq) = vibix::task::env::env();
+    let deadline = clock.now().raw() + 300; // 3 s at 100 Hz
+    while clock.now().raw() < deadline {
+        if drain_ops.drained.load(Ordering::SeqCst) {
+            break;
+        }
+        x86_64::instructions::hlt();
+    }
+
+    // Inode 0's writepage must have fired (the drain trigger ran
+    // from within writepage).
+    assert!(
+        drain_ops.calls() >= 1,
+        "inode 0 writepage must have fired to set draining: calls={}",
+        drain_ops.calls(),
+    );
+
+    // At least one of the subsequent inodes must NOT have been
+    // visited — the per-inode SbActiveGuard::try_acquire returned
+    // ENOENT and the daemon exited the inner loop.
+    let any_skipped = recorders.iter().any(|r| r.calls() == 0);
+    assert!(
+        any_skipped,
+        "at least one inode after the drain trigger must be skipped; \
+         calls: {:?}",
+        recorders.iter().map(|r| r.calls()).collect::<Vec<_>>(),
+    );
+
+    // The total writepage calls across all inodes must be strictly
+    // less than DRAIN_NUM_INODES (one page each). If all fired, the
+    // per-inode guard check didn't abort the loop.
+    let total: u32 = drain_ops.calls() + recorders.iter().map(|r| r.calls()).sum::<u32>();
+    assert!(
+        (total as usize) < DRAIN_NUM_INODES,
+        "total writepage calls ({total}) must be < {DRAIN_NUM_INODES} \
+         (daemon should have exited mid-loop)",
+    );
+
+    // `join` must complete — the daemon exited cleanly after
+    // `try_acquire` returned ENOENT and `writeback_loop` returned.
     handle.join();
 }
