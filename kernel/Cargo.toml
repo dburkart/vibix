@@ -564,3 +564,8 @@ required-features = ["page_cache"]
 name = "writeback_complete_wq"
 harness = false
 required-features = ["page_cache"]
+
+[[test]]
+name = "writeback_integration"
+harness = false
+required-features = ["page_cache"]
