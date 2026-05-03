@@ -56,7 +56,7 @@
 
 use crate::mem::addrspace::USER_VA_END;
 use crate::mem::vmatree::ProtUser;
-use crate::mem::vmobject::Access;
+use crate::mem::vmobject::{Access, VmFault};
 
 /// User-visible `PROT_*` bits, mirrored out of `mman.h`. Width and
 /// values match the Linux ABI so future file-backed `mmap` can take
@@ -559,6 +559,120 @@ pub fn is_present_fault(err: u64) -> bool {
     err & ERR_P != 0
 }
 
+// ── VmFault → resolver-action classifier (RFC 0007 §Page-fault path) ──────
+
+/// Maximum number of [`VmFault::ParkAndRetry`] re-entries the resolver
+/// will perform on a single fault before giving up and surfacing
+/// `SIGBUS`. Bounds livelock if a misbehaving filler abandons its stub
+/// in a tight loop (e.g. cache page repeatedly evicted between
+/// install-race wake and re-lookup) — the resolver makes forward
+/// progress by terminating the offending thread instead of spinning.
+///
+/// The bound is generous: every retry costs one slow-path round trip
+/// through `FileObject::fault`, and the bounded-recursion property
+/// inside `FileObject::fault` already guarantees at most a single park
+/// per call. Eight outer retries means up to eight independent
+/// install-race losses, which is more than any realistic eviction
+/// storm should produce on a single fault.
+pub const PARK_AND_RETRY_BUDGET: u32 = 8;
+
+/// Action the page-fault resolver should take given a `Result<u64,
+/// VmFault>` from [`crate::mem::vmobject::VmObject::fault`].
+///
+/// Pure-logic classification — kept in this module so host unit tests
+/// can drive every variant without standing up a real
+/// [`crate::mem::vmobject::VmObject`]. The arch-specific handler in
+/// `arch::x86_64::idt::page_fault` matches against this enum and
+/// performs the corresponding side-effect (PTE install, CoW, retry,
+/// SIGBUS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultResolution {
+    /// `Ok(phys)` — install `phys` into the user PTE with the VMA's
+    /// cached flags and IRET. The frame's refcount has already been
+    /// bumped by the `VmObject::fault` impl for the new PTE reference
+    /// (RFC 0007 §Refcount discipline).
+    Mapped(u64),
+
+    /// [`VmFault::CoWNeeded`] — the resolver must drive
+    /// [`crate::mem::paging::cow_copy_and_remap`] for the faulting
+    /// page exactly the way a fork-induced CoW is handled today
+    /// (RFC 0007 §Algorithms — `MAP_PRIVATE` write fault). The CoW
+    /// helper allocates a fresh frame, copies the master page through
+    /// the HHDM, and remaps the PTE writable.
+    CoW,
+
+    /// [`VmFault::ParkAndRetry`] — the install-race loser observed
+    /// the winner abandon its stub. `FileObject::fault` already parked
+    /// on the cache-page wait-queue once before returning this; the
+    /// resolver re-enters `VmObject::fault` against a fresh stub. A
+    /// `retry_count` greater than [`PARK_AND_RETRY_BUDGET`] downgrades
+    /// to [`FaultResolution::Sigbus`] to bound livelock — see
+    /// [`should_park_and_retry`].
+    Retry,
+
+    /// SIGBUS-equivalent terminal failure. Covers:
+    ///
+    /// * [`VmFault::ReadFailed`] — `AddressSpaceOps::readpage`
+    ///   returned an errno; the failing fault is the one task that
+    ///   observed the failed fill and must take the signal.
+    /// * [`VmFault::OutOfRange`] — fault past `i_size` /
+    ///   `len_pages`. POSIX mandates SIGBUS, not SIGSEGV, for a
+    ///   read past EOF on a file-backed mmap.
+    /// * [`VmFault::OutOfMemory`] / [`VmFault::RefcountSaturated`] —
+    ///   resource exhaustion the kernel cannot recover. SIGBUS is the
+    ///   closest portable signal; the alternative is hanging the
+    ///   thread, which is worse.
+    Sigbus,
+
+    /// [`VmFault::ProtectionViolation`] — the access kind is rejected
+    /// at the `VmObject` layer. Falls through to the existing
+    /// access-violation path which produces SIGSEGV (RFC 0007
+    /// §Algorithms — protection-violation arm). Kept as its own
+    /// variant rather than collapsed into `Sigbus` because the user
+    /// signal is different and downstream tooling (siginfo, strace)
+    /// must be able to tell the two apart.
+    AccessViolation,
+}
+
+/// Classify the [`VmObject::fault`] result into a resolver action.
+///
+/// This is the pure-logic seam between `arch/x86_64/idt::page_fault`
+/// and the rest of the kernel: every behavioural distinction between
+/// `Ok` / `CoWNeeded` / `ParkAndRetry` / `ReadFailed(_)` / etc. is
+/// encoded here so host unit tests can drive every arm without a
+/// running CPU. The arch handler then matches once on the returned
+/// [`FaultResolution`] and issues the side effects.
+///
+/// The mapping is total — every `Result<u64, VmFault>` produces a
+/// well-defined [`FaultResolution`]. Adding a new `VmFault` variant
+/// without updating this function is a `match` exhaustiveness error,
+/// which is exactly the compile-time guard the RFC asks for
+/// (§FileObject — error surface).
+pub fn classify_vm_fault_result(res: Result<u64, VmFault>) -> FaultResolution {
+    match res {
+        Ok(phys) => FaultResolution::Mapped(phys),
+        Err(VmFault::CoWNeeded) => FaultResolution::CoW,
+        Err(VmFault::ParkAndRetry) => FaultResolution::Retry,
+        Err(VmFault::ReadFailed(_)) => FaultResolution::Sigbus,
+        Err(VmFault::OutOfRange) => FaultResolution::Sigbus,
+        Err(VmFault::OutOfMemory) => FaultResolution::Sigbus,
+        Err(VmFault::RefcountSaturated) => FaultResolution::Sigbus,
+        Err(VmFault::ProtectionViolation) => FaultResolution::AccessViolation,
+    }
+}
+
+/// True if a `ParkAndRetry`-classified fault should re-enter
+/// [`crate::mem::vmobject::VmObject::fault`] for another attempt
+/// rather than being demoted to SIGBUS. `retry_count` is the number of
+/// retries the resolver has *already* performed on this fault (zero on
+/// first park).
+///
+/// Pulled out of the resolver loop into pure logic so the bound is
+/// host-testable and the constant lives next to its consumers.
+pub fn should_park_and_retry(retry_count: u32) -> bool {
+    retry_count < PARK_AND_RETRY_BUDGET
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,5 +904,208 @@ mod tests {
                 Ok((0, 1)),
             );
         }
+    }
+
+    // ── classify_vm_fault_result ───────────────────────────────────────────
+    //
+    // RFC 0007 §Page-fault path: every `VmFault` variant maps to a
+    // well-defined resolver action. The classifier is the single seam
+    // the arch handler consults; if a future variant is added without
+    // updating it, the `match` exhaustiveness check fails the build.
+    // The tests below pin the mapping per the RFC's table so a silent
+    // re-routing (e.g. "ReadFailed becomes SIGSEGV") would surface
+    // here on the host before reaching kernel-target CI.
+
+    #[test]
+    fn classify_ok_returns_mapped_with_phys() {
+        assert_eq!(
+            classify_vm_fault_result(Ok(0x1234_5000)),
+            FaultResolution::Mapped(0x1234_5000),
+        );
+    }
+
+    #[test]
+    fn classify_cow_needed_returns_cow() {
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::CoWNeeded)),
+            FaultResolution::CoW,
+        );
+    }
+
+    #[test]
+    fn classify_park_and_retry_returns_retry() {
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::ParkAndRetry)),
+            FaultResolution::Retry,
+        );
+    }
+
+    #[test]
+    fn classify_read_failed_returns_sigbus_independent_of_errno() {
+        // Errno is preserved on the wire (FileObject::fault carries it
+        // through), but the resolver collapses every errno into SIGBUS
+        // — the user-visible signal is the same regardless of whether
+        // the FS reported EIO, ENOSPC, or any other readpage failure.
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::ReadFailed(crate::fs::EIO))),
+            FaultResolution::Sigbus,
+        );
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::ReadFailed(-1))),
+            FaultResolution::Sigbus,
+        );
+    }
+
+    #[test]
+    fn classify_out_of_range_returns_sigbus() {
+        // POSIX: a fault past `i_size` on a file-backed mmap delivers
+        // SIGBUS, not SIGSEGV. The variant is shared with bounded
+        // anonymous objects (which can also surface OutOfRange when a
+        // VMA exceeds `len_pages`); both paths terminate the offending
+        // thread with the same signal.
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::OutOfRange)),
+            FaultResolution::Sigbus,
+        );
+    }
+
+    #[test]
+    fn classify_out_of_memory_returns_sigbus() {
+        // Frame allocator exhaustion: SIGBUS is the closest portable
+        // signal. Hanging the offending thread would be worse — it
+        // would prevent any other task from making progress (the kernel
+        // has already lost the allocation race).
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::OutOfMemory)),
+            FaultResolution::Sigbus,
+        );
+    }
+
+    #[test]
+    fn classify_refcount_saturated_returns_sigbus() {
+        // RFC 0001 exact-or-over invariant: refusing to add the
+        // (u16::MAX + 1)-th reference is the right call. The faulter
+        // takes SIGBUS rather than the kernel UAF-ing on the matching
+        // `frame::put`.
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::RefcountSaturated)),
+            FaultResolution::Sigbus,
+        );
+    }
+
+    #[test]
+    fn classify_protection_violation_returns_access_violation() {
+        // ProtectionViolation is the SIGSEGV-equivalent arm; do not
+        // collapse into Sigbus. The arch handler falls through to the
+        // existing ring-3 access-violation path which delivers SIGSEGV
+        // and runs the user signal handler (if installed) — distinct
+        // from the SIGBUS path used for ReadFailed/OutOfRange.
+        assert_eq!(
+            classify_vm_fault_result(Err(VmFault::ProtectionViolation)),
+            FaultResolution::AccessViolation,
+        );
+    }
+
+    #[test]
+    fn park_and_retry_budget_bounds_livelock() {
+        // First park: retry_count=0 — proceed.
+        assert!(should_park_and_retry(0));
+        // Last legal retry — still under bound.
+        assert!(should_park_and_retry(PARK_AND_RETRY_BUDGET - 1));
+        // Bound reached — demote to SIGBUS.
+        assert!(!should_park_and_retry(PARK_AND_RETRY_BUDGET));
+        assert!(!should_park_and_retry(PARK_AND_RETRY_BUDGET + 100));
+    }
+
+    // ── End-to-end: synthesized VmObject → classifier routing ──────────────
+    //
+    // Issue #739 acceptance criterion: a synthesized object returns
+    // each `VmFault` variant and the resolver routes correctly. The
+    // file-object end of the chain has its own host coverage in
+    // `mem::file_object::tests`; the tests below close the loop by
+    // composing a minimal `VmObject` against the live classifier so a
+    // future change to either side surfaces here.
+
+    use crate::mem::vmobject::{VmFault as Vf, VmObject};
+    use alloc::sync::Arc;
+    use core::cell::Cell;
+
+    /// Single-shot mock that returns a caller-supplied `Result` from
+    /// `fault`. `Cell` is enough — host tests are single-threaded
+    /// unless they explicitly fan out.
+    struct MockObject {
+        next: Cell<Option<Result<u64, Vf>>>,
+    }
+
+    // SAFETY: host-only mock; the unit tests that consume it are
+    // single-threaded so the `Cell` shape is fine. The unsafe impl
+    // is needed because `VmObject: Send + Sync` and `Cell<T>: !Sync`.
+    unsafe impl Sync for MockObject {}
+    unsafe impl Send for MockObject {}
+
+    impl MockObject {
+        fn new(res: Result<u64, Vf>) -> Arc<Self> {
+            Arc::new(Self {
+                next: Cell::new(Some(res)),
+            })
+        }
+    }
+
+    impl VmObject for MockObject {
+        fn fault(&self, _offset: usize, _access: crate::mem::vmobject::Access) -> Result<u64, Vf> {
+            self.next.take().expect("MockObject::fault called twice")
+        }
+        fn len_pages(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn clone_private(&self) -> Arc<dyn VmObject> {
+            // Not exercised by these tests — never called. Return a
+            // fresh mock that would panic if consulted to keep the
+            // contract simple.
+            Arc::new(Self {
+                next: Cell::new(None),
+            })
+        }
+    }
+
+    fn route_through_classifier(res: Result<u64, Vf>) -> FaultResolution {
+        let mock = MockObject::new(res);
+        let trait_obj: Arc<dyn VmObject> = mock;
+        let outcome = trait_obj.fault(0, crate::mem::vmobject::Access::Read);
+        classify_vm_fault_result(outcome)
+    }
+
+    #[test]
+    fn synthesized_object_routes_cow_needed_to_cow() {
+        assert_eq!(
+            route_through_classifier(Err(Vf::CoWNeeded)),
+            FaultResolution::CoW,
+        );
+    }
+
+    #[test]
+    fn synthesized_object_routes_park_and_retry_to_retry() {
+        assert_eq!(
+            route_through_classifier(Err(Vf::ParkAndRetry)),
+            FaultResolution::Retry,
+        );
+    }
+
+    #[test]
+    fn synthesized_object_routes_read_failed_to_sigbus() {
+        // EIO is the canonical readpage error; the resolver collapses
+        // every errno into SIGBUS uniformly.
+        assert_eq!(
+            route_through_classifier(Err(Vf::ReadFailed(crate::fs::EIO))),
+            FaultResolution::Sigbus,
+        );
+    }
+
+    #[test]
+    fn synthesized_object_routes_ok_to_mapped() {
+        assert_eq!(
+            route_through_classifier(Ok(0x4000)),
+            FaultResolution::Mapped(0x4000),
+        );
     }
 }
