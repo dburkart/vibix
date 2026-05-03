@@ -365,13 +365,8 @@ pub fn load_user_elf_with_vmas(
     // VMA so fork copies it, and the TCB address is recorded for `MSR_FS_BASE`.
     let tls = parsed.tls_info();
     let (tcb_addr, tls_region_start, tls_region_pages) = if let Some(ref info) = tls {
-        let (tcb_va, region_start, page_count) = allocate_tls_block(
-            bytes,
-            info,
-            &mut image_end,
-            _pml4,
-            address_space,
-        )?;
+        let (tcb_va, region_start, page_count) =
+            allocate_tls_block(bytes, info, &mut image_end, _pml4, address_space)?;
         (Some(tcb_va), region_start, page_count)
     } else {
         (None, 0, 0)
@@ -641,8 +636,8 @@ pub fn deep_copy_tls_block(
         //   3. Copies page content (parent's data) via HHDM
         //   4. Re-maps the fresh frame with full write permission
         //   5. Decrements the refcount on the old shared frame
-        let new_frame =
-            paging::cow_copy_and_remap(child_pml4, page, tls_flags).map_err(LoadError::MapFailed)?;
+        let new_frame = paging::cow_copy_and_remap(child_pml4, page, tls_flags)
+            .map_err(LoadError::MapFailed)?;
 
         // Fix up the TCB self-pointer if the TCB falls within this page.
         // The TCB VA is `fs_base`; its self-pointer at offset 0 must

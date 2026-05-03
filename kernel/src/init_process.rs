@@ -195,8 +195,12 @@ pub fn launch(bytes: &'static [u8]) -> usize {
         INIT_FS_BASE.store(tcb, Ordering::Release);
         INIT_TLS_REGION_START.store(image.tls_region_start, Ordering::Release);
         INIT_TLS_REGION_PAGES.store(image.tls_region_pages, Ordering::Release);
-        serial_println!("init: TLS block allocated, tcb={:#x}, region={:#x}+{}p",
-            tcb, image.tls_region_start, image.tls_region_pages);
+        serial_println!(
+            "init: TLS block allocated, tcb={:#x}, region={:#x}+{}p",
+            tcb,
+            image.tls_region_start,
+            image.tls_region_pages
+        );
     }
     INIT_ADDRESS_SPACE.call_once(|| Arc::new(RwLock::new(aspace)));
 
