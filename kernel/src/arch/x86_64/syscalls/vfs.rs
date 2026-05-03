@@ -1458,6 +1458,17 @@ pub fn sys_fsync_impl(fd_raw: u64, data_only: bool) -> i64 {
     }
 }
 
+/// `sync()` syscall body. Flushes all dirty pages and buffers across
+/// every mount to stable storage using the RFC 0007 two-stage ordering:
+/// page-cache dirty pages first, then `BlockCache::sync_fs` fences the
+/// buffer cache. Always returns 0 — Linux `sync(2)` is infallible.
+///
+/// Issue #756 (Workstream D).
+pub fn sys_sync_impl() -> i64 {
+    crate::block::writeback::sync_all_mounts();
+    0
+}
+
 /// Resolve the inode behind an fd for the fchmod/fchown family. Returns
 /// `EBADF` on an out-of-range fd, or on any backend that doesn't expose
 /// a VFS inode (e.g. a pure `SerialBackend`) since there is nothing to

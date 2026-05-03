@@ -630,6 +630,13 @@ pub unsafe extern "C" fn syscall_dispatch(
         // for the data_only-vs-fsync split.
         FDATASYNC => super::syscalls::vfs::sys_fsync_impl(a0, true),
 
+        // sync() — flush all dirty pages and buffers across every
+        // mount to stable storage. RFC 0007 §Ordering vs fsync
+        // (issue #756): two-stage ordering — page-cache pages first,
+        // then BlockCache::sync_fs fences the rest. Always returns 0
+        // (Linux semantics: sync(2) is infallible).
+        SYNC => super::syscalls::vfs::sys_sync_impl(),
+
         // dup2(oldfd, newfd)
         DUP2 => {
             let oldfd = a0 as i32;
@@ -1898,6 +1905,7 @@ pub mod syscall_nr {
     pub const FCNTL: u64 = 72;
     pub const FSYNC: u64 = 74;
     pub const FDATASYNC: u64 = 75;
+    pub const SYNC: u64 = 162;
     pub const FSTAT: u64 = 5;
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
@@ -1980,6 +1988,7 @@ mod tests {
         assert_eq!(syscall_nr::FCNTL, 72, "SYS_fcntl must be 72");
         assert_eq!(syscall_nr::FSYNC, 74, "SYS_fsync must be 74");
         assert_eq!(syscall_nr::FDATASYNC, 75, "SYS_fdatasync must be 75");
+        assert_eq!(syscall_nr::SYNC, 162, "SYS_sync must be 162");
         assert_eq!(syscall_nr::LSEEK, 8, "SYS_lseek must be 8");
 
         // Memory management

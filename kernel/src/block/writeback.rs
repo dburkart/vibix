@@ -1,15 +1,18 @@
-//! Per-mount writeback daemon.
+//! Per-mount writeback daemon and `sync(2)` support.
 //!
 //! Implements RFC 0004 §Buffer cache writeback (Workstream C, wave 1,
-//! issue #555). Each call to [`start`] spawns one kernel task that:
+//! issue #555) and RFC 0007 §Ordering vs fsync (Workstream D, issue
+//! #756). Each call to [`start`] spawns one kernel task that:
 //!
 //! 1. Sleeps for the configured writeback interval (default 30 s,
 //!    configurable via `writeback_secs=<N>` on the kernel command
 //!    line).
 //! 2. Acquires an [`SbActiveGuard`] on the mount's superblock to pin it
 //!    for the duration of the flush.
-//! 3. Calls [`BlockCache::sync_fs`] with the mount's [`DeviceId`],
-//!    which flushes every dirty buffer belonging to this mount.
+//! 3. Flushes page-cache dirty pages first (`writepage` with its
+//!    internal bitmap -> indirect -> data ordering), then calls
+//!    [`BlockCache::sync_fs`] to fence the buffer cache — the
+//!    two-stage ordering specified by RFC 0007 §Ordering vs fsync.
 //! 4. Drops the guard and repeats.
 //!
 //! Shutdown is driven by [`WritebackHandle::join`]:
@@ -472,6 +475,29 @@ mod daemon {
                 }
             };
 
+            // RFC 0007 §Ordering vs fsync (issue #756): two-stage
+            // writeback ordering — page-cache pages are flushed first
+            // (`writepage` drives its own bitmap -> indirect -> data
+            // ordering internally), then `BlockCache::sync_fs` fences
+            // the buffer cache. This ensures that page-cache data
+            // written through `writepage` (which marks buffer-cache
+            // buffers dirty as a side-effect) is committed to stable
+            // storage by the subsequent `sync_fs` fence.
+            //
+            // Stage 1: page-cache dirty-page sweep. Snapshot-then-
+            // writepage discipline: dirty pgoffs are collected under
+            // `cache.inner.lock()` (via [`PageCache::snapshot_dirty`]),
+            // the lock is dropped, and then `writepage` runs against
+            // the snapshot. Skip-on-shutdown: re-check `sb.draining`
+            // between inodes so a `sys_umount` racing the sweep
+            // observes a prompt exit rather than serving the entire
+            // inode list.
+            sweep_inode_mappings(state);
+
+            // Stage 2: buffer-cache fence. Flushes every dirty buffer
+            // belonging to this mount — including any buffers that
+            // `writepage` (stage 1) marked dirty as a side-effect of
+            // writing page-cache data through the block layer.
             if let Err(e) = state.cache.sync_fs(state.device_id) {
                 crate::serial_println!(
                     "writeback: sync_fs failed on fs_id={} device={:?}: {:?}",
@@ -480,22 +506,6 @@ mod daemon {
                     e,
                 );
             }
-
-            // RFC 0007 §MAP_SHARED writeback (issue #755): after the
-            // buffer-cache flush, walk every superblock-mounted inode's
-            // `mapping` and call `writepage` on each dirty `pgoff`.
-            // Snapshot-then-writepage discipline: dirty pgoffs are
-            // collected under `cache.inner.lock()` (via
-            // [`PageCache::snapshot_dirty`]), the lock is dropped, and
-            // then `writepage` runs against the snapshot.
-            //
-            // Skip-on-shutdown: re-check `sb.draining` between inodes
-            // so a `sys_umount` racing the sweep observes a prompt
-            // exit rather than serving the entire inode list. The bare
-            // hook here is what the issue calls for; #760 will harden
-            // the predicate (e.g. by promoting the check into a real
-            // `SbActiveGuard::is_draining` query path).
-            sweep_inode_mappings(state);
 
             state.bump_sweeps();
             drop(guard);
@@ -674,10 +684,145 @@ mod daemon {
             clock.now() < deadline
         });
     }
+
+    // -----------------------------------------------------------------
+    // sync(2) support — immediate two-stage flush across all mounts.
+    //
+    // RFC 0007 §Ordering vs fsync (Workstream D, issue #756): `sync(2)`
+    // triggers an immediate page-cache + buffer-cache flush across
+    // every live mount. The two-stage ordering (page cache first, then
+    // BlockCache::sync_fs) matches the daemon's main loop.
+    // -----------------------------------------------------------------
+
+    /// Perform an immediate two-stage writeback flush across every
+    /// mount in the global mount table.
+    ///
+    /// For each non-draining mount:
+    ///   1. Page-cache dirty pages are flushed via `writepage`
+    ///      (with the FS-internal bitmap -> indirect -> data ordering).
+    ///   2. `BlockCache::sync_fs` fences the buffer cache.
+    ///
+    /// This is the kernel-side implementation of `sync(2)`. Returns
+    /// only after every reachable dirty page and buffer is on stable
+    /// storage (best-effort: individual writepage/sync_fs failures are
+    /// logged but do not abort the sweep of other mounts).
+    ///
+    /// Called from `sys_sync_impl` (the `sync(2)` syscall handler).
+    pub fn sync_all_mounts() {
+        use alloc::vec::Vec;
+
+        use crate::fs::vfs::mount_table::MOUNT_TABLE;
+        use crate::fs::vfs::super_block::SbActiveGuard;
+
+        // Snapshot the mount table under the read lock. We clone the
+        // `Arc<MountEdge>` refs so the table lock is released before
+        // any I/O begins — no flush runs under the table lock.
+        let edges: Vec<_> = {
+            let table = MOUNT_TABLE.read();
+            table.iter().cloned().collect()
+        };
+
+        for edge in edges {
+            let sb = &edge.super_block;
+
+            // Pin the superblock for the duration of this mount's
+            // flush. If the SB is draining (unmount in progress),
+            // skip it — the unmount path's own sync_fs will handle
+            // its buffers.
+            let guard = match SbActiveGuard::try_acquire(sb) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+
+            // Stage 1: page-cache flush.
+            sync_mount_page_cache(sb);
+
+            // Stage 2: buffer-cache fence.
+            if let Err(e) = sb.ops.sync_fs(sb) {
+                crate::serial_println!("sync: sync_fs failed on fs_id={}: {:?}", sb.fs_id.0, e,);
+            }
+
+            drop(guard);
+        }
+    }
+
+    /// Page-cache flush for a single mount — the stage-1 half of the
+    /// two-stage ordering used by both `sync_all_mounts` and the
+    /// daemon's sweep. Walks every inode the superblock surfaces via
+    /// `for_each_mapped_inode` and flushes each dirty page through
+    /// `writepage`.
+    #[cfg(feature = "page_cache")]
+    fn sync_mount_page_cache(sb: &Arc<SuperBlock>) {
+        use crate::mem::page_cache::{CachePage, PG_DIRTY};
+        use crate::mem::paging;
+        use alloc::vec::Vec;
+        use core::sync::atomic::Ordering;
+
+        let mut inodes: Vec<Arc<crate::fs::vfs::Inode>> = Vec::new();
+        sb.ops.for_each_mapped_inode(&mut |inode| {
+            inodes.push(Arc::clone(inode));
+        });
+
+        for inode in inodes {
+            if sb.draining.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let pc = match inode.mapping.read().as_ref() {
+                Some(pc) => Arc::clone(pc),
+                None => continue,
+            };
+
+            let snapshot: Vec<(u64, Arc<CachePage>)> = pc.snapshot_dirty();
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            let ops = pc.ops();
+            for (pgoff, page) in snapshot {
+                if sb.draining.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                page.begin_writeback();
+
+                let mut buf = [0u8; 4096];
+                // SAFETY: same justification as `sweep_inode_mappings` —
+                // `page.phys` is a valid 4 KiB frame, HHDM-mapped.
+                unsafe {
+                    let hhdm = paging::hhdm_offset();
+                    let src = (hhdm.as_u64() + page.phys) as *const u8;
+                    core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), 4096);
+                }
+
+                match ops.writepage(pgoff, &buf) {
+                    Ok(()) => {
+                        pc.clear_page_dirty(pgoff);
+                    }
+                    Err(errno) => {
+                        pc.bump_wb_err();
+                        page.state.fetch_or(PG_DIRTY, Ordering::Release);
+                        crate::serial_println!(
+                            "sync: writepage(ino={} pgoff={}) failed: {}",
+                            inode.ino,
+                            pgoff,
+                            errno,
+                        );
+                    }
+                }
+
+                page.end_writeback();
+            }
+        }
+    }
+
+    /// Compile-out stub when `feature = "page_cache"` is off.
+    #[cfg(not(feature = "page_cache"))]
+    fn sync_mount_page_cache(_sb: &Arc<SuperBlock>) {}
 }
 
 #[cfg(target_os = "none")]
-pub use daemon::{start, WritebackHandle};
+pub use daemon::{start, sync_all_mounts, WritebackHandle};
 
 #[cfg(test)]
 mod tests {
