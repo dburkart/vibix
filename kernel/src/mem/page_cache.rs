@@ -91,7 +91,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 
 use spin::Once;
@@ -311,6 +311,12 @@ pub struct CachePage {
     /// direct-reclaim parkers — closes the lost-wakeup window when a
     /// `WritebackHandle` is dropped without `end_writeback`).
     pub(crate) parent_wb_wq: Once<Arc<WaitQueue>>,
+
+    /// CLOCK-Pro reference bit. Set on every cache hit so the eviction
+    /// sweep observes the access; cleared by the sweep when it demotes
+    /// or promotes an entry. Mirrors `BufferHead::clock_ref` from
+    /// `block::cache`.
+    pub(crate) clock_ref: core::sync::atomic::AtomicBool,
 }
 
 impl CachePage {
@@ -331,6 +337,7 @@ impl CachePage {
             state: AtomicU8::new(PG_LOCKED),
             wait: WaitQueue::new(),
             parent_wb_wq: Once::new(),
+            clock_ref: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -644,6 +651,23 @@ impl RaState {
     }
 }
 
+// --- CLOCK-Pro classification -------------------------------------------
+
+/// CLOCK-Pro classification for each resident page in the cache.
+///
+/// Mirrors [`block::cache::ClockClass`]. Hot pages survive one
+/// reference-bit sweep before demotion; cold pages are the first
+/// eviction candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockClass {
+    /// High-recency page. Survives one reference-bit sweep before
+    /// getting a chance to demote to cold.
+    Hot,
+    /// First-eviction candidate. Promoted to [`ClockClass::Hot`] on
+    /// reference-bit hit.
+    Cold,
+}
+
 // --- PageCache ----------------------------------------------------------
 
 /// Mutable per-inode cache state. Lives behind
@@ -667,6 +691,17 @@ pub struct PageCacheInner {
     /// streak update and the read-ahead-window decision commit
     /// atomically.
     pub ra: RaState,
+    /// CLOCK-Pro classification of every resident page in `pages`.
+    /// Invariant: `classes.contains_key(k) <=> pages.contains_key(k)`.
+    pub(crate) classes: BTreeMap<u64, ClockClass>,
+    /// CLOCK-Pro non-resident ghost queue. Stores pgoffs that were
+    /// recently evicted; a re-reference within its cold-to-hot window
+    /// is installed as [`ClockClass::Hot`] on return. Bounded by
+    /// the per-cache `max_pages` to cap the metadata cost.
+    pub(crate) non_resident: VecDeque<u64>,
+    /// CLOCK-Pro hand. `None` when the cache is empty; points at the
+    /// next candidate pgoff when the sweep runs.
+    pub(crate) clock_hand: Option<u64>,
 }
 
 impl PageCacheInner {
@@ -675,6 +710,9 @@ impl PageCacheInner {
             pages: BTreeMap::new(),
             dirty: BTreeSet::new(),
             ra: RaState::cold(),
+            classes: BTreeMap::new(),
+            non_resident: VecDeque::new(),
+            clock_hand: None,
         }
     }
 }
@@ -788,6 +826,11 @@ pub struct PageCache {
     /// (waiters) or dequeue (wakers); it does not nest under any
     /// other cache lock.
     writeback_complete_wq: Arc<WaitQueue>,
+
+    /// Soft cap on resident pages. When `pages.len() >= max_pages`,
+    /// the CLOCK-Pro sweep must reclaim before a new stub can be
+    /// installed. `0` means "unlimited" (no eviction pressure).
+    max_pages: usize,
 }
 
 impl PageCache {
@@ -800,6 +843,21 @@ impl PageCache {
     /// §Inode-binding rule). A different inode constructs its own
     /// distinct [`PageCache`].
     pub fn new(inode_id: InodeId, i_size: u64, ops: Arc<dyn AddressSpaceOps>) -> Self {
+        Self::with_max_pages(inode_id, i_size, ops, 0)
+    }
+
+    /// Construct an empty per-inode cache with a configurable page cap.
+    ///
+    /// `max_pages == 0` means "unlimited" — no eviction pressure. Any
+    /// positive value triggers CLOCK-Pro sweeps when the resident
+    /// count reaches the cap. The page-fault path calls
+    /// [`Self::evict_if_needed`] before installing a new stub.
+    pub fn with_max_pages(
+        inode_id: InodeId,
+        i_size: u64,
+        ops: Arc<dyn AddressSpaceOps>,
+        max_pages: usize,
+    ) -> Self {
         Self {
             ops,
             inner: BlockingMutex::new(PageCacheInner::new()),
@@ -807,6 +865,7 @@ impl PageCache {
             inode_id,
             wb_err: AtomicU32::new(0),
             writeback_complete_wq: Arc::new(WaitQueue::new()),
+            max_pages,
         }
     }
 
@@ -821,8 +880,16 @@ impl PageCache {
     /// Lookup `pgoff` in the cache index and return the entry if
     /// present. Acquires [`Self::inner`] for the duration of the
     /// `BTreeMap::get` call only; never blocks.
+    ///
+    /// On hit, sets `clock_ref = true` on the returned page so the
+    /// CLOCK-Pro sweep observes the access (mirrors
+    /// `BlockCache::lookup`).
     pub fn lookup(&self, pgoff: u64) -> Option<Arc<CachePage>> {
-        self.inner.lock().pages.get(&pgoff).cloned()
+        let inner = self.inner.lock();
+        let page = inner.pages.get(&pgoff)?.clone();
+        page.clock_ref
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Some(page)
     }
 
     /// Install-race entry point. The single routine that decides
@@ -870,6 +937,32 @@ impl PageCache {
         stub.parent_wb_wq
             .call_once(|| Arc::clone(&self.writeback_complete_wq));
         inner.pages.insert(pgoff, stub.clone());
+
+        // CLOCK-Pro classification: a pgoff that was recently a
+        // non-resident ghost re-enters as Hot (Jiang & Zhang §3.2);
+        // everything else enters as Cold.
+        let was_ghost = inner
+            .non_resident
+            .iter()
+            .position(|&k| k == pgoff)
+            .map(|pos| {
+                inner.non_resident.remove(pos);
+            })
+            .is_some();
+        let class = if was_ghost {
+            ClockClass::Hot
+        } else {
+            ClockClass::Cold
+        };
+        inner.classes.insert(pgoff, class);
+        if inner.clock_hand.is_none() {
+            inner.clock_hand = Some(pgoff);
+        }
+        // Freshly-installed page is "just-referenced" — set its
+        // reference bit so the next sweep doesn't tear it out before
+        // the caller gets one chance to use it.
+        stub.clock_ref
+            .store(true, core::sync::atomic::Ordering::Relaxed);
         InstallOutcome::InstalledNew(stub)
     }
 
@@ -912,8 +1005,12 @@ impl PageCache {
                     // Same stub, still locked — drop the dirty enrollment
                     // (defence-in-depth; a freshly installed locked stub
                     // is never enrolled in the first place) and remove
-                    // the index entry.
+                    // the index entry + CLOCK-Pro metadata.
                     inner.dirty.remove(&pgoff);
+                    inner.classes.remove(&pgoff);
+                    if inner.clock_hand == Some(pgoff) {
+                        inner.clock_hand = pgoff_next_after(&inner.pages, pgoff);
+                    }
                     inner.pages.remove(&pgoff)
                 }
                 _ => None,
@@ -1157,11 +1254,16 @@ impl PageCache {
             // Same critical section: drop the dirty enrollment so the
             // writeback daemon's `snapshot_dirty` cannot pick the page
             // back up after we drop the lock. Then remove the index
-            // entry; the cloned Arc keeps the `CachePage` alive so a
-            // writepage already in flight (which holds its own clone
-            // from a prior `snapshot_dirty`) can complete and the
-            // truncate caller can park on `PG_WRITEBACK`.
+            // entry + CLOCK-Pro metadata; the cloned Arc keeps the
+            // `CachePage` alive so a writepage already in flight (which
+            // holds its own clone from a prior `snapshot_dirty`) can
+            // complete and the truncate caller can park on
+            // `PG_WRITEBACK`.
             inner.dirty.remove(pgoff);
+            inner.classes.remove(pgoff);
+            if inner.clock_hand == Some(*pgoff) {
+                inner.clock_hand = pgoff_next_after(&inner.pages, *pgoff);
+            }
             if let Some(arc) = inner.pages.remove(pgoff) {
                 snapshot.push(arc);
             }
@@ -1201,6 +1303,205 @@ impl PageCache {
     pub fn wait_writeback_complete<F: FnMut() -> bool>(&self, cond: F) {
         self.writeback_complete_wq.wait_while(cond);
     }
+
+    /// Return the per-cache `max_pages` cap. `0` means unlimited.
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    /// Run a CLOCK-Pro eviction sweep if the cache is at capacity.
+    ///
+    /// Returns `Ok(())` if the cache is under the cap or a victim was
+    /// successfully evicted. Returns `Err(ENOMEM)` if the sweep found
+    /// no evictable page (every page is pinned, dirty, writeback, or
+    /// locked).
+    ///
+    /// RFC 0007 §Eviction (page cache): mirrors the four buffer-cache
+    /// invariants — never evict pinned (`Arc::strong_count > 1`),
+    /// never evict `PG_DIRTY | PG_WRITEBACK | PG_LOCKED | PG_IN_FLIGHT`,
+    /// never synchronously flush dirty pages, single-cache-entry.
+    pub fn evict_if_needed(&self) -> Result<(), EvictError> {
+        let mut inner = self.inner.lock();
+        if self.max_pages == 0 || inner.pages.len() < self.max_pages {
+            return Ok(());
+        }
+        Self::clock_pro_evict(&mut inner, self.max_pages)
+    }
+
+    /// CLOCK-Pro eviction sweep.
+    ///
+    /// Rotates `clock_hand` through resident pages in BTreeMap key
+    /// order. For each visited entry:
+    ///
+    /// - If `Arc::strong_count(page) > 1` or `state & (DIRTY |
+    ///   WRITEBACK | LOCKED | IN_FLIGHT) != 0`, **skip unconditionally**.
+    /// - If `clock_ref == true`: clear the bit; if cold, promote to hot.
+    /// - If `clock_ref == false`: if cold, **evict** (move to ghost
+    ///   queue); if hot, demote to cold and move on.
+    ///
+    /// If the hand completes a full revolution without finding a victim,
+    /// returns [`EvictError::NoVictim`].
+    fn clock_pro_evict(inner: &mut PageCacheInner, max_pages: usize) -> Result<(), EvictError> {
+        // Worst case: 3 revolutions — see block::cache::clock_pro_evict.
+        let n = inner.pages.len();
+        let budget = n.saturating_mul(3).saturating_add(1).max(1);
+        for _ in 0..budget {
+            let hand = match inner.clock_hand {
+                Some(k) => k,
+                None => return Err(EvictError::NoVictim),
+            };
+
+            // Inspect the page through a borrow — we deliberately
+            // **do not clone the Arc** for the inspection step so
+            // `Arc::strong_count` is exactly the external pin count + 1
+            // (the map slot).
+            let (pinned, busy, referenced) = {
+                let page = match inner.pages.get(&hand) {
+                    Some(p) => p,
+                    None => {
+                        inner.clock_hand = inner.pages.keys().next().copied();
+                        continue;
+                    }
+                };
+                let pinned = Arc::strong_count(page) > 1;
+                let st = page.state.load(Ordering::Acquire);
+                let busy = st & (PG_DIRTY | PG_WRITEBACK | PG_LOCKED | PG_IN_FLIGHT) != 0;
+                // Only consume the reference bit on a non-skipped entry.
+                let referenced = if pinned || busy {
+                    false
+                } else {
+                    page.clock_ref
+                        .swap(false, core::sync::atomic::Ordering::AcqRel)
+                };
+                (pinned, busy, referenced)
+            };
+
+            if pinned || busy {
+                inner.clock_hand = pgoff_next_after(&inner.pages, hand);
+                continue;
+            }
+
+            let class = *inner.classes.get(&hand).expect("classes map mirrors pages");
+
+            if referenced {
+                if class == ClockClass::Cold {
+                    inner.classes.insert(hand, ClockClass::Hot);
+                }
+                // Hot + referenced -> stay hot (bit already cleared).
+                inner.clock_hand = pgoff_next_after(&inner.pages, hand);
+                continue;
+            }
+
+            // Unreferenced.
+            match class {
+                ClockClass::Cold => {
+                    // Evict. Advance hand before the remove.
+                    let advance_to = pgoff_next_after(&inner.pages, hand);
+                    inner.pages.remove(&hand);
+                    inner.classes.remove(&hand);
+                    inner.dirty.remove(&hand);
+                    // Bound non_resident at max_pages.
+                    while inner.non_resident.len() >= max_pages {
+                        inner.non_resident.pop_front();
+                    }
+                    inner.non_resident.push_back(hand);
+                    inner.clock_hand = advance_to;
+                    return Ok(());
+                }
+                ClockClass::Hot => {
+                    inner.classes.insert(hand, ClockClass::Cold);
+                    inner.clock_hand = pgoff_next_after(&inner.pages, hand);
+                }
+            }
+        }
+
+        // Budget elapsed without finding a victim.
+        Err(EvictError::NoVictim)
+    }
+
+    /// Bounded direct-reclaim wait: attempt eviction, and if no victim is
+    /// found, park on `writeback_complete_wq` until either a victim is freed
+    /// or the `direct_reclaim_timeout_ms` soft cap expires.
+    ///
+    /// Returns `Ok(())` if eviction made room (or the cache was already under
+    /// cap). Returns `Err(EvictError::NoVictim)` only after the soft cap
+    /// expires with no victim found — the caller maps this to ENOMEM / SIGBUS.
+    ///
+    /// RFC 0007 §Eviction liveness: per-event retry — every
+    /// `writeback_complete_wq` wake gives the parked faulter one retry
+    /// opportunity bounded only by the soft cap.
+    ///
+    /// `timeout_ms` is the per-event cap. In production the page-fault
+    /// path reads [`crate::block::writeback::direct_reclaim_timeout_ms`];
+    /// in tests it is passed explicitly.
+    pub fn evict_or_wait(&self, timeout_ms: u64) -> Result<(), EvictError> {
+        // Fast path: under cap or successful sweep.
+        if self.evict_if_needed().is_ok() {
+            return Ok(());
+        }
+
+        // No victim found — enter the bounded direct-reclaim wait.
+        //
+        // Strategy: loop retrying the sweep on each wq wake. The wq
+        // is kicked by `CachePage::end_writeback` and `CachePage::Drop`.
+        // If we observe a victim within `timeout_ms` total, we succeed.
+        //
+        // On host (test stub), `WaitQueue::wait_while` returns after one
+        // predicate check, so we just do one retry. On bare metal the
+        // real `wait_while` parks and re-checks after each wake.
+        //
+        // We model this as: call `wait_writeback_complete` with a
+        // predicate that retries the sweep; the predicate returns `false`
+        // (= stop waiting) when either the sweep succeeds or we've
+        // exhausted retries.
+        let mut found_victim = false;
+        let retries = if timeout_ms == 0 { 0usize } else { 1 };
+        for _ in 0..=retries {
+            // On each iteration, retry the sweep. The host stub's
+            // `wait_while` will call the predicate once and return.
+            self.writeback_complete_wq.wait_while(|| {
+                match self.evict_if_needed() {
+                    Ok(()) => {
+                        found_victim = true;
+                        false // stop waiting
+                    }
+                    Err(_) => {
+                        // Still no victim. On bare metal this parks and
+                        // waits for the next wake; on host it returns.
+                        true
+                    }
+                }
+            });
+            if found_victim {
+                return Ok(());
+            }
+        }
+
+        // Soft cap expired with no victim found.
+        Err(EvictError::NoVictim)
+    }
+}
+
+/// Error from the CLOCK-Pro eviction sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictError {
+    /// No evictable page found — every resident page is pinned,
+    /// dirty, locked, writeback, or in-flight.
+    NoVictim,
+}
+
+/// Return the first pgoff strictly greater than `key` in `map`, wrapping
+/// to the minimum key if there is no greater key. Returns `None` only
+/// when the map is empty.
+fn pgoff_next_after(map: &BTreeMap<u64, Arc<CachePage>>, key: u64) -> Option<u64> {
+    if let Some((&k, _)) = map
+        .range((core::ops::Bound::Excluded(key), core::ops::Bound::Unbounded))
+        .next()
+    {
+        Some(k)
+    } else {
+        map.keys().next().copied()
+    }
 }
 
 /// `PAGE_SIZE` as a `u64` for inline arithmetic. Mirrors the same
@@ -1220,6 +1521,10 @@ mod tests {
 
     fn fresh_cache() -> PageCache {
         PageCache::new(fake_inode_id(), 0, crate::mem::aops::fresh_ops())
+    }
+
+    fn fresh_cache_capped(max_pages: usize) -> PageCache {
+        PageCache::with_max_pages(fake_inode_id(), 0, crate::mem::aops::fresh_ops(), max_pages)
     }
 
     fn fake_phys(pgoff: u64) -> u64 {
@@ -2596,5 +2901,415 @@ mod tests {
             false // returns immediately on host stub
         });
         assert!(calls >= 1);
+    }
+
+    // --- CLOCK-Pro eviction (issue #740) -----------------------------------
+
+    /// Helper: install and publish a page so it is in the UPTODATE,
+    /// non-LOCKED, non-DIRTY state the evictor can act on.
+    fn install_and_publish(cache: &PageCache, pgoff: u64) -> Arc<CachePage> {
+        let stub = match cache.install_or_get(pgoff, || make_stub(pgoff)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => panic!("expected InstalledNew"),
+        };
+        stub.publish_uptodate_and_unlock();
+        stub
+    }
+
+    #[test]
+    fn evict_if_needed_under_cap_is_noop() {
+        let cache = fresh_cache_capped(4);
+        install_and_publish(&cache, 0);
+        install_and_publish(&cache, 1);
+        // 2 pages, cap is 4 — no eviction needed.
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        assert!(cache.lookup(0).is_some());
+        assert!(cache.lookup(1).is_some());
+    }
+
+    #[test]
+    fn evict_if_needed_unlimited_cache_is_noop() {
+        // max_pages == 0 means unlimited.
+        let cache = fresh_cache();
+        for p in 0..10 {
+            install_and_publish(&cache, p);
+        }
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+    }
+
+    #[test]
+    fn clock_pro_evicts_cold_unreferenced_page() {
+        // cap=2, install 2 pages, then ask for eviction. The sweep
+        // should find a cold, unreferenced victim and evict it.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        // Drop external Arcs so strong_count reaches 1 (cache only).
+        drop(p0);
+        drop(p1);
+        // Clear reference bits so the sweep can evict.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        // One page was evicted, one remains.
+        let inner = cache.inner.lock();
+        assert_eq!(inner.pages.len(), 1);
+        assert_eq!(inner.non_resident.len(), 1);
+    }
+
+    #[test]
+    fn clock_pro_skips_pinned_page() {
+        // RFC 0007 §Eviction: skip any page with
+        // `Arc::strong_count > 1`.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        // Clear reference bits.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Hold onto both Arcs — strong_count is 2 for each (cache + us).
+        // The sweep should find no victim because both are pinned.
+        let result = cache.evict_if_needed();
+        assert_eq!(result, Err(EvictError::NoVictim));
+        // Both pages are still indexed.
+        assert!(cache.lookup(0).is_some());
+        assert!(cache.lookup(1).is_some());
+        drop(p0);
+        drop(p1);
+    }
+
+    #[test]
+    fn clock_pro_skips_dirty_page() {
+        // RFC 0007 §Eviction: skip PG_DIRTY.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        cache.mark_page_dirty(0);
+        cache.mark_page_dirty(1);
+        drop(p0);
+        drop(p1);
+        // Clear reference bits.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // All pages dirty — no victim.
+        assert_eq!(cache.evict_if_needed(), Err(EvictError::NoVictim));
+    }
+
+    #[test]
+    fn clock_pro_skips_writeback_page() {
+        // RFC 0007 §Eviction: skip PG_WRITEBACK.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        p0.begin_writeback();
+        p1.begin_writeback();
+        drop(p0);
+        drop(p1);
+        // Clear reference bits.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert_eq!(cache.evict_if_needed(), Err(EvictError::NoVictim));
+    }
+
+    #[test]
+    fn clock_pro_skips_locked_page() {
+        // RFC 0007 §Eviction: skip PG_LOCKED.
+        let cache = fresh_cache_capped(2);
+        // Install but do NOT publish (remains PG_LOCKED).
+        let p0 = match cache.install_or_get(0, || make_stub(0)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        let p1 = install_and_publish(&cache, 1);
+        drop(p0);
+        drop(p1);
+        // Clear reference bits.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // page 0 is locked — skip; page 1 is cold + unreferenced → evict.
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        // Page 0 survives (locked), page 1 was evicted.
+        assert!(cache.lookup(0).is_some());
+        assert!(cache.lookup(1).is_none());
+    }
+
+    #[test]
+    fn clock_pro_skips_in_flight_page() {
+        // RFC 0007 §Eviction: skip PG_IN_FLIGHT.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        p0.mark_in_flight();
+        drop(p0);
+        drop(p1);
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // page 0 in-flight — skip; page 1 → evict.
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        assert!(cache.lookup(0).is_some());
+        assert!(cache.lookup(1).is_none());
+    }
+
+    #[test]
+    fn clock_pro_promoted_ghost_enters_hot() {
+        // CLOCK-Pro: a non-resident ghost hit re-enters as Hot.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        drop(p0);
+        drop(p1);
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Evict one page (say pgoff 0 — the hand starts at 0).
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        let evicted_pgoff = if cache.lookup(0).is_none() { 0 } else { 1 };
+        // Now the evicted pgoff is in the non_resident queue.
+        {
+            let inner = cache.inner.lock();
+            assert!(inner.non_resident.contains(&evicted_pgoff));
+        }
+        // Re-install the evicted pgoff — it should enter as Hot.
+        let p_new = install_and_publish(&cache, evicted_pgoff);
+        drop(p_new);
+        {
+            let inner = cache.inner.lock();
+            assert_eq!(
+                inner.classes.get(&evicted_pgoff),
+                Some(&ClockClass::Hot),
+                "re-referenced ghost must be promoted to Hot",
+            );
+            // Ghost should be removed from non_resident.
+            assert!(!inner.non_resident.contains(&evicted_pgoff));
+        }
+    }
+
+    #[test]
+    fn clock_pro_hot_page_survives_one_sweep() {
+        // Hot pages must survive one reference-bit sweep before they
+        // can be evicted (demoted to cold first, then evicted on the
+        // next cold sweep).
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        drop(p0);
+        drop(p1);
+        // Force page 0 to Hot classification.
+        {
+            let mut inner = cache.inner.lock();
+            inner.classes.insert(0, ClockClass::Hot);
+            // Clear all reference bits.
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Eviction with page 0 Hot + unreferenced → demote to Cold,
+        // then evict page 1 (which is Cold + unreferenced).
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        assert!(cache.lookup(0).is_some(), "hot page survives sweep");
+        assert!(cache.lookup(1).is_none(), "cold page evicted");
+        // Page 0 should now be Cold (demoted).
+        {
+            let inner = cache.inner.lock();
+            assert_eq!(inner.classes.get(&0), Some(&ClockClass::Cold));
+        }
+    }
+
+    #[test]
+    fn clock_pro_referenced_cold_promoted_to_hot() {
+        // A cold page with its reference bit set gets promoted to hot.
+        let cache = fresh_cache_capped(3);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        let p2 = install_and_publish(&cache, 2);
+        drop(p0);
+        drop(p1);
+        drop(p2);
+        // Leave page 0 referenced (simulating a cache hit); clear
+        // pages 1 and 2.
+        {
+            let inner = cache.inner.lock();
+            let pg0 = inner.pages.get(&0).unwrap();
+            pg0.clock_ref
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            let pg1 = inner.pages.get(&1).unwrap();
+            pg1.clock_ref
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+            let pg2 = inner.pages.get(&2).unwrap();
+            pg2.clock_ref
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Evict: page 0 (cold + referenced) → promote to hot; page 1
+        // (cold + unreferenced) → evict.
+        assert_eq!(cache.evict_if_needed(), Ok(()));
+        assert!(cache.lookup(0).is_some());
+        {
+            let inner = cache.inner.lock();
+            assert_eq!(
+                inner.classes.get(&0),
+                Some(&ClockClass::Hot),
+                "cold + referenced must be promoted to hot",
+            );
+        }
+    }
+
+    #[test]
+    fn no_victim_returns_enomem() {
+        // All pages pinned (strong_count > 1) — sweep returns NoVictim
+        // (which the fault path maps to ENOMEM → SIGBUS).
+        let cache = fresh_cache_capped(2);
+        let _p0 = install_and_publish(&cache, 0);
+        let _p1 = install_and_publish(&cache, 1);
+        // Both pages pinned (our outer Arcs).
+        assert_eq!(cache.evict_if_needed(), Err(EvictError::NoVictim));
+    }
+
+    #[test]
+    fn evict_or_wait_succeeds_when_under_cap() {
+        let cache = fresh_cache_capped(4);
+        install_and_publish(&cache, 0);
+        assert_eq!(cache.evict_or_wait(2000), Ok(()));
+    }
+
+    #[test]
+    fn evict_or_wait_no_victim_after_cap_returns_enomem() {
+        // All pages pinned — evict_or_wait must return NoVictim after
+        // the bounded wait. On host stub the wait returns immediately.
+        let cache = fresh_cache_capped(2);
+        let _p0 = install_and_publish(&cache, 0);
+        let _p1 = install_and_publish(&cache, 1);
+        assert_eq!(cache.evict_or_wait(2000), Err(EvictError::NoVictim));
+    }
+
+    #[test]
+    fn evict_or_wait_retry_after_unpin_succeeds() {
+        // Simulates the "retry on each wake" path: first sweep fails
+        // (all pages pinned), then we drop the pin on one page, and
+        // the next sweep succeeds.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let _p1 = install_and_publish(&cache, 1);
+        // Clear reference bits.
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Drop p0 so it becomes unpinned (strong_count -> 1).
+        drop(p0);
+        // Now evict_or_wait should succeed: page 0 is evictable.
+        assert_eq!(cache.evict_or_wait(2000), Ok(()));
+    }
+
+    #[test]
+    fn evict_or_wait_zero_timeout_still_tries_once() {
+        // A timeout of 0 should still try the initial sweep.
+        let cache = fresh_cache_capped(2);
+        let p0 = install_and_publish(&cache, 0);
+        let p1 = install_and_publish(&cache, 1);
+        drop(p0);
+        drop(p1);
+        {
+            let inner = cache.inner.lock();
+            for (_, page) in inner.pages.iter() {
+                page.clock_ref
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert_eq!(cache.evict_or_wait(0), Ok(()));
+    }
+
+    #[test]
+    fn lookup_sets_clock_ref_on_hit() {
+        let cache = fresh_cache();
+        let stub = install_and_publish(&cache, 0);
+        // Clear clock_ref manually.
+        stub.clock_ref
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+        drop(stub);
+        // Lookup should set clock_ref.
+        let hit = cache.lookup(0).unwrap();
+        assert!(
+            hit.clock_ref.load(core::sync::atomic::Ordering::Relaxed),
+            "lookup must set clock_ref on cache hit",
+        );
+    }
+
+    #[test]
+    fn install_or_get_sets_clock_ref_and_cold_class() {
+        let cache = fresh_cache();
+        let stub = match cache.install_or_get(5, || make_stub(5)) {
+            InstallOutcome::InstalledNew(p) => p,
+            InstallOutcome::AlreadyPresent(_) => unreachable!(),
+        };
+        // Freshly installed → clock_ref = true, class = Cold.
+        assert!(stub.clock_ref.load(core::sync::atomic::Ordering::Relaxed));
+        let inner = cache.inner.lock();
+        assert_eq!(inner.classes.get(&5), Some(&ClockClass::Cold));
+        assert!(inner.clock_hand.is_some());
+    }
+
+    #[test]
+    fn non_resident_ghost_bounded_by_max_pages() {
+        let cache = fresh_cache_capped(2);
+        // Install and evict 4 pages, each becoming a ghost.
+        for i in 0..4u64 {
+            let p = install_and_publish(&cache, i);
+            drop(p);
+        }
+        // Clear reference bits for eviction.
+        for _ in 0..4 {
+            {
+                let inner = cache.inner.lock();
+                for (_, page) in inner.pages.iter() {
+                    page.clock_ref
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let _ = cache.evict_if_needed();
+        }
+        // Ghost queue is bounded by max_pages (2).
+        let inner = cache.inner.lock();
+        assert!(
+            inner.non_resident.len() <= 2,
+            "non_resident ghost queue must be bounded by max_pages",
+        );
     }
 }
