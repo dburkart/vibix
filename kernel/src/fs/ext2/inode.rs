@@ -610,15 +610,21 @@ impl FileOps for Ext2Inode {
         // between mmap and mprotect). The check uses
         // `Inode.permission(EXECUTE)` against the current task's
         // credentials per the RFC's errno table.
-        let exec_allowed = {
-            let cred = crate::task::current_credentials();
-            crate::fs::vfs::ops::default_permission(
-                &f.inode,
-                &cred,
-                crate::fs::vfs::Access::EXECUTE,
-            )
-            .is_ok()
-        };
+        //
+        // `try_current_credentials` returns `None` in integration tests
+        // that drive the mmap hook without a task context. The
+        // conservative default is `false` (deny exec) — in production
+        // the syscall path always has a running task.
+        let exec_allowed = crate::task::try_current_credentials()
+            .map(|cred| {
+                crate::fs::vfs::ops::default_permission(
+                    &f.inode,
+                    &cred,
+                    crate::fs::vfs::Access::EXECUTE,
+                )
+                .is_ok()
+            })
+            .unwrap_or(false);
 
         let fo = crate::mem::file_object::FileObject::new(
             cache,
