@@ -47,7 +47,7 @@ pub const USER_STACK_TOP: u64 = USER_STACK_PAGE_VA + 0x1000;
 /// # Panics
 /// - If `bytes` is empty or fails ELF parsing.
 /// - If frame allocation or PTE installation fails.
-pub fn launch(bytes: &[u8]) -> usize {
+pub fn launch(bytes: &'static [u8]) -> usize {
     // 1. Build a fresh AddressSpace with a new PML4.
     let mut aspace = AddressSpace::new_empty();
     let pml4 = aspace.page_table_frame();

@@ -1,12 +1,21 @@
-//! Integration test for #578: `execve` must refuse dynamically-linked
-//! binaries with `ENOEXEC` until a userspace `ld.so` lands.
+//! Integration test for #763: the PT_INTERP ENOEXEC gate from RFC 0004
+//! Workstream F has been removed. `execve` of a dynamically-linked ELF
+//! now proceeds past the old gate and fails only because the named
+//! interpreter module is not present among the Limine modules
+//! (`InterpNotFound` → still `-8`/ENOEXEC from the LoadError mapping,
+//! but via the loader, not the gate).
 //!
-//! Synthesizes a minimal but otherwise well-formed ELF64 image that
-//! carries a `PT_INTERP` program header naming `/lib/ld-linux.so.2` and
-//! feeds it to the public `arch::x86_64::syscall::exec_atomic` hook.
-//! Asserts that the call returns `Err(-8)` (ENOEXEC) and that the
-//! caller's address-space `Arc` pointer is unchanged — the gate must
-//! refuse the binary *before* any staged PML4 could be committed.
+//! The test synthesizes a minimal ELF64 with a `PT_INTERP` naming a
+//! non-existent interpreter and verifies that:
+//!
+//! 1. `exec_atomic` returns `Err(-8)` (ENOEXEC) — the interpreter
+//!    module is absent, so the loader returns `InterpNotFound`.
+//! 2. The caller's address-space `Arc` pointer is unchanged (the staged
+//!    PML4 is never committed on failure).
+//!
+//! Prior to #763 the gate refused the binary *before* even attempting
+//! the load; now the binary passes through and the loader's
+//! `InterpNotFound` is the observable failure mode.
 
 #![no_std]
 #![no_main]
@@ -42,8 +51,8 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[(
-        "execve_refuses_ptinterp_with_enoexec",
-        &(execve_refuses_ptinterp_with_enoexec as fn()),
+        "execve_ptinterp_passes_gate_fails_interp_not_found",
+        &(execve_ptinterp_passes_gate_fails_interp_not_found as fn()),
     )];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -53,11 +62,6 @@ fn run_tests() {
 }
 
 // --- ELF64 synthesis helpers --------------------------------------------
-//
-// Just enough machinery to emit a well-formed ELF64 with one PT_INTERP
-// segment and two PT_LOAD segments. Fields we don't care about are left
-// zero — the loader (and the execve gate) only look at the ELF magic,
-// e_phoff/e_phnum, and the phdr entries themselves.
 
 const EHDR_SIZE: usize = 0x40;
 const PHDR_SIZE: usize = 0x38;
@@ -125,7 +129,7 @@ fn sample_elf_with_interp(path: &[u8]) -> Vec<u8> {
     bytes
 }
 
-static WORKER_OBSERVED_ENOEXEC: AtomicUsize = AtomicUsize::new(0);
+static WORKER_OBSERVED_ERR: AtomicUsize = AtomicUsize::new(0);
 static WORKER_ASPACE_PRESERVED: AtomicUsize = AtomicUsize::new(0);
 static WORKER_DONE: AtomicUsize = AtomicUsize::new(0);
 
@@ -134,25 +138,28 @@ fn exec_worker() -> ! {
     let before_ptr = Arc::as_ptr(&before) as usize;
     drop(before);
 
-    // Synthesize a dynamically-linked ELF: well-formed phdr table with
-    // one PT_INTERP. If the gate is missing, the loader would attempt
-    // to resolve `/lib/ld-linux.so.2` as a Limine module and return a
-    // different errno (InterpNotFound → -ENOEXEC too, but via a path
-    // we explicitly do not want to exercise here).
+    // Synthesize a dynamically-linked ELF with a PT_INTERP naming a
+    // non-existent interpreter. The old gate would have returned
+    // ENOEXEC before reaching the loader; now the loader proceeds
+    // and returns InterpNotFound (still mapped to -8 by exec_atomic).
     let bytes = sample_elf_with_interp(b"/lib/ld-linux.so.2");
-    match exec_atomic(&bytes) {
+    // Leak the Vec so the slice is 'static — exec_atomic now requires
+    // &'static [u8] for the demand-paged loader.
+    let leaked: &'static [u8] = bytes.leak();
+    match exec_atomic(leaked) {
         Ok(_never) => {
             unreachable!("exec_atomic returned Ok with a dynamically-linked ELF");
         }
         Err(code) => {
+            // -8 = ENOEXEC, which is the mapping of LoadError (either
+            // InterpNotFound or InterpLoadFailed).
             if code == -8 {
-                WORKER_OBSERVED_ENOEXEC.fetch_add(1, Ordering::SeqCst);
+                WORKER_OBSERVED_ERR.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
 
-    // Gate must refuse before any staged PML4 commit — address-space
-    // identity must be preserved.
+    // Address-space identity must be preserved on failure.
     let after = task::current_address_space();
     let after_ptr = Arc::as_ptr(&after) as usize;
     drop(after);
@@ -164,8 +171,8 @@ fn exec_worker() -> ! {
     task::exit();
 }
 
-fn execve_refuses_ptinterp_with_enoexec() {
-    WORKER_OBSERVED_ENOEXEC.store(0, Ordering::SeqCst);
+fn execve_ptinterp_passes_gate_fails_interp_not_found() {
+    WORKER_OBSERVED_ERR.store(0, Ordering::SeqCst);
     WORKER_ASPACE_PRESERVED.store(0, Ordering::SeqCst);
     WORKER_DONE.store(0, Ordering::SeqCst);
 
@@ -187,13 +194,13 @@ fn execve_refuses_ptinterp_with_enoexec() {
         "exec_worker never finished"
     );
     assert_eq!(
-        WORKER_OBSERVED_ENOEXEC.load(Ordering::SeqCst),
+        WORKER_OBSERVED_ERR.load(Ordering::SeqCst),
         1,
-        "exec_atomic with PT_INTERP did not return -ENOEXEC"
+        "exec_atomic with PT_INTERP did not return -8 (InterpNotFound)"
     );
     assert_eq!(
         WORKER_ASPACE_PRESERVED.load(Ordering::SeqCst),
         1,
-        "address-space Arc swapped despite refused exec — gate ran too late"
+        "address-space Arc swapped despite failed exec — staged PML4 leaked"
     );
 }
