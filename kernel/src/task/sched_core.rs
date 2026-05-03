@@ -48,19 +48,40 @@ use x86_64::registers::model_specific::Msr;
 /// area after a context switch.
 const MSR_FS_BASE: u32 = 0xC000_0100;
 
-/// Save the current CPU's `MSR_FS_BASE` into `task.fs_base`.
+/// Save the current CPU's FS base into `task.fs_base`.
+///
+/// When `CR4.FSGSBASE` is enabled (#836) this uses the `rdfsbase`
+/// instruction — a non-serialising, ~1-cycle read — instead of the
+/// `rdmsr` path (~20-40 cycles, serialising). The fast-path flag is
+/// cached in [`crate::arch::x86_64::fsgsbase_enabled`] and checked at
+/// each call; it never changes after early boot so the branch predicts
+/// perfectly.
 ///
 /// # Safety
 /// Must be called with IRQs disabled (or from an ISR) so no concurrent
-/// context switch can race the MSR read.
+/// context switch can race the read.
 #[inline(always)]
 unsafe fn save_fs_base(task: &mut Task) {
-    task.fs_base = Msr::new(MSR_FS_BASE).read();
+    if crate::arch::x86_64::fsgsbase_enabled() {
+        // SAFETY: CR4.FSGSBASE is set, so `rdfsbase` is legal.
+        let val: u64;
+        core::arch::asm!(
+            "rdfsbase {}",
+            out(reg) val,
+            options(nomem, nostack, preserves_flags),
+        );
+        task.fs_base = val;
+    } else {
+        task.fs_base = Msr::new(MSR_FS_BASE).read();
+    }
 }
 
-/// Restore `task.fs_base` into the CPU's `MSR_FS_BASE`. Skips the
+/// Restore `task.fs_base` into the CPU's FS base register. Skips the
 /// write when `fs_base == 0` (kernel tasks with no userspace TLS) as
-/// an optimisation — `wrmsr` is an expensive serialising instruction.
+/// an optimisation.
+///
+/// When `CR4.FSGSBASE` is enabled (#836) this uses `wrfsbase` instead
+/// of the serialising `wrmsr`.
 ///
 /// # Safety
 /// Must be called with IRQs disabled so the restored value is not
@@ -69,7 +90,16 @@ unsafe fn save_fs_base(task: &mut Task) {
 unsafe fn restore_fs_base(task: &Task) {
     let val = task.fs_base;
     if val != 0 {
-        Msr::new(MSR_FS_BASE).write(val);
+        if crate::arch::x86_64::fsgsbase_enabled() {
+            // SAFETY: CR4.FSGSBASE is set, so `wrfsbase` is legal.
+            core::arch::asm!(
+                "wrfsbase {}",
+                in(reg) val,
+                options(nomem, nostack, preserves_flags),
+            );
+        } else {
+            Msr::new(MSR_FS_BASE).write(val);
+        }
     }
 }
 

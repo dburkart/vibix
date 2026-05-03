@@ -573,3 +573,7 @@ required-features = ["page_cache"]
 [[test]]
 name = "dynlinker_stub"
 harness = false
+
+[[test]]
+name = "fsgsbase"
+harness = false
