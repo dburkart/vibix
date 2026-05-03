@@ -36,6 +36,14 @@ static INIT_STACK_PTR: AtomicU64 = AtomicU64::new(0);
 /// install as `MSR_FS_BASE`. Zero means no TLS block was allocated.
 static INIT_FS_BASE: AtomicU64 = AtomicU64::new(0);
 
+/// Page-aligned start VA of the init process's static TLS block.
+/// Set by `launch`; read by `init_ring3_entry` to record on the task
+/// so fork can deep-copy the TLS pages (#834).
+static INIT_TLS_REGION_START: AtomicU64 = AtomicU64::new(0);
+
+/// Number of 4 KiB pages in the init process's static TLS block.
+static INIT_TLS_REGION_PAGES: AtomicU64 = AtomicU64::new(0);
+
 /// Pre-built init AddressSpace (with ELF VMAs and stack VMA).
 /// Consumed by `init_ring3_entry` on first and only use.
 static INIT_ADDRESS_SPACE: Once<Arc<RwLock<AddressSpace>>> = Once::new();
@@ -185,7 +193,10 @@ pub fn launch(bytes: &'static [u8]) -> usize {
     INIT_STACK_PTR.store(initial_rsp, Ordering::Release);
     if let Some(tcb) = image.tcb_addr {
         INIT_FS_BASE.store(tcb, Ordering::Release);
-        serial_println!("init: TLS block allocated, tcb={:#x}", tcb);
+        INIT_TLS_REGION_START.store(image.tls_region_start, Ordering::Release);
+        INIT_TLS_REGION_PAGES.store(image.tls_region_pages, Ordering::Release);
+        serial_println!("init: TLS block allocated, tcb={:#x}, region={:#x}+{}p",
+            tcb, image.tls_region_start, image.tls_region_pages);
     }
     INIT_ADDRESS_SPACE.call_once(|| Arc::new(RwLock::new(aspace)));
 
@@ -254,6 +265,11 @@ fn init_ring3_entry() -> ! {
         unsafe {
             x86_64::registers::model_specific::Msr::new(0xC000_0100).write(fs_base);
         }
+        // Record the TLS region boundaries so fork can deep-copy the
+        // TLS pages into the child (#834).
+        let tls_start = INIT_TLS_REGION_START.load(Ordering::Acquire);
+        let tls_pages = INIT_TLS_REGION_PAGES.load(Ordering::Acquire);
+        crate::task::set_current_tls_region(tls_start, tls_pages);
     }
 
     serial_println!(

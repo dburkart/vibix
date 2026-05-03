@@ -247,6 +247,17 @@ pub(super) struct Task {
     /// `fork` copies this from the parent so the child inherits the
     /// parent's TLS pointer.
     pub fs_base: u64,
+
+    /// Page-aligned start VA of the static TLS block allocated by the
+    /// loader (or zero if no TLS block was allocated). Used by the fork
+    /// path to deep-copy the parent's TLS pages into the child's address
+    /// space so the child gets an immediately-private copy without
+    /// waiting for CoW faults (#834).
+    pub tls_region_start: u64,
+    /// Number of 4 KiB pages in the static TLS block (zero when no TLS
+    /// block exists). Together with `tls_region_start` this defines the
+    /// exact VA range the fork path must deep-copy.
+    pub tls_region_pages: u64,
 }
 
 impl Task {
@@ -280,6 +291,8 @@ impl Task {
             credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0,
             fs_base: 0,
+            tls_region_start: 0,
+            tls_region_pages: 0,
         }
     }
 
@@ -373,6 +386,8 @@ impl Task {
             credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0, // kernel-only task — no ring-3 syscall stack needed yet
             fs_base: 0,
+            tls_region_start: 0,
+            tls_region_pages: 0,
         }
     }
 
@@ -407,6 +422,20 @@ impl Task {
         self.fs_base = val;
     }
 
+    /// Returns the static TLS block region start VA and page count.
+    /// `(0, 0)` means no TLS block was allocated.
+    pub fn tls_region(&self) -> (u64, u64) {
+        (self.tls_region_start, self.tls_region_pages)
+    }
+
+    /// Records the static TLS block region boundaries. Called after
+    /// `allocate_tls_block` succeeds so fork can deep-copy the TLS
+    /// pages into the child's address space (#834).
+    pub fn set_tls_region(&mut self, start: u64, pages: u64) {
+        self.tls_region_start = start;
+        self.tls_region_pages = pages;
+    }
+
     /// Returns `true` if `addr` falls within this task's guard page.
     ///
     /// Always returns `false` for the bootstrap task (`guard_base == 0`).
@@ -435,6 +464,8 @@ impl Task {
         parent_priority: u8,
         parent_affinity: u64,
         parent_fs_base: u64,
+        parent_tls_region_start: u64,
+        parent_tls_region_pages: u64,
         parent_fpu: *const crate::arch::x86_64::fpu::FpuArea,
         child_address_space: alloc::sync::Arc<spin::RwLock<AddressSpace>>,
         child_cr3: PhysFrame<Size4KiB>,
@@ -549,6 +580,8 @@ impl Task {
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.
             syscall_stack_top: (stack_base + STACK_SIZE) as u64,
             fs_base: parent_fs_base,
+            tls_region_start: parent_tls_region_start,
+            tls_region_pages: parent_tls_region_pages,
         })
     }
 }
@@ -622,5 +655,27 @@ mod fs_base_tests {
             val,
             "fs_base getter must return the value that was set"
         );
+    }
+
+    /// The bootstrap task must start with zero TLS region — no static
+    /// TLS block exists until the ELF loader allocates one.
+    #[test]
+    fn bootstrap_tls_region_is_zero() {
+        let t = Task::bootstrap();
+        let (start, pages) = t.tls_region();
+        assert_eq!(start, 0, "bootstrap task must have tls_region_start=0");
+        assert_eq!(pages, 0, "bootstrap task must have tls_region_pages=0");
+    }
+
+    /// TLS region setter/getter round-trip.
+    #[test]
+    fn tls_region_setter_getter_round_trip() {
+        let mut t = Task::bootstrap();
+        let start = 0x0000_4030_0000u64;
+        let pages = 3u64;
+        t.set_tls_region(start, pages);
+        let (got_start, got_pages) = t.tls_region();
+        assert_eq!(got_start, start, "tls_region_start must round-trip");
+        assert_eq!(got_pages, pages, "tls_region_pages must round-trip");
     }
 }
