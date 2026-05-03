@@ -41,7 +41,7 @@ const VERSION: u8 = 1;
 /// lands around ~990 KiB today while the largest test ELF needs
 /// ~1.15 MiB. 2.5 MiB gives both headroom. If it overflows, xtask
 /// aborts with a clear "bump LNTAB_BYTES" error.
-pub const LNTAB_BYTES: usize = 2 * 1024 * 1024 + 512 * 1024;
+pub const LNTAB_BYTES: usize = 3 * 1024 * 1024;
 
 /// Fixed-size reservation patched in place by xtask after linking. The
 /// explicit non-zero magic in the first four bytes forces LLVM to emit
