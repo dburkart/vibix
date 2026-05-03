@@ -577,3 +577,7 @@ harness = false
 [[test]]
 name = "fsgsbase"
 harness = false
+
+[[test]]
+name = "tls_context_switch"
+harness = false
