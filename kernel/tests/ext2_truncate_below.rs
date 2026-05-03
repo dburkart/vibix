@@ -41,7 +41,6 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use vibix::block::BlockDevice;
-use vibix::fs::ext2::aops::Ext2Aops;
 use vibix::fs::ext2::inode::Ext2Inode;
 use vibix::fs::ext2::{alloc_inode, iget, Ext2Fs, Ext2Super};
 use vibix::fs::vfs::inode::Inode;
@@ -194,15 +193,6 @@ fn install_published_page(inode: &Arc<Inode>, pgoff: u64) -> Arc<CachePage> {
     stub
 }
 
-/// Build + install an [`Ext2Aops`] on `inode`. Required so the
-/// page-cache mapping is reachable from `inode.aops` and so the
-/// `setattr` shrink path picks up the truncate hook.
-fn install_aops(super_arc: &Arc<Ext2Super>, inode: &Arc<Inode>, ext2_inode: &Arc<Ext2Inode>) {
-    let aops = Ext2Aops::new(super_arc, ext2_inode);
-    let installed = inode.set_aops(aops);
-    assert!(installed, "set_aops must install on a fresh inode");
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -214,7 +204,9 @@ fn install_aops(super_arc: &Arc<Ext2Super>, inode: &Arc<Inode>, ext2_inode: &Arc
 fn shrink_truncate_drops_cached_pages_above_new_size() {
     let (sb, _fs, super_arc) = mount_rw();
     let (_ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
-    install_aops(&super_arc, &inode, &ext2_inode);
+
+    // iget now installs Ext2Aops for regular files automatically
+    // (issue #753 / #808), so no manual install_aops call is needed.
 
     // Pretend the file is 4 pages worth of data (16 KiB) so the
     // truncate has both kept and dropped pages to walk. We update
@@ -274,7 +266,6 @@ fn shrink_truncate_drops_cached_pages_above_new_size() {
 fn shrink_truncate_below_zero_drops_every_cached_page() {
     let (sb, _fs, super_arc) = mount_rw();
     let (_ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
-    install_aops(&super_arc, &inode, &ext2_inode);
 
     {
         let mut m = ext2_inode.meta.write();
@@ -380,7 +371,6 @@ fn shrink_truncate_with_writeback_in_flight_is_awaited() {
 
     let (sb, _fs, super_arc) = mount_rw();
     let (_ino, inode, ext2_inode) = fresh_regular(&sb, &super_arc);
-    install_aops(&super_arc, &inode, &ext2_inode);
 
     {
         let mut m = ext2_inode.meta.write();
