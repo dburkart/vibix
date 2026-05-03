@@ -123,14 +123,20 @@ pub extern "C" fn _start() -> ! {
             Ok(()) => serial_println!("block: lba0[0..16]={:02x?}", &sector[..16]),
             Err(e) => serial_println!("block: lba0 read failed: {:?}", e),
         }
-        // Exercise the write path end-to-end. Uses a sector in the tail
-        // of the test disk (LBA 2047 of a 1 MiB disk, well past anything
-        // the read probe above touches) so we don't trample the magic at
-        // LBA 0. The readback proves DMA both ways against a real device.
+        // Exercise the write path end-to-end. Uses a sector near the
+        // tail of a 64 MiB ext2 rootfs image (issue #823 switched the
+        // smoke disk from a 1 MiB scratch image to the deterministic
+        // ext2 image). LBA 131000 is ~63.9 MiB in — well past any
+        // metadata or allocated data blocks on the nearly-empty image,
+        // so the write cannot corrupt the ext2 filesystem that
+        // vfs::init mounts moments later. Reads past the device's
+        // capacity return an error, which the match arm below handles
+        // gracefully, so smaller disks (e.g. old 1 MiB scratch) simply
+        // log "write failed" instead of a readback-ok confirmation.
         let mut probe = [0u8; vibix::block::SECTOR_SIZE];
         probe[..8].copy_from_slice(b"WR-PROBE");
         probe[8..12].copy_from_slice(&0xdeadbeef_u32.to_le_bytes());
-        const PROBE_LBA: u64 = 2047;
+        const PROBE_LBA: u64 = 131000;
         match vibix::block::write(PROBE_LBA, &probe) {
             Ok(()) => {
                 let mut back = [0u8; vibix::block::SECTOR_SIZE];
@@ -247,16 +253,41 @@ pub extern "C" fn _start() -> ! {
 
     // Launch PID 1: load the init ELF into a user-space address space
     // and spawn a task that drops to ring-3.
-    match vibix::mem::userspace_module_elf_bytes() {
-        Some(bytes) => {
-            serial_println!("userspace: loader mapping image ({} bytes)", bytes.len());
-            vibix::init_process::launch(bytes);
+    //
+    // Preferred path (issue #823): open `/init` from the mounted ext2
+    // root filesystem and feed its bytes to the demand-paged ELF loader.
+    // The Vec is leaked to produce `&'static [u8]` because the
+    // `ElfBytesOps` / `PageCache` backing the file-backed VMAs must
+    // outlive the process (demand faults read from the slice). The leak
+    // is bounded by the binary's file size and conceptually reclaimed at
+    // process exit — same lifetime as the Limine module path.
+    //
+    // Fallback: if the VFS has no `/init` (e.g. tarfs root, ramfs, or
+    // ext2 not compiled in), fall back to the Limine boot module. This
+    // keeps the boot path functional even without a block-device rootfs.
+    let init_bytes: &'static [u8] = match vibix::shell::vfs_helpers::read_all(b"/init") {
+        Ok(v) if !v.is_empty() => {
+            let len = v.len();
+            let leaked = v.leak();
+            serial_println!(
+                "userspace: loaded /init from VFS ({} bytes, demand-paged)",
+                len
+            );
+            leaked
         }
-        None => {
-            serial_println!("kernel panic: Limine userspace init module missing");
-            panic!("Limine userspace init module missing");
+        Ok(_) => {
+            serial_println!("userspace: /init from VFS is empty, trying Limine module");
+            limine_init_fallback()
         }
-    }
+        Err(e) => {
+            serial_println!(
+                "userspace: /init VFS read failed (errno={}), trying Limine module",
+                e
+            );
+            limine_init_fallback()
+        }
+    };
+    vibix::init_process::launch(init_bytes);
 
     #[cfg(feature = "bench")]
     vibix::task::spawn(vibix::bench::run_all);
@@ -266,6 +297,24 @@ pub extern "C" fn _start() -> ! {
     // rotates us to any other ready task (shell, cursor_blink).
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+/// Fallback: load the init ELF from the Limine boot module. Panics if
+/// the module is absent.
+fn limine_init_fallback() -> &'static [u8] {
+    match vibix::mem::userspace_module_elf_bytes() {
+        Some(bytes) => {
+            serial_println!(
+                "userspace: loader mapping image ({} bytes, Limine module fallback)",
+                bytes.len()
+            );
+            bytes
+        }
+        None => {
+            serial_println!("kernel panic: /init not found in VFS and Limine module missing");
+            panic!("/init not found in VFS and Limine userspace init module missing");
+        }
     }
 }
 

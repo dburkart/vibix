@@ -24,7 +24,7 @@ pic8259 = "0.11"
 pc-keyboard = "0.8"
 
 [features]
-default = ["vfs_creds"]
+default = ["vfs_creds", "ext2", "page_cache"]
 # Enable to trigger a UD2 after init; verifies the invalid-opcode handler path.
 fault-test = []
 # Enable to fire a deliberate `panic!()` after init; useful for eyeballing
