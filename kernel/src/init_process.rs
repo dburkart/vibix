@@ -241,12 +241,19 @@ fn init_ring3_entry() -> ! {
     // stack so concurrent/parallel syscalls don't clobber each other.
     crate::task::arm_ring3_syscall_stack();
 
-    // Install the FS base for the static TLS block so MSR_FS_BASE is
-    // written on the first context switch into this task. If no PT_TLS
-    // was present, INIT_FS_BASE is 0 and we skip the write.
+    // Install the FS base for the static TLS block. We must both store
+    // the value in the task struct (so the context-switch restore path
+    // sees it) AND write MSR_FS_BASE directly (so the first preemption's
+    // save path reads the correct value instead of 0). Without the
+    // direct MSR write, the save path does `rdmsr(MSR_FS_BASE)` which
+    // returns 0 and overwrites the stored TCB address — breaking TLS on
+    // the first context switch out of this task. See issue #833.
     let fs_base = INIT_FS_BASE.load(Ordering::Acquire);
     if fs_base != 0 {
         crate::task::set_current_fs_base(fs_base);
+        unsafe {
+            x86_64::registers::model_specific::Msr::new(0xC000_0100).write(fs_base);
+        }
     }
 
     serial_println!(

@@ -1335,7 +1335,11 @@ pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible
     // Install the FS base for the static TLS block allocated by the loader.
     // exec replaces the entire address space, so any prior arch_prctl(ARCH_SET_FS)
     // value is stale; reset to the new TCB address or 0 if no PT_TLS.
-    crate::task::set_current_fs_base(image.tcb_addr.unwrap_or(0));
+    // We must write both the task struct field AND the hardware MSR so
+    // the first preemption's rdmsr save reads the correct value. (#833)
+    let exec_fs_base = image.tcb_addr.unwrap_or(0);
+    crate::task::set_current_fs_base(exec_fs_base);
+    unsafe { Msr::new(MSR_FS_BASE).write(exec_fs_base) };
 
     // If the binary has a dynamic interpreter (PT_INTERP), jump to the
     // interpreter's entry point; otherwise jump directly to the binary's entry.
