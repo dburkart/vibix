@@ -929,8 +929,7 @@ mod tests {
 
         // Copy .tdata content.
         let tdata_off_usize = tdata_off as usize;
-        buf[tdata_off_usize..tdata_off_usize + tdata_content.len()]
-            .copy_from_slice(&tdata_content);
+        buf[tdata_off_usize..tdata_off_usize + tdata_content.len()].copy_from_slice(&tdata_content);
 
         // Write TCB self-pointer.
         let tcb_offset_in_buf = (tcb_va - region_start) as usize;
@@ -938,10 +937,7 @@ mod tests {
         buf[tcb_offset_in_buf..tcb_offset_in_buf + 8].copy_from_slice(&ptr_bytes);
 
         // Verify .tdata was copied.
-        assert_eq!(
-            &buf[tdata_off_usize..tdata_off_usize + 48],
-            &[0xAA; 48]
-        );
+        assert_eq!(&buf[tdata_off_usize..tdata_off_usize + 48], &[0xAA; 48]);
 
         // Verify .tbss is zero.
         let tbss_start = tdata_off_usize + 48;

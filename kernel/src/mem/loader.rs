@@ -354,7 +354,13 @@ pub fn load_user_elf_with_vmas(
     // VMA so fork copies it, and the TCB address is recorded for `MSR_FS_BASE`.
     let tls = parsed.tls_info();
     let tcb_addr = if let Some(ref info) = tls {
-        Some(allocate_tls_block(bytes, info, &mut image_end, _pml4, address_space)?)
+        Some(allocate_tls_block(
+            bytes,
+            info,
+            &mut image_end,
+            _pml4,
+            address_space,
+        )?)
     } else {
         None
     };
@@ -486,8 +492,7 @@ fn allocate_tls_block(
     for i in 0..page_count {
         let va = VirtAddr::new(region_start + i * PAGE_SIZE);
         let page = Page::<Size4KiB>::containing_address(va);
-        let frame = paging::map_in_pml4(pml4, page, tls_flags)
-            .map_err(LoadError::MapFailed)?;
+        let frame = paging::map_in_pml4(pml4, page, tls_flags).map_err(LoadError::MapFailed)?;
 
         // Record the frame in the AnonObject so fork can find it.
         anon.insert_existing_frame(i as usize, frame.start_address().as_u64())
@@ -525,11 +530,7 @@ fn allocate_tls_block(
                 // SAFETY: frame was just allocated and mapped; HHDM gives
                 // writable access. `n` is bounded by PAGE_SIZE.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        elf_src.as_ptr(),
-                        dst.as_mut_ptr::<u8>(),
-                        n,
-                    );
+                    core::ptr::copy_nonoverlapping(elf_src.as_ptr(), dst.as_mut_ptr::<u8>(), n);
                 }
             }
         }
