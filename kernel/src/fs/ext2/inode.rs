@@ -603,12 +603,30 @@ impl FileOps for Ext2Inode {
         // walk; the access mode itself is install-once at open(2).
         let open_mode = f.flags.load(Ordering::Relaxed) & crate::fs::flags::O_ACCMODE;
 
+        // RFC 0007 §Security Considerations — snapshot execute permission
+        // at mmap time so `mprotect` can enforce the "PROT_EXEC upgrade
+        // requires execute permission on the backing inode" rule without
+        // re-checking the live inode (whose permissions may have changed
+        // between mmap and mprotect). The check uses
+        // `Inode.permission(EXECUTE)` against the current task's
+        // credentials per the RFC's errno table.
+        let exec_allowed = {
+            let cred = crate::task::current_credentials();
+            crate::fs::vfs::ops::default_permission(
+                &f.inode,
+                &cred,
+                crate::fs::vfs::Access::EXECUTE,
+            )
+            .is_ok()
+        };
+
         let fo = crate::mem::file_object::FileObject::new(
             cache,
             file_offset_pages,
             len_pages,
             share,
             open_mode,
+            exec_allowed,
         );
         Ok(fo as alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>)
     }

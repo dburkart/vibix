@@ -107,6 +107,13 @@ pub struct FileObject {
     /// owns the access decision once `mmap` returns.
     open_mode: u32,
 
+    /// Whether the backing inode had execute permission at `mmap` time.
+    /// Snapshotted once (just like `open_mode`) so `mprotect` can reject
+    /// `PROT_EXEC` upgrades without re-checking the live inode, which
+    /// may have had its permissions changed between `mmap` and
+    /// `mprotect`. RFC 0007 §Security Considerations, §Errno table.
+    exec_allowed: bool,
+
     /// Per-VMA private-frame cache for `MAP_PRIVATE` write faults.
     /// Empty for `Share::Shared`. After a CoW write fault, the new
     /// private frame is recorded here so a re-fault (e.g. after
@@ -131,6 +138,11 @@ impl FileObject {
     /// it looked up — both are snapshotted here, **never** re-read off
     /// the live `OpenFile` (RFC 0007 §FileObject `open_mode` snapshot).
     ///
+    /// `exec_allowed` is the result of `Inode::permission(EXECUTE)`
+    /// at `mmap` time, snapshotted so `mprotect` can enforce the
+    /// `PROT_EXEC` upgrade rule without re-checking the live inode
+    /// (RFC 0007 §Security Considerations).
+    ///
     /// `cache` is captured into the new object's `Arc<PageCache>` slot
     /// and never rebound (RFC 0007 §Inode-binding rule).
     pub fn new(
@@ -139,6 +151,7 @@ impl FileObject {
         len_pages: usize,
         share: Share,
         open_mode: u32,
+        exec_allowed: bool,
     ) -> Arc<Self> {
         // Validate the file-page window: `file_offset_pages + len_pages`
         // must not wrap. Lookups below combine the two via `pgoff_of`,
@@ -158,6 +171,7 @@ impl FileObject {
             len_pages,
             share,
             open_mode,
+            exec_allowed,
             private_frames: BlockingMutex::new(BTreeMap::new()),
         })
     }
@@ -187,6 +201,14 @@ impl FileObject {
     /// (RFC 0007 §FileObject `open_mode` snapshot, §Security B1).
     pub fn open_mode(&self) -> u32 {
         self.open_mode
+    }
+
+    /// Whether the backing inode had execute permission at `mmap` time.
+    /// Consulted by `mprotect` to enforce the "PROT_EXEC upgrade
+    /// requires execute permission on the backing inode" rule
+    /// (RFC 0007 §Security Considerations).
+    pub fn exec_allowed(&self) -> bool {
+        self.exec_allowed
     }
 
     /// Look up an already-recorded private frame for `pgoff`, if any.
@@ -273,6 +295,9 @@ impl FileObject {
             // the "PROT_WRITE upgrade needs O_RDWR" rule across a
             // fork. RFC 0007 §FileObject `open_mode` snapshot.
             open_mode: self.open_mode,
+            // Exec-permission snapshot carries across fork for the
+            // same reason as open_mode.
+            exec_allowed: self.exec_allowed,
             private_frames: BlockingMutex::new(BTreeMap::new()),
         })
     }
@@ -542,6 +567,16 @@ impl VmObject for FileObject {
         let _ = &self.cache;
     }
 
+    // ---- mprotect permission gates (RFC 0007 §Security B1) ---------------
+
+    fn mprotect_open_mode(&self) -> Option<u32> {
+        Some(self.open_mode)
+    }
+
+    fn mprotect_exec_allowed(&self) -> Option<bool> {
+        Some(self.exec_allowed)
+    }
+
     /// `madvise(MADV_DONTNEED)` fan-out for the [first, last) VMA-local
     /// range. Drops `private_frames` entries; the cache eviction is
     /// the daemon's responsibility (#740).
@@ -655,7 +690,7 @@ mod tests {
 
     fn fresh_object(share: Share) -> Arc<FileObject> {
         let cache = cache_with_pages(8);
-        FileObject::new(cache, 0, 8, share, 0o2 /* O_RDWR */)
+        FileObject::new(cache, 0, 8, share, 0o2 /* O_RDWR */, true)
     }
 
     #[test]
@@ -844,9 +879,16 @@ mod tests {
     #[test]
     fn open_mode_snapshot_round_trips() {
         let cache = cache_with_pages(2);
-        let ro = FileObject::new(cache.clone(), 0, 2, Share::Shared, 0 /* O_RDONLY */);
+        let ro = FileObject::new(
+            cache.clone(),
+            0,
+            2,
+            Share::Shared,
+            0, /* O_RDONLY */
+            false,
+        );
         assert_eq!(ro.open_mode(), 0);
-        let rw = FileObject::new(cache, 0, 2, Share::Shared, 0o2 /* O_RDWR */);
+        let rw = FileObject::new(cache, 0, 2, Share::Shared, 0o2 /* O_RDWR */, true);
         assert_eq!(rw.open_mode(), 0o2);
     }
 
@@ -855,7 +897,7 @@ mod tests {
         // VMA covers file pages [4..8). A fault at VMA-local offset
         // 0 must hit the cache at pgoff 4, not 0.
         let cache = cache_with_pages(8);
-        let obj = FileObject::new(cache.clone(), 4, 4, Share::Shared, 0o2);
+        let obj = FileObject::new(cache.clone(), 4, 4, Share::Shared, 0o2, true);
         let phys = obj.fault(0, Access::Read).unwrap();
         // Cache now indexes pgoff 4.
         let page = cache.lookup(4).expect("pgoff 4 must be resident");
@@ -887,7 +929,7 @@ mod tests {
             8 * FRAME_SIZE,
             Arc::new(FailingOps),
         ));
-        let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2);
+        let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2, true);
         let err = obj.fault(0, Access::Read).unwrap_err();
         assert_eq!(err, VmFault::ReadFailed(crate::fs::EIO));
         // Stub removed: a subsequent fault re-enters install_or_get
@@ -991,7 +1033,7 @@ mod tests {
         ));
         probe.install_cache(cache.clone());
 
-        let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2);
+        let obj = FileObject::new(cache.clone(), 0, 8, Share::Shared, 0o2, true);
         // Drive a fault — winner path runs `readpage`.
         let phys = obj
             .fault(0, Access::Read)
@@ -1046,5 +1088,60 @@ mod tests {
             Arc::strong_count(p)
         };
         assert_eq!(strong_borrow, 1);
+    }
+
+    // --- RFC 0007 §Security B1 — mprotect permission gates -----
+
+    #[test]
+    fn mprotect_open_mode_returns_snapshot() {
+        let cache = cache_with_pages(2);
+        let ro: Arc<dyn VmObject> = FileObject::new(
+            cache.clone(),
+            0,
+            2,
+            Share::Shared,
+            0, /* O_RDONLY */
+            true,
+        );
+        assert_eq!(ro.mprotect_open_mode(), Some(0));
+        let rw: Arc<dyn VmObject> =
+            FileObject::new(cache, 0, 2, Share::Shared, 0o2 /* O_RDWR */, true);
+        assert_eq!(rw.mprotect_open_mode(), Some(0o2));
+    }
+
+    #[test]
+    fn mprotect_exec_allowed_returns_snapshot() {
+        let cache = cache_with_pages(2);
+        let exec: Arc<dyn VmObject> =
+            FileObject::new(cache.clone(), 0, 2, Share::Shared, 0o2, true);
+        assert_eq!(exec.mprotect_exec_allowed(), Some(true));
+        let noexec: Arc<dyn VmObject> = FileObject::new(cache, 0, 2, Share::Shared, 0o2, false);
+        assert_eq!(noexec.mprotect_exec_allowed(), Some(false));
+    }
+
+    #[test]
+    fn anon_object_returns_none_for_mprotect_gates() {
+        use crate::mem::vmobject::AnonObject;
+        let anon: Arc<dyn VmObject> = AnonObject::new(Some(4));
+        assert_eq!(anon.mprotect_open_mode(), None);
+        assert_eq!(anon.mprotect_exec_allowed(), None);
+    }
+
+    #[test]
+    fn clone_private_preserves_exec_allowed() {
+        let cache = cache_with_pages(2);
+        let parent = FileObject::new(cache, 0, 2, Share::Shared, 0o2, false);
+        let child = parent.clone_private_concrete();
+        assert_eq!(child.exec_allowed(), false);
+        assert_eq!(child.mprotect_exec_allowed(), Some(false));
+    }
+
+    #[test]
+    fn exec_allowed_snapshot_round_trips() {
+        let cache = cache_with_pages(2);
+        let yes = FileObject::new(cache.clone(), 0, 2, Share::Shared, 0, true);
+        assert!(yes.exec_allowed());
+        let no = FileObject::new(cache, 0, 2, Share::Shared, 0, false);
+        assert!(!no.exec_allowed());
     }
 }

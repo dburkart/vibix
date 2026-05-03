@@ -450,7 +450,8 @@ fn register_demand_vmas(
                 file_offset_pages,
                 file_pages,
                 Share::Private,
-                0o2, // O_RDWR snapshot — the loader has full access
+                0o2,  // O_RDWR snapshot — the loader has full access
+                true, // exec_allowed — loader is mapping an executable
             );
             let file_start = effective_vaddr as usize;
             let file_end = file_start + file_pages * PAGE_SIZE as usize;

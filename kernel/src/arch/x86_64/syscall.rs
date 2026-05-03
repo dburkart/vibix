@@ -1600,9 +1600,16 @@ unsafe fn sys_munmap(addr: u64, len: u64) -> i64 {
 /// `mprotect(addr, len, prot)` — Linux `mprotect_fixup` semantics.
 /// `-EINVAL` on validation failure or unknown PROT bits; `-ENOMEM` only
 /// when a sub-page of `[addr, addr+len)` is literally unmapped.
+///
+/// RFC 0007 §Security B1: for file-backed VMAs, `PROT_WRITE` upgrades
+/// on `MAP_SHARED` mappings require `open_mode == O_RDWR`, and
+/// `PROT_EXEC` upgrades require the backing inode to have had execute
+/// permission at `mmap` time. Both checks consult the snapshot stored
+/// on the `FileObject` — never the live `OpenFile` or inode.
 unsafe fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
-    use crate::fs::{EINVAL, ENOMEM};
+    use crate::fs::{EACCES, EINVAL, ENOMEM};
     use crate::mem::pf::{validate_user_range, AddrAlign, PROT_EXEC, PROT_READ, PROT_WRITE};
+    use crate::mem::vmatree::Share;
 
     let prot = prot as u32;
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
@@ -1621,8 +1628,48 @@ unsafe fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         return ENOMEM;
     }
 
+    // RFC 0007 §Security B1 — file-backed mprotect permission gates.
+    //
+    // Walk every VMA that overlaps `[start, start+len)` and reject the
+    // request if a file-backed VMA's snapshot forbids the upgrade:
+    //
+    //   PROT_WRITE on a MAP_SHARED VMA whose open_mode != O_RDWR → EACCES
+    //   PROT_EXEC  on a VMA whose backing inode lacked execute perm  → EACCES
+    //
+    // `O_RDWR = 2` — pinned by the static asserts in `crate::fs::flags`.
+    const O_RDWR: u32 = 2;
+    let want_write = prot & PROT_WRITE != 0;
+    let want_exec = prot & PROT_EXEC != 0;
+    let start = range.addr;
+    let end = range.addr + range.len;
+    if want_write || want_exec {
+        for vma in guard.iter() {
+            if vma.end <= start {
+                continue;
+            }
+            if vma.start >= end {
+                break;
+            }
+            // PROT_WRITE upgrade on a MAP_SHARED file-backed VMA.
+            if want_write && vma.share == Share::Shared {
+                if let Some(mode) = vma.object.mprotect_open_mode() {
+                    if mode != O_RDWR {
+                        return EACCES;
+                    }
+                }
+            }
+            // PROT_EXEC upgrade on a file-backed VMA whose inode lacked
+            // execute permission at mmap time.
+            if want_exec {
+                if let Some(false) = vma.object.mprotect_exec_allowed() {
+                    return EACCES;
+                }
+            }
+        }
+    }
+
     let pte_bits = prot_pte_from_prot_user(prot);
-    guard.sys_mprotect_range(range.addr, range.addr + range.len, prot, pte_bits);
+    guard.sys_mprotect_range(start, end, prot, pte_bits);
     0
 }
 
