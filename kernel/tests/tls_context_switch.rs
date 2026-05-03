@@ -46,10 +46,7 @@ fn run_tests() {
             "tls_fs_base_preserved_across_preemption",
             &(tls_fs_base_preserved_across_preemption as fn()),
         ),
-        (
-            "fork_tls_isolation",
-            &(fork_tls_isolation as fn()),
-        ),
+        ("fork_tls_isolation", &(fork_tls_isolation as fn())),
         (
             "arch_prctl_set_get_roundtrip",
             &(arch_prctl_set_get_roundtrip as fn()),
@@ -179,8 +176,14 @@ fn tls_fs_base_preserved_across_preemption() {
     serial_println!("tls preemption: a_iters={a} b_iters={b} a_fail={af} b_fail={bf}");
     assert!(a > 0, "tls_worker_a never ran (a={a})");
     assert!(b > 0, "tls_worker_b never ran (b={b})");
-    assert!(!af, "tls_worker_a saw FS base corruption (TLS not preserved)");
-    assert!(!bf, "tls_worker_b saw FS base corruption (TLS not preserved)");
+    assert!(
+        !af,
+        "tls_worker_a saw FS base corruption (TLS not preserved)"
+    );
+    assert!(
+        !bf,
+        "tls_worker_b saw FS base corruption (TLS not preserved)"
+    );
 }
 
 // ==========================================================================
@@ -203,9 +206,7 @@ fn fork_tls_isolation() {
     const TLS_PAGES: usize = 1;
 
     let mut parent = AddressSpace::new_empty();
-    let tls_flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::NO_EXECUTE;
+    let tls_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     parent.insert(Vma::new(
         TLS_VA,
         TLS_VA + TLS_PAGES * 4096,
@@ -226,7 +227,9 @@ fn fork_tls_isolation() {
     flusher.finish();
 
     // The child must have a TLS VMA at the same address range.
-    let child_vma = child.find(TLS_VA).expect("child TLS VMA missing after fork");
+    let child_vma = child
+        .find(TLS_VA)
+        .expect("child TLS VMA missing after fork");
     assert_eq!(child_vma.start, TLS_VA, "child TLS VMA start mismatch");
     assert_eq!(
         child_vma.end,
@@ -325,8 +328,7 @@ fn tcb_self_pointer_via_fs_deref() {
     use vibix::mem::paging::hhdm_offset;
 
     // Allocate a fresh physical frame.
-    let frame_phys = vibix::mem::frame::alloc()
-        .expect("frame alloc failed for TCB test page");
+    let frame_phys = vibix::mem::frame::alloc().expect("frame alloc failed for TCB test page");
 
     // Compute the HHDM virtual address for this frame.
     let hhdm = hhdm_offset();
