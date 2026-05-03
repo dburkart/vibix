@@ -475,6 +475,18 @@ fn allocate_tls_block(
     use super::vmatree::{Share, Vma};
     use super::vmobject::{AnonObject, VmObject};
 
+    // Validate that the .tdata template bytes are within the ELF file.
+    // The ELF parser validates PT_LOAD file ranges, but PT_TLS goes through
+    // a separate path and must be checked here to avoid panicking on a
+    // malformed binary.
+    let tdata_file_end = info
+        .file_offset
+        .checked_add(info.tdata_size)
+        .ok_or(LoadError::NotElf64)?;
+    if tdata_file_end > elf_bytes.len() as u64 {
+        return Err(LoadError::NotElf64);
+    }
+
     let region_start = *image_end;
     let (tdata_off, tcb_va, page_count) = elf::compute_tls_layout(region_start, info);
     let tdata_start = region_start + tdata_off;

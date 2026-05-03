@@ -241,12 +241,18 @@ fn init_ring3_entry() -> ! {
     // stack so concurrent/parallel syscalls don't clobber each other.
     crate::task::arm_ring3_syscall_stack();
 
-    // Install the FS base for the static TLS block so MSR_FS_BASE is
-    // written on the first context switch into this task. If no PT_TLS
-    // was present, INIT_FS_BASE is 0 and we skip the write.
+    // Install the FS base for the static TLS block. Both the task's saved
+    // fs_base and the hardware MSR_FS_BASE must be written here because
+    // jump_to_ring3 enters user mode directly without a context switch
+    // (the switch-in restore path won't run until a preemption or yield).
     let fs_base = INIT_FS_BASE.load(Ordering::Acquire);
     if fs_base != 0 {
         crate::task::set_current_fs_base(fs_base);
+        // Write the hardware MSR immediately so %fs-relative accesses
+        // resolve correctly from the first userspace instruction.
+        unsafe {
+            x86_64::registers::model_specific::Msr::new(0xC000_0100).write(fs_base);
+        }
     }
 
     serial_println!(

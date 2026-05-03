@@ -39,7 +39,7 @@ const VERSION: u8 = 1;
 /// Integration-test binaries pull in more code paths than the main
 /// kernel and produce notably larger line tables — the main kernel
 /// lands around ~990 KiB today while the largest test ELF needs
-/// ~1.15 MiB. 2.5 MiB gives both headroom. If it overflows, xtask
+/// ~1.15 MiB. 3 MiB gives both headroom. If it overflows, xtask
 /// aborts with a clear "bump LNTAB_BYTES" error.
 pub const LNTAB_BYTES: usize = 3 * 1024 * 1024;
 
