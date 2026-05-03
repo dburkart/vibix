@@ -129,6 +129,34 @@ pub fn setattr(ext2_inode: &Ext2Inode, inode: &Inode, attr: &SetAttr) -> Result<
         }
 
         if new_size < cur_size {
+            // Drive the per-inode page-cache truncate **before** any
+            // on-disk block is freed (RFC 0007 §Truncate, unmap,
+            // MADV_DONTNEED): drop every cached page strictly above
+            // `new_size` and park on `PG_WRITEBACK` for any in-flight
+            // `writepage` over the truncated tail. Skipping this would
+            // leave the writeback daemon free to commit stale bytes
+            // into blocks the FS is concurrently returning to the
+            // allocator. The hook is feature-gated because the
+            // `aops` slot on `Inode` is only present when the
+            // `page_cache` feature is on (RFC 0007 migration window);
+            // off-feature builds fall straight through to the
+            // existing block-free path.
+            //
+            // Best-effort: an inode with no installed `aops` (no FS
+            // wired into the page cache yet, or a unit-test-built
+            // `Ext2Inode` without `iget` publication) simply skips
+            // the cache half. The on-disk free below still runs and
+            // is the security-relevant guarantee — the page-cache
+            // park is the *additional* invariant that protects the
+            // writeback daemon from a TOCTOU on the freed blocks.
+            #[cfg(feature = "page_cache")]
+            {
+                let aops = inode.aops.lock().as_ref().map(Arc::clone);
+                if let Some(aops) = aops {
+                    aops.truncate_below(new_size);
+                }
+            }
+
             // Shrinking: free everything above `new_size`.
             let (freed_data_blocks, updated_i_block) =
                 truncate_free(&super_ref, &cur_i_block, new_size)?;
