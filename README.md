@@ -169,7 +169,7 @@ Exit QEMU with `Ctrl-a x`.
 
 ## Testing
 
-Three layers, all driven by xtask:
+Five layers, all driven by xtask:
 
 1. **Host unit tests** (`cargo xtask test`, first phase) — `cargo test
    --lib` over pure-logic modules (e.g. `mem::frame`, `input::RingBuffer`).
@@ -177,78 +177,34 @@ Three layers, all driven by xtask:
    compile against host `std` under `cargo test`.
 2. **In-kernel integration tests** (`cargo xtask test`, second phase) —
    each file under `kernel/tests/` is its own `no_std` + `no_main`
-   kernel binary. `cargo test --target x86_64-unknown-none` builds each,
-   and a custom runner (`xtask test-runner`) wraps each compiled ELF in
-   an ISO and boots it under QEMU. Pass/fail comes from the
-   `isa-debug-exit` protocol (Success = 0x20 → process 65, Failure =
-   0x10 → process 33). `should_panic` inverts its panic handler to
-   verify the panic path itself.
-
-   Current integration tests: `basic_boot`, `heap_alloc`, `heap_grow`,
-   `should_panic`, `timer_tick`, `paging`, `pml4_switch`, `page_fault`,
-   `tasks`, `preempt`, `blocking_sync`, `apic_online`, `backtrace`.
-3. **End-to-end smoke** (`cargo xtask smoke`) — boots the normal kernel,
-   captures serial output, and asserts on a fixed list of markers:
-   `vibix booting`, `memory map:`, `hhdm offset:`, `GDT + IDT loaded`,
-   `heap: 1024 KiB`, `paging: mapper online`, `paging: IST guard installed`,
-   `paging: switched to kernel PML4`, `PIC remapped`, `acpi: MADT parsed`,
-   `apic: BSP online`, `ioapic: initialized`, `timer: 100 Hz`,
-   `vibix online.`, `interrupts enabled`, `tasks: scheduler online`.
-   Cheap regression lane: rename a log line and this goes red.
-
-## Layout
-
-```
-kernel/              # the kernel crate (lib + thin bin)
-  linker.ld          # higher-half layout, Limine request sections
-  limine.conf        # boot-loader config
-  src/
-    lib.rs           # module tree; #![cfg_attr(not(test), no_std)]
-    main.rs          # _start, init sequence, panic handler (backtrace + klog dump)
-    boot.rs          # Limine request statics (framebuffer, HHDM, memmap, RSDP)
-    serial.rs        # COM1 writer + serial_print!/serial_println!
-    framebuffer.rs   # font8x8 console + print!/println!
-    test_harness.rs  # QemuExitCode, Testable, test panic handler
-    test_hook.rs     # one-shot #PF expectation hooks for fault-injection tests
-    klog.rs          # 64 KiB leveled ring-buffer log (Error/Warn/Info/Debug/Trace)
-    ksymtab.rs       # embedded kernel symbol table (addr→name, patched post-link)
-    acpi.rs          # RSDP→XSDT/RSDT→MADT parser; extracts LAPIC/IOAPIC topology
-    time.rs          # PIT channel 0 at 100 Hz; uptime_ms() monotonic clock
-    input.rs         # RingBuffer<T,N> + PS/2 keyboard ISR + pc_keyboard decoding
-    mem/
-      frame.rs       # BitmapFrameAllocator (host-unit-tested; supports deallocation)
-      heap.rs        # heap init + #[global_allocator]; auto-grows via paging
-      paging.rs      # kernel PML4 builder; map_range; WC framebuffer via PAT
-      pat.rs         # Page Attribute Table reprogramming (WC slot)
-    arch/x86_64/
-      gdt.rs         # GDT + TSS with IST for #DF
-      idt.rs         # IDT installation; exception handlers
-      interrupts.rs  # PIT timer + keyboard ISR vectors
-      pic.rs         # 8259 PIC remap + mask (disabled once APIC takes over)
-      apic.rs        # LAPIC + IOAPIC init; IRQ routing; BSP bringup
-      ist_guard.rs   # unmapped guard page below #DF IST stack
-      backtrace.rs   # RBP-chain unwinder; resolves frames via ksymtab
-    task/
-      mod.rs         # scheduler entry points; preemption tick hook
-      task.rs        # per-task kernel stack + saved register context
-      scheduler.rs   # round-robin ready queue
-      switch.rs      # hand-written context-switch assembly
-  tests/             # one no_std kernel binary per file (13 total)
-    basic_boot.rs
-    heap_alloc.rs
-    heap_grow.rs
-    should_panic.rs
-    timer_tick.rs
-    paging.rs
-    pml4_switch.rs
-    page_fault.rs
-    tasks.rs
-    preempt.rs
-    blocking_sync.rs
-    apic_online.rs
-    backtrace.rs
-xtask/               # build/iso/run/test/smoke/lint orchestrator
-```
+   kernel binary (116 at last count). `cargo test --target
+   x86_64-unknown-none` builds each, and a custom runner (`xtask
+   test-runner`) wraps each compiled ELF in an ISO and boots it under
+   QEMU. Pass/fail comes from the `isa-debug-exit` protocol (Success =
+   0x20 → process 65, Failure = 0x10 → process 33). `should_panic`
+   inverts its panic handler to verify the panic path itself. Tests
+   cover memory management, scheduling, VFS, ext2, syscalls, signals,
+   userspace loading, fork/exec, TLS, TTY job control, and more.
+   Integration tests support sharding (`--shard=I/N`) for parallel CI.
+3. **POSIX conformance** (`cargo xtask pjdfstest`) — runs the
+   [pjdfstest](https://github.com/pjd/pjdfstest) suite inside the
+   kernel to validate filesystem syscall semantics (chmod, chown, link,
+   mkdir, open, rename, rmdir, symlink, truncate, unlink, utimensat).
+4. **Deterministic simulation** (`cargo test -p simulator`) — a
+   host-side simulator (RFC 0006) replays the kernel's scheduler and
+   concurrency paths under deterministic seeds, turning flaky
+   concurrency bugs into reproducible failures. The fast suite (bounded
+   seed corpus, 10k ticks each) gates every PR; a nightly sweep (10k
+   randomized seeds × 100k ticks) explores deeper. Failing seeds are
+   captured as regression fixtures in `tests/seeds/regression.txt`.
+5. **End-to-end smoke** (`cargo xtask smoke`) — boots the full kernel
+   with an ext2 root filesystem on virtio-blk, captures serial output,
+   and asserts on a fixed list of markers covering the entire boot
+   sequence: early boot, memory/paging init, ACPI/APIC/HPET/timer
+   bringup, block device probe, VFS mounts (`/`, `/dev`, `/tmp`),
+   scheduler online, userspace ELF loading, ring-3 entry, and a
+   fork+exec+wait round-trip from the init process. Cheap regression
+   lane: rename a log line and this goes red.
 
 ## License
 
