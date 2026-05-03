@@ -599,6 +599,77 @@ pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
     build_userspace_binary("pjdfstest_runner", "userspace/pjdfstest_runner/link.ld")
 }
 
+/// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
+///
+/// Produces an ET_DYN ELF64 with a single page-aligned PT_LOAD segment.
+/// This is the smallest valid interpreter the demand-paged ELF loader will
+/// accept: the kernel resolves PT_INTERP, finds this module, parses it as
+/// ET_DYN, and loads its segment at `INTERP_LOAD_BASE`. The test then
+/// inspects the `LoadedImage` fields without ever executing the stub.
+///
+/// The fixture is generated at ISO-build time rather than committed as a
+/// binary blob so it stays in sync with any future parser tightening.
+fn generate_stub_interp() -> R<PathBuf> {
+    let out = workspace_root().join("target").join("stub_interp.elf");
+    fs::create_dir_all(out.parent().unwrap())?;
+
+    const EHDR: usize = 64;
+    const PHDR: usize = 56;
+    // File layout: one 4 KiB page containing EHDR + PHDR + padding.
+    // PT_LOAD maps file offset 0 → vaddr 0, filesz = memsz = 0x1000.
+    // e_entry = 0x80 (just past EHDR+PHDR; holds a `jmp .` stub).
+    let file_size: usize = 0x1000; // 4 KiB
+    let mut buf = vec![0u8; file_size];
+
+    // ---- ELF header ----
+    buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    buf[4] = 2; // ELFCLASS64
+    buf[5] = 1; // ELFDATA2LSB
+    buf[6] = 1; // EV_CURRENT
+                // e_type = ET_DYN
+    buf[16..18].copy_from_slice(&3u16.to_le_bytes());
+    // e_machine = EM_X86_64
+    buf[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+    // e_version
+    buf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    // e_entry = 0x80 (just past EHDR+PHDR; relative for ET_DYN)
+    buf[24..32].copy_from_slice(&0x80u64.to_le_bytes());
+    // e_phoff = EHDR
+    buf[32..40].copy_from_slice(&(EHDR as u64).to_le_bytes());
+    // e_ehsize
+    buf[52..54].copy_from_slice(&(EHDR as u16).to_le_bytes());
+    // e_phentsize
+    buf[54..56].copy_from_slice(&(PHDR as u16).to_le_bytes());
+    // e_phnum = 1
+    buf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+    // ---- Program header: PT_LOAD RX ----
+    let p = EHDR;
+    // p_type = PT_LOAD
+    buf[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
+    // p_flags = PF_R | PF_X
+    buf[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+    // p_offset = 0 (page-aligned)
+    buf[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
+    // p_vaddr = 0 (ET_DYN: relative, OS adds base)
+    buf[p + 16..p + 24].copy_from_slice(&0u64.to_le_bytes());
+    // p_paddr = 0
+    buf[p + 24..p + 32].copy_from_slice(&0u64.to_le_bytes());
+    // p_filesz = 0x1000
+    buf[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+    // p_memsz = 0x1000
+    buf[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    // p_align = 0x1000
+    buf[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    // Place a `jmp .` (0xEB 0xFE) at offset 0x80 = the entry point.
+    buf[0x80] = 0xEB;
+    buf[0x81] = 0xFE;
+
+    fs::write(&out, &buf)?;
+    Ok(out)
+}
+
 fn kernel_binary(opts: &BuildOpts) -> PathBuf {
     let profile = if opts.release { "release" } else { "debug" };
     workspace_root()
@@ -1292,6 +1363,9 @@ fn make_iso_inner(
         workspace_root().join("userspace/lib/ld-musl-x86_64.so.1"),
         iso_root.join("boot/ld-musl-x86_64.so.1"),
     )?;
+    // #764: stub dynamic-linker fixture for the dynlinker_stub integration test.
+    let stub_interp = generate_stub_interp()?;
+    fs::copy(&stub_interp, iso_root.join("boot/stub_interp.elf"))?;
     {
         let src = workspace_root().join("kernel/limine.conf");
         let dst = iso_root.join("boot/limine/limine.conf");

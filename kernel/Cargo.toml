@@ -569,3 +569,7 @@ required-features = ["page_cache"]
 name = "writeback_integration"
 harness = false
 required-features = ["page_cache"]
+
+[[test]]
+name = "dynlinker_stub"
+harness = false
