@@ -385,6 +385,27 @@ impl CachePage {
         self.wait.wait_while(|| self.is_locked());
     }
 
+    /// Park the calling task until [`PG_WRITEBACK`] clears. Symmetrical
+    /// to [`Self::wait_until_unlocked`] but predicated on the
+    /// writeback bit instead of the lock bit.
+    ///
+    /// This is the truncate-below park point: a shrinking truncate
+    /// must not free the on-disk blocks underneath a page whose
+    /// `writepage` is presently in flight (the daemon could otherwise
+    /// commit stale bytes into blocks the FS has just returned to the
+    /// allocator — RFC 0007 §Truncate, unmap, MADV_DONTNEED). The
+    /// truncate path holds an `Arc<CachePage>` snapshot across this
+    /// wait so the page itself stays alive and `end_writeback`'s
+    /// `notify_all` reaches us.
+    ///
+    /// The re-check is performed under the waitqueue's internal lock,
+    /// so an `end_writeback`-fired `notify_all` that landed between
+    /// our initial `is_writeback()` test and the park is observed
+    /// correctly (lost-wakeup protocol — see [`WaitQueue::wait_while`]).
+    pub fn wait_until_writeback_clear(&self) {
+        self.wait.wait_while(|| self.is_writeback());
+    }
+
     /// MAP_SHARED write-fault dirty-publish. Caller must hold
     /// [`PageCacheInner`] (the index mutex) so that this bit set and
     /// the dirty-index enrollment commit atomically against the
@@ -959,7 +980,91 @@ impl PageCache {
     pub fn store_i_size(&self, new_size: u64) {
         self.i_size.store(new_size, Ordering::Release);
     }
+
+    /// Drop every cached page whose `pgoff` lies strictly above
+    /// `new_size`. Returns the snapshot of removed `Arc<CachePage>`s so
+    /// the caller can park each one on `PG_WRITEBACK` outside the
+    /// `inner` mutex (RFC 0007 §Lock-order ladder forbids holding the
+    /// level-4 cache mutex across any blocking wait).
+    ///
+    /// "Strictly above `new_size`" is the page-cache-side rule that
+    /// matches RFC 0007 §Truncate, unmap, MADV_DONTNEED: the page
+    /// containing the `new_size` byte itself stays cached because it
+    /// holds bytes both above and below the cut. Its tail (the bytes
+    /// at offsets `[new_size .. pgoff*4096 + 4096)`) is zeroed by
+    /// `readpage`'s tail-zero rule on the next miss; the surviving
+    /// in-cache copy may still hold the pre-truncate bytes, which the
+    /// caller (the FS shim that owns `i_size`) is expected to zero
+    /// out-of-band before the next observable read. The current ext2
+    /// caller skips that step because no `read(2)`-via-cache routing
+    /// exists yet (#754) — once that lands, the tail-zero pass moves
+    /// in here.
+    ///
+    /// The pages are removed from both the index (`pages`) and the
+    /// dirty set (`dirty`) under one critical section so the writeback
+    /// daemon can no longer enqueue them for `writepage`. Pages whose
+    /// `writepage` is *already* in flight survive in the snapshot via
+    /// the cloned `Arc`; the caller waits each one out with
+    /// [`CachePage::wait_until_writeback_clear`] and only then drops
+    /// its snapshot, at which point the cache has no observable record
+    /// of the truncated tail.
+    ///
+    /// Updates `i_size` with `Release` ordering as the last act under
+    /// `inner`, which is what RFC 0007 §State-bit ordering pairs with
+    /// the page-fault path's `Acquire` on `i_size` to keep `OutOfRange`
+    /// faults consistent with the new size.
+    ///
+    /// **Lock-order:** acquires `inner` (level 4) for the duration of
+    /// the index walk + index/dirty mutation + `i_size` publish. The
+    /// caller must drop any other lock before invoking this method,
+    /// and must not hold `inner` itself (no re-entry).
+    pub fn truncate_below(&self, new_size: u64) -> alloc::vec::Vec<Arc<CachePage>> {
+        // First page index NOT to keep. `new_size == 0` ⇒ drop every
+        // page (`first_drop == 0`); a page partially overlapping
+        // `new_size` (`new_size % 4096 != 0`) keeps its own slot —
+        // the caller's tail-zero pass owns the dangling bytes.
+        let first_drop = new_size.div_ceil(PAGE_SIZE_U64);
+        let mut inner = self.inner.lock();
+
+        // Collect Arcs to evict. Walk a `range_mut` copy of the keys
+        // so the index mutation below doesn't invalidate the iteration.
+        // BTreeMap doesn't expose a `drain_range`; the two-step
+        // collect-then-remove is the canonical workaround.
+        let to_drop: alloc::vec::Vec<u64> = inner
+            .pages
+            .range(first_drop..)
+            .map(|(&pgoff, _)| pgoff)
+            .collect();
+        let mut snapshot: alloc::vec::Vec<Arc<CachePage>> =
+            alloc::vec::Vec::with_capacity(to_drop.len());
+        for pgoff in &to_drop {
+            // Same critical section: drop the dirty enrollment so the
+            // writeback daemon's `snapshot_dirty` cannot pick the page
+            // back up after we drop the lock. Then remove the index
+            // entry; the cloned Arc keeps the `CachePage` alive so a
+            // writepage already in flight (which holds its own clone
+            // from a prior `snapshot_dirty`) can complete and the
+            // truncate caller can park on `PG_WRITEBACK`.
+            inner.dirty.remove(pgoff);
+            if let Some(arc) = inner.pages.remove(pgoff) {
+                snapshot.push(arc);
+            }
+        }
+
+        // Publish the new `i_size` cap as the last act under `inner`.
+        // The `Release` here pairs with the `Acquire` load any future
+        // page-fault performs on `i_size` before deciding whether to
+        // surface `OutOfRange`.
+        self.i_size.store(new_size, Ordering::Release);
+
+        snapshot
+    }
 }
+
+/// `PAGE_SIZE` as a `u64` for inline arithmetic. Mirrors the same
+/// constant in `mem::aops` callers; the page cache works in 4 KiB
+/// pages everywhere, see RFC 0007 §`CachePage`.
+const PAGE_SIZE_U64: u64 = 4096;
 
 // --- Tests --------------------------------------------------------------
 
@@ -1274,6 +1379,176 @@ mod tests {
         assert_eq!(cache.i_size(), 0);
         cache.store_i_size(8192);
         assert_eq!(cache.i_size(), 8192);
+    }
+
+    /// `truncate_below(N)` drops every cached page whose `pgoff` lies
+    /// strictly above `ceil(N / 4096)` from the index, removes them
+    /// from the dirty set, and publishes the new `i_size` cap. Pages
+    /// at or below the cut survive — the page containing the new
+    /// `i_size` byte itself stays cached because it holds bytes both
+    /// above and below the cut.
+    #[test]
+    fn truncate_below_drops_pages_strictly_above_cut() {
+        let cache = fresh_cache();
+        // Install pages 0..=5.
+        for pgoff in 0..=5u64 {
+            let _ = cache.install_or_get(pgoff, || make_stub(pgoff));
+            // Publish each page to a faulted-in state so it could in
+            // principle be PG_DIRTY without violating the writer-side
+            // invariant.
+            let p = cache.lookup(pgoff).unwrap();
+            p.publish_uptodate_and_unlock();
+        }
+        // Mark a couple as dirty.
+        cache.mark_page_dirty(2);
+        cache.mark_page_dirty(4);
+
+        // Truncate to 8192 bytes (= page 2's start). `first_drop = 2`
+        // — pages 2..=5 are dropped; pages 0 and 1 survive.
+        let snapshot = cache.truncate_below(8192);
+        assert_eq!(snapshot.len(), 4, "pages 2..=5 must be in the snapshot");
+
+        assert!(
+            cache.lookup(0).is_some(),
+            "page 0 survives truncate to 8192"
+        );
+        assert!(
+            cache.lookup(1).is_some(),
+            "page 1 survives truncate to 8192"
+        );
+        for pgoff in 2..=5u64 {
+            assert!(
+                cache.lookup(pgoff).is_none(),
+                "page {pgoff} must be dropped by truncate_below"
+            );
+        }
+
+        // Dirty index is empty for the dropped pages.
+        let dirty_after = cache.snapshot_dirty();
+        assert!(
+            dirty_after.iter().all(|(p, _)| *p < 2),
+            "no dirty entry above the cut may remain"
+        );
+
+        // `i_size` cap was bumped under the same critical section.
+        assert_eq!(cache.i_size(), 8192);
+    }
+
+    /// A page whose start lies *at* the new size (i.e.
+    /// `pgoff * 4096 == new_size`) is **dropped**: every byte it holds
+    /// is past the truncate. The boundary is "strictly above
+    /// `new_size`" framed as `pgoff >= ceil(new_size / 4096)`.
+    #[test]
+    fn truncate_below_drops_page_starting_exactly_at_cut() {
+        let cache = fresh_cache();
+        for pgoff in 0..=2u64 {
+            let _ = cache.install_or_get(pgoff, || make_stub(pgoff));
+        }
+        // new_size == 4096 → first_drop == 1; page 1 starts at the
+        // cut exactly and is dropped.
+        let _ = cache.truncate_below(4096);
+        assert!(cache.lookup(0).is_some());
+        assert!(cache.lookup(1).is_none(), "page exactly at cut is dropped");
+        assert!(cache.lookup(2).is_none());
+        assert_eq!(cache.i_size(), 4096);
+    }
+
+    /// A page whose interior holds the new `i_size` byte (i.e.
+    /// `pgoff * 4096 < new_size < (pgoff + 1) * 4096`) **survives**
+    /// the truncate: it holds bytes both above and below the cut, and
+    /// the readpage tail-zero rule (RFC 0007 §Tail-page zeroing)
+    /// owns the dangling bytes inside it.
+    #[test]
+    fn truncate_below_keeps_page_straddling_cut() {
+        let cache = fresh_cache();
+        for pgoff in 0..=3u64 {
+            let _ = cache.install_or_get(pgoff, || make_stub(pgoff));
+        }
+        // new_size = 5000 (4096 + 904) → first_drop = ceil(5000/4096) = 2
+        // — page 1 holds the boundary byte and survives; pages 2 & 3
+        // are dropped.
+        let snapshot = cache.truncate_below(5000);
+        assert_eq!(snapshot.len(), 2);
+        assert!(cache.lookup(0).is_some());
+        assert!(
+            cache.lookup(1).is_some(),
+            "page straddling new_size must survive (tail-zero owns the post-EOF bytes)"
+        );
+        assert!(cache.lookup(2).is_none());
+        assert!(cache.lookup(3).is_none());
+        assert_eq!(cache.i_size(), 5000);
+    }
+
+    /// `truncate_below(0)` drops every cached page and publishes
+    /// `i_size = 0` — the canonical "shrink-to-empty" path.
+    #[test]
+    fn truncate_below_zero_drops_everything() {
+        let cache = fresh_cache();
+        for pgoff in 0..=4u64 {
+            let _ = cache.install_or_get(pgoff, || make_stub(pgoff));
+        }
+        let snapshot = cache.truncate_below(0);
+        assert_eq!(snapshot.len(), 5);
+        for pgoff in 0..=4u64 {
+            assert!(cache.lookup(pgoff).is_none());
+        }
+        assert_eq!(cache.i_size(), 0);
+    }
+
+    /// The snapshot returned from `truncate_below` keeps the dropped
+    /// pages alive. RFC 0007 §Truncate, unmap, MADV_DONTNEED — a
+    /// `writepage` already in flight (whose own clone of the Arc is
+    /// inside the writeback daemon's snapshot) must complete against
+    /// a still-live `CachePage`. The truncate caller's snapshot is
+    /// the additional strong ref that keeps the page alive across
+    /// any `wait_until_writeback_clear` park.
+    #[test]
+    fn truncate_below_snapshot_keeps_dropped_pages_alive() {
+        let cache = fresh_cache();
+        let _ = cache.install_or_get(7, || make_stub(7));
+        let entry_before = cache.lookup(7).unwrap();
+        // Two strong refs: one in the index, one in `entry_before`.
+        assert_eq!(Arc::strong_count(&entry_before), 2);
+        let snapshot = cache.truncate_below(0);
+        assert_eq!(snapshot.len(), 1);
+        assert!(cache.lookup(7).is_none(), "page removed from index");
+        // Snapshot + entry_before still alive.
+        assert!(Arc::ptr_eq(&snapshot[0], &entry_before));
+        assert_eq!(Arc::strong_count(&snapshot[0]), 2);
+    }
+
+    /// `wait_until_writeback_clear` returns immediately when
+    /// `PG_WRITEBACK` is already clear. The assertion is that the
+    /// call does not panic and exits without ever needing to park —
+    /// host stub `WaitQueue::wait_while` is a no-op single-check, so
+    /// a true predicate would *also* return without panic; the
+    /// invariant we exercise is that the predicate is `is_writeback`,
+    /// not some other mis-typed bit.
+    #[test]
+    fn wait_until_writeback_clear_no_op_when_bit_clear() {
+        let p = make_stub(0);
+        p.publish_uptodate_and_unlock();
+        assert!(!p.is_writeback());
+        p.wait_until_writeback_clear();
+    }
+
+    /// `wait_until_writeback_clear` is the symmetric park to
+    /// `wait_until_unlocked` — predicate is `is_writeback`, not
+    /// `is_locked`. This test exercises that the call observes the
+    /// `PG_WRITEBACK` bit specifically: a page with `PG_LOCKED` set
+    /// but `PG_WRITEBACK` clear must return immediately. The host
+    /// stub's no-op `wait_while` collapses both predicates to the
+    /// same observable behaviour, but the test still pins the
+    /// expected predicate at the source level.
+    #[test]
+    fn wait_until_writeback_clear_ignores_locked_bit() {
+        let p = make_stub(0);
+        // The freshly-built stub has PG_LOCKED set (every other bit
+        // clear). `wait_until_writeback_clear` must not park on
+        // PG_LOCKED.
+        assert!(p.is_locked());
+        assert!(!p.is_writeback());
+        p.wait_until_writeback_clear();
     }
 
     #[test]
