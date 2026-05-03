@@ -450,4 +450,90 @@ mod tests {
         // Same path for fdatasync.
         assert_eq!(of.do_fsync(true), Err(crate::fs::EIO));
     }
+
+    /// RFC 0007 §`wb_err` errseq: simulated `writepage` failure bumps
+    /// the `PageCache::wb_err` counter, `Inode::wb_err()` delegates to
+    /// the mapping, and `do_fsync` surfaces a sticky `EIO` exactly
+    /// once per open file description. A second `do_fsync` on the same
+    /// fd observes a clean state (consume-once-per-witness). A second
+    /// fd opened against the same inode also sees the error exactly
+    /// once, independently of the first fd's snapshot.
+    #[cfg(feature = "page_cache")]
+    #[test]
+    fn wb_err_errseq_sticky_eio_once_per_fd() {
+        use core::sync::atomic::Ordering;
+
+        let sb = Arc::new(SuperBlock::new(
+            FsId(10),
+            Arc::new(StubSuper),
+            "stub",
+            512,
+            SbFlags::default(),
+        ));
+        let inode = Arc::new(Inode::new(
+            1,
+            Arc::downgrade(&sb),
+            Arc::new(StubInode),
+            Arc::new(StubFile),
+            InodeKind::Reg,
+            InodeMeta::default(),
+        ));
+
+        // Install aops so page_cache_or_create succeeds, then get a
+        // handle to the PageCache so we can simulate writeback errors.
+        inode.set_aops(crate::mem::aops::tests::fresh_ops());
+        let pc = inode.page_cache_or_create().expect("aops installed");
+
+        // Baseline: no writeback errors yet. wb_err is 0 and inode
+        // delegates to the mapping.
+        assert_eq!(pc.wb_err(), 0);
+        assert_eq!(inode.wb_err(), 0);
+
+        // Open fd1 — snapshots wb_err=0.
+        let dentry1 = Dentry::new_root(inode.clone());
+        let file_ops1: Arc<dyn FileOps> = Arc::new(StubFile);
+        let guard1 = SbActiveGuard::try_acquire(&sb).expect("guard");
+        let fd1 = OpenFile::new(dentry1, inode.clone(), file_ops1, sb.clone(), 0, guard1);
+        assert_eq!(fd1.wb_err_snapshot.load(Ordering::Acquire), 0);
+
+        // fsync on fd1 before any error — clean.
+        assert_eq!(fd1.do_fsync(false), Ok(()));
+
+        // Simulate a writepage failure (writeback daemon would call
+        // this on every writepage Err).
+        pc.bump_wb_err();
+        assert_eq!(pc.wb_err(), 1);
+        assert_eq!(inode.wb_err(), 1);
+
+        // fd1.do_fsync must now return EIO — counter advanced.
+        assert_eq!(fd1.do_fsync(false), Err(crate::fs::EIO));
+
+        // fd1.do_fsync again — snapshot caught up, must be Ok.
+        assert_eq!(fd1.do_fsync(false), Ok(()));
+        assert_eq!(fd1.wb_err_snapshot.load(Ordering::Acquire), 1);
+
+        // Open fd2 *after* the error — snapshots wb_err=1.
+        let dentry2 = Dentry::new_root(inode.clone());
+        let file_ops2: Arc<dyn FileOps> = Arc::new(StubFile);
+        let guard2 = SbActiveGuard::try_acquire(&sb).expect("guard");
+        let fd2 = OpenFile::new(dentry2, inode.clone(), file_ops2, sb.clone(), 0, guard2);
+        // Snapshot matches current counter — no pending error.
+        assert_eq!(fd2.wb_err_snapshot.load(Ordering::Acquire), 1);
+        assert_eq!(fd2.do_fsync(false), Ok(()));
+
+        // Simulate a second writepage failure.
+        pc.bump_wb_err();
+        assert_eq!(inode.wb_err(), 2);
+
+        // Both fds see EIO exactly once.
+        assert_eq!(fd1.do_fsync(false), Err(crate::fs::EIO));
+        assert_eq!(fd1.do_fsync(false), Ok(()));
+        assert_eq!(fd2.do_fsync(false), Err(crate::fs::EIO));
+        assert_eq!(fd2.do_fsync(false), Ok(()));
+
+        // fdatasync exercises the same errseq path.
+        pc.bump_wb_err();
+        assert_eq!(fd1.do_fsync(true), Err(crate::fs::EIO));
+        assert_eq!(fd1.do_fsync(true), Ok(()));
+    }
 }

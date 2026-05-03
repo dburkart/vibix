@@ -118,18 +118,27 @@ pub struct Inode {
 impl Inode {
     /// Read the inode's page-cache `wb_err` errseq counter.
     ///
-    /// Forward-compat seam for RFC 0007: once issue #745 lands an
-    /// `Option<Arc<PageCache>>` `mapping` field on `Inode`, this
-    /// becomes `self.mapping.as_ref().map(|m| m.wb_err()).unwrap_or(0)`.
-    /// Until then, no inode has a mapping and the counter is
-    /// universally zero — `fsync(2)` therefore never surfaces a
-    /// sticky `EIO`, which is correct because there is no writeback
-    /// daemon yet to bump the counter (#755).
+    /// When the `page_cache` feature is active *and* a
+    /// [`PageCache`] has been lazily installed via
+    /// [`Inode::page_cache_or_create`], delegates to
+    /// [`PageCache::wb_err`]. Otherwise returns 0 — an inode
+    /// without a page cache has had no writeback, so no writeback
+    /// error.
     ///
-    /// Defining the accessor now means the syscall layer can already
-    /// consume the errseq value via `OpenFile::wb_err_snapshot`
-    /// without rewriting any plumbing when the mapping field lands.
+    /// The accessor is the bridge between `OpenFile::do_fsync`
+    /// (which reads `inode.wb_err()`) and the writeback daemon
+    /// (which calls `PageCache::bump_wb_err` on every `writepage`
+    /// failure). Together they implement the RFC 0007 §`wb_err`
+    /// errseq "consume once per witness" pattern: `fsync` surfaces
+    /// a sticky `EIO` exactly once per open file description when
+    /// the counter has advanced since that description's snapshot.
     pub fn wb_err(&self) -> u32 {
+        #[cfg(feature = "page_cache")]
+        {
+            if let Some(pc) = self.mapping.read().as_ref() {
+                return pc.wb_err();
+            }
+        }
         0
     }
 
