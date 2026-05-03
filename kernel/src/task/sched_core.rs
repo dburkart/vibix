@@ -149,6 +149,7 @@ pub fn fork_current_task(
         parent_credentials,
         parent_priority,
         parent_affinity,
+        parent_fs_base,
         parent_fpu_ptr,
     ) = {
         let mut sched = SCHED.lock();
@@ -187,6 +188,7 @@ pub fn fork_current_task(
             parent_credentials,
             cur.priority,
             cur.affinity,
+            cur.fs_base,
             // SAFETY: the parent Task is the currently-running task and stays
             // alive in SCHED for the duration of this syscall. We only read
             // the FPU area during the new_forked call below.
@@ -224,6 +226,7 @@ pub fn fork_current_task(
             regs,
             parent_priority,
             parent_affinity,
+            parent_fs_base,
             parent_fpu_ptr,
             child_aspace,
             child_cr3,
