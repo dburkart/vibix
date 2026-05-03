@@ -40,6 +40,39 @@ use crate::arch::x86_64::fpu;
 use crate::serial_println;
 use crate::time::TICK_MS;
 
+use x86_64::registers::model_specific::Msr;
+
+/// `IA32_FS_BASE` — holds the 64-bit FS segment base used by userspace
+/// TLS (`%fs:0` dereferences to the address stored here). Saved on
+/// switch-out and restored on switch-in so each task sees its own TLS
+/// area after a context switch.
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// Save the current CPU's `MSR_FS_BASE` into `task.fs_base`.
+///
+/// # Safety
+/// Must be called with IRQs disabled (or from an ISR) so no concurrent
+/// context switch can race the MSR read.
+#[inline(always)]
+unsafe fn save_fs_base(task: &mut Task) {
+    task.fs_base = Msr::new(MSR_FS_BASE).read();
+}
+
+/// Restore `task.fs_base` into the CPU's `MSR_FS_BASE`. Skips the
+/// write when `fs_base == 0` (kernel tasks with no userspace TLS) as
+/// an optimisation — `wrmsr` is an expensive serialising instruction.
+///
+/// # Safety
+/// Must be called with IRQs disabled so the restored value is not
+/// clobbered before the task actually runs.
+#[inline(always)]
+unsafe fn restore_fs_base(task: &Task) {
+    let val = task.fs_base;
+    if val != 0 {
+        Msr::new(MSR_FS_BASE).write(val);
+    }
+}
+
 /// Default time slice, in milliseconds. At 100 Hz this lines up with a
 /// single PIT tick — every tick is a rescheduling opportunity.
 pub(crate) const DEFAULT_SLICE_MS: u32 = 10;
@@ -1046,7 +1079,7 @@ pub fn exit() -> ! {
     // released. IrqLock cannot be used end-to-end here because the
     // guard drop would re-enable IRQs before context_switch.
     interrupts::disable();
-    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_task_ptr) = {
         let mut sched = SCHED.lock();
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
@@ -1100,7 +1133,14 @@ pub fn exit() -> ! {
         // `context_switch`'s single write to `prev.rsp`.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         drop(victims);
-        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr)
+        let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
+        (
+            prev_rsp_ptr,
+            next_rsp,
+            next_cr3,
+            next_fpu_ptr,
+            next_task_ptr,
+        )
     };
     // Poke the reaper before we switch away. `notify_all` takes
     // `WaitQueue.inner` then `SCHED` (via `task::wake`); SCHED was
@@ -1109,8 +1149,10 @@ pub fn exit() -> ! {
     // SAFETY: IRQs are masked, SCHED is dropped, prev_rsp_ptr targets
     // a stable heap location, next_cr3 is a valid per-task PML4,
     // next_fpu_ptr points into a Box<FpuArea> pinned by the scheduler.
-    // We intentionally skip `fpu::save` — the exiting task is doomed.
+    // We intentionally skip `fpu::save` and `save_fs_base` — the
+    // exiting task is doomed and its state will never be restored.
     unsafe {
+        restore_fs_base(&*next_task_ptr);
         fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
@@ -1318,6 +1360,8 @@ pub fn preempt_tick() {
         .expect("just pushed");
     let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
     let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
+    let prev_task_ptr: *mut Task = &mut **prev_ref;
+    let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
     drop(sched);
 
     // SAFETY: `prev_rsp_ptr` / `prev_fpu_ptr` / `next_fpu_ptr` point
@@ -1330,8 +1374,12 @@ pub fn preempt_tick() {
     // PML4 whose upper half mirrors the kernel PML4 (by construction
     // in `Task::new` / `Task::bootstrap`). `fpu::init()` ran during
     // `arch::init`, so fxsave64/fxrstor64 are legal on this CPU.
+    // `prev_task_ptr` / `next_task_ptr` point at the same stable heap
+    // Tasks for the MSR_FS_BASE save/restore (#831).
     unsafe {
+        save_fs_base(&mut *prev_task_ptr);
         fpu::save(&mut *prev_fpu_ptr);
+        restore_fs_base(&*next_task_ptr);
         fpu::restore(&*next_fpu_ptr);
         // Note: SYSCALL/TSS stack pointers were armed above under the
         // SCHED lock via `set_active_syscall_stack`; see the helper for
@@ -1382,7 +1430,15 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3) = {
+    let (
+        prev_rsp_ptr,
+        prev_fpu_ptr,
+        next_fpu_ptr,
+        next_rsp,
+        next_cr3,
+        prev_task_ptr,
+        next_task_ptr,
+    ) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -1449,8 +1505,18 @@ pub fn block_current() {
         // points at). Same invariant as preempt_tick's ready-queue push.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
+        let prev_task_ptr: *mut Task = &mut **prev_ref;
+        let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
 
-        (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3)
+        (
+            prev_rsp_ptr,
+            prev_fpu_ptr,
+            next_fpu_ptr,
+            next_rsp,
+            next_cr3,
+            prev_task_ptr,
+            next_task_ptr,
+        )
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
@@ -1458,8 +1524,12 @@ pub fn block_current() {
     // prev_fpu_ptr / next_fpu_ptr target stable heap memory (see the
     // insert comment above). `next_cr3` is a valid per-task PML4 (see
     // preempt_tick). `fpu::init()` ran during `arch::init`.
+    // `prev_task_ptr` / `next_task_ptr` target stable heap Tasks for
+    // the MSR_FS_BASE save/restore (#831).
     unsafe {
+        save_fs_base(&mut *prev_task_ptr);
         fpu::save(&mut *prev_fpu_ptr);
+        restore_fs_base(&*next_task_ptr);
         fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
