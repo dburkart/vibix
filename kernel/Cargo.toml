@@ -478,6 +478,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_truncate_below"
+harness = false
+required-features = ["ext2", "page_cache"]
+
+[[test]]
 name = "ext2_create"
 harness = false
 required-features = ["ext2"]

@@ -3,7 +3,7 @@
 //! readahead / truncate.
 //!
 //! RFC 0007 §`AddressSpaceOps` and §Tail-page zeroing are the normative
-//! spec. This module currently lands three of the four trait methods:
+//! spec. This module lands all four trait methods:
 //!
 //! - `readpage` (issue #749) — parsed sparse / dense / past-EOF logic
 //!   in [`Ext2Aops::readpage`].
@@ -12,11 +12,14 @@
 //! - `readahead` (issue #752) — speculative buffer-cache prefetch over
 //!   `[start, start + nr_pages)` driven by the page cache's per-inode
 //!   `ra_state` heuristic (#741); see [`Ext2Aops::readahead`].
-//!
-//! The remaining method is deliberately left at the trait default:
-//!
-//! - `truncate_below` is left at the trait default (no-op + spinlock
-//!   assert). Issue #751 will replace it.
+//! - `truncate_below` (issue #751) — drop every page strictly above
+//!   `new_size` from the per-inode page cache and park on
+//!   `PG_WRITEBACK` for any in-flight `writepage`s that overlap the
+//!   truncated tail. The on-disk block-free walk that follows is
+//!   driven by `setattr` itself ([`super::setattr`]) — `truncate_below`
+//!   only owns the page-cache half of the truncate so the block-free
+//!   path can stay an `RMW + flush_inode_slot` transaction with no
+//!   writeback contention (RFC 0007 §Truncate, unmap, MADV_DONTNEED).
 //!
 //! # Pipeline (`readpage`)
 //!
@@ -720,8 +723,134 @@ impl AddressSpaceOps for Ext2Aops {
         }
     }
 
-    // `truncate_below` left at the trait default — no-op +
-    // `assert_no_spinlocks_held`. Issue #751 will replace it.
+    /// Drop every cached page strictly above `new_size` from the
+    /// per-inode page cache and wait out any `writepage` in flight
+    /// over the truncated tail.
+    ///
+    /// RFC 0007 §Truncate, unmap, MADV_DONTNEED is the normative spec.
+    /// Closes the on-disk UAF surface where the writeback daemon's
+    /// `writepage` could otherwise commit stale bytes into blocks the
+    /// FS is concurrently freeing: a shrinking `setattr(size = N)`
+    /// must not free disk blocks underneath any page whose
+    /// `writepage` has not yet returned. The contract this method
+    /// honours:
+    ///
+    /// 1. **Drop cached pages with `pgoff >= ceil(new_size / 4096)`.**
+    ///    The page-cache index is updated under its own level-4 mutex
+    ///    so the writeback daemon's snapshot can no longer enqueue
+    ///    them. The page containing the `new_size` byte itself stays
+    ///    cached: it holds bytes both above and below the cut, and
+    ///    its tail is the readpage tail-zero rule's job (RFC 0007
+    ///    §Tail-page zeroing).
+    /// 2. **Park on `PG_WRITEBACK` for every dropped page.** A page
+    ///    whose `writepage` is presently in flight survives in the
+    ///    snapshot (the cache hands us a strong `Arc<CachePage>` and
+    ///    the daemon's own snapshot still holds another). We park on
+    ///    [`CachePage::wait_until_writeback_clear`] so the daemon's
+    ///    `end_writeback` reaches us before the truncate caller
+    ///    proceeds to the on-disk free.
+    /// 3. **Return.** The on-disk block-free walk
+    ///    ([`super::setattr::truncate_free`]) is driven by `setattr`
+    ///    itself, after this returns. Splitting the cache half here
+    ///    keeps the block-free path a single inode-slot RMW
+    ///    transaction with no writeback contention — RFC 0007
+    ///    §Truncate, unmap, MADV_DONTNEED specifies the cache park as
+    ///    a strict precondition of the block free, which this method
+    ///    discharges.
+    ///
+    /// # Lock-order
+    ///
+    /// The `assert_no_spinlocks_held` invariant is the first
+    /// statement; the page cache's level-4 mutex is acquired only by
+    /// [`PageCache::truncate_below`] and is released before any
+    /// `wait_until_writeback_clear` park.
+    ///
+    /// # Best-effort cache lookup
+    ///
+    /// `Ext2Aops` carries [`Weak`] handles to its mount and inode. A
+    /// torn-down mount, a torn-down inode, or an inode whose VFS
+    /// reflection is not in the mount's inode cache (e.g. a unit test
+    /// that constructs an `Ext2Aops` directly without `iget`) all
+    /// surface here as "no observable page cache to truncate" and
+    /// the method becomes a no-op. The `setattr` caller's on-disk
+    /// block-free still runs; the page cache, if any was constructed
+    /// out-of-band, would simply observe stale `i_size` until its
+    /// next own-truncate. This is acceptable because every production
+    /// path goes through the `iget` cache, where the mapping is
+    /// reachable.
+    fn truncate_below(&self, new_size: u64) {
+        // RFC 0007 §Lock-order ladder: every method on this trait
+        // calls `assert_no_spinlocks_held` as its very first statement.
+        assert_no_spinlocks_held("Ext2Aops::truncate_below");
+
+        // The cache-side work is gated on the `page_cache` feature
+        // because the `mapping` field on `Inode` is itself gated on
+        // that feature (RFC 0007 migration window). Off-feature builds
+        // collapse to the trait-default-equivalent no-op; the
+        // `setattr` caller's on-disk block-free still runs and
+        // remains the security-relevant behaviour. The cfg switch is
+        // expected to retire when `page_cache` becomes default.
+        #[cfg(feature = "page_cache")]
+        {
+            // Best-effort: a torn-down mount or inode means there is
+            // nothing observable to truncate. The on-disk free is
+            // setattr's responsibility and runs unaffected.
+            let Some(super_ref) = self.super_ref.upgrade() else {
+                return;
+            };
+            let Some(ext2_inode) = self.inode_ref.upgrade() else {
+                return;
+            };
+
+            // Resolve the VFS Inode that owns the per-inode page
+            // cache. The `inode_cache` on `Ext2Super` is keyed by
+            // ext2 ino; the `Weak<Inode>` it stores is the only
+            // reachable handle to the VFS inode the cache hangs off.
+            // A miss here means the inode has not been published
+            // through `iget` (e.g. a direct unit-test construction);
+            // the truncate becomes a no-op.
+            let vfs_inode = {
+                let cache = super_ref.inode_cache.lock();
+                cache.get(&ext2_inode.ino).and_then(Weak::upgrade)
+            };
+            let Some(vfs_inode) = vfs_inode else {
+                return;
+            };
+
+            // The mapping is published lazily on first read-via-cache
+            // / mmap; an inode that has never been faulted has no
+            // cache. Either way, no cached pages to drop and no
+            // writeback to park on.
+            let Some(pc) = vfs_inode.mapping.read().as_ref().map(Arc::clone) else {
+                return;
+            };
+
+            // Step 1 + 3 (under inner): snapshot every page strictly
+            // above `new_size`, remove them from `pages` + `dirty`,
+            // and publish the new `i_size` cap. The snapshot keeps
+            // the `Arc<CachePage>`s alive so a writepage already in
+            // flight can finish.
+            let snapshot = pc.truncate_below(new_size);
+
+            // Step 2 (outside inner): park on `PG_WRITEBACK` for
+            // each dropped page. The order doesn't matter — every
+            // wait is on a disjoint waitqueue. After this loop the
+            // snapshot drops, at which point the cache no longer
+            // references the truncated tail (only the writeback
+            // daemon's own snapshot, if any, is left, and it has
+            // already cleared `PG_WRITEBACK` before we returned from
+            // the wait).
+            for page in &snapshot {
+                page.wait_until_writeback_clear();
+            }
+            // Snapshot drops here.
+        }
+        // The `_ = new_size` suppresses an unused-variable warning
+        // when the body is `cfg`-stripped on `--no-default-features`
+        // builds without the `page_cache` flag.
+        #[cfg(not(feature = "page_cache"))]
+        let _ = new_size;
+    }
 }
 
 // ---------------------------------------------------------------------------
