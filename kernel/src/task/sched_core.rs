@@ -559,6 +559,40 @@ pub fn current_syscall_stack_top() -> u64 {
         .unwrap_or(0)
 }
 
+/// Return the `fs_base` value of the currently-running task (the FS
+/// segment base used for TLS). Called by `arch_prctl(ARCH_GET_FS)`.
+///
+/// Briefly locks the scheduler, reads the `u64`, and releases.
+///
+/// # Panics
+/// Panics if called before [`init`] (no running task).
+pub fn current_fs_base() -> u64 {
+    SCHED
+        .lock()
+        .current
+        .as_ref()
+        .expect("current_fs_base: no running task")
+        .fs_base()
+}
+
+/// Set the `fs_base` value of the currently-running task.
+/// Called by `arch_prctl(ARCH_SET_FS)` after address validation.
+///
+/// Briefly locks the scheduler, writes the `u64`, and releases.
+/// The caller is responsible for also writing `MSR_FS_BASE` so that
+/// the hardware segment base matches.
+///
+/// # Panics
+/// Panics if called before [`init`] (no running task).
+pub fn set_current_fs_base(val: u64) {
+    SCHED
+        .lock()
+        .current
+        .as_mut()
+        .expect("set_current_fs_base: no running task")
+        .set_fs_base(val);
+}
+
 fn find_priority(sched: &Scheduler, id: usize) -> Option<u8> {
     if let Some(cur) = sched.current.as_ref() {
         if cur.id == id {

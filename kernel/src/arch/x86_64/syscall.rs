@@ -60,6 +60,7 @@ const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
+const MSR_FS_BASE: u32 = 0xC000_0100;
 
 /// EFER.SCE — enables SYSCALL/SYSRET.
 const EFER_SCE: u64 = 1 << 0;
@@ -1170,6 +1171,44 @@ pub unsafe extern "C" fn syscall_dispatch(
         // Workstream B wave 1); list bounded at NGROUPS_MAX=32.
         SETGROUPS => super::syscalls::creds::sys_setgroups(a0 as i32, a1),
 
+        // arch_prctl(code, addr) — x86_64 TLS base manipulation.
+        // Issue #832 (epic #827: x86_64 static TLS).
+        // ARCH_SET_FS (0x1002): set FS base for TLS; validates canonical
+        //   user-range address, stores in task, writes MSR_FS_BASE.
+        // ARCH_GET_FS (0x1003): read FS base from task into userspace ptr.
+        ARCH_PRCTL => {
+            const ARCH_SET_FS: u64 = 0x1002;
+            const ARCH_GET_FS: u64 = 0x1003;
+            match a0 {
+                ARCH_SET_FS => {
+                    let addr = a1;
+                    // Reject non-canonical or kernel-half addresses.
+                    if addr >= crate::mem::addrspace::USER_VA_END {
+                        crate::fs::EPERM
+                    } else {
+                        // Store in current task's fs_base field.
+                        crate::task::set_current_fs_base(addr);
+                        // Write the hardware MSR so %fs-relative accesses
+                        // resolve to the new base immediately on return.
+                        unsafe { Msr::new(MSR_FS_BASE).write(addr) };
+                        0
+                    }
+                }
+                ARCH_GET_FS => {
+                    let out_ptr = a1 as usize;
+                    if let Err(e) = uaccess::check_user_range(out_ptr, 8) {
+                        return e.as_errno();
+                    }
+                    let val = crate::task::current_fs_base();
+                    match unsafe { uaccess::copy_to_user(out_ptr, &val.to_ne_bytes()) } {
+                        Ok(()) => 0,
+                        Err(e) => e.as_errno(),
+                    }
+                }
+                _ => crate::fs::EINVAL,
+            }
+        }
+
         _ => -38i64, // ENOSYS
     };
     // RFC 0006 / #718: syscall exit emit point. Records the same
@@ -1979,6 +2018,7 @@ pub mod syscall_nr {
     pub const SETRESGID: u64 = 119;
     pub const GETGROUPS: u64 = 115;
     pub const SETGROUPS: u64 = 116;
+    pub const ARCH_PRCTL: u64 = 158;
 }
 
 #[cfg(test)]
@@ -2110,5 +2150,8 @@ mod tests {
         assert_eq!(syscall_nr::MOUNT, 165, "SYS_mount must be 165");
         // Umount plumbing (issue #576, RFC 0004 Workstream F)
         assert_eq!(syscall_nr::UMOUNT2, 166, "SYS_umount2 must be 166");
+
+        // TLS (issue #832, epic #827)
+        assert_eq!(syscall_nr::ARCH_PRCTL, 158, "SYS_arch_prctl must be 158");
     }
 }
