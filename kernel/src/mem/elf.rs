@@ -11,6 +11,7 @@ use x86_64::VirtAddr;
 
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+const PT_TLS: u32 = 7;
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
 
@@ -68,6 +69,30 @@ pub(crate) struct LoadSegment {
     pub filesz: u64,
     pub file_offset: u64,
     pub flags: PageTableFlags,
+}
+
+/// Layout of a `PT_TLS` segment extracted from the ELF program headers.
+///
+/// Holds the information the runtime needs to allocate and initialise a
+/// static TLS block:
+///
+/// - `tdata_src` — virtual address of the `.tdata` initialisation image
+///   inside the ELF file (relative to p_offset).
+/// - `tdata_size` — size of `.tdata` (file-backed initialisation data,
+///   equal to `p_filesz`).
+/// - `total_size` — total TLS block size including zero-filled `.tbss`
+///   (equal to `p_memsz`).
+/// - `align` — alignment requirement (`p_align`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsInfo {
+    /// Byte offset of the `.tdata` initialisation image within the ELF file.
+    pub file_offset: u64,
+    /// Size of `.tdata` (file-backed initialisation data, `p_filesz`).
+    pub tdata_size: u64,
+    /// Total TLS block size including `.tbss` (`p_memsz`).
+    pub total_size: u64,
+    /// Alignment requirement for the TLS block (`p_align`).
+    pub align: u64,
 }
 
 /// Parsed ELF64 image metadata for segment walking.
@@ -203,6 +228,33 @@ impl<'a> ParsedElf<'a> {
     /// Size of each program-header entry (`e_phentsize`).
     pub(crate) fn phdr_entsize(&self) -> u16 {
         self.ehdr.e_phentsize
+    }
+
+    /// Return TLS segment layout from the first `PT_TLS` program header,
+    /// or `None` if the ELF has no `PT_TLS` segment.
+    ///
+    /// At most one `PT_TLS` segment is expected per the ELF spec; if
+    /// present it describes the `.tdata` / `.tbss` layout the runtime
+    /// needs to allocate a static TLS block.
+    pub(crate) fn tls_info(&self) -> Option<TlsInfo> {
+        for i in 0..self.phnum {
+            let off = i * core::mem::size_of::<Elf64Phdr>();
+            // SAFETY: phdr_bytes was bounds-checked during parse to hold
+            // exactly `phnum` contiguous Elf64Phdr records.
+            let ph = unsafe {
+                core::ptr::read_unaligned(self.phdr_bytes.as_ptr().add(off).cast::<Elf64Phdr>())
+            };
+            if ph.p_type != PT_TLS {
+                continue;
+            }
+            return Some(TlsInfo {
+                file_offset: ph.p_offset,
+                tdata_size: ph.p_filesz,
+                total_size: ph.p_memsz,
+                align: ph.p_align,
+            });
+        }
+        None
     }
 
     /// Return the interpreter path from the PT_INTERP segment, if present.
@@ -633,5 +685,99 @@ mod tests {
         bytes[path_offset + path.len()] = b'!';
         let parsed = parse_elf64(&bytes);
         assert!(parsed.interp_path().is_none());
+    }
+
+    /// Build a minimal ELF with a PT_TLS segment and two PT_LOAD segments.
+    /// `tdata_size` is `p_filesz` (initialised .tdata), `total_size` is
+    /// `p_memsz` (includes .tbss zero-fill), `align` is `p_align`.
+    fn sample_elf_with_tls(tdata_size: u64, total_size: u64, align: u64) -> Vec<u8> {
+        // Layout: EHDR | PHDR[0]=PT_LOAD(rx) | PHDR[1]=PT_LOAD(rw) | PHDR[2]=PT_TLS
+        // Append `tdata_size` bytes of dummy .tdata content after the phdr table.
+        let phdr_count = 3;
+        let phdr_table_size = phdr_count * PHDR_SIZE;
+        let tdata_offset = EHDR_SIZE + phdr_table_size;
+        let total = tdata_offset + tdata_size as usize;
+
+        let mut bytes = vec![0u8; total];
+        // ELF header
+        bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // little-endian
+        bytes[6] = 1; // ELF v1
+        put16(&mut bytes, 16, 2); // ET_EXEC
+        put16(&mut bytes, 18, 0x3e); // x86_64
+        put32(&mut bytes, 20, 1); // EV_CURRENT
+        put64(&mut bytes, 24, 0x400080); // entry (within PT_LOAD[0])
+        put64(&mut bytes, 32, EHDR_SIZE as u64); // e_phoff
+        put16(&mut bytes, 52, EHDR_SIZE as u16); // e_ehsize
+        put16(&mut bytes, 54, PHDR_SIZE as u16); // e_phentsize
+        put16(&mut bytes, 56, phdr_count as u16); // e_phnum
+
+        // phdr 0: PT_LOAD RX (covers entry 0x400080)
+        let p0 = EHDR_SIZE;
+        put32(&mut bytes, p0, 1); // PT_LOAD
+        put32(&mut bytes, p0 + 4, 1); // PF_X
+        put64(&mut bytes, p0 + 16, 0x400000); // p_vaddr
+        put64(&mut bytes, p0 + 40, 0x2000); // p_memsz
+
+        // phdr 1: PT_LOAD RW
+        let p1 = EHDR_SIZE + PHDR_SIZE;
+        put32(&mut bytes, p1, 1); // PT_LOAD
+        put32(&mut bytes, p1 + 4, 2); // PF_W
+        put64(&mut bytes, p1 + 16, 0x402000); // p_vaddr
+        put64(&mut bytes, p1 + 40, 0x1000); // p_memsz
+
+        // phdr 2: PT_TLS
+        let p2 = EHDR_SIZE + 2 * PHDR_SIZE;
+        put32(&mut bytes, p2, 7); // PT_TLS
+        put32(&mut bytes, p2 + 4, 6); // PF_R | PF_W (typical for TLS)
+        put64(&mut bytes, p2 + 8, tdata_offset as u64); // p_offset
+        put64(&mut bytes, p2 + 16, 0x404000); // p_vaddr
+        put64(&mut bytes, p2 + 32, tdata_size); // p_filesz (.tdata)
+        put64(&mut bytes, p2 + 40, total_size); // p_memsz (.tdata + .tbss)
+        put64(&mut bytes, p2 + 48, align); // p_align
+
+        // Fill .tdata content with a recognisable pattern.
+        for i in 0..tdata_size as usize {
+            bytes[tdata_offset + i] = 0xAA;
+        }
+
+        bytes
+    }
+
+    #[test]
+    fn tls_info_returns_correct_layout() {
+        let tdata_size = 0x40; // 64 bytes of .tdata
+        let total_size = 0x80; // 128 bytes total (.tdata + .tbss)
+        let align = 16;
+        let bytes = sample_elf_with_tls(tdata_size, total_size, align);
+        let parsed = parse_elf64(&bytes);
+
+        let tls = parsed
+            .tls_info()
+            .expect("tls_info() should return Some for ELF with PT_TLS");
+        let expected_offset = (EHDR_SIZE + 3 * PHDR_SIZE) as u64;
+        assert_eq!(tls.file_offset, expected_offset);
+        assert_eq!(tls.tdata_size, tdata_size);
+        assert_eq!(tls.total_size, total_size);
+        assert_eq!(tls.align, align);
+    }
+
+    #[test]
+    fn tls_info_none_when_no_tls_segment() {
+        let bytes = sample_elf_bytes();
+        let parsed = parse_elf64(&bytes);
+        assert!(parsed.tls_info().is_none());
+    }
+
+    #[test]
+    fn tls_info_zero_sized_tbss() {
+        // .tdata = .tbss size means no .tbss at all (p_filesz == p_memsz).
+        let size = 0x20;
+        let bytes = sample_elf_with_tls(size, size, 8);
+        let parsed = parse_elf64(&bytes);
+        let tls = parsed.tls_info().unwrap();
+        assert_eq!(tls.tdata_size, size);
+        assert_eq!(tls.total_size, size);
     }
 }

@@ -46,7 +46,7 @@ use x86_64::VirtAddr;
 use alloc::sync::Arc;
 
 use super::addrspace::USER_VA_END;
-use super::elf;
+use super::elf::{self, TlsInfo};
 use super::paging;
 use super::tlb::Flusher;
 
@@ -117,6 +117,9 @@ pub struct LoadedImage {
     pub phdr_count: u16,
     /// Size of each program-header entry in bytes (AT_PHENT).
     pub phdr_entsize: u16,
+    /// Static TLS segment layout extracted from PT_TLS, if present.
+    /// Used to allocate the initial TLS block for the process.
+    pub tls_info: Option<TlsInfo>,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -165,6 +168,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         phdr_vaddr: 0,
         phdr_count: 0,
         phdr_entsize: 0,
+        tls_info: parsed.tls_info(),
     })
 }
 
@@ -239,6 +243,7 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         phdr_vaddr: parsed.phdr_vaddr(),
         phdr_count: parsed.phdr_count(),
         phdr_entsize: parsed.phdr_entsize(),
+        tls_info: parsed.tls_info(),
     })
 }
 
@@ -345,6 +350,7 @@ pub fn load_user_elf_with_vmas(
         phdr_vaddr: parsed.phdr_vaddr(),
         phdr_count: parsed.phdr_count(),
         phdr_entsize: parsed.phdr_entsize(),
+        tls_info: parsed.tls_info(),
     };
 
     // Check for a dynamic interpreter (PT_INTERP). If present, resolve
