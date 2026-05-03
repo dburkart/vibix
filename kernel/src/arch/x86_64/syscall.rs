@@ -1332,6 +1332,11 @@ pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible
         &random_bytes,
     );
 
+    // Install the FS base for the static TLS block allocated by the loader.
+    // exec replaces the entire address space, so any prior arch_prctl(ARCH_SET_FS)
+    // value is stale; reset to the new TCB address or 0 if no PT_TLS.
+    crate::task::set_current_fs_base(image.tcb_addr.unwrap_or(0));
+
     // If the binary has a dynamic interpreter (PT_INTERP), jump to the
     // interpreter's entry point; otherwise jump directly to the binary's entry.
     let effective_entry = image.interp_entry.unwrap_or(image.entry);

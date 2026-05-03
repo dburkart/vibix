@@ -95,6 +95,38 @@ pub struct TlsInfo {
     pub align: u64,
 }
 
+/// Size of the Thread Control Block (TCB) for x86_64 ELF variant II TLS.
+/// Contains a single self-pointer (`%fs:0 == &TCB`).
+pub const TCB_SIZE: u64 = 8;
+
+const PAGE_SIZE_ELF: u64 = 4096;
+
+/// Compute the TLS block layout for the given [`TlsInfo`] per x86_64
+/// variant II conventions. Returns `(tdata_offset, tcb_va, total_pages)`
+/// where:
+///
+/// - `tdata_offset` is the byte offset of the `.tdata` start relative
+///   to `region_start`.
+/// - `tcb_va` is the virtual address of the TCB (the value for
+///   `MSR_FS_BASE`).
+/// - `total_pages` is the number of 4 KiB pages the region occupies.
+///
+/// `region_start` is the page-aligned base where the TLS region begins.
+///
+/// Layout (low to high):
+/// ```text
+/// [padding] [.tdata (tdata_size)] [.tbss (total_size - tdata_size)] [TCB (8 bytes)]
+///            ^--- aligned to p_align                                  ^--- fs_base
+/// ```
+pub fn compute_tls_layout(region_start: u64, info: &TlsInfo) -> (u64, u64, u64) {
+    let align = if info.align < 2 { 1 } else { info.align };
+    let tdata_start = (region_start + align - 1) & !(align - 1);
+    let tcb_va = tdata_start + info.total_size;
+    let region_end = (tcb_va + TCB_SIZE + PAGE_SIZE_ELF - 1) & !(PAGE_SIZE_ELF - 1);
+    let total_pages = (region_end - region_start) / PAGE_SIZE_ELF;
+    (tdata_start - region_start, tcb_va, total_pages)
+}
+
 /// Parsed ELF64 image metadata for segment walking.
 #[derive(Clone, Copy)]
 pub(crate) struct ParsedElf<'a> {
@@ -779,5 +811,171 @@ mod tests {
         let tls = parsed.tls_info().unwrap();
         assert_eq!(tls.tdata_size, size);
         assert_eq!(tls.total_size, size);
+    }
+
+    // --- TLS block layout tests (compute_tls_layout) -----------------------
+
+    const PAGE_SZ: u64 = 4096;
+
+    /// Verify basic layout: tdata_offset is aligned, TCB sits right after
+    /// the TLS data, and total_pages covers the whole region.
+    #[test]
+    fn compute_tls_layout_basic() {
+        let info = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 64,
+            total_size: 128,
+            align: 16,
+        };
+        let region_start = 0x403000u64; // page-aligned
+        let (tdata_off, tcb_va, total_pages) = super::compute_tls_layout(region_start, &info);
+
+        // tdata starts at an aligned offset within the region.
+        let tdata_start = region_start + tdata_off;
+        assert_eq!(
+            tdata_start % 16,
+            0,
+            "tdata_start must be aligned to p_align"
+        );
+
+        // TCB is right after the total TLS data area.
+        assert_eq!(tcb_va, tdata_start + info.total_size);
+
+        // Region covers at least tcb_va + TCB_SIZE.
+        let region_end = region_start + total_pages * PAGE_SZ;
+        assert!(
+            region_end >= tcb_va + super::TCB_SIZE,
+            "region must cover TCB"
+        );
+        // Region end is page-aligned.
+        assert_eq!(region_end % PAGE_SZ, 0);
+    }
+
+    /// When region_start is already aligned, tdata_offset should be 0.
+    #[test]
+    fn compute_tls_layout_already_aligned() {
+        let info = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 32,
+            total_size: 32,
+            align: 8,
+        };
+        // 0x404000 is already 8-byte aligned.
+        let (tdata_off, tcb_va, _) = super::compute_tls_layout(0x404000, &info);
+        assert_eq!(tdata_off, 0, "no padding needed when already aligned");
+        assert_eq!(tcb_va, 0x404000 + 32);
+    }
+
+    /// Alignment of 0 or 1 means no alignment constraint — treated as 1.
+    #[test]
+    fn compute_tls_layout_trivial_align() {
+        let info_align0 = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 10,
+            total_size: 20,
+            align: 0,
+        };
+        let info_align1 = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 10,
+            total_size: 20,
+            align: 1,
+        };
+        let base = 0x405000u64;
+        let (off0, tcb0, pages0) = super::compute_tls_layout(base, &info_align0);
+        let (off1, tcb1, pages1) = super::compute_tls_layout(base, &info_align1);
+        assert_eq!(off0, off1);
+        assert_eq!(tcb0, tcb1);
+        assert_eq!(pages0, pages1);
+        // With align=1, no padding is needed.
+        assert_eq!(off0, 0);
+    }
+
+    /// Large alignment (64-byte). A page-aligned region_start is already
+    /// 64-aligned, so no padding is needed.
+    #[test]
+    fn compute_tls_layout_large_align() {
+        let info = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 100,
+            total_size: 256,
+            align: 64,
+        };
+        let base = 0x403000u64;
+        let (tdata_off, tcb_va, _) = super::compute_tls_layout(base, &info);
+        let tdata_start = base + tdata_off;
+        assert_eq!(tdata_start % 64, 0);
+        assert_eq!(tcb_va, tdata_start + 256);
+    }
+
+    /// Verify that the TCB self-pointer layout is correct by simulating
+    /// the allocation on a local buffer.
+    #[test]
+    fn tls_block_layout_self_pointer() {
+        let tdata_content = [0xAAu8; 48];
+        let info = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 48,
+            total_size: 80, // 48 .tdata + 32 .tbss
+            align: 16,
+        };
+
+        let region_start = 0x500000u64;
+        let (tdata_off, tcb_va, total_pages) = super::compute_tls_layout(region_start, &info);
+
+        // Simulate filling a buffer.
+        let buf_size = (total_pages * PAGE_SZ) as usize;
+        let mut buf = vec![0u8; buf_size];
+
+        // Copy .tdata content.
+        let tdata_off_usize = tdata_off as usize;
+        buf[tdata_off_usize..tdata_off_usize + tdata_content.len()]
+            .copy_from_slice(&tdata_content);
+
+        // Write TCB self-pointer.
+        let tcb_offset_in_buf = (tcb_va - region_start) as usize;
+        let ptr_bytes = tcb_va.to_le_bytes();
+        buf[tcb_offset_in_buf..tcb_offset_in_buf + 8].copy_from_slice(&ptr_bytes);
+
+        // Verify .tdata was copied.
+        assert_eq!(
+            &buf[tdata_off_usize..tdata_off_usize + 48],
+            &[0xAA; 48]
+        );
+
+        // Verify .tbss is zero.
+        let tbss_start = tdata_off_usize + 48;
+        let tbss_end = tbss_start + 32;
+        assert!(
+            buf[tbss_start..tbss_end].iter().all(|&b| b == 0),
+            ".tbss region must be zero-filled"
+        );
+
+        // Verify TCB self-pointer: reading 8 bytes at tcb offset gives tcb_va.
+        let self_ptr = u64::from_le_bytes(
+            buf[tcb_offset_in_buf..tcb_offset_in_buf + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(self_ptr, tcb_va, "TCB[0] must be a self-pointer");
+    }
+
+    /// Zero-size TLS: tdata_size=0, total_size=0 should still produce a
+    /// valid TCB (just the self-pointer, no TLS data).
+    #[test]
+    fn compute_tls_layout_zero_size() {
+        let info = super::TlsInfo {
+            file_offset: 0,
+            tdata_size: 0,
+            total_size: 0,
+            align: 1,
+        };
+        let base = 0x406000u64;
+        let (tdata_off, tcb_va, total_pages) = super::compute_tls_layout(base, &info);
+        assert_eq!(tdata_off, 0);
+        assert_eq!(tcb_va, base); // TCB right at region_start
+        assert!(total_pages >= 1, "need at least one page for the TCB");
+        let region_end = base + total_pages * PAGE_SZ;
+        assert!(region_end >= tcb_va + super::TCB_SIZE);
     }
 }

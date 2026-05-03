@@ -120,6 +120,12 @@ pub struct LoadedImage {
     /// Static TLS segment layout extracted from PT_TLS, if present.
     /// Used to allocate the initial TLS block for the process.
     pub tls_info: Option<TlsInfo>,
+    /// Virtual address of the TCB (Thread Control Block) allocated for
+    /// the initial static TLS block. This is the value that should be
+    /// written to `MSR_FS_BASE` so that `%fs:0` yields the TCB
+    /// self-pointer (x86_64 ELF variant II layout). `None` when the
+    /// binary has no `PT_TLS` segment.
+    pub tcb_addr: Option<u64>,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -169,6 +175,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         phdr_count: 0,
         phdr_entsize: 0,
         tls_info: parsed.tls_info(),
+        tcb_addr: None,
     })
 }
 
@@ -244,6 +251,7 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         phdr_count: parsed.phdr_count(),
         phdr_entsize: parsed.phdr_entsize(),
         tls_info: parsed.tls_info(),
+        tcb_addr: None,
     })
 }
 
@@ -339,7 +347,17 @@ pub fn load_user_elf_with_vmas(
 
     // Register file-backed + zero-tail VMAs for the main binary's PT_LOAD
     // segments. Returns `(segment_count, page_aligned_image_end)`.
-    let (segments, image_end) = register_demand_vmas(bytes, parsed, 0, address_space)?;
+    let (segments, mut image_end) = register_demand_vmas(bytes, parsed, 0, address_space)?;
+
+    // Allocate the static TLS block when PT_TLS is present. The block is
+    // placed at `image_end` (page-aligned), registered as a writable AnonObject
+    // VMA so fork copies it, and the TCB address is recorded for `MSR_FS_BASE`.
+    let tls = parsed.tls_info();
+    let tcb_addr = if let Some(ref info) = tls {
+        Some(allocate_tls_block(bytes, info, &mut image_end, _pml4, address_space)?)
+    } else {
+        None
+    };
 
     let mut image = LoadedImage {
         entry,
@@ -350,7 +368,8 @@ pub fn load_user_elf_with_vmas(
         phdr_vaddr: parsed.phdr_vaddr(),
         phdr_count: parsed.phdr_count(),
         phdr_entsize: parsed.phdr_entsize(),
-        tls_info: parsed.tls_info(),
+        tls_info: tls,
+        tcb_addr,
     };
 
     // Check for a dynamic interpreter (PT_INTERP). If present, resolve
@@ -419,6 +438,131 @@ fn read_interp_from_fs(interp_path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         Ok(bytes) if !bytes.is_empty() => Some(bytes),
         _ => None,
     }
+}
+
+// --- allocate_tls_block: static TLS block allocation (x86_64 variant II) ---
+
+/// Allocate a static TLS block in the userspace address space per the
+/// x86_64 ELF variant II layout:
+///
+/// ```text
+/// low addr                                                      high addr
+/// [.tdata copy | .tbss zeroes] [TCB (8 bytes, self-pointer)]
+///  ^--- aligned to p_align      ^--- fs_base (thread pointer)
+/// ```
+///
+/// The block is placed at `*image_end` (page-aligned), mapped eagerly
+/// into `pml4`, and registered as an `AnonObject`-backed VMA so
+/// `fork` copies it. `.tdata` template bytes are copied from the ELF
+/// file; `.tbss` is zero-filled; TCB[0] is set to `&TCB`.
+///
+/// On success, updates `*image_end` past the TLS pages and returns
+/// the virtual address of the TCB (the value for `MSR_FS_BASE`).
+#[cfg(target_os = "none")]
+fn allocate_tls_block(
+    elf_bytes: &[u8],
+    info: &TlsInfo,
+    image_end: &mut u64,
+    pml4: PhysFrame<Size4KiB>,
+    aspace: &mut super::addrspace::AddressSpace,
+) -> Result<u64, LoadError> {
+    use super::vmatree::{Share, Vma};
+    use super::vmobject::{AnonObject, VmObject};
+
+    let region_start = *image_end;
+    let (tdata_off, tcb_va, page_count) = elf::compute_tls_layout(region_start, info);
+    let tdata_start = region_start + tdata_off;
+    let region_end = region_start + page_count * PAGE_SIZE;
+
+    // Map the pages eagerly into the user PML4 and fill them.
+    let tls_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    let hhdm = paging::hhdm_offset();
+    let anon = AnonObject::new(Some(page_count as usize));
+
+    for i in 0..page_count {
+        let va = VirtAddr::new(region_start + i * PAGE_SIZE);
+        let page = Page::<Size4KiB>::containing_address(va);
+        let frame = paging::map_in_pml4(pml4, page, tls_flags)
+            .map_err(LoadError::MapFailed)?;
+
+        // Record the frame in the AnonObject so fork can find it.
+        anon.insert_existing_frame(i as usize, frame.start_address().as_u64())
+            .expect("TLS: freshly-mapped frame cannot be saturated");
+
+        // Zero-fill is already done by map_in_pml4 (zeroed frames), but
+        // we need to copy .tdata content into the right offset.
+        let page_base_va = region_start + i * PAGE_SIZE;
+        let page_end_va = page_base_va + PAGE_SIZE;
+
+        // Copy .tdata bytes that overlap this page.
+        let tdata_end = tdata_start + info.tdata_size;
+        if tdata_end > page_base_va && tdata_start < page_end_va {
+            let src_start = if tdata_start > page_base_va {
+                0u64
+            } else {
+                page_base_va - tdata_start
+            };
+            let dst_offset = if tdata_start > page_base_va {
+                tdata_start - page_base_va
+            } else {
+                0
+            };
+            let copy_end = core::cmp::min(tdata_end, page_end_va);
+            let copy_start_in_page = if tdata_start > page_base_va {
+                tdata_start - page_base_va
+            } else {
+                0
+            };
+            let n = (copy_end - (page_base_va + copy_start_in_page)) as usize;
+            if n > 0 {
+                let elf_src = &elf_bytes[(info.file_offset + src_start) as usize
+                    ..(info.file_offset + src_start) as usize + n];
+                let dst = hhdm + frame.start_address().as_u64() + dst_offset;
+                // SAFETY: frame was just allocated and mapped; HHDM gives
+                // writable access. `n` is bounded by PAGE_SIZE.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        elf_src.as_ptr(),
+                        dst.as_mut_ptr::<u8>(),
+                        n,
+                    );
+                }
+            }
+        }
+
+        // Write the TCB self-pointer if the TCB falls within this page.
+        if tcb_va >= page_base_va && tcb_va < page_end_va {
+            let tcb_offset_in_page = tcb_va - page_base_va;
+            let dst = hhdm + frame.start_address().as_u64() + tcb_offset_in_page;
+            // SAFETY: TCB is 8 bytes; offset+8 is within the page because
+            // region_end is page-aligned and TCB_SIZE=8 fits within a page
+            // boundary (tcb_va + 8 <= region_end).
+            unsafe {
+                core::ptr::write_unaligned(dst.as_mut_ptr::<u64>(), tcb_va);
+            }
+        }
+    }
+
+    // Register the TLS region as a private AnonObject VMA so fork copies it.
+    let vma = Vma::new(
+        region_start as usize,
+        region_end as usize,
+        0x3, // PROT_READ|WRITE
+        tls_flags.bits(),
+        Share::Private,
+        anon as Arc<dyn VmObject>,
+        0,
+    );
+    aspace.insert(vma);
+
+    // Advance image_end past the TLS region so the heap starts after it.
+    *image_end = region_end;
+
+    Ok(tcb_va)
 }
 
 // --- register_demand_vmas: file-backed + zero-tail VMA registration -------

@@ -609,7 +609,10 @@ pub fn current_fs_base() -> u64 {
 }
 
 /// Set the `fs_base` value of the currently-running task.
-/// Called by `arch_prctl(ARCH_SET_FS)` after address validation.
+/// Called by `arch_prctl(ARCH_SET_FS)` after address validation, and by
+/// the init process launcher and `exec_atomic` after allocating a static
+/// TLS block so the TCB address is propagated to the context-switch path
+/// that restores `MSR_FS_BASE`.
 ///
 /// Briefly locks the scheduler, writes the `u64`, and releases.
 /// The caller is responsible for also writing `MSR_FS_BASE` so that

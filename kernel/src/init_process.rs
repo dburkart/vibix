@@ -31,6 +31,11 @@ static INIT_ENTRY: AtomicU64 = AtomicU64::new(0);
 /// the stack frame. Set by `launch`; read by `init_ring3_entry`.
 static INIT_STACK_PTR: AtomicU64 = AtomicU64::new(0);
 
+/// TCB address for the initial static TLS block. Set by `launch` when
+/// the loaded ELF has a PT_TLS segment; read by `init_ring3_entry` to
+/// install as `MSR_FS_BASE`. Zero means no TLS block was allocated.
+static INIT_FS_BASE: AtomicU64 = AtomicU64::new(0);
+
 /// Pre-built init AddressSpace (with ELF VMAs and stack VMA).
 /// Consumed by `init_ring3_entry` on first and only use.
 static INIT_ADDRESS_SPACE: Once<Arc<RwLock<AddressSpace>>> = Once::new();
@@ -178,6 +183,10 @@ pub fn launch(bytes: &'static [u8]) -> usize {
     }
     INIT_ENTRY.store(effective_entry.as_u64(), Ordering::Release);
     INIT_STACK_PTR.store(initial_rsp, Ordering::Release);
+    if let Some(tcb) = image.tcb_addr {
+        INIT_FS_BASE.store(tcb, Ordering::Release);
+        serial_println!("init: TLS block allocated, tcb={:#x}", tcb);
+    }
     INIT_ADDRESS_SPACE.call_once(|| Arc::new(RwLock::new(aspace)));
 
     // 5. Spawn the kernel task that will drop to ring-3 and register it
@@ -231,6 +240,14 @@ fn init_ring3_entry() -> ! {
     // multi-process correctness: each user-space task needs its own SYSCALL
     // stack so concurrent/parallel syscalls don't clobber each other.
     crate::task::arm_ring3_syscall_stack();
+
+    // Install the FS base for the static TLS block so MSR_FS_BASE is
+    // written on the first context switch into this task. If no PT_TLS
+    // was present, INIT_FS_BASE is 0 and we skip the write.
+    let fs_base = INIT_FS_BASE.load(Ordering::Acquire);
+    if fs_base != 0 {
+        crate::task::set_current_fs_base(fs_base);
+    }
 
     serial_println!(
         "init: entering ring-3 entry={:#x} rsp={:#x}",
