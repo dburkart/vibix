@@ -237,6 +237,16 @@ pub(super) struct Task {
     /// this value whenever they switch into this task so that ring-3
     /// syscalls land on the right per-task stack.
     pub syscall_stack_top: u64,
+
+    /// Userspace FS segment base address (`MSR_FS_BASE` value).
+    ///
+    /// Written by `arch_prctl(ARCH_SET_FS)` and restored into
+    /// `MSR_FS_BASE` on every context switch into this task. Zero
+    /// until userspace requests a TLS area via `arch_prctl`.
+    ///
+    /// `fork` copies this from the parent so the child inherits the
+    /// parent's TLS pointer.
+    pub fs_base: u64,
 }
 
 impl Task {
@@ -269,6 +279,7 @@ impl Task {
             cwd: None,
             credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0,
+            fs_base: 0,
         }
     }
 
@@ -361,6 +372,7 @@ impl Task {
             cwd: None,
             credentials: BlockingRwLock::new(Arc::new(Credential::kernel())),
             syscall_stack_top: 0, // kernel-only task — no ring-3 syscall stack needed yet
+            fs_base: 0,
         }
     }
 
@@ -383,6 +395,16 @@ impl Task {
         } else {
             STACK_SIZE / 4096
         }
+    }
+
+    /// Returns the userspace FS segment base address (`MSR_FS_BASE`).
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
+    /// Sets the userspace FS segment base address (`MSR_FS_BASE`).
+    pub fn set_fs_base(&mut self, val: u64) {
+        self.fs_base = val;
     }
 
     /// Returns `true` if `addr` falls within this task's guard page.
@@ -412,6 +434,7 @@ impl Task {
         regs: &ForkUserRegs,
         parent_priority: u8,
         parent_affinity: u64,
+        parent_fs_base: u64,
         parent_fpu: *const crate::arch::x86_64::fpu::FpuArea,
         child_address_space: alloc::sync::Arc<spin::RwLock<AddressSpace>>,
         child_cr3: PhysFrame<Size4KiB>,
@@ -525,6 +548,7 @@ impl Task {
             // so it doesn't clobber the parent's saved SYSCALL context on the
             // shared INIT_KERNEL_STACK. Use the top of this task's kernel stack.
             syscall_stack_top: (stack_base + STACK_SIZE) as u64,
+            fs_base: parent_fs_base,
         })
     }
 }
@@ -571,6 +595,32 @@ mod stack_slot_tests {
             (a - TASK_STACKS_VA_BASE) % TASK_SLOT_SIZE,
             0,
             "bump-allocated slot must be slot-aligned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fs_base_tests {
+    use super::*;
+
+    /// The bootstrap task must start with `fs_base == 0` — no
+    /// userspace TLS is configured until `arch_prctl(ARCH_SET_FS)`.
+    #[test]
+    fn bootstrap_fs_base_is_zero() {
+        let t = Task::bootstrap();
+        assert_eq!(t.fs_base(), 0, "bootstrap task must have fs_base=0");
+    }
+
+    /// Setter/getter round-trip: write an arbitrary value, read it back.
+    #[test]
+    fn fs_base_setter_getter_round_trip() {
+        let mut t = Task::bootstrap();
+        let val: u64 = 0x0000_7FFF_DEAD_BEE0;
+        t.set_fs_base(val);
+        assert_eq!(
+            t.fs_base(),
+            val,
+            "fs_base getter must return the value that was set"
         );
     }
 }
