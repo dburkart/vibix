@@ -1100,7 +1100,13 @@ pub fn exit() -> ! {
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         drop(victims);
         let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
-        (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_task_ptr)
+        (
+            prev_rsp_ptr,
+            next_rsp,
+            next_cr3,
+            next_fpu_ptr,
+            next_task_ptr,
+        )
     };
     // Poke the reaper before we switch away. `notify_all` takes
     // `WaitQueue.inner` then `SCHED` (via `task::wake`); SCHED was
@@ -1390,7 +1396,15 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3, prev_task_ptr, next_task_ptr) = {
+    let (
+        prev_rsp_ptr,
+        prev_fpu_ptr,
+        next_fpu_ptr,
+        next_rsp,
+        next_cr3,
+        prev_task_ptr,
+        next_task_ptr,
+    ) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
@@ -1460,7 +1474,15 @@ pub fn block_current() {
         let prev_task_ptr: *mut Task = &mut **prev_ref;
         let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
 
-        (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3, prev_task_ptr, next_task_ptr)
+        (
+            prev_rsp_ptr,
+            prev_fpu_ptr,
+            next_fpu_ptr,
+            next_rsp,
+            next_cr3,
+            prev_task_ptr,
+            next_task_ptr,
+        )
     };
 
     // SAFETY: IRQs are masked, the SCHED lock is dropped so the
