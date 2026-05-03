@@ -541,3 +541,8 @@ harness = false
 name = "block_writeback_inode_walk"
 harness = false
 required-features = ["page_cache"]
+
+[[test]]
+name = "writeback_complete_wq"
+harness = false
+required-features = ["page_cache"]
