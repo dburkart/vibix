@@ -213,6 +213,8 @@ pub fn fork_current_task(
         parent_priority,
         parent_affinity,
         parent_fs_base,
+        parent_tls_region_start,
+        parent_tls_region_pages,
         parent_fpu_ptr,
     ) = {
         let mut sched = SCHED.lock();
@@ -244,6 +246,7 @@ pub fn fork_current_task(
         // makes that race benign: the child gets whichever Credential
         // was current at the instant of `read()`.
         let parent_credentials = Arc::clone(&*cur.credentials.read());
+        let (tls_start, tls_pages) = cur.tls_region();
         (
             Arc::clone(&cur.address_space),
             Arc::clone(&cur.fd_table),
@@ -252,6 +255,8 @@ pub fn fork_current_task(
             cur.priority,
             cur.affinity,
             cur.fs_base,
+            tls_start,
+            tls_pages,
             // SAFETY: the parent Task is the currently-running task and stays
             // alive in SCHED for the duration of this syscall. We only read
             // the FPU area during the new_forked call below.
@@ -262,7 +267,7 @@ pub fn fork_current_task(
 
     // CoW-clone the address space (requires AddressSpace write lock).
     crate::fork_trace!("fork-trace: [fork_current_task] → fork_address_space()");
-    let child_aspace = {
+    let mut child_aspace = {
         let mut tlb = crate::mem::tlb::Flusher::new_active();
         let child = parent_address_space.write().fork_address_space(&mut tlb)?;
         tlb.finish();
@@ -273,6 +278,31 @@ pub fn fork_current_task(
         "fork-trace: [fork_current_task] ← fork_address_space() child_cr3={:#x}",
         child_cr3.start_address().as_u64()
     );
+
+    // Deep-copy the parent's TLS block into the child's address space
+    // (#834). The CoW fork above gave the child read-only references to
+    // the parent's TLS frames; this replaces them with fresh private
+    // copies so the child can write to TLS variables (e.g. errno)
+    // without triggering a CoW page fault on the first access.
+    if parent_tls_region_start != 0 && parent_tls_region_pages != 0 {
+        let parent_cr3 = parent_address_space.read().page_table_frame();
+        crate::fork_trace!(
+            "fork-trace: [fork_current_task] → deep_copy_tls_block(start={:#x}, pages={})",
+            parent_tls_region_start,
+            parent_tls_region_pages
+        );
+        crate::mem::loader::deep_copy_tls_block(
+            parent_cr3,
+            &mut child_aspace,
+            child_cr3,
+            parent_fs_base,
+            parent_tls_region_start,
+            parent_tls_region_pages,
+        )
+        .map_err(|_| crate::mem::addrspace::ForkError::OutOfMemory)?;
+        crate::fork_trace!("fork-trace: [fork_current_task] ← deep_copy_tls_block()");
+    }
+
     let child_aspace = Arc::new(RwLock::new(child_aspace));
 
     // Clone the fd table (slot-independent, description-shared).
@@ -290,6 +320,8 @@ pub fn fork_current_task(
             parent_priority,
             parent_affinity,
             parent_fs_base,
+            parent_tls_region_start,
+            parent_tls_region_pages,
             parent_fpu_ptr,
             child_aspace,
             child_cr3,
@@ -657,6 +689,22 @@ pub fn set_current_fs_base(val: u64) {
         .as_mut()
         .expect("set_current_fs_base: no running task")
         .set_fs_base(val);
+}
+
+/// Record the static TLS block boundaries on the currently-running task.
+/// Called by `exec_atomic` and `init_ring3_entry` after the loader
+/// allocates a TLS block, so the fork path can deep-copy the TLS pages
+/// into the child (#834).
+///
+/// # Panics
+/// Panics if called before [`init`] (no running task).
+pub fn set_current_tls_region(start: u64, pages: u64) {
+    SCHED
+        .lock()
+        .current
+        .as_mut()
+        .expect("set_current_tls_region: no running task")
+        .set_tls_region(start, pages);
 }
 
 fn find_priority(sched: &Scheduler, id: usize) -> Option<u8> {

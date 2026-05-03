@@ -126,6 +126,13 @@ pub struct LoadedImage {
     /// self-pointer (x86_64 ELF variant II layout). `None` when the
     /// binary has no `PT_TLS` segment.
     pub tcb_addr: Option<u64>,
+    /// Page-aligned start VA of the static TLS block allocated by the
+    /// loader. Zero when no TLS block was allocated. Used by the fork
+    /// path to deep-copy TLS pages (#834).
+    pub tls_region_start: u64,
+    /// Number of 4 KiB pages in the static TLS block. Zero when no TLS
+    /// block was allocated.
+    pub tls_region_pages: u64,
 }
 
 /// Parse `bytes` as an ELF64 image and install its `PT_LOAD` segments
@@ -176,6 +183,8 @@ pub fn load(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         phdr_entsize: 0,
         tls_info: parsed.tls_info(),
         tcb_addr: None,
+        tls_region_start: 0,
+        tls_region_pages: 0,
     })
 }
 
@@ -252,6 +261,8 @@ pub fn load_user_elf(bytes: &[u8], pml4: PhysFrame<Size4KiB>) -> Result<LoadedIm
         phdr_entsize: parsed.phdr_entsize(),
         tls_info: parsed.tls_info(),
         tcb_addr: None,
+        tls_region_start: 0,
+        tls_region_pages: 0,
     })
 }
 
@@ -353,16 +364,12 @@ pub fn load_user_elf_with_vmas(
     // placed at `image_end` (page-aligned), registered as a writable AnonObject
     // VMA so fork copies it, and the TCB address is recorded for `MSR_FS_BASE`.
     let tls = parsed.tls_info();
-    let tcb_addr = if let Some(ref info) = tls {
-        Some(allocate_tls_block(
-            bytes,
-            info,
-            &mut image_end,
-            _pml4,
-            address_space,
-        )?)
+    let (tcb_addr, tls_region_start, tls_region_pages) = if let Some(ref info) = tls {
+        let (tcb_va, region_start, page_count) =
+            allocate_tls_block(bytes, info, &mut image_end, _pml4, address_space)?;
+        (Some(tcb_va), region_start, page_count)
     } else {
-        None
+        (None, 0, 0)
     };
 
     let mut image = LoadedImage {
@@ -376,6 +383,8 @@ pub fn load_user_elf_with_vmas(
         phdr_entsize: parsed.phdr_entsize(),
         tls_info: tls,
         tcb_addr,
+        tls_region_start,
+        tls_region_pages,
     };
 
     // Check for a dynamic interpreter (PT_INTERP). If present, resolve
@@ -463,7 +472,9 @@ fn read_interp_from_fs(interp_path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// file; `.tbss` is zero-filled; TCB[0] is set to `&TCB`.
 ///
 /// On success, updates `*image_end` past the TLS pages and returns
-/// the virtual address of the TCB (the value for `MSR_FS_BASE`).
+/// `(tcb_va, region_start, page_count)` — the TCB virtual address
+/// (the value for `MSR_FS_BASE`), the page-aligned start of the TLS
+/// region, and the number of 4 KiB pages it spans.
 #[cfg(target_os = "none")]
 fn allocate_tls_block(
     elf_bytes: &[u8],
@@ -471,7 +482,7 @@ fn allocate_tls_block(
     image_end: &mut u64,
     pml4: PhysFrame<Size4KiB>,
     aspace: &mut super::addrspace::AddressSpace,
-) -> Result<u64, LoadError> {
+) -> Result<(u64, u64, u64), LoadError> {
     use super::vmatree::{Share, Vma};
     use super::vmobject::{AnonObject, VmObject};
 
@@ -563,7 +574,91 @@ fn allocate_tls_block(
     // Advance image_end past the TLS region so the heap starts after it.
     *image_end = region_end;
 
-    Ok(tcb_va)
+    Ok((tcb_va, region_start, page_count))
+}
+
+// --- deep_copy_tls_block: fork TLS deep-copy (#834) -------------------------
+
+/// Deep-copy the parent's TLS block pages into the child's address space
+/// after a CoW fork. The fork path gave the child read-only references to
+/// the parent's TLS frames via CoW. This function replaces every CoW
+/// page in the child's TLS region with a fresh private copy of the
+/// parent's page content, then fixes up the TCB self-pointer in the
+/// child's copy so `%fs:0` still yields the correct TCB address.
+///
+/// The eager deep-copy avoids the CoW page fault that would otherwise
+/// fire on the child's first write to any TLS variable (e.g. `errno`).
+///
+/// `parent_pml4` — the parent's PML4 frame (for reading TLS page content).
+/// `_child_aspace` — the child's address space (reserved for future VMA
+///     cache updates; currently unused because `cow_copy_and_remap` handles
+///     PTE + refcount bookkeeping).
+/// `child_pml4` — the child's PML4 frame (for replacing CoW mappings).
+/// `fs_base` — TCB virtual address (same VA in parent and child).
+/// `tls_region_start` — page-aligned start VA of the TLS block.
+/// `tls_region_pages` — number of 4 KiB pages in the TLS block.
+#[cfg(target_os = "none")]
+pub fn deep_copy_tls_block(
+    parent_pml4: x86_64::structures::paging::PhysFrame<Size4KiB>,
+    _child_aspace: &mut super::addrspace::AddressSpace,
+    child_pml4: x86_64::structures::paging::PhysFrame<Size4KiB>,
+    fs_base: u64,
+    tls_region_start: u64,
+    tls_region_pages: u64,
+) -> Result<(), LoadError> {
+    use x86_64::structures::paging::{Page, PageTableFlags};
+
+    let hhdm = paging::hhdm_offset();
+
+    // Writable + user-accessible + NX — the TLS block is always RW data.
+    let tls_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    for i in 0..tls_region_pages {
+        let va = tls_region_start + i * PAGE_SIZE;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+
+        // Look up the parent's physical frame for this page. If the page
+        // hasn't been faulted in yet (demand-paged), skip — the child
+        // will demand-fault it independently from the VMA.
+        if paging::translate_in_pml4(parent_pml4, VirtAddr::new(va)).is_none() {
+            continue;
+        }
+
+        // The child's PTE for this page is currently a read-only CoW
+        // alias of the parent's frame. Replace it with a fresh frame
+        // containing a copy of the parent's content via
+        // cow_copy_and_remap, which:
+        //   1. Unmaps the child's CoW PTE
+        //   2. Allocates a fresh frame
+        //   3. Copies page content (parent's data) via HHDM
+        //   4. Re-maps the fresh frame with full write permission
+        //   5. Decrements the refcount on the old shared frame
+        let new_frame = paging::cow_copy_and_remap(child_pml4, page, tls_flags)
+            .map_err(LoadError::MapFailed)?;
+
+        // Fix up the TCB self-pointer if the TCB falls within this page.
+        // The TCB VA is `fs_base`; its self-pointer at offset 0 must
+        // equal `fs_base`. The cow_copy_and_remap already copied the
+        // parent's content, so the self-pointer is correct (same VA in
+        // parent and child). This write is technically a no-op for fork
+        // (the VA doesn't change), but we do it defensively to ensure
+        // the invariant holds.
+        if fs_base >= va && fs_base < va + PAGE_SIZE {
+            let tcb_offset_in_page = fs_base - va;
+            let dst = hhdm + new_frame.start_address().as_u64() + tcb_offset_in_page;
+            // SAFETY: the frame was just allocated for our exclusive use.
+            // The 8-byte write fits within the page (TCB is 8 bytes and
+            // sits within the region).
+            unsafe {
+                core::ptr::write_unaligned(dst.as_mut_ptr::<u64>(), fs_base);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // --- register_demand_vmas: file-backed + zero-tail VMA registration -------

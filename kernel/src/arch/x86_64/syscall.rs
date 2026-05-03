@@ -1341,6 +1341,11 @@ pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible
     crate::task::set_current_fs_base(exec_fs_base);
     unsafe { Msr::new(MSR_FS_BASE).write(exec_fs_base) };
 
+    // Record the TLS region boundaries so fork can deep-copy the TLS
+    // block into the child (#834). exec replaces the entire address
+    // space, so prior TLS region info is stale.
+    crate::task::set_current_tls_region(image.tls_region_start, image.tls_region_pages);
+
     // If the binary has a dynamic interpreter (PT_INTERP), jump to the
     // interpreter's entry point; otherwise jump directly to the binary's entry.
     let effective_entry = image.interp_entry.unwrap_or(image.entry);
