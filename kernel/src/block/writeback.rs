@@ -89,10 +89,10 @@ pub fn is_disabled() -> bool {
     CONFIGURED_SECS.load(Ordering::SeqCst) == DISABLE_SENTINEL
 }
 
-/// Parse a kernel command-line string, looking for
-/// `writeback_secs=<N>`. Whitespace-delimited; `N` must parse as a
-/// `u64` or the token is silently ignored (we'd rather continue
-/// booting with the default than panic on a typo).
+/// Parse a kernel command-line string, looking for the writeback
+/// knobs. Whitespace-delimited; values must parse as a `u64` or the
+/// token is silently ignored (we'd rather continue booting with the
+/// default than panic on a typo).
 ///
 /// The parser recognises:
 ///
@@ -100,14 +100,18 @@ pub fn is_disabled() -> bool {
 ///   the sentinel).
 /// - `writeback_secs=N` for any other `N` → override the default to N
 ///   seconds.
+/// - `direct_reclaim_timeout_ms=N` → override the CLOCK-Pro
+///   direct-reclaim soft cap (RFC 0007 §Eviction liveness, issue
+///   #757). `0` resets to [`DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS`].
 ///
 /// Multiple occurrences: last one wins, matching how Linux handles
 /// duplicate cmdline parameters.
 ///
-/// Returns `true` if any `writeback_secs=…` token was found (so the
-/// caller can log that the override was applied); `false` otherwise.
+/// Returns `true` if any recognised token was found (so the caller can
+/// log that an override was applied); `false` otherwise.
 pub fn parse_cmdline(cmdline: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"writeback_secs=";
+    const SECS_PREFIX: &[u8] = b"writeback_secs=";
+    const RECLAIM_PREFIX: &[u8] = b"direct_reclaim_timeout_ms=";
     let mut matched = false;
     let mut i = 0;
     while i < cmdline.len() {
@@ -119,7 +123,7 @@ pub fn parse_cmdline(cmdline: &[u8]) -> bool {
             i += 1;
         }
         let token = &cmdline[start..i];
-        if let Some(rest) = token.strip_prefix(PREFIX) {
+        if let Some(rest) = token.strip_prefix(SECS_PREFIX) {
             if let Some(secs) = parse_u64(rest) {
                 if secs == 0 {
                     set_configured_secs(DISABLE_SENTINEL);
@@ -130,6 +134,13 @@ pub fn parse_cmdline(cmdline: &[u8]) -> bool {
             }
             // Unparseable value → ignore; boot continues with the
             // previously-set (or default) cadence.
+        } else if let Some(rest) = token.strip_prefix(RECLAIM_PREFIX) {
+            if let Some(ms) = parse_u64(rest) {
+                set_direct_reclaim_timeout_ms(ms);
+                matched = true;
+            }
+            // Unparseable value → ignore; same fail-soft policy as
+            // the writeback_secs branch above.
         }
     }
     matched
@@ -160,6 +171,55 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
 #[doc(hidden)]
 pub fn reset_configured_for_tests() {
     CONFIGURED_SECS.store(0, Ordering::SeqCst);
+    DIRECT_RECLAIM_TIMEOUT_MS.store(0, Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------
+// Direct-reclaim soft-cap knob (RFC 0007 §Eviction liveness, issue #757).
+//
+// CLOCK-Pro direct reclaim (#740) parks on `PageCache::writeback_complete_wq`
+// for at most this many milliseconds before surfacing `ENOMEM`. Lives in
+// this module rather than `mem::page_cache` because the cmdline parser is
+// already here and the knob shares the parse-once-at-boot lifecycle.
+// ---------------------------------------------------------------------------
+
+/// Compile-time default: 2 seconds. RFC 0007 §Eviction liveness, item 3:
+/// "configurable via … `direct_reclaim_timeout_ms=<N>` override". The 2 s
+/// cap is the bounded-direct-reclaim option (a) from the academic
+/// blocking finding — long enough to wait out a typical writepage
+/// latency, short enough that a pathological workload cannot park a
+/// faulting thread for the full 30 s writeback interval.
+pub const DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS: u64 = 2_000;
+
+/// Kernel-cmdline override, in milliseconds. `0` means "use
+/// [`DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS`]"; any non-zero value replaces
+/// the default for every subsequent direct-reclaim park.
+///
+/// The consumer of this value (CLOCK-Pro eviction) lands in #740. This
+/// PR (#757) wires up the knob alongside the per-cache waitqueue
+/// primitive itself so the cmdline surface is stable from day one and
+/// #740 can read [`direct_reclaim_timeout_ms`] without re-litigating
+/// the parser.
+static DIRECT_RECLAIM_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Install a kernel-cmdline `direct_reclaim_timeout_ms=<N>` override.
+/// `0` resets to [`DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS`]; any other value
+/// becomes the new soft cap.
+pub fn set_direct_reclaim_timeout_ms(ms: u64) {
+    DIRECT_RECLAIM_TIMEOUT_MS.store(ms, Ordering::SeqCst);
+}
+
+/// Current direct-reclaim soft cap in milliseconds. Reflects the most
+/// recent [`set_direct_reclaim_timeout_ms`] value, falling back to
+/// [`DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS`] if no override has been
+/// installed.
+pub fn direct_reclaim_timeout_ms() -> u64 {
+    let override_ = DIRECT_RECLAIM_TIMEOUT_MS.load(Ordering::SeqCst);
+    if override_ == 0 {
+        DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS
+    } else {
+        override_
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,5 +750,62 @@ mod tests {
         reset_configured_for_tests();
         set_configured_secs(DISABLE_SENTINEL);
         assert!(is_disabled());
+    }
+
+    // --- direct_reclaim_timeout_ms knob (issue #757) ---------------------
+
+    #[test]
+    fn direct_reclaim_timeout_default_before_any_override() {
+        let _g = TEST_LOCK.lock();
+        reset_configured_for_tests();
+        assert_eq!(
+            direct_reclaim_timeout_ms(),
+            DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_sets_direct_reclaim_timeout() {
+        let _g = TEST_LOCK.lock();
+        reset_configured_for_tests();
+        assert!(parse_cmdline(b"direct_reclaim_timeout_ms=500"));
+        assert_eq!(direct_reclaim_timeout_ms(), 500);
+    }
+
+    #[test]
+    fn parse_cmdline_direct_reclaim_zero_resets_to_default() {
+        let _g = TEST_LOCK.lock();
+        reset_configured_for_tests();
+        // First set a non-zero override...
+        assert!(parse_cmdline(b"direct_reclaim_timeout_ms=750"));
+        assert_eq!(direct_reclaim_timeout_ms(), 750);
+        // ...then a zero token clears it back to the default.
+        assert!(parse_cmdline(b"direct_reclaim_timeout_ms=0"));
+        assert_eq!(
+            direct_reclaim_timeout_ms(),
+            DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_direct_reclaim_garbage_value_ignored() {
+        let _g = TEST_LOCK.lock();
+        reset_configured_for_tests();
+        assert!(!parse_cmdline(b"direct_reclaim_timeout_ms=xyz"));
+        assert_eq!(
+            direct_reclaim_timeout_ms(),
+            DEFAULT_DIRECT_RECLAIM_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_both_knobs_independently() {
+        let _g = TEST_LOCK.lock();
+        reset_configured_for_tests();
+        assert!(parse_cmdline(
+            b"writeback_secs=12 direct_reclaim_timeout_ms=1500"
+        ));
+        assert_eq!(configured_secs(), 12);
+        assert_eq!(direct_reclaim_timeout_ms(), 1500);
     }
 }
