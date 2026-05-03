@@ -1515,6 +1515,74 @@ mod tests {
         assert_eq!(cache.wb_err(), 3);
     }
 
+    /// RFC 0007 §`wb_err` errseq end-to-end: simulates the
+    /// `writepage` Err → `bump_wb_err` → fsync snapshot comparison
+    /// chain. Two independent "file descriptions" (modelled as
+    /// separate `AtomicU32` snapshots — the same shape as
+    /// `OpenFile::wb_err_snapshot`) each observe the sticky EIO
+    /// exactly once per advance, consuming it on read.
+    ///
+    /// This exercises the pattern at the `PageCache` layer so it
+    /// runs as a host unit test even though `OpenFile` (VFS module)
+    /// is only compiled for `target_os = "none"`.
+    #[test]
+    fn wb_err_errseq_sticky_eio_once_per_snapshot() {
+        use core::sync::atomic::AtomicU32;
+
+        let cache = fresh_cache();
+
+        // Two "file descriptions" snapshot wb_err at open time.
+        let fd1_snapshot = AtomicU32::new(cache.wb_err());
+        let fd2_snapshot = AtomicU32::new(cache.wb_err());
+
+        // Helper: compare-and-advance a snapshot, return true if
+        // the counter advanced (i.e. fsync would return EIO).
+        let check_and_consume = |snap: &AtomicU32| -> bool {
+            let current = cache.wb_err();
+            let seen = snap.load(Ordering::Acquire);
+            let advanced = seen != current;
+            if advanced {
+                snap.store(current, Ordering::Release);
+            }
+            advanced
+        };
+
+        // No error yet — both fds clean.
+        assert!(!check_and_consume(&fd1_snapshot));
+        assert!(!check_and_consume(&fd2_snapshot));
+
+        // Simulate a writepage failure.
+        cache.bump_wb_err();
+
+        // Both fds see EIO exactly once.
+        assert!(check_and_consume(&fd1_snapshot));
+        assert!(!check_and_consume(&fd1_snapshot)); // consumed
+        assert!(check_and_consume(&fd2_snapshot));
+        assert!(!check_and_consume(&fd2_snapshot)); // consumed
+
+        // A second failure — both see EIO again, once each.
+        cache.bump_wb_err();
+        assert!(check_and_consume(&fd1_snapshot));
+        assert!(!check_and_consume(&fd1_snapshot));
+        assert!(check_and_consume(&fd2_snapshot));
+        assert!(!check_and_consume(&fd2_snapshot));
+
+        // Open a third fd *after* two failures (snapshot=2).
+        let fd3_snapshot = AtomicU32::new(cache.wb_err());
+        // fd3 is up to date — no pending error.
+        assert!(!check_and_consume(&fd3_snapshot));
+
+        // Third failure.
+        cache.bump_wb_err();
+        // All three see it once.
+        assert!(check_and_consume(&fd1_snapshot));
+        assert!(check_and_consume(&fd2_snapshot));
+        assert!(check_and_consume(&fd3_snapshot));
+        assert!(!check_and_consume(&fd1_snapshot));
+        assert!(!check_and_consume(&fd2_snapshot));
+        assert!(!check_and_consume(&fd3_snapshot));
+    }
+
     #[test]
     fn i_size_round_trips() {
         let cache = fresh_cache();
