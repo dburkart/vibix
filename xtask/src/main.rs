@@ -1485,7 +1485,11 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
             )
             .into());
         }
-        None => (ensure_test_disk()?, Vec::new()),
+        None => {
+            let init_bin = build_userspace_init()?;
+            let img = ext2_image::build(&workspace_root(), Some(&init_bin), true)?;
+            (img, Vec::new())
+        }
     };
     for extra in cmdline_extras {
         extra_cmdline.push((*extra).to_string());
