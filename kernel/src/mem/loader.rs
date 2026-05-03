@@ -80,7 +80,8 @@ pub enum LoadError {
     /// the panic can't be reached from a malformed user ELF.
     SegmentEndsAtUserVaEnd,
     /// The main ELF has a PT_INTERP segment naming an interpreter, but no
-    /// Limine module with a matching path suffix was found.
+    /// Limine module with a matching path suffix was found and the
+    /// interpreter could not be read from the mounted VFS either.
     InterpNotFound,
     /// The interpreter ELF named by PT_INTERP failed to parse or map.
     InterpLoadFailed,
@@ -315,8 +316,9 @@ fn unmap_partial_load_at_base(
 /// provides the definitive TLB flush before entering user code.
 ///
 /// PT_INTERP is handled identically: the named interpreter is located
-/// among the Limine modules by path suffix, parsed, and loaded at
-/// `INTERP_LOAD_BASE` via the same file-backed VMA approach.
+/// among the Limine modules by path suffix (fallback: read from the
+/// mounted VFS), parsed, and loaded at `INTERP_LOAD_BASE` via the
+/// same file-backed VMA approach.
 #[cfg(target_os = "none")]
 pub fn load_user_elf_with_vmas(
     bytes: &'static [u8],
@@ -345,17 +347,43 @@ pub fn load_user_elf_with_vmas(
         phdr_entsize: parsed.phdr_entsize(),
     };
 
-    // Check for a dynamic interpreter (PT_INTERP). If present, look it up
-    // in the Limine modules by path suffix, load its segments at
-    // INTERP_LOAD_BASE via the same demand-paged approach.
+    // Check for a dynamic interpreter (PT_INTERP). If present, resolve
+    // the interpreter ELF and recursively load its PT_LOAD segments at
+    // INTERP_LOAD_BASE via the same demand-paged approach, then transfer
+    // initial PC to the interpreter.
+    //
+    // Resolution order:
+    //   1. Limine boot modules (basename match) — works during early
+    //      bootstrap when the VFS may not be mounted yet.
+    //   2. VFS path walk (full PT_INTERP path against the mounted root
+    //      filesystem) — the normal path for execve of dynamic binaries
+    //      once the FS is up.
     if let Some(interp_path) = parsed.interp_path() {
+        // Try Limine modules first (basename match).
         let interp_basename = interp_path
             .iter()
             .rposition(|&b| b == b'/')
             .map(|slash| &interp_path[slash + 1..])
             .unwrap_or(interp_path);
-        let interp_bytes =
-            elf::module_bytes_for_path(interp_basename).ok_or(LoadError::InterpNotFound)?;
+        let module_bytes: Option<&'static [u8]> = elf::module_bytes_for_path(interp_basename);
+
+        // Fall back to reading the interpreter from the VFS. The Vec is
+        // leaked to produce `&'static [u8]` because `register_demand_vmas`
+        // builds a `PageCache` + `ElfBytesOps` that must outlive the
+        // process (demand faults read from it). The leak is bounded by
+        // the interpreter's file size and reclaimed only at process exit
+        // (same lifetime as the Limine module path).
+        let fs_bytes: Option<&'static [u8]> = if module_bytes.is_none() {
+            read_interp_from_fs(interp_path).map(|v| &*v.leak())
+        } else {
+            None
+        };
+
+        let interp_bytes: &'static [u8] = match (module_bytes, fs_bytes) {
+            (Some(m), _) => m,
+            (None, Some(v)) => v,
+            (None, None) => return Err(LoadError::InterpNotFound),
+        };
 
         let interp_parsed =
             elf::try_parse_elf64(interp_bytes).ok_or(LoadError::InterpLoadFailed)?;
@@ -369,6 +397,22 @@ pub fn load_user_elf_with_vmas(
     }
 
     Ok(image)
+}
+
+/// Attempt to read the interpreter ELF from the mounted VFS at the full
+/// PT_INTERP path (e.g. `/lib/ld-musl-x86_64.so.1`). Returns `None` if the
+/// VFS root is not yet mounted or the file does not exist.
+///
+/// The returned `Vec<u8>` is heap-allocated; the caller leaks it to get
+/// `&'static [u8]` for the demand-paged `PageCache` / `ElfBytesOps`.
+#[cfg(target_os = "none")]
+fn read_interp_from_fs(interp_path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    // Guard: the VFS may not be mounted yet during early init bootstrap.
+    crate::fs::vfs::root()?;
+    match crate::shell::vfs_helpers::read_all(interp_path) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        _ => None,
+    }
 }
 
 // --- register_demand_vmas: file-backed + zero-tail VMA registration -------
