@@ -66,8 +66,8 @@ fn exec_worker() -> ! {
     // Garbage that cannot parse as ELF64 — `try_parse_elf64` rejects
     // and `load_user_elf_with_vmas` returns `Err(LoadError::NotElf64)`,
     // which the syscall arm maps to ENOEXEC (-8).
-    let garbage = [0u8; 64];
-    match exec_atomic(&garbage) {
+    static GARBAGE: [u8; 64] = [0u8; 64];
+    match exec_atomic(&GARBAGE) {
         Ok(_never) => {
             // exec_atomic returned Ok? That means the swap committed
             // (and we never come back via a normal return because

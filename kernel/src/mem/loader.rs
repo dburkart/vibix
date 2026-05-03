@@ -1,4 +1,6 @@
-//! Minimal ELF64 image loader.
+//! ELF64 image loader — demand-paged via file-backed VMAs.
+//!
+//! ## Kernel-image loader (`load`)
 //!
 //! Walks `PT_LOAD` segments of an ELF payload, allocates and maps 4 KiB
 //! pages at each segment's `p_vaddr`, and copies `p_filesz` bytes from
@@ -9,10 +11,28 @@
 //! must therefore run before `task::init()`; later-spawned tasks will
 //! inherit the mapping automatically.
 //!
-//! Scope: enough to prove end-to-end control transfer into a separately
-//! linked ELF image. No ring-3, no per-process address spaces, no user
-//! stack allocation — the entry is called at ring-0 with the kernel's
-//! current stack still active.
+//! ## Userspace loader (`load_user_elf_with_vmas`) — RFC 0007 §Demand-paged execve
+//!
+//! Rewrites the eager copy model into file-backed VMAs with demand faulting:
+//!
+//! - For each `PT_LOAD` segment, the **file-backed prefix**
+//!   `[p_offset .. p_offset + p_filesz)` (rounded to pages) is backed
+//!   by a [`FileObject`] over a per-binary [`PageCache`], inserted as
+//!   a `Share::Private` VMA at the page-aligned `p_vaddr`. Page reads
+//!   are deferred to the page-fault handler's `VmObject::fault` dispatch.
+//! - When `p_memsz > p_filesz`, a second `AnonObject`-backed
+//!   `Share::Private` VMA covers the zero tail (`.bss`). This prevents
+//!   file data from leaking into `.bss` (RFC 0007 §Tail-page zeroing,
+//!   split-segment trick).
+//! - No frames are eagerly allocated into the PML4. The first touch on
+//!   `.text` triggers a page fault → `FileObject::fault` → `readpage`
+//!   → install PTE. `.bss` faults produce a fresh zero-fill page via
+//!   `AnonObject::fault`.
+//!
+//! The backing `AddressSpaceOps` implementation for the loader is
+//! [`ElfBytesOps`], which reads from the in-memory `&'static [u8]`
+//! slice of the Limine module. This is the same data path the eager
+//! loader used to `memcpy` through the HHDM, but deferred to fault time.
 //!
 //! The loader writes segment contents through the HHDM window rather
 //! than through the just-installed PTE, so the final mapping flags can
@@ -274,81 +294,61 @@ fn unmap_partial_load_at_base(
     }
 }
 
-/// Load `bytes` as a lower-half ELF into `pml4` AND register each
-/// `PT_LOAD` segment as a `Share::Private` VMA in `address_space` with
-/// a pre-populated `AnonObject` cache. This lets `fork_address_space`
-/// walk the segments when forking a process that was bootstrapped via
-/// the ELF loader.
+/// Load `bytes` as a lower-half ELF into `address_space` using
+/// demand-paged, file-backed VMAs (RFC 0007 §Demand-paged execve).
 ///
-/// Each frame allocated by the loader is inserted into the AnonObject
-/// cache with an extra reference count so the cache and PTE both hold
-/// independent references, matching the invariant `AnonObject::fault`
-/// establishes for demand-paged frames.
+/// For each `PT_LOAD` segment:
+///
+/// 1. **File-backed prefix** — the pages covering `[p_offset ..
+///    p_offset + p_filesz)` (rounded to page boundaries) are backed by
+///    a [`FileObject`] over a per-binary [`PageCache`]. No frames are
+///    eagerly allocated; reads are deferred to the page-fault handler.
+///
+/// 2. **Zero tail** — when `p_memsz > p_filesz`, the page-aligned
+///    remainder is backed by a fresh [`AnonObject`] (zero-fill on
+///    demand). This prevents file data from leaking into `.bss`.
+///
+/// The `pml4` parameter is still accepted so callers that installed
+/// frames before this function was demand-paged can continue to pass
+/// it; this function does NOT eagerly install any PTEs — the PML4 is
+/// untouched. The CR3 write in `init_ring3_entry` / `exec_atomic`
+/// provides the definitive TLB flush before entering user code.
+///
+/// PT_INTERP is handled identically: the named interpreter is located
+/// among the Limine modules by path suffix, parsed, and loaded at
+/// `INTERP_LOAD_BASE` via the same file-backed VMA approach.
 #[cfg(target_os = "none")]
 pub fn load_user_elf_with_vmas(
-    bytes: &[u8],
-    pml4: PhysFrame<Size4KiB>,
+    bytes: &'static [u8],
+    _pml4: PhysFrame<Size4KiB>,
     address_space: &mut super::addrspace::AddressSpace,
 ) -> Result<LoadedImage, LoadError> {
-    use super::vmatree::{Share, Vma};
-    use super::vmobject::{AnonObject, VmObject};
-
-    let mut image = load_user_elf(bytes, pml4)?;
-
     let parsed = elf::try_parse_elf64(bytes).ok_or(LoadError::NotElf64)?;
 
-    // Helper closure: register one ELF segment as a VMA, pre-populating the
-    // AnonObject cache with the frames the loader just installed at
-    // `effective_vaddr = seg.vaddr + base_offset`.
-    let mut register_vma = |seg: elf::LoadSegment, base_offset: u64| {
-        let effective_vaddr = seg.vaddr.as_u64().wrapping_add(base_offset);
-        if effective_vaddr >= UPPER_HALF_START {
-            return;
-        }
-        let page_count = seg.memsz.div_ceil(PAGE_SIZE) as usize;
-        let start = effective_vaddr as usize;
-        let end = start + page_count * PAGE_SIZE as usize;
-        let obj = AnonObject::new(Some(page_count));
-
-        // Pre-populate the cache with the frames the loader just mapped.
-        for i in 0..page_count {
-            let va = VirtAddr::new(effective_vaddr + i as u64 * PAGE_SIZE);
-            if let Some((frame, _)) = paging::translate_in_pml4(pml4, va) {
-                let phys = frame.start_address().as_u64();
-                // insert_existing_frame increments refcount by 1 for the
-                // cache reference. The PTE reference was set by the loader
-                // on a freshly-allocated frame (refcount 1), so saturation
-                // is statically impossible here.
-                obj.insert_existing_frame(i, phys)
-                    .expect("loader: freshly-mapped ELF frame cannot be saturated");
-            }
-        }
-
-        let prot_pte =
-            (seg.flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits();
-        let vma = Vma::new(
-            start,
-            end,
-            0x3,
-            prot_pte,
-            Share::Private,
-            obj as Arc<dyn VmObject>,
-            0,
-        );
-        address_space.insert(vma);
-    };
-
-    for seg in parsed.load_segments() {
-        register_vma(seg, 0);
+    let entry = parsed.entry();
+    if entry.as_u64() >= UPPER_HALF_START {
+        return Err(LoadError::SegmentNotLowerHalf);
     }
+
+    // Register file-backed + zero-tail VMAs for the main binary's PT_LOAD
+    // segments. Returns `(segment_count, page_aligned_image_end)`.
+    let (segments, image_end) = register_demand_vmas(bytes, parsed, 0, address_space)?;
+
+    let mut image = LoadedImage {
+        entry,
+        segments,
+        image_end,
+        interp_entry: None,
+        interp_base: None,
+        phdr_vaddr: parsed.phdr_vaddr(),
+        phdr_count: parsed.phdr_count(),
+        phdr_entsize: parsed.phdr_entsize(),
+    };
 
     // Check for a dynamic interpreter (PT_INTERP). If present, look it up
     // in the Limine modules by path suffix, load its segments at
-    // INTERP_LOAD_BASE, and record its adjusted entry point.
+    // INTERP_LOAD_BASE via the same demand-paged approach.
     if let Some(interp_path) = parsed.interp_path() {
-        // PT_INTERP stores the full path (e.g. `/lib/ld-musl-x86_64.so.1`)
-        // but the Limine module is usually published under `/boot/...`. Match
-        // on the basename only so the path prefix difference doesn't matter.
         let interp_basename = interp_path
             .iter()
             .rposition(|&b| b == b'/')
@@ -360,45 +360,8 @@ pub fn load_user_elf_with_vmas(
         let interp_parsed =
             elf::try_parse_elf64(interp_bytes).ok_or(LoadError::InterpLoadFailed)?;
 
-        // Load interpreter PT_LOAD segments at INTERP_LOAD_BASE.
-        let mut interp_completed = 0usize;
-        let mut interp_partial_pages = 0u64;
-        let mut interp_err: Option<LoadError> = None;
-        for seg in interp_parsed.load_segments() {
-            let seg_end = seg
-                .vaddr
-                .as_u64()
-                .wrapping_add(INTERP_LOAD_BASE)
-                .wrapping_add(seg.memsz);
-            if seg_end >= USER_VA_END {
-                interp_err = Some(LoadError::InterpLoadFailed);
-                break;
-            }
-            if let Err((e, mapped)) = map_user_segment(interp_bytes, seg, pml4, INTERP_LOAD_BASE) {
-                interp_partial_pages = mapped;
-                interp_err = Some(e);
-                break;
-            }
-            interp_completed += 1;
-        }
-        if let Some(e) = interp_err {
-            // Free any interpreter frames we already mapped so the staged
-            // AddressSpace doesn't leak them on drop (VMAs haven't been
-            // registered yet at this point).
-            unmap_partial_load_at_base(
-                interp_parsed,
-                pml4,
-                INTERP_LOAD_BASE,
-                interp_completed,
-                interp_partial_pages,
-            );
-            return Err(e);
-        }
-
-        // Register interpreter segments as VMAs so fork copies them.
-        for seg in interp_parsed.load_segments() {
-            register_vma(seg, INTERP_LOAD_BASE);
-        }
+        register_demand_vmas(interp_bytes, interp_parsed, INTERP_LOAD_BASE, address_space)
+            .map_err(|_| LoadError::InterpLoadFailed)?;
 
         let interp_entry_vaddr = interp_parsed.entry().as_u64() + INTERP_LOAD_BASE;
         image.interp_entry = Some(VirtAddr::new(interp_entry_vaddr));
@@ -406,6 +369,179 @@ pub fn load_user_elf_with_vmas(
     }
 
     Ok(image)
+}
+
+// --- register_demand_vmas: file-backed + zero-tail VMA registration -------
+
+/// Monotonic counter for synthetic inode IDs — each invocation (main binary +
+/// interpreter) gets a distinct InodeId so page caches are per-binary
+/// (RFC 0007 §Inode-binding rule).
+static NEXT_SYNTH_INO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Register file-backed + zero-tail VMAs for one ELF's `PT_LOAD`
+/// segments into `aspace`. `elf_bytes` is the full in-memory ELF slice;
+/// `base_offset` is `0` for the main binary and `INTERP_LOAD_BASE` for
+/// the interpreter.
+///
+/// Returns `(segment_count, page_aligned_image_end)` on success.
+#[cfg(target_os = "none")]
+fn register_demand_vmas(
+    elf_bytes: &'static [u8],
+    parsed_elf: elf::ParsedElf<'_>,
+    base_offset: u64,
+    aspace: &mut super::addrspace::AddressSpace,
+) -> Result<(usize, u64), LoadError> {
+    use super::file_object::FileObject;
+    use super::page_cache::{InodeId, PageCache};
+    use super::vmatree::{Share, Vma};
+    use super::vmobject::{AnonObject, VmObject};
+
+    // Build a per-binary PageCache. The `ElfBytesOps` reads from the
+    // in-memory Limine module; i_size is the full ELF file length so
+    // every PT_LOAD file range is within bounds.
+    let synth_ino = NEXT_SYNTH_INO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let inode_id = InodeId::new(0xE1F0_0000, synth_ino);
+    let ops = Arc::new(ElfBytesOps::new(elf_bytes));
+    let cache = Arc::new(PageCache::new(
+        inode_id,
+        elf_bytes.len() as u64,
+        ops as Arc<dyn super::aops::AddressSpaceOps>,
+    ));
+
+    let mut segments = 0usize;
+    let mut image_end = 0u64;
+
+    for seg in parsed_elf.load_segments() {
+        let effective_vaddr = seg
+            .vaddr
+            .as_u64()
+            .checked_add(base_offset)
+            .ok_or(LoadError::SegmentNotLowerHalf)?;
+        if effective_vaddr >= UPPER_HALF_START {
+            return Err(LoadError::SegmentNotLowerHalf);
+        }
+        let seg_end_unaligned = effective_vaddr
+            .checked_add(seg.memsz)
+            .ok_or(LoadError::SegmentNotLowerHalf)?;
+        if seg_end_unaligned > UPPER_HALF_START {
+            return Err(LoadError::SegmentNotLowerHalf);
+        }
+        let seg_end = (seg_end_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if seg_end >= USER_VA_END {
+            return Err(LoadError::SegmentEndsAtUserVaEnd);
+        }
+        if effective_vaddr & (PAGE_SIZE - 1) != 0 {
+            return Err(LoadError::SegmentNotPageAligned);
+        }
+
+        let prot_pte =
+            (seg.flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits();
+
+        // --- File-backed prefix VMA ---
+        //
+        // Covers `[effective_vaddr .. effective_vaddr + file_pages * PAGE_SIZE)`.
+        // The `file_offset_pages` points into the cache at the page-aligned
+        // start of `p_offset`, and `len_pages` is the page-aligned file size.
+        let file_pages = seg.filesz.div_ceil(PAGE_SIZE) as usize;
+        if file_pages > 0 {
+            let file_offset_pages = seg.file_offset / PAGE_SIZE;
+            let file_obj = FileObject::new(
+                cache.clone(),
+                file_offset_pages,
+                file_pages,
+                Share::Private,
+                0o2, // O_RDWR snapshot — the loader has full access
+            );
+            let file_start = effective_vaddr as usize;
+            let file_end = file_start + file_pages * PAGE_SIZE as usize;
+            let file_vma = Vma::new(
+                file_start,
+                file_end,
+                0x3,
+                prot_pte,
+                Share::Private,
+                file_obj as Arc<dyn VmObject>,
+                0,
+            );
+            aspace.insert(file_vma);
+        }
+
+        // --- Zero-tail (.bss) VMA ---
+        //
+        // When `p_memsz > p_filesz`, the remaining pages are zero-fill.
+        // This is the `.bss` section (or alignment padding). Backed by
+        // an `AnonObject` so the first fault returns a zeroed page.
+        let total_pages = seg.memsz.div_ceil(PAGE_SIZE) as usize;
+        if total_pages > file_pages {
+            let bss_page_count = total_pages - file_pages;
+            let bss_start = effective_vaddr as usize + file_pages * PAGE_SIZE as usize;
+            let bss_end = bss_start + bss_page_count * PAGE_SIZE as usize;
+            let bss_obj = AnonObject::new(Some(bss_page_count));
+            let bss_vma = Vma::new(
+                bss_start,
+                bss_end,
+                0x3,
+                prot_pte,
+                Share::Private,
+                bss_obj as Arc<dyn VmObject>,
+                0,
+            );
+            aspace.insert(bss_vma);
+        }
+
+        if seg_end > image_end {
+            image_end = seg_end;
+        }
+        segments += 1;
+    }
+    Ok((segments, image_end))
+}
+
+// --- ElfBytesOps: AddressSpaceOps for in-memory ELF module bytes ----------
+
+/// `AddressSpaceOps` implementation that reads from an in-memory
+/// `&'static [u8]` ELF module slice. Used by the demand-paged ELF
+/// loader to serve `readpage` requests from the Limine module's bytes.
+///
+/// On `readpage(pgoff, buf)`, the implementation copies up to 4 KiB
+/// from `bytes[pgoff * 4096 ..]` into `buf`, zero-filling the tail
+/// past `bytes.len()` (RFC 0007 §Tail-page zeroing — no stale frame
+/// data leaks into userspace).
+struct ElfBytesOps {
+    bytes: &'static [u8],
+}
+
+impl ElfBytesOps {
+    fn new(bytes: &'static [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl super::aops::AddressSpaceOps for ElfBytesOps {
+    fn readpage(&self, pgoff: u64, buf: &mut [u8; 4096]) -> Result<usize, i64> {
+        crate::debug_lockdep::assert_no_spinlocks_held("ElfBytesOps::readpage");
+
+        let start = (pgoff as usize).saturating_mul(PAGE_SIZE as usize);
+        if start >= self.bytes.len() {
+            // Entirely past EOF — zero-fill.
+            buf.fill(0);
+            return Ok(0);
+        }
+        let end = core::cmp::min(start + PAGE_SIZE as usize, self.bytes.len());
+        let n = end - start;
+        buf[..n].copy_from_slice(&self.bytes[start..end]);
+        if n < PAGE_SIZE as usize {
+            buf[n..].fill(0);
+        }
+        Ok(n)
+    }
+
+    fn writepage(&self, _pgoff: u64, _buf: &[u8; 4096]) -> Result<(), i64> {
+        crate::debug_lockdep::assert_no_spinlocks_held("ElfBytesOps::writepage");
+        // The ELF loader's PageCache is never dirty — all segments are
+        // Private (CoW) and the in-memory module is read-only.
+        Err(crate::fs::EROFS)
+    }
 }
 
 /// On error, returns the underlying `LoadError` along with the number of
