@@ -58,6 +58,10 @@ const KERNEL_BUILD_STD_ARGS: &[&str] = &[
     "build-std-features=compiler-builtins-mem",
 ];
 
+/// Custom target spec for vibix userspace (std programs cross-compiled
+/// with `-Z build-std`). The JSON file lives at the workspace root.
+const VIBIX_USERSPACE_TARGET: &str = "x86_64-unknown-vibix.json";
+
 // QEMU process exit codes produced by `isa-debug-exit` writing our
 // QemuExitCode values. See kernel/src/test_harness.rs.
 const QEMU_EXIT_SUCCESS: i32 = 65; // (0x20 << 1) | 1
@@ -393,6 +397,9 @@ fn main() -> R<()> {
             }
         }
         "clean" => clean()?,
+        "validate-target" => {
+            validate_vibix_target()?;
+        }
         "bench" => {
             // `xtask bench <target>`. Currently only `page-cache` is
             // wired (#743 — RFC 0007 host-side cold-mmap fault-latency
@@ -427,7 +434,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|validate-target|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
             );
             std::process::exit(2);
         }
@@ -3414,5 +3421,101 @@ repro: starting fork loop cycles=500 hb=50
                  lower bound; if you dropped a clobber, restore it (issue #531)."
             );
         }
+    }
+}
+
+// ─── validate-target ───────────────────────────────────────────────────────
+
+/// Validate that the `x86_64-unknown-vibix.json` target spec is well-formed
+/// and contains the required fields for vibix userspace cross-compilation.
+fn validate_vibix_target() -> R<()> {
+    let spec_path = workspace_root().join(VIBIX_USERSPACE_TARGET);
+    if !spec_path.exists() {
+        return Err(format!(
+            "target spec not found at {}",
+            spec_path.display()
+        )
+        .into());
+    }
+
+    let contents = fs::read_to_string(&spec_path)?;
+    let spec: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        format!(
+            "target spec {} is not valid JSON: {e}",
+            spec_path.display()
+        )
+    })?;
+
+    let obj = spec
+        .as_object()
+        .ok_or("target spec root is not a JSON object")?;
+
+    // Required fields and their expected values (where a specific value is
+    // mandated by the RFC). `None` means "must be present, any value ok".
+    let required: &[(&str, Option<&str>)] = &[
+        ("llvm-target", Some("x86_64-unknown-none-elf")),
+        ("arch", Some("x86_64")),
+        ("os", Some("vibix")),
+        ("linker-flavor", Some("gnu-lld")),
+        ("linker", Some("rust-lld")),
+        ("panic-strategy", Some("abort")),
+        ("relocation-model", Some("static")),
+        ("tls-model", Some("initial-exec")),
+        ("features", Some("+sse,+sse2")),
+        ("data-layout", None),
+        ("target-endian", Some("little")),
+        ("target-pointer-width", Some("64")),
+    ];
+
+    let mut errors = Vec::new();
+    for &(key, expected_val) in required {
+        match obj.get(key) {
+            None => errors.push(format!("missing required field: \"{key}\"")),
+            Some(val) => {
+                if let Some(expected) = expected_val {
+                    let actual = val.as_str().unwrap_or("");
+                    if actual != expected {
+                        errors.push(format!(
+                            "field \"{key}\": expected \"{expected}\", got \"{actual}\""
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Boolean fields that must be true.
+    for key in ["has-thread-local", "disable-redzone"] {
+        match obj.get(key) {
+            None => errors.push(format!("missing required field: \"{key}\"")),
+            Some(val) => {
+                if val.as_bool() != Some(true) {
+                    errors.push(format!("field \"{key}\" must be true"));
+                }
+            }
+        }
+    }
+
+    // Boolean fields that must be false.
+    for key in ["position-independent-executables"] {
+        match obj.get(key) {
+            None => errors.push(format!("missing required field: \"{key}\"")),
+            Some(val) => {
+                if val.as_bool() != Some(false) {
+                    errors.push(format!("field \"{key}\" must be false"));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!("✓ target spec {} is well-formed", spec_path.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "target spec validation failed:\n  • {}",
+            errors.join("\n  • ")
+        )
+        .into())
     }
 }

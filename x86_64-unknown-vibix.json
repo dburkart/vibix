@@ -1,0 +1,27 @@
+{
+  "llvm-target": "x86_64-unknown-none-elf",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "arch": "x86_64",
+  "target-endian": "little",
+  "target-pointer-width": "64",
+  "target-c-int-width": "32",
+  "os": "vibix",
+  "env": "",
+  "vendor": "unknown",
+  "linker-flavor": "gnu-lld",
+  "linker": "rust-lld",
+  "pre-link-args": {
+    "gnu-lld": ["-nostdlib", "-static"]
+  },
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "features": "+sse,+sse2",
+  "has-thread-local": true,
+  "tls-model": "initial-exec",
+  "position-independent-executables": false,
+  "static-position-independent-executables": false,
+  "relocation-model": "static",
+  "executables": true,
+  "max-atomic-width": 64,
+  "crt-objects-fallback": "false"
+}
