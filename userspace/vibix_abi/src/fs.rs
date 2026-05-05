@@ -125,7 +125,13 @@ pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 /// Open a file relative to a directory fd.
 #[inline]
 pub unsafe fn openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> i64 {
-    syscall::syscall4(SYS_OPENAT, dirfd as u64, path as u64, flags as u64, mode as u64)
+    syscall::syscall4(
+        SYS_OPENAT,
+        dirfd as u64,
+        path as u64,
+        flags as u64,
+        mode as u64,
+    )
 }
 
 /// Read from a file descriptor.
@@ -251,7 +257,13 @@ pub unsafe fn lchown(path: *const u8, uid: u32, gid: u32) -> i64 {
 /// Change file timestamps.
 #[inline]
 pub unsafe fn utimensat(dirfd: i32, path: *const u8, times: *const Timespec, flags: i32) -> i64 {
-    syscall::syscall4(SYS_UTIMENSAT, dirfd as u64, path as u64, times as u64, flags as u64)
+    syscall::syscall4(
+        SYS_UTIMENSAT,
+        dirfd as u64,
+        path as u64,
+        times as u64,
+        flags as u64,
+    )
 }
 
 /// Truncate a file by fd.
