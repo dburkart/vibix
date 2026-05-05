@@ -186,7 +186,12 @@ fn execute_pipeline_background(
         crate::job::restore_default_signals();
         // Execute the pipeline synchronously in the child.
         let status = execute_pipeline(pipeline, env);
-        std::process::exit(status);
+        let exit_code = if status == crate::builtins::EXIT_REQUESTED {
+            env.last_status
+        } else {
+            status
+        };
+        std::process::exit(exit_code);
     }
 
     // Parent: set the child into its own process group (race-safe).

@@ -1087,7 +1087,12 @@ pub fn parse_job_spec(spec: &str) -> Option<usize> {
     } else {
         spec
     };
-    num_str.parse::<usize>().ok()
+    let id = num_str.parse::<usize>().ok()?;
+    if id == 0 {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1757,6 +1762,8 @@ mod tests {
         assert_eq!(parse_job_spec("abc"), None);
         assert_eq!(parse_job_spec("%abc"), None);
         assert_eq!(parse_job_spec(""), None);
+        assert_eq!(parse_job_spec("%0"), None);
+        assert_eq!(parse_job_spec("0"), None);
     }
 
     // ── jobs builtin ───────────────────────────────────────────────
