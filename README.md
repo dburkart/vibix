@@ -8,6 +8,8 @@ Claude and Cursor agents looping through plan → implement → PR → review �
 merge. The long-term goal is a full operating system. The immediate goal is
 to see how far autonomous agents can get before the wheels fall off.
 
+https://github.com/user-attachments/assets/fdb42734-7727-4852-a758-a35cafb03182
+
 ## Instructions for Humans
 
 vibix has assembled a tiny agentic bureaucracy to build itself. There is a
