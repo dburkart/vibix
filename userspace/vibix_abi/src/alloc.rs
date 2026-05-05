@@ -67,8 +67,12 @@ unsafe impl GlobalAlloc for VibixAllocator {
             }
 
             // Try to commit our bump.  If another thread raced us, retry.
-            match BRK_CURRENT.compare_exchange(current, new_brk, Ordering::AcqRel, Ordering::Relaxed)
-            {
+            match BRK_CURRENT.compare_exchange(
+                current,
+                new_brk,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return aligned as *mut u8,
                 Err(_) => continue,
             }
@@ -91,12 +95,12 @@ fn mmap_alloc(size: usize) -> *mut u8 {
     let ret = unsafe {
         syscall::syscall6(
             SYS_MMAP,
-            0,                          // addr (kernel chooses)
-            size as u64,                // length
-            PROT_READ | PROT_WRITE,     // prot
+            0,                           // addr (kernel chooses)
+            size as u64,                 // length
+            PROT_READ | PROT_WRITE,      // prot
             MAP_PRIVATE | MAP_ANONYMOUS, // flags
-            u64::MAX,                   // fd (-1)
-            0,                          // offset
+            u64::MAX,                    // fd (-1)
+            0,                           // offset
         )
     };
     // mmap returns MAP_FAILED (typically -1..-4095) on error.
