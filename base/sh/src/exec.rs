@@ -23,9 +23,10 @@
 //! match is found, a "command not found" diagnostic is printed and exit
 //! status 127 is set.
 
-use crate::builtins::{is_builtin, run_builtin, EXIT_REQUESTED};
+use crate::builtins::{is_builtin, is_job_builtin, run_builtin, run_job_builtin, EXIT_REQUESTED};
 use crate::expand::{expand_word, field_split, Environment};
 use crate::glob::glob_expand_words;
+use crate::job::JobTable;
 use crate::parser::{Command, List, ListOp, Pipeline, SimpleCommand};
 
 // ── Extern C declarations ──────────────────────────────────────────
@@ -51,18 +52,43 @@ fn get_errno() -> i32 {
     unsafe { *__errno_location() }
 }
 
+// ── Raw wait4 wrapper ─────────────────────────────────────────────
+
+/// Raw wait4 wrapper exposed for use by the job module.
+#[cfg(not(test))]
+pub unsafe fn wait4_raw(pid: i32, wstatus: *mut i32, options: i32, rusage: *const u8) -> i32 {
+    wait4(pid, wstatus, options, rusage)
+}
+
 // ── Public API ─────────────────────────────────────────────────────
 
 /// Execute a parsed list (the top-level AST node).
 ///
 /// Returns the exit status of the last command executed. The caller
 /// should update `env.last_status` with this value.
+///
+/// This version has no job table — background pipelines are ignored
+/// (executed synchronously). Use [`execute_list_with_jobs`] for
+/// interactive mode with job control.
 pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
+    execute_list_inner(list, env, None)
+}
+
+/// Execute a parsed list with job-control support.
+///
+/// Background pipelines (`cmd &`) are forked into their own process
+/// group and tracked in the job table.
+pub fn execute_list_with_jobs(list: &List, env: &mut Environment, jobs: &mut JobTable) -> i32 {
+    execute_list_inner(list, env, Some(jobs))
+}
+
+/// Inner implementation shared by both list-execution entry points.
+fn execute_list_inner(list: &List, env: &mut Environment, mut jobs: Option<&mut JobTable>) -> i32 {
     if list.pipelines.is_empty() {
         return env.last_status;
     }
 
-    let mut status = execute_pipeline(&list.pipelines[0], env);
+    let mut status = execute_pipeline_maybe_bg(&list.pipelines[0], env, jobs.as_deref_mut());
     if status == EXIT_REQUESTED {
         return EXIT_REQUESTED;
     }
@@ -74,7 +100,7 @@ pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
 
         match op {
             ListOp::Semi => {
-                status = execute_pipeline(next, env);
+                status = execute_pipeline_maybe_bg(next, env, jobs.as_deref_mut());
                 if status == EXIT_REQUESTED {
                     return EXIT_REQUESTED;
                 }
@@ -82,7 +108,7 @@ pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
             }
             ListOp::And => {
                 if status == 0 {
-                    status = execute_pipeline(next, env);
+                    status = execute_pipeline_maybe_bg(next, env, jobs.as_deref_mut());
                     if status == EXIT_REQUESTED {
                         return EXIT_REQUESTED;
                     }
@@ -92,7 +118,7 @@ pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
             }
             ListOp::Or => {
                 if status != 0 {
-                    status = execute_pipeline(next, env);
+                    status = execute_pipeline_maybe_bg(next, env, jobs.as_deref_mut());
                     if status == EXIT_REQUESTED {
                         return EXIT_REQUESTED;
                     }
@@ -106,6 +132,114 @@ pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
     status
 }
 
+/// Execute a pipeline, handling the background flag if a job table
+/// is available.
+fn execute_pipeline_maybe_bg(
+    pipeline: &Pipeline,
+    env: &mut Environment,
+    jobs: Option<&mut JobTable>,
+) -> i32 {
+    if pipeline.background {
+        execute_pipeline_background(pipeline, env, jobs)
+    } else {
+        execute_pipeline_fg(pipeline, env, jobs)
+    }
+}
+
+/// Execute a pipeline in the foreground. If the pipeline contains
+/// job-control builtins, the job table is passed through.
+fn execute_pipeline_fg(pipeline: &Pipeline, env: &mut Environment, jobs: Option<&mut JobTable>) -> i32 {
+    let n = pipeline.commands.len();
+    if n == 0 {
+        return 0;
+    }
+
+    // Single command — check for job-control builtins.
+    if n == 1 {
+        return execute_command_with_jobs(&pipeline.commands[0], env, jobs);
+    }
+
+    // Multi-command pipeline — no job builtin dispatch (pipes require fork).
+    execute_pipeline_multi(pipeline, env)
+}
+
+/// Execute a pipeline in the background by forking a child process.
+#[cfg(not(test))]
+fn execute_pipeline_background(
+    pipeline: &Pipeline,
+    env: &mut Environment,
+    jobs: Option<&mut JobTable>,
+) -> i32 {
+    // Reconstruct the command string for display.
+    let cmd_str = pipeline_to_string(pipeline);
+
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        eprintln!("sh: fork: failed (errno {})", get_errno());
+        return 1;
+    }
+
+    if pid == 0 {
+        // Child: put ourselves in our own process group.
+        crate::job::set_process_group(0, 0);
+        // Restore default signal handlers.
+        crate::job::restore_default_signals();
+        // Execute the pipeline synchronously in the child.
+        let status = execute_pipeline(pipeline, env);
+        let exit_code = if status == crate::builtins::EXIT_REQUESTED {
+            env.last_status
+        } else {
+            status
+        };
+        std::process::exit(exit_code);
+    }
+
+    // Parent: set the child into its own process group (race-safe).
+    crate::job::set_process_group(pid, pid);
+
+    // Track the background job.
+    if let Some(jobs) = jobs {
+        let job_id = jobs.add(pid, pid, cmd_str.clone());
+        env.last_bg_pid = pid as u32;
+        eprintln!("[{job_id}] {pid}");
+    }
+
+    // Background jobs return 0 immediately.
+    0
+}
+
+#[cfg(test)]
+fn execute_pipeline_background(
+    _pipeline: &Pipeline,
+    _env: &mut Environment,
+    _jobs: Option<&mut JobTable>,
+) -> i32 {
+    0
+}
+
+/// Reconstruct a display string from a pipeline AST.
+#[cfg_attr(test, allow(dead_code))]
+fn pipeline_to_string(pipeline: &Pipeline) -> String {
+    let mut parts = Vec::new();
+    for cmd in &pipeline.commands {
+        match cmd {
+            Command::Simple(sc) => {
+                let mut words = sc.assignments.clone();
+                words.extend(sc.words.clone());
+                parts.push(words.join(" "));
+            }
+            Command::Subshell { .. } => {
+                parts.push("(...)".to_string());
+            }
+        }
+    }
+    let mut s = parts.join(" | ");
+    if pipeline.background {
+        s.push_str(" &");
+    }
+    s
+}
+
 // ── Pipeline execution ─────────────────────────────────────────────
 
 /// Execute a pipeline of one or more commands.
@@ -113,6 +247,9 @@ pub fn execute_list(list: &List, env: &mut Environment) -> i32 {
 /// For a single command, no pipes are created. For multi-command
 /// pipelines, pipes connect each stage's stdout to the next stage's
 /// stdin. The exit status is that of the last command in the pipeline.
+///
+/// Used by `execute_pipeline_background` in the forked child process.
+#[cfg_attr(test, allow(dead_code))]
 fn execute_pipeline(pipeline: &Pipeline, env: &mut Environment) -> i32 {
     let n = pipeline.commands.len();
     if n == 0 {
@@ -224,7 +361,21 @@ fn execute_pipeline_multi(_pipeline: &Pipeline, _env: &mut Environment) -> i32 {
 
 // ── Command dispatch ───────────────────────────────────────────────
 
+/// Execute a single command with optional job-table access.
+///
+/// Job-control builtins (jobs, fg, bg) are dispatched through this
+/// path so they can access the job table.
+fn execute_command_with_jobs(cmd: &Command, env: &mut Environment, jobs: Option<&mut JobTable>) -> i32 {
+    match cmd {
+        Command::Simple(sc) => execute_simple_with_jobs(sc, env, jobs),
+        Command::Subshell { body, redirects } => execute_subshell(body, redirects, env),
+    }
+}
+
 /// Execute a single command (simple or subshell).
+///
+/// Used by `execute_pipeline` in the forked child process path.
+#[cfg_attr(test, allow(dead_code))]
 fn execute_command(cmd: &Command, env: &mut Environment) -> i32 {
     match cmd {
         Command::Simple(sc) => execute_simple(sc, env),
@@ -278,6 +429,64 @@ fn execute_subshell(
 }
 
 // ── Simple command execution ───────────────────────────────────────
+
+/// Execute a simple command with optional job-table access.
+///
+/// This variant dispatches job-control builtins (jobs, fg, bg) when
+/// a job table is available.
+fn execute_simple_with_jobs(sc: &SimpleCommand, env: &mut Environment, jobs: Option<&mut JobTable>) -> i32 {
+    // Expand all words.
+    let mut expanded_words: Vec<String> = Vec::new();
+    for word in &sc.words {
+        match expand_word(word, env) {
+            Ok(expanded) => {
+                let ifs = env.get("IFS").map(|s| s.to_string());
+                let fields = field_split(&expanded, ifs.as_deref());
+                expanded_words.extend(fields);
+            }
+            Err(e) => {
+                eprintln!("sh: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let expanded_words = glob_expand_words(&expanded_words);
+
+    if expanded_words.is_empty() {
+        for assignment in &sc.assignments {
+            if let Some(eq_pos) = assignment.find('=') {
+                let name = &assignment[..eq_pos];
+                let raw_value = &assignment[eq_pos + 1..];
+                let value = match expand_word(raw_value, env) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("sh: {e}");
+                        return 1;
+                    }
+                };
+                env.set(name, &value, None);
+            }
+        }
+        return 0;
+    }
+
+    let cmd_name = &expanded_words[0];
+    let args: Vec<String> = expanded_words[1..].to_vec();
+
+    // Dispatch job-control builtins when a job table is available.
+    if is_job_builtin(cmd_name) {
+        if let Some(jobs) = jobs {
+            return execute_job_builtin(cmd_name, &args, &sc.redirects, &sc.assignments, env, jobs);
+        }
+    }
+
+    if is_builtin(cmd_name) {
+        return execute_builtin(cmd_name, &args, &sc.redirects, &sc.assignments, env);
+    }
+
+    execute_external(cmd_name, &expanded_words, &sc.redirects, &sc.assignments, env)
+}
 
 /// Execute a simple command.
 ///
@@ -405,7 +614,69 @@ fn execute_builtin(
     status
 }
 
+/// Execute a job-control builtin with redirect save/restore.
+fn execute_job_builtin(
+    name: &str,
+    args: &[String],
+    redirects: &[crate::parser::Redirect],
+    assignments: &[String],
+    env: &mut Environment,
+    jobs: &mut JobTable,
+) -> i32 {
+    // Apply pre-command assignments temporarily.
+    let mut saved_vars: Vec<(String, Option<String>)> = Vec::new();
+    for assignment in assignments {
+        if let Some(eq_pos) = assignment.find('=') {
+            let var_name = &assignment[..eq_pos];
+            let raw_value = &assignment[eq_pos + 1..];
+            let value = match expand_word(raw_value, env) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("sh: {e}");
+                    return 1;
+                }
+            };
+            saved_vars.push((var_name.to_string(), env.get(var_name).map(|s| s.to_string())));
+            env.set(var_name, &value, None);
+        }
+    }
+
+    // Apply redirections.
+    let saved_fds: Option<crate::redirect::SavedFds> = if !redirects.is_empty() {
+        #[cfg(not(test))]
+        {
+            match crate::redirect::apply_redirects(redirects) {
+                Ok(saved) => Some(saved),
+                Err(e) => {
+                    eprintln!("sh: {e}");
+                    restore_vars(&saved_vars, env);
+                    return 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            let _ = redirects;
+            None
+        }
+    } else {
+        None
+    };
+
+    let status = run_job_builtin(name, args, env, jobs);
+
+    // Restore redirections.
+    if let Some(saved) = saved_fds {
+        if let Err(e) = saved.restore() {
+            eprintln!("sh: {e}");
+        }
+    }
+
+    status
+}
+
 /// Restore saved variable values.
+#[cfg_attr(test, allow(dead_code))]
 fn restore_vars(saved: &[(String, Option<String>)], env: &mut Environment) {
     for (name, old_val) in saved.iter().rev() {
         match old_val {

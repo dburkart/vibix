@@ -86,9 +86,14 @@ pub enum Command {
 }
 
 /// A pipeline: one or more commands connected by `|`.
+///
+/// When `background` is true, the pipeline was terminated by `&` and
+/// should be executed asynchronously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
+    /// Run this pipeline in the background (`&` operator).
+    pub background: bool,
 }
 
 /// The connector between adjacent pipelines inside a [`List`].
@@ -216,6 +221,20 @@ impl<'a> Parser<'a> {
                     ops.push(ListOp::Semi);
                     pipelines.push(self.parse_pipeline()?);
                 }
+                Token::Ampersand => {
+                    // `&` marks the preceding pipeline as background,
+                    // then acts like `;` (separator).
+                    if let Some(last) = pipelines.last_mut() {
+                        last.background = true;
+                    }
+                    self.bump()?;
+                    self.skip_newlines()?;
+                    if self.at_list_end() {
+                        break;
+                    }
+                    ops.push(ListOp::Semi);
+                    pipelines.push(self.parse_pipeline()?);
+                }
                 Token::And => {
                     self.bump()?;
                     self.skip_newlines()?;
@@ -248,7 +267,7 @@ impl<'a> Parser<'a> {
             commands.push(self.parse_command()?);
         }
 
-        Ok(Pipeline { commands })
+        Ok(Pipeline { commands, background: false })
     }
 
     /// ```text
@@ -1080,5 +1099,63 @@ mod tests {
         let list = ast("test -f /etc/motd && cat /etc/motd || echo missing");
         assert_eq!(list.pipelines.len(), 3);
         assert_eq!(list.ops, vec![ListOp::And, ListOp::Or]);
+    }
+
+    // ── Background operator (&) ───────────────────────────────────
+
+    #[test]
+    fn background_simple() {
+        let list = ast("sleep 10 &");
+        assert_eq!(list.pipelines.len(), 1);
+        assert!(list.pipelines[0].background);
+        match &list.pipelines[0].commands[0] {
+            Command::Simple(sc) => {
+                assert_eq!(sc.words, vec!["sleep", "10"]);
+            }
+            _ => panic!("expected SimpleCommand"),
+        }
+    }
+
+    #[test]
+    fn background_with_foreground() {
+        // `cmd1 & cmd2` — first is background, second is foreground.
+        let list = ast("cmd1 & cmd2");
+        assert_eq!(list.pipelines.len(), 2);
+        assert!(list.pipelines[0].background);
+        assert!(!list.pipelines[1].background);
+        assert_eq!(list.ops, vec![ListOp::Semi]);
+    }
+
+    #[test]
+    fn background_multiple() {
+        let list = ast("cmd1 & cmd2 &");
+        assert_eq!(list.pipelines.len(), 2);
+        assert!(list.pipelines[0].background);
+        assert!(list.pipelines[1].background);
+    }
+
+    #[test]
+    fn background_in_list() {
+        // `cmd1 & cmd2 && cmd3`
+        let list = ast("cmd1 & cmd2 && cmd3");
+        assert_eq!(list.pipelines.len(), 3);
+        assert!(list.pipelines[0].background);
+        assert!(!list.pipelines[1].background);
+        assert!(!list.pipelines[2].background);
+        assert_eq!(list.ops, vec![ListOp::Semi, ListOp::And]);
+    }
+
+    #[test]
+    fn foreground_pipeline_not_background() {
+        let list = ast("ls | grep foo");
+        assert!(!list.pipelines[0].background);
+    }
+
+    #[test]
+    fn background_pipeline() {
+        let list = ast("ls | sort &");
+        assert_eq!(list.pipelines.len(), 1);
+        assert!(list.pipelines[0].background);
+        assert_eq!(list.pipelines[0].commands.len(), 2);
     }
 }
