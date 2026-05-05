@@ -141,6 +141,7 @@ vibix implements ~65 syscall numbers using the Linux x86_64 ABI
 | `clock_gettime` | 228 | `std::time::Instant`, `SystemTime` |
 | `nanosleep` | 35 | `std::thread::sleep()` |
 | `getrandom` | 318 | `std::collections::HashMap` seed |
+| `readv` | 19 | `std::io::Read` vectored I/O, nix |
 | `writev` | 20 | `std::io::Write` vectored I/O |
 | `pread64` | 17 | `std::os::unix::fs::FileExt` |
 | `pwrite64` | 18 | `std::os::unix::fs::FileExt` |
@@ -212,18 +213,18 @@ is a thin wrapper over the same syscall stubs that `vibix_abi` uses.
   "os": "vibix",
   "env": "",
   "vendor": "unknown",
-  "linker-flavor": "gnu-lld-cc",
+  "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {
-    "gnu-lld-cc": ["-nostdlib", "-static"]
+    "gnu-lld": ["-nostdlib", "-static"]
   },
   "panic-strategy": "abort",
   "disable-redzone": true,
   "features": "+sse,+sse2",
   "has-thread-local": true,
   "tls-model": "initial-exec",
-  "position-independent-executables": true,
-  "static-position-independent-executables": true,
+  "position-independent-executables": false,
+  "static-position-independent-executables": false,
   "relocation-model": "static",
   "executables": true,
   "max-atomic-width": 64,
@@ -241,6 +242,11 @@ Key choices:
 - `"features": "+sse,+sse2"` — userspace can use SSE (kernel
   does XSAVE/XRSTOR on context switch).
 - `"relocation-model": "static"` — static linking in Phase 1.
+  Non-PIE (`position-independent-executables: false`) to match:
+  userspace binaries load at a fixed address (0x400000).
+- `"linker-flavor": "gnu-lld"` — raw linker invocation (not a
+  compiler-driver wrapper like `gnu-lld-cc`, which would add
+  `-Wl,` prefixes that `rust-lld` does not understand).
 
 #### vibix_abi crate structure
 
@@ -312,8 +318,10 @@ the kernel allocates a fresh TLS block per task (epic #827) and sets
 The critical path to a working `println!` on vibix:
 
 1. **Add missing syscalls to kernel** — `getpid`(39), `exit_group`(231),
-   `writev`(20), `getrandom`(318), `clock_gettime`(228). These are
-   trivial implementations (≤20 lines each).
+   `readv`(19), `writev`(20), `getrandom`(318), `clock_gettime`(228).
+   Most are trivial (≤20 lines each); `readv`/`writev` require the
+   iovec copy-then-validate pattern and atomicity constraints
+   described below.
 
 2. **Create `vibix_abi` crate** — syscall macro, `GlobalAlloc` via
    `brk`/`mmap`, errno, stdio (`write` to fd 1/2).
@@ -355,15 +363,49 @@ The critical path to a working `println!` on vibix:
 
 #### Phase 3: Threading + sync (`std::thread`, `std::sync`)
 
-1. **Implement `clone`(56) syscall** — `CLONE_VM | CLONE_FS |
-   CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS |
-   CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID`. This is the most
-   complex new syscall — requires shared address space, shared fd
-   table, per-thread TLS allocation.
+1. **Implement `clone`(56) syscall** — the implementation MUST
+   whitelist only the flags needed for pthreads-style threading and
+   reject all others with `-EINVAL`. The accepted set is:
+   `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+   CLONE_THREAD | CLONE_SETTLS | CLONE_PARENT_SETTID |
+   CLONE_CHILD_CLEARTID | CLONE_SYSVSEM`. Any flags outside this
+   mask return `-EINVAL`. This prevents unvalidated flag
+   combinations from creating unexpected resource-sharing
+   configurations. Implementation requires: shared (not CoW)
+   address space via `Arc<RwLock<AddressSpace>>`, shared fd table
+   via the existing `Arc<Mutex<FileDescTable>>`, per-thread TLS
+   block allocation (fresh allocation, not deep copy), and shared
+   signal disposition with per-thread signal masks.
+
+   **fd table locking under `CLONE_FILES`.** Today each `fork`
+   child gets its own `Arc<Mutex<FileDescTable>>` so the
+   `spin::Mutex` is uncontended. With `CLONE_FILES`, sibling
+   threads share the *same* mutex. Since interrupts are re-enabled
+   at the top of `syscall_dispatch` (`sti`), the timer ISR can
+   preempt a thread inside the fd-table critical section. If the
+   scheduler switches to a co-thread that also enters a fd-table
+   path, the second thread spins forever — a hard deadlock on
+   single-CPU. **Fix:** convert `FileDescTable`'s lock to
+   `IrqLock` (disable interrupts for the critical section) so the
+   holder cannot be preempted. The critical sections are short
+   (fd lookup, insert, close), so interrupt latency impact is
+   negligible.
 
 2. **Implement `futex`(202) syscall** — `FUTEX_WAIT`, `FUTEX_WAKE`,
    `FUTEX_WAIT_PRIVATE`, `FUTEX_WAKE_PRIVATE`. Backed by a
    per-address wait queue in the kernel.
+
+   **Atomicity invariant.** `FUTEX_WAIT` must atomically verify
+   `*uaddr == expected` and enqueue the caller before any
+   concurrent `FUTEX_WAKE` can observe the waiter. The
+   implementation must hold the per-bucket lock across both the
+   `copy_from_user` value check and the waitqueue enqueue —
+   analogous to Linux's `hb->lock` in `futex_wait_queue()`.
+   Without this, a preemption between the value check and the
+   enqueue allows a concurrent `FUTEX_WAKE` to find zero waiters,
+   causing a lost wakeup. The bucket lock should be an `IrqLock`
+   to prevent the same preemption-under-spinlock deadlock described
+   above for the fd table.
 
 3. **Add `sched_yield`(24), `set_tid_address`(218), `gettid`(186)**.
 
@@ -430,9 +472,27 @@ concepts are introduced. The syscall numbers match Linux so that the
 |---|---|---|---|
 | 39 | `getpid` | `() → pid_t` | Return current task's PID |
 | 231 | `exit_group` | `(status: i32) → !` | Exit all threads in process |
+| 19 | `readv` | `(fd, iov, iovcnt) → ssize_t` | Vectored read |
 | 20 | `writev` | `(fd, iov, iovcnt) → ssize_t` | Vectored write |
 | 318 | `getrandom` | `(buf, len, flags) → ssize_t` | Fill buf from CSPRNG |
 | 228 | `clock_gettime` | `(clk_id, tp) → 0/-errno` | CLOCK_MONOTONIC, CLOCK_REALTIME |
+
+**`readv`/`writev` implementation constraints:**
+
+1. **TOCTOU mitigation.** The iovec array is a new shape of
+   user-memory access not seen in existing vibix syscalls (which only
+   handle single flat buffers). The kernel MUST `copy_from_user` the
+   entire `iovec` array into a kernel-side buffer before validating
+   any `iov_base`/`iov_len` pair. This prevents a concurrent
+   userspace thread from mutating an iovec entry between validation
+   and use.
+
+2. **Atomicity.** POSIX requires that a single `writev`/`readv` call
+   be atomic with respect to other writes/reads on the same file
+   description. The kernel implementation must hold the file position
+   lock (or equivalent serialization) across all iovec segments. A
+   naive per-segment loop that drops and reacquires the lock between
+   segments would allow concurrent writers to interleave.
 
 **New syscall implementations (Phase 2):**
 
@@ -469,12 +529,21 @@ RDRAND/RDSEED. The kernel already warns when hardware RNG is
 unavailable (for AT_RANDOM). `getrandom` should block or return
 `-EAGAIN` if entropy is insufficient, per the Linux semantics.
 
+**clone flag whitelist.** The `clone` syscall accepts only the
+pthreads-required flag set (`CLONE_VM | CLONE_FS | CLONE_FILES |
+CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS |
+CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_SYSVSEM`).
+All other flag bits are rejected with `-EINVAL`. This prevents
+unvalidated combinations from creating unexpected resource-sharing
+configurations that could enable privilege escalation.
+
 **clone thread isolation.** Threads share an address space and fd
-table. The kernel must ensure: (a) the shared fd table uses proper
-locking (it already does — `spin::Mutex`), (b) TLS blocks are
-allocated per-thread (epic #827 handles this for fork; clone needs
-the same path), (c) signal disposition is shared but signal masks
-are per-thread.
+table. The kernel must ensure: (a) the shared fd table uses
+`IrqLock` (not `spin::Mutex`) to prevent preemption-under-lock
+deadlocks when threads contend on the same table, (b) TLS blocks
+are freshly allocated per-thread (not deep-copied from the
+parent), (c) signal disposition is shared but signal masks are
+per-thread.
 
 **vibix_libc as attack surface.** The libc shim runs in userspace
 (ring 3). A bug in `vibix_libc` cannot compromise the kernel — it
@@ -602,7 +671,7 @@ the unix PAL, update the target JSON).
 
 ## Implementation Roadmap
 
-- [ ] Implement missing Phase 1 syscalls: `getpid`, `exit_group`, `writev`, `getrandom`, `clock_gettime`
+- [ ] Implement missing Phase 1 syscalls: `getpid`, `exit_group`, `readv`, `writev`, `getrandom`, `clock_gettime`
 - [ ] Create `vibix_abi` crate with syscall macro, GlobalAlloc, errno, and stdio
 - [ ] Create `x86_64-unknown-vibix.json` target spec and integrate with xtask build pipeline
 - [ ] Fork std and add vibix PAL (`sys/pal/vibix/`) with stdio support; build with `-Z build-std`
