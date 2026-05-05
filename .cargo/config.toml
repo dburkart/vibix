@@ -27,6 +27,8 @@ rustflags = [
   "-C", "relocation-model=static",
   "-C", "no-redzone=yes",
   "-C", "force-frame-pointers=yes",
+  "-C", "link-arg=-z", "-C", "link-arg=separate-loadable-segments",
+  "-C", "link-arg=--image-base=0x400000",
 ]
 
 # `build-std` is intentionally NOT in [unstable] here — it would apply

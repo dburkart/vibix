@@ -38,7 +38,7 @@ members = [
 # `host-fuzz` feature; pulling it into the workspace would force the host
 # feature surface on the kernel-target build graph. `cargo xtask fuzz ext2`
 # drives it directly.
-exclude = ["tests/pjdfstest", "kernel/fuzz"]
+exclude = ["tests/pjdfstest", "kernel/fuzz", "userspace/std_hello"]
 resolver = "2"
 
 [workspace.package]

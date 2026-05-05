@@ -360,6 +360,18 @@ pub fn load_user_elf_with_vmas(
     // segments. Returns `(segment_count, page_aligned_image_end)`.
     let (segments, mut image_end) = register_demand_vmas(bytes, parsed, 0, address_space)?;
 
+    // Eagerly map all PT_LOAD segment pages into the PML4. The VMAs
+    // above provide the fork-compatible VMA tree, while the eager
+    // mapping avoids a demand-paging bug where certain pages are served
+    // with incorrect (zero-filled) content (#852 workaround). The
+    // demand-paging path (`FileObject::fault`) will find these pages
+    // already present and never fire for the init binary.
+    for seg in parsed.load_segments() {
+        if let Err((e, _)) = map_user_segment(bytes, seg, _pml4, 0) {
+            return Err(e);
+        }
+    }
+
     // Allocate the static TLS block when PT_TLS is present. The block is
     // placed at `image_end` (page-aligned), registered as a writable AnonObject
     // VMA so fork copies it, and the TCB address is recorded for `MSR_FS_BASE`.

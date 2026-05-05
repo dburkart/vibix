@@ -18,6 +18,8 @@
 //!                      without booting QEMU (issue #526, for CI pre-build)
 //!   shell-pipeline — boot with the shell-pipeline integration binary as PID 1
 //!                    and assert `SHELL_PIPELINE_OK: 4` on serial (issue #462)
+//!   std-hello     — build std_hello (println! via std PAL), boot as PID 1 on
+//!                   ext2 root, assert `hello from std` on serial (issue #852)
 //!   lint          — run clippy on xtask (host) and vibix (kernel, no_std)
 //!   isr-audit     — scan ISR-reachable files for blocking-lock regressions
 //!   nm-check      — RFC 0005 Phase 1 (#669): build the release kernel + ISO
@@ -257,6 +259,7 @@ fn main() -> R<()> {
             repro_fork_build(&opts)?;
         }
         "shell-pipeline" => shell_pipeline(&opts)?,
+        "std-hello" => std_hello(&opts)?,
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "nm-check" => {
@@ -438,7 +441,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|lint|isr-audit|nm-check|validate-target|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|std-hello|lint|isr-audit|nm-check|validate-target|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
             );
             std::process::exit(2);
         }
@@ -733,6 +736,55 @@ fn build_userspace_hello_dyn() -> R<PathBuf> {
         .join("userspace_hello_dyn");
     if !bin.exists() {
         return Err(format!("userspace_hello_dyn missing at {}", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
+/// Build the `std_hello` binary — a standard Rust binary targeting vibix
+/// that uses `println!` via the vibix PAL. Built out-of-tree with
+/// `-Z build-std` pointed at the in-repo std fork (issue #852).
+///
+/// The binary is compiled against `x86_64-unknown-vibix.json` and linked
+/// statically with the custom std PAL; it exercises the full
+/// target-spec → vibix_abi → std → println! stack.
+fn build_userspace_std_hello() -> R<PathBuf> {
+    let ws = workspace_root();
+    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
+    let manifest = ws.join("userspace/std_hello/Cargo.toml");
+    let library_root = ws.join("library");
+
+    let target_dir = ws.join("target");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ws)
+        // Point -Z build-std at the in-repo std fork.
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .args([
+            "-Z",
+            "build-std=std,core,alloc,panic_abort",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "unstable-options",
+            "-Z",
+            "json-target-spec",
+            "--target",
+        ])
+        .arg(&target_spec);
+    check(cmd.status()?)?;
+
+    // The output lands under target/<target-triple>/debug/<bin-name>.
+    // The target triple for a JSON spec is the file-stem of the spec.
+    let bin = target_dir
+        .join("x86_64-unknown-vibix")
+        .join("debug")
+        .join("std_hello");
+    if !bin.exists() {
+        return Err(format!("std_hello binary missing at {} after build", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
@@ -2582,6 +2634,145 @@ fn shell_pipeline(opts: &BuildOpts) -> R<()> {
         (false, None) => {
             Err("shell-pipeline: terminated with no success and no failure marker".into())
         }
+    }
+}
+
+/// Boot the `std_hello` binary as PID 1 under QEMU and assert the
+/// `hello from std` marker appears on serial (issue #852).
+///
+/// This is the Phase 1 capstone test: a standard Rust binary using
+/// `println!` runs on vibix and emits output on the serial console,
+/// proving the entire stack works (target spec, vibix_abi, std PAL,
+/// syscalls).
+fn std_hello(opts: &BuildOpts) -> R<()> {
+    use std::collections::VecDeque;
+    use std::io::BufRead as _;
+    use std::time::Instant;
+
+    const HARD_CAP: Duration = Duration::from_secs(120);
+    const SUCCESS_MARKER: &str = "hello from std";
+    const PANIC_MARKER: &str = "KERNEL PANIC:";
+
+    let kernel = build(opts)?;
+    let init_bin = build_userspace_std_hello()?;
+
+    // Install std_hello as /init in the ext2 rootfs image.
+    let disk = ext2_image::build(&workspace_root(), Some(&init_bin), true)?;
+    let iso = workspace_root().join("target").join("vibix-std-hello.iso");
+    make_iso_with_cmdline(&kernel, &iso, "iso_std_hello", "root=/dev/vda")?;
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M",
+            "q35",
+            "-cpu",
+            "max",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .args(virtio_blk_args(&disk))
+        .arg("-cdrom")
+        .arg(&iso)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let hard_pid = pid;
+    let hard_watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(HARD_CAP) {
+            let _ = Command::new("kill").arg(hard_pid.to_string()).status();
+        }
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut success = false;
+    let mut failure: Option<String> = None;
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(64);
+    const TICK: Duration = Duration::from_millis(200);
+
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(line) => {
+                print!("{line}");
+                if tail.len() == 64 {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
+
+                if line.contains(PANIC_MARKER) {
+                    failure = Some(format!("kernel panic: {}", line.trim_end()));
+                    break;
+                }
+                if line.contains(SUCCESS_MARKER) {
+                    success = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if start.elapsed() > HARD_CAP {
+                    failure = Some(format!("hard cap exceeded ({HARD_CAP:?}) without success"));
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !success && failure.is_none() {
+                    failure = Some(format!("QEMU exited before `{SUCCESS_MARKER}` marker"));
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(cancel_tx);
+    let _ = hard_watchdog.join();
+    let _ = reader_handle.join();
+    let _ = child.wait();
+
+    match (success, failure) {
+        (true, _) => {
+            println!("→ std-hello: `{SUCCESS_MARKER}` in {:?} ✓", start.elapsed());
+            Ok(())
+        }
+        (false, Some(msg)) => {
+            eprintln!("--- captured serial (tail) ---");
+            for line in &tail {
+                eprint!("{line}");
+            }
+            eprintln!("------------------------------");
+            Err(format!("std-hello: {msg}").into())
+        }
+        (false, None) => Err("std-hello: terminated with no success and no failure marker".into()),
     }
 }
 
