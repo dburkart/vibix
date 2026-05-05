@@ -73,19 +73,15 @@ fn resolve_limine_module_finds_hello_elf() {
     let bytes = resolve_execve_binary(b"/boot/userspace_hello.elf")
         .expect("resolve should find userspace_hello.elf via Limine module");
     assert!(bytes.len() > 4, "module bytes must be non-trivial");
-    assert_eq!(
-        &bytes[..4],
-        b"\x7fELF",
-        "first 4 bytes must be ELF magic"
-    );
+    assert_eq!(&bytes[..4], b"\x7fELF", "first 4 bytes must be ELF magic");
 }
 
 /// `/etc/hostname` exists in the rootfs tarball. `resolve_execve_binary`
 /// should find it via VFS and return its raw content (which is not ELF —
 /// the caller validates ELF separately).
 fn resolve_vfs_file_returns_bytes() {
-    let bytes = resolve_execve_binary(b"/etc/hostname")
-        .expect("resolve should find /etc/hostname via VFS");
+    let bytes =
+        resolve_execve_binary(b"/etc/hostname").expect("resolve should find /etc/hostname via VFS");
     // The rootfs hostname file contains "vibix\n".
     assert_eq!(bytes, b"vibix\n", "hostname file should contain 'vibix\\n'");
 }

@@ -1512,12 +1512,14 @@ unsafe fn sys_execve(
     argv_uva: u64,
     envp_uva: u64,
 ) -> Result<core::convert::Infallible, i64> {
-    use alloc::vec::Vec;
     use crate::fs::vfs::path_walk::PATH_MAX;
+    use alloc::vec::Vec;
 
     // 1. Copy path from userspace.
     let mut path_buf: Vec<u8> = Vec::new();
-    path_buf.try_reserve_exact(PATH_MAX + 1).map_err(|_| crate::fs::ENOMEM)?;
+    path_buf
+        .try_reserve_exact(PATH_MAX + 1)
+        .map_err(|_| crate::fs::ENOMEM)?;
     path_buf.resize(PATH_MAX + 1, 0u8);
     let n = copy_path_from_user(path_uva as usize, &mut path_buf)?;
     path_buf.truncate(n);
@@ -1533,16 +1535,10 @@ unsafe fn sys_execve(
 
     // 4. Copy argv and envp from userspace.
     let mut arg_budget = EXECVE_MAX_ARG_BYTES;
-    let argv_vecs = copy_string_array_from_user(
-        argv_uva as usize,
-        EXECVE_MAX_ARGS,
-        &mut arg_budget,
-    )?;
-    let envp_vecs = copy_string_array_from_user(
-        envp_uva as usize,
-        EXECVE_MAX_ARGS,
-        &mut arg_budget,
-    )?;
+    let argv_vecs =
+        copy_string_array_from_user(argv_uva as usize, EXECVE_MAX_ARGS, &mut arg_budget)?;
+    let envp_vecs =
+        copy_string_array_from_user(envp_uva as usize, EXECVE_MAX_ARGS, &mut arg_budget)?;
 
     // Build &[&[u8]] slices for the stack writer. Each inner slice
     // includes the trailing NUL byte (required by the SysV ABI — argv

@@ -77,7 +77,14 @@ pub fn write_initial_stack(
     params: &AuxvParams,
     random_bytes: &[u8; 16],
 ) -> u64 {
-    write_initial_stack_with_args(stack_phys, stack_page_user_va, params, random_bytes, &[], &[])
+    write_initial_stack_with_args(
+        stack_phys,
+        stack_page_user_va,
+        params,
+        random_bytes,
+        &[],
+        &[],
+    )
 }
 
 /// Write the System V AMD64 initial stack layout with argv and envp.
