@@ -37,6 +37,7 @@ const LIB_LOAD_BASE: u64 = 0x5000_0000;
 // Syscall numbers (Linux x86_64 ABI).
 const SYS_WRITE: u64 = 1;
 const SYS_MMAP: u64 = 9;
+const SYS_MUNMAP: u64 = 11;
 const SYS_MPROTECT: u64 = 10;
 const SYS_EXIT: u64 = 60;
 const SYS_ARCH_PRCTL: u64 = 158;
@@ -530,17 +531,29 @@ unsafe fn load_library(name: &[u8]) -> Option<LoadedObject> {
             return None;
         }
 
-        // Copy file content.
+        // Copy file content, clamping to file bounds to avoid OOB reads
+        // from malformed ELFs with inflated p_filesz/p_offset.
         let copy_len = if seg_filesz < map_len {
             seg_filesz
         } else {
             map_len
         };
-        ptr::copy_nonoverlapping(
-            elf_bytes.add(seg_offset as usize),
-            mapped as *mut u8,
-            copy_len as usize,
-        );
+        let safe_copy_len = if seg_offset + copy_len > file_size {
+            if seg_offset >= file_size {
+                0
+            } else {
+                file_size - seg_offset
+            }
+        } else {
+            copy_len
+        };
+        if safe_copy_len > 0 {
+            ptr::copy_nonoverlapping(
+                elf_bytes.add(seg_offset as usize),
+                mapped as *mut u8,
+                safe_copy_len as usize,
+            );
+        }
 
         // Set final protection (remove write if not needed).
         if prot != (PROT_READ | PROT_WRITE) {
@@ -565,6 +578,9 @@ unsafe fn load_library(name: &[u8]) -> Option<LoadedObject> {
     if obj.dynamic != 0 {
         parse_dynamic(&mut obj);
     }
+
+    // Release the temporary file mapping now that segments are copied.
+    syscall2(SYS_MUNMAP, map_addr as u64, file_size);
 
     serial::puts(b"ld-vibix: loaded ");
     serial::puts(name);
