@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 name = "sh"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 # Standalone package — not part of the main workspace. Built with
 # `-Z build-std` against the in-repo std fork (see xtask build).
 [workspace]
