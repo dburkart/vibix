@@ -1,0 +1,10 @@
+[package]
+name = "vibix_abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "vibix_abi"
+path = "src/lib.rs"
