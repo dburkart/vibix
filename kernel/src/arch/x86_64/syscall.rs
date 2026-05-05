@@ -1227,6 +1227,30 @@ pub unsafe extern "C" fn syscall_dispatch(
         // getrandom(buf, len, flags) — fill buffer from CSPRNG.
         GETRANDOM => super::syscalls::phase1::sys_getrandom(a0 as usize, a1 as usize, a2 as u32),
 
+        // pread64(fd, buf, count, offset) — read at offset.
+        PREAD64 => {
+            super::syscalls::phase2::sys_pread64(a0 as u32, a1 as usize, a2 as usize, a3 as i64)
+        }
+
+        // pwrite64(fd, buf, count, offset) — write at offset.
+        PWRITE64 => {
+            super::syscalls::phase2::sys_pwrite64(a0 as u32, a1 as usize, a2 as usize, a3 as i64)
+        }
+
+        // nanosleep(req, rem) — sleep for specified duration.
+        NANOSLEEP => super::syscalls::phase2::sys_nanosleep(a0 as usize, a1 as usize),
+
+        // uname(buf) — fill utsname struct with system info.
+        UNAME => super::syscalls::phase2::sys_uname(a0 as usize),
+
+        // rename(oldpath, newpath) — rename a file.
+        RENAME => super::syscalls::phase2::sys_rename(a0 as usize, a1 as usize),
+
+        // renameat(olddfd, oldpath, newdfd, newpath) — rename relative to dirfds.
+        RENAMEAT => {
+            super::syscalls::phase2::sys_renameat(a0 as i32, a1 as usize, a2 as i32, a3 as usize)
+        }
+
         _ => -38i64, // ENOSYS
     };
     // RFC 0006 / #718: syscall exit emit point. Records the same
@@ -2057,6 +2081,12 @@ pub mod syscall_nr {
     pub const CLOCK_GETTIME: u64 = 228;
     pub const EXIT_GROUP: u64 = 231;
     pub const GETRANDOM: u64 = 318;
+    pub const PREAD64: u64 = 17;
+    pub const PWRITE64: u64 = 18;
+    pub const NANOSLEEP: u64 = 35;
+    pub const UNAME: u64 = 63;
+    pub const RENAME: u64 = 82;
+    pub const RENAMEAT: u64 = 264;
 }
 
 #[cfg(test)]
@@ -2191,5 +2221,13 @@ mod tests {
 
         // TLS (issue #832, epic #827)
         assert_eq!(syscall_nr::ARCH_PRCTL, 158, "SYS_arch_prctl must be 158");
+
+        // Phase 2: Rust std (issue #853)
+        assert_eq!(syscall_nr::PREAD64, 17, "SYS_pread64 must be 17");
+        assert_eq!(syscall_nr::PWRITE64, 18, "SYS_pwrite64 must be 18");
+        assert_eq!(syscall_nr::NANOSLEEP, 35, "SYS_nanosleep must be 35");
+        assert_eq!(syscall_nr::UNAME, 63, "SYS_uname must be 63");
+        assert_eq!(syscall_nr::RENAME, 82, "SYS_rename must be 82");
+        assert_eq!(syscall_nr::RENAMEAT, 264, "SYS_renameat must be 264");
     }
 }

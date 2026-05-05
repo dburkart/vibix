@@ -7,4 +7,5 @@
 pub mod creds;
 pub mod ioctl;
 pub mod phase1;
+pub mod phase2;
 pub mod vfs;
