@@ -197,9 +197,11 @@ pub fn sys_writev(fd: u32, iov_user: usize, iovcnt: usize) -> i64 {
 /// `getrandom(buf, len, flags)` — fill user buffer from CSPRNG.
 ///
 /// Sources entropy from RDRAND/RDSEED via the kernel CSPRNG module.
-/// Returns the number of bytes written, or -EFAULT on bad pointer.
-/// Ignores flags for now (no blocking semantics needed — hardware RNG
-/// is always available on supported platforms).
+/// Returns the number of bytes written, or -EFAULT on bad pointer,
+/// or -ENOSYS if the hardware RNG is unavailable. Per Linux semantics
+/// and RFC 0009 §Security Considerations, getrandom must not silently
+/// return predictable data — callers depend on cryptographic quality
+/// for HashMap seeds and other security-sensitive uses.
 pub fn sys_getrandom(buf: usize, len: usize, _flags: u32) -> i64 {
     if len == 0 {
         return 0;
@@ -218,9 +220,9 @@ pub fn sys_getrandom(buf: usize, len: usize, _flags: u32) -> i64 {
             let val = match csprng::rdrand64() {
                 Some(v) => v,
                 None => {
-                    // Fallback: use a deterministic value mixed with offset.
-                    // This matches the AT_RANDOM fallback approach.
-                    0x9e37_79b9_7f4a_7c15u64.wrapping_add(written as u64)
+                    // Hardware RNG unavailable — return error rather than
+                    // silently degrading to predictable output.
+                    return -38i64; // ENOSYS
                 }
             };
             let bytes = val.to_le_bytes();
@@ -233,7 +235,7 @@ pub fn sys_getrandom(buf: usize, len: usize, _flags: u32) -> i64 {
             // Fill remaining bytes.
             let val = match csprng::rdrand64() {
                 Some(v) => v,
-                None => 0x9e37_79b9_7f4a_7c15u64.wrapping_add(written as u64),
+                None => return -38i64, // ENOSYS
             };
             let bytes = val.to_le_bytes();
             match unsafe { uaccess::copy_to_user(buf + written, &bytes[..remaining]) } {
