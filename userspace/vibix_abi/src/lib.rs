@@ -10,6 +10,8 @@
 pub mod alloc;
 pub mod errno;
 pub mod fs;
+pub mod futex;
 pub mod process;
 pub mod stdio;
 pub mod syscall;
+pub mod thread;
