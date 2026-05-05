@@ -1,7 +1,7 @@
 ---
 rfc: 0009
 title: Rust std on vibix
-status: Draft
+status: In Review
 created: 2026-05-05
 ---
 
