@@ -36,7 +36,7 @@ const VERSION: u8 = 1;
 /// to 384 KiB (from 320 KiB) after the test-crate symbol set grew past
 /// the old cap on ext2 integration tests (observed 263912 bytes on
 /// `ext2_file_read`).
-pub const KSYMTAB_BYTES: usize = 384 * 1024;
+pub const KSYMTAB_BYTES: usize = 448 * 1024;
 
 /// Fixed-size reservation patched in place by xtask after linking. We
 /// deliberately DO NOT use a custom `#[link_section]` — a separate

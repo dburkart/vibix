@@ -1251,6 +1251,24 @@ pub unsafe extern "C" fn syscall_dispatch(
             super::syscalls::phase2::sys_renameat(a0 as i32, a1 as usize, a2 as i32, a3 as usize)
         }
 
+        // sched_yield() — voluntarily yield the CPU.
+        SCHED_YIELD => super::syscalls::phase3::sys_sched_yield(),
+
+        // clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
+        CLONE => super::syscalls::phase3::sys_clone(ctx, a0, a1, a2, a3, a4),
+
+        // getppid() — return parent PID.
+        GETPPID => super::syscalls::phase3::sys_getppid(),
+
+        // gettid() — return thread ID.
+        GETTID => super::syscalls::phase3::sys_gettid(),
+
+        // futex(uaddr, op, val, timeout, uaddr2, val3) — fast userspace locking.
+        FUTEX => super::syscalls::phase3::sys_futex(a0 as usize, a1 as u32, a2 as u32, a3, a4, a5),
+
+        // set_tid_address(tidptr) — set clear_child_tid pointer, return TID.
+        SET_TID_ADDRESS => super::syscalls::phase3::sys_set_tid_address(a0 as usize),
+
         _ => -38i64, // ENOSYS
     };
     // RFC 0006 / #718: syscall exit emit point. Records the same
@@ -2087,6 +2105,12 @@ pub mod syscall_nr {
     pub const UNAME: u64 = 63;
     pub const RENAME: u64 = 82;
     pub const RENAMEAT: u64 = 264;
+    pub const SCHED_YIELD: u64 = 24;
+    pub const CLONE: u64 = 56;
+    pub const GETPPID: u64 = 110;
+    pub const GETTID: u64 = 186;
+    pub const FUTEX: u64 = 202;
+    pub const SET_TID_ADDRESS: u64 = 218;
 }
 
 #[cfg(test)]
