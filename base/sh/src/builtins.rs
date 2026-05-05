@@ -19,6 +19,7 @@
 //!   environment.
 
 use crate::expand::Environment;
+use crate::job::JobTable;
 
 // ── Builtin dispatch ────────────────────────────────────────────────
 
@@ -26,8 +27,25 @@ use crate::expand::Environment;
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "export" | "unset" | "echo" | "test" | "[" | "read" | "exec" | "set" | "."
+        "cd" | "exit"
+            | "export"
+            | "unset"
+            | "echo"
+            | "test"
+            | "["
+            | "read"
+            | "exec"
+            | "set"
+            | "."
+            | "jobs"
+            | "fg"
+            | "bg"
     )
+}
+
+/// Returns `true` if the builtin requires access to the job table.
+pub fn is_job_builtin(name: &str) -> bool {
+    matches!(name, "jobs" | "fg" | "bg")
 }
 
 /// Execute a builtin command and return its exit status.
@@ -49,10 +67,27 @@ pub fn run_builtin(name: &str, args: &[String], env: &mut Environment) -> i32 {
         "exec" => builtin_exec(args, env),
         "set" => builtin_set(args, env),
         "." => builtin_dot(args, env),
+        // Job-control builtins without a job table — this path should
+        // not normally be taken (exec.rs dispatches them via
+        // run_job_builtin instead), but handle gracefully.
+        "jobs" | "fg" | "bg" => {
+            eprintln!("sh: {name}: no job control");
+            1
+        }
         _ => {
             eprintln!("sh: {name}: not a builtin");
             1
         }
+    }
+}
+
+/// Execute a job-control builtin with access to the job table.
+pub fn run_job_builtin(name: &str, args: &[String], env: &mut Environment, jobs: &mut JobTable) -> i32 {
+    match name {
+        "jobs" => builtin_jobs(args, jobs),
+        "fg" => builtin_fg(args, env, jobs),
+        "bg" => builtin_bg(args, env, jobs),
+        _ => run_builtin(name, args, env),
     }
 }
 
@@ -868,6 +903,193 @@ fn dot_source(path: &str, extra_args: &[String], env: &mut Environment) -> i32 {
     result
 }
 
+// ── jobs ───────────────────────────────────────────────────────────
+
+/// List all active jobs.
+///
+/// `jobs` — print one line per active job showing its number, status,
+/// and the original command string.
+fn builtin_jobs(_args: &[String], jobs: &mut JobTable) -> i32 {
+    // Reap any children that have finished before listing.
+    crate::job::reap_children(jobs);
+    for job in jobs.active_jobs() {
+        let marker = if Some(job.id) == jobs.current_job_id() {
+            "+"
+        } else {
+            "-"
+        };
+        println!("[{}]{}\t{}\t{}", job.id, marker, job.status, job.command);
+    }
+    0
+}
+
+// ── fg ─────────────────────────────────────────────────────────────
+
+/// Bring a background/stopped job to the foreground.
+///
+/// - `fg` (no args) — bring the current (most recent) job to fg.
+/// - `fg %N` — bring job N to foreground.
+/// - `fg N` — bring job N to foreground.
+fn builtin_fg(args: &[String], env: &mut Environment, jobs: &mut JobTable) -> i32 {
+    let job_id = if args.is_empty() {
+        match jobs.current_job_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("sh: fg: no current job");
+                return 1;
+            }
+        }
+    } else {
+        match parse_job_spec(&args[0]) {
+            Some(id) => id,
+            None => {
+                eprintln!("sh: fg: {}: no such job", args[0]);
+                return 1;
+            }
+        }
+    };
+
+    let (pgid, status, cmd) = match jobs.get(job_id) {
+        Some(job) => (job.pgid, job.status, job.command.clone()),
+        None => {
+            eprintln!("sh: fg: %{job_id}: no such job");
+            return 1;
+        }
+    };
+
+    // Print the command being foregrounded.
+    eprintln!("{cmd}");
+
+    // If the job is stopped, send SIGCONT to its process group.
+    if status == crate::job::JobStatus::Stopped {
+        crate::job::send_signal(-pgid, crate::job::SIGCONT);
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = crate::job::JobStatus::Running;
+        }
+    }
+
+    // Wait for the job to finish or stop.
+    fg_wait(pgid, job_id, env, jobs)
+}
+
+/// Wait for a foreground job to complete or stop.
+#[cfg(not(test))]
+fn fg_wait(pgid: i32, job_id: usize, env: &mut Environment, jobs: &mut JobTable) -> i32 {
+    loop {
+        let mut wstatus: i32 = 0;
+        let pid = unsafe {
+            crate::exec::wait4_raw(
+                -pgid,
+                &mut wstatus,
+                crate::job::WUNTRACED,
+                std::ptr::null(),
+            )
+        };
+        if pid <= 0 {
+            break;
+        }
+        if crate::job::wifstopped(wstatus) {
+            // Job was stopped — update the job table.
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.status = crate::job::JobStatus::Stopped;
+            }
+            let sig = crate::job::wstopsig(wstatus);
+            let exit_code = 128 + sig;
+            env.last_status = exit_code;
+            eprintln!();
+            if let Some(job) = jobs.get(job_id) {
+                eprintln!("[{}]+\tStopped\t\t{}", job.id, job.command);
+            }
+            return exit_code;
+        } else {
+            // Job exited or was signaled — remove from table.
+            let exit_code = if crate::job::wifsignaled(wstatus) {
+                128 + crate::job::wtermsig(wstatus)
+            } else {
+                crate::job::wexitstatus(wstatus)
+            };
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.status = crate::job::JobStatus::Done(exit_code);
+            }
+            env.last_status = exit_code;
+            return exit_code;
+        }
+    }
+    env.last_status
+}
+
+#[cfg(test)]
+fn fg_wait(_pgid: i32, _job_id: usize, env: &mut Environment, _jobs: &mut JobTable) -> i32 {
+    env.last_status
+}
+
+// ── bg ─────────────────────────────────────────────────────────────
+
+/// Resume a stopped job in the background.
+///
+/// - `bg` (no args) — resume the current (most recent) stopped job.
+/// - `bg %N` — resume job N in the background.
+fn builtin_bg(args: &[String], env: &mut Environment, jobs: &mut JobTable) -> i32 {
+    let _ = env;
+    let job_id = if args.is_empty() {
+        // Find the most recent stopped job.
+        match jobs
+            .active_jobs()
+            .iter()
+            .rev()
+            .find(|j| j.status == crate::job::JobStatus::Stopped)
+            .map(|j| j.id)
+        {
+            Some(id) => id,
+            None => {
+                eprintln!("sh: bg: no current job");
+                return 1;
+            }
+        }
+    } else {
+        match parse_job_spec(&args[0]) {
+            Some(id) => id,
+            None => {
+                eprintln!("sh: bg: {}: no such job", args[0]);
+                return 1;
+            }
+        }
+    };
+
+    let (pgid, status, cmd) = match jobs.get(job_id) {
+        Some(job) => (job.pgid, job.status, job.command.clone()),
+        None => {
+            eprintln!("sh: bg: %{job_id}: no such job");
+            return 1;
+        }
+    };
+
+    if status != crate::job::JobStatus::Stopped {
+        eprintln!("sh: bg: job {job_id} already running");
+        return 1;
+    }
+
+    // Send SIGCONT and mark as running.
+    crate::job::send_signal(-pgid, crate::job::SIGCONT);
+    if let Some(job) = jobs.get_mut(job_id) {
+        job.status = crate::job::JobStatus::Running;
+    }
+    eprintln!("[{job_id}]+ {cmd} &");
+    0
+}
+
+// ── Job spec parsing ──────────────────────────────────────────────
+
+/// Parse a job specification like `%1` or `1` into a job ID.
+pub fn parse_job_spec(spec: &str) -> Option<usize> {
+    let num_str = if let Some(stripped) = spec.strip_prefix('%') {
+        stripped
+    } else {
+        spec
+    };
+    num_str.parse::<usize>().ok()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Validate that a string is a valid POSIX shell variable name.
@@ -1496,5 +1718,124 @@ mod tests {
         let mut e = env();
         let status = run_builtin("nosuch", &args(&[]), &mut e);
         assert_eq!(status, 1);
+    }
+
+    // ── is_builtin recognizes new builtins ─────────────────────────
+
+    #[test]
+    fn is_builtin_recognizes_job_builtins() {
+        assert!(is_builtin("jobs"));
+        assert!(is_builtin("fg"));
+        assert!(is_builtin("bg"));
+    }
+
+    #[test]
+    fn is_job_builtin_identifies_job_cmds() {
+        assert!(is_job_builtin("jobs"));
+        assert!(is_job_builtin("fg"));
+        assert!(is_job_builtin("bg"));
+        assert!(!is_job_builtin("echo"));
+        assert!(!is_job_builtin("cd"));
+    }
+
+    // ── parse_job_spec ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_job_spec_percent() {
+        assert_eq!(parse_job_spec("%1"), Some(1));
+        assert_eq!(parse_job_spec("%42"), Some(42));
+    }
+
+    #[test]
+    fn parse_job_spec_bare_number() {
+        assert_eq!(parse_job_spec("1"), Some(1));
+        assert_eq!(parse_job_spec("99"), Some(99));
+    }
+
+    #[test]
+    fn parse_job_spec_invalid() {
+        assert_eq!(parse_job_spec("abc"), None);
+        assert_eq!(parse_job_spec("%abc"), None);
+        assert_eq!(parse_job_spec(""), None);
+    }
+
+    // ── jobs builtin ───────────────────────────────────────────────
+
+    #[test]
+    fn jobs_empty_table() {
+        let mut jobs = JobTable::new();
+        let status = builtin_jobs(&args(&[]), &mut jobs);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn jobs_with_entries() {
+        let mut jobs = JobTable::new();
+        jobs.add(100, 100, "sleep 10 &".to_string());
+        jobs.add(200, 200, "cat &".to_string());
+        let status = builtin_jobs(&args(&[]), &mut jobs);
+        assert_eq!(status, 0);
+    }
+
+    // ── fg builtin ─────────────────────────────────────────────────
+
+    #[test]
+    fn fg_no_current_job() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        let status = builtin_fg(&args(&[]), &mut e, &mut jobs);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn fg_nonexistent_job() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        let status = builtin_fg(&args(&["%99"]), &mut e, &mut jobs);
+        assert_eq!(status, 1);
+    }
+
+    // ── bg builtin ─────────────────────────────────────────────────
+
+    #[test]
+    fn bg_no_stopped_job() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        let status = builtin_bg(&args(&[]), &mut e, &mut jobs);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn bg_running_job_already() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        jobs.add(100, 100, "cmd &".to_string());
+        let status = builtin_bg(&args(&["%1"]), &mut e, &mut jobs);
+        assert_eq!(status, 1); // already running
+    }
+
+    #[test]
+    fn bg_stopped_job() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        jobs.add(100, 100, "cmd".to_string());
+        jobs.get_mut(1).unwrap().status = crate::job::JobStatus::Stopped;
+        let status = builtin_bg(&args(&["%1"]), &mut e, &mut jobs);
+        assert_eq!(status, 0);
+        assert_eq!(
+            jobs.get(1).unwrap().status,
+            crate::job::JobStatus::Running
+        );
+    }
+
+    // ── run_job_builtin dispatch ───────────────────────────────────
+
+    #[test]
+    fn dispatch_job_builtins() {
+        let mut e = env();
+        let mut jobs = JobTable::new();
+        // jobs with empty table should succeed
+        let status = run_job_builtin("jobs", &args(&[]), &mut e, &mut jobs);
+        assert_eq!(status, 0);
     }
 }
