@@ -6,7 +6,7 @@
 use crate::ffi::CStr;
 use crate::io;
 use crate::num::NonZero;
-use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::atomic::{Atomic, Ordering};
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
@@ -67,7 +67,7 @@ pub struct Thread {
 #[repr(C)]
 struct ThreadData {
     /// The child's TID -- set by clone, cleared on exit.
-    child_tid: AtomicU32,
+    child_tid: Atomic<u32>,
     /// Base of the mmap'd stack allocation.
     stack_base: *mut u8,
     /// Size of the stack allocation.
@@ -108,7 +108,7 @@ impl Thread {
 
         // Allocate ThreadData on the heap.
         let data = Box::into_raw(Box::new(ThreadData {
-            child_tid: AtomicU32::new(0),
+            child_tid: Atomic::new(0),
             stack_base,
             stack_size,
             init: Some(init),
@@ -132,7 +132,7 @@ impl Thread {
         // The child starts at `thread_trampoline` with RSP = stack_top.
         // We use inline asm to call clone because we need to set up the child
         // to jump to our trampoline with the correct stack.
-        let child_tid_ptr = &(*data).child_tid as *const AtomicU32 as *mut u32;
+        let child_tid_ptr = &(*data).child_tid as *const Atomic<u32> as *mut u32;
         let ret: i64;
         unsafe {
             core::arch::asm!(
@@ -195,15 +195,7 @@ impl Thread {
                 break;
             }
             // FUTEX_WAIT on the child_tid address.
-            crate::sys::futex::futex_wait(
-                // The futex functions take &Atomic<u32>; AtomicU32 is Atomic<u32>.
-                unsafe {
-                    &*(&data.child_tid as *const AtomicU32
-                        as *const crate::sync::atomic::Atomic<u32>)
-                },
-                tid,
-                None,
-            );
+            crate::sys::futex::futex_wait(&data.child_tid, tid, None);
         }
 
         // Thread has exited. Clean up.

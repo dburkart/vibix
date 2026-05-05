@@ -37,8 +37,10 @@ struct Timespec {
 ///
 /// Returns `true` if woken normally (or spuriously), `false` on timeout.
 pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
-    let timespec = timeout.and_then(|dur| {
-        Some(Timespec { tv_sec: dur.as_secs().try_into().ok()?, tv_nsec: dur.subsec_nanos() as i64 })
+    let timespec = timeout.map(|dur| {
+        let tv_sec = i64::try_from(dur.as_secs()).unwrap_or(i64::MAX);
+        let tv_nsec = i64::from(dur.subsec_nanos());
+        Timespec { tv_sec, tv_nsec }
     });
 
     let timeout_ptr = match timespec.as_ref() {
