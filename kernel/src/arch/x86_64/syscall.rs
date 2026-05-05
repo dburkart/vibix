@@ -1228,10 +1228,14 @@ pub unsafe extern "C" fn syscall_dispatch(
         GETRANDOM => super::syscalls::phase1::sys_getrandom(a0 as usize, a1 as usize, a2 as u32),
 
         // pread64(fd, buf, count, offset) — read at offset.
-        PREAD64 => super::syscalls::phase2::sys_pread64(a0 as u32, a1 as usize, a2 as usize, a3 as i64),
+        PREAD64 => {
+            super::syscalls::phase2::sys_pread64(a0 as u32, a1 as usize, a2 as usize, a3 as i64)
+        }
 
         // pwrite64(fd, buf, count, offset) — write at offset.
-        PWRITE64 => super::syscalls::phase2::sys_pwrite64(a0 as u32, a1 as usize, a2 as usize, a3 as i64),
+        PWRITE64 => {
+            super::syscalls::phase2::sys_pwrite64(a0 as u32, a1 as usize, a2 as usize, a3 as i64)
+        }
 
         // nanosleep(req, rem) — sleep for specified duration.
         NANOSLEEP => super::syscalls::phase2::sys_nanosleep(a0 as usize, a1 as usize),
@@ -1243,7 +1247,9 @@ pub unsafe extern "C" fn syscall_dispatch(
         RENAME => super::syscalls::phase2::sys_rename(a0 as usize, a1 as usize),
 
         // renameat(olddfd, oldpath, newdfd, newpath) — rename relative to dirfds.
-        RENAMEAT => super::syscalls::phase2::sys_renameat(a0 as i32, a1 as usize, a2 as i32, a3 as usize),
+        RENAMEAT => {
+            super::syscalls::phase2::sys_renameat(a0 as i32, a1 as usize, a2 as i32, a3 as usize)
+        }
 
         _ => -38i64, // ENOSYS
     };

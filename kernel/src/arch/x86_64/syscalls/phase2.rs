@@ -4,7 +4,7 @@
 //! nanosleep(35), uname(63).
 
 use super::super::uaccess;
-use super::vfs::{AT_FDCWD};
+use super::vfs::AT_FDCWD;
 
 /// `rename(oldpath, newpath)` — rename a file or directory.
 ///
@@ -139,7 +139,11 @@ pub fn sys_pread64(fd: u32, buf_uva: usize, count: usize, offset: i64) -> i64 {
 
     while total < count {
         let n = core::cmp::min(chunk.len(), count - total);
-        match vfs.open_file.ops.read(&vfs.open_file, &mut chunk[..n], off + total as u64) {
+        match vfs
+            .open_file
+            .ops
+            .read(&vfs.open_file, &mut chunk[..n], off + total as u64)
+        {
             Ok(0) => break, // EOF
             Ok(nread) => {
                 match unsafe { uaccess::copy_to_user(buf_uva + total, &chunk[..nread]) } {
@@ -205,7 +209,11 @@ pub fn sys_pwrite64(fd: u32, buf_uva: usize, count: usize, offset: i64) -> i64 {
             Ok(()) => {}
             Err(e) => return e.as_errno(),
         }
-        match vfs.open_file.ops.write(&vfs.open_file, &chunk[..n], off + total as u64) {
+        match vfs
+            .open_file
+            .ops
+            .write(&vfs.open_file, &chunk[..n], off + total as u64)
+        {
             Ok(0) => break,
             Ok(nw) => {
                 total += nw;
@@ -292,20 +300,11 @@ pub fn sys_uname(buf: usize) -> i64 {
     // nodename (hostname)
     copy_field(&mut utsname[FIELD_LEN..FIELD_LEN * 2], b"vibix");
     // release
-    copy_field(
-        &mut utsname[FIELD_LEN * 2..FIELD_LEN * 3],
-        b"0.1.0",
-    );
+    copy_field(&mut utsname[FIELD_LEN * 2..FIELD_LEN * 3], b"0.1.0");
     // version
-    copy_field(
-        &mut utsname[FIELD_LEN * 3..FIELD_LEN * 4],
-        b"#1 SMP",
-    );
+    copy_field(&mut utsname[FIELD_LEN * 3..FIELD_LEN * 4], b"#1 SMP");
     // machine
-    copy_field(
-        &mut utsname[FIELD_LEN * 4..FIELD_LEN * 5],
-        b"x86_64",
-    );
+    copy_field(&mut utsname[FIELD_LEN * 4..FIELD_LEN * 5], b"x86_64");
     // domainname
     copy_field(&mut utsname[FIELD_LEN * 5..FIELD_LEN * 6], b"(none)");
 
@@ -324,9 +323,9 @@ fn copy_field(dst: &mut [u8], src: &[u8]) {
 
 /// Copy a user path into a heap buffer (mirrors the helper in vfs.rs).
 fn copy_user_path(path_uva: u64) -> Result<alloc::vec::Vec<u8>, i64> {
-    use alloc::vec::Vec;
-    use crate::fs::vfs::path_walk::PATH_MAX;
     use super::super::syscall::copy_path_from_user_pub;
+    use crate::fs::vfs::path_walk::PATH_MAX;
+    use alloc::vec::Vec;
 
     let mut buf: Vec<u8> = Vec::new();
     if buf.try_reserve_exact(PATH_MAX + 1).is_err() {
