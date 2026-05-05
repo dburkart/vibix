@@ -227,12 +227,17 @@ pub fn resolve_fd(redir: &Redirect) -> RawFd {
 }
 
 /// Strip leading tabs from each line of a here-document body (for the
-/// `<<-` variant).
+/// `<<-` variant). Preserves a trailing newline if the input has one.
 pub fn strip_heredoc_tabs(body: &str) -> String {
-    body.lines()
+    let mut result: String = body
+        .lines()
         .map(|line| line.trim_start_matches('\t'))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if body.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 // ── Core redirect application (runtime, not compiled for tests) ──────
@@ -628,6 +633,18 @@ mod tests {
     #[test]
     fn strip_tabs_single_line() {
         assert_eq!(strip_heredoc_tabs("\thello"), "hello");
+    }
+
+    #[test]
+    fn strip_tabs_preserves_trailing_newline() {
+        let input = "\thello\n\tworld\n";
+        assert_eq!(strip_heredoc_tabs(input), "hello\nworld\n");
+    }
+
+    #[test]
+    fn strip_tabs_no_trailing_newline() {
+        let input = "\thello\n\tworld";
+        assert_eq!(strip_heredoc_tabs(input), "hello\nworld");
     }
 
     // ── Redirect integration tests (pure logic) ──────────────────────
