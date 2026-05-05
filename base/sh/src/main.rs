@@ -1,5 +1,6 @@
 #![feature(restricted_std)]
 
+mod expand;
 mod lexer;
 mod parser;
 
