@@ -17,7 +17,7 @@ on the failure being scheduler-driven rather than hardware-fault-driven.
 [#478](https://github.com/dburkart/vibix/issues/478)'s production
 evidence is unambiguous about the failure shape: the kernel emits
 `init: iretq to ring-3` to the serial port, then **no userspace output
-ever appears**. In particular, the `userspace/init/src/main.rs::_start`
+ever appears**. In particular, the `base/init/src/main.rs::_start`
 diagnostic markers `init: pre-write marker` (a `write(2, …)` immediately
 on entry, before any other userspace work) never appear in failing
 runs. That makes the failure window strictly the gap between IRETQ
@@ -175,5 +175,5 @@ analogue of #478.
   [`kernel/src/arch/x86_64/syscall.rs`](../../kernel/src/arch/x86_64/syscall.rs)
   `jump_to_ring3` — the kernel-side seam the trap-frame surface would
   intercept.
-- [`userspace/init/src/main.rs`](../../userspace/init/src/main.rs)
+- [`base/init/src/main.rs`](../../base/init/src/main.rs)
   `_start` (~line 103) — the userspace side of the failure window.

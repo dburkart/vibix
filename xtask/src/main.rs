@@ -614,7 +614,10 @@ fn build_userspace_shell_pipeline() -> R<PathBuf> {
 /// `cargo xtask pjdfstest`. Same link layout as `userspace_init` so
 /// the kernel's ELF loader doesn't need any new code paths.
 pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
-    build_userspace_binary("pjdfstest_runner", "tests/userspace/pjdfstest_runner/link.ld")
+    build_userspace_binary(
+        "pjdfstest_runner",
+        "tests/userspace/pjdfstest_runner/link.ld",
+    )
 }
 
 /// Build the vibix dynamic linker (`ld-vibix.so`).
