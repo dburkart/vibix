@@ -8,12 +8,17 @@
     target_os = "hermit",
     target_os = "motor",
     target_os = "uefi",
+    target_os = "vibix",
     target_os = "wasi",
     target_os = "xous",
 ))]
 mod common;
 
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+        pub use vibix::*;
+    }
     any(
         all(target_family = "unix", not(any(target_os = "espidf", target_os = "vita"))),
         target_os = "hermit",

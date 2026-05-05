@@ -30,7 +30,8 @@ pub fn abort_internal() -> ! {
 }
 
 // SAFETY: must be called only once during runtime initialization.
-pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {
+pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
+    unsafe { crate::sys::args::init(argc, argv) };
 }
 
 // SAFETY: must be called only once during runtime cleanup.
@@ -41,15 +42,36 @@ pub unsafe fn cleanup() {}
 /// The kernel loads ELF binaries with entry point set to `_start`.
 /// Since vibix has no CRT, std provides the entry point directly.
 /// `main` is the symbol rustc generates that calls `lang_start`.
+///
+/// The kernel writes the standard SysV AMD64 initial stack layout:
+///   [rsp]       = argc
+///   [rsp + 8]   = argv[0]
+///   ...
+///   [rsp + 8*argc] = argv[argc-1]
+///   [rsp + 8*(argc+1)] = NULL (argv terminator)
+///   followed by envp and auxv.
+///
+/// We use `global_asm!` to emit a raw entry stub that reads argc/argv
+/// from the stack before any Rust prologue can disturb rsp, then calls
+/// `_start_rust(argc, argv)`.
+#[cfg(not(test))]
+core::arch::global_asm!(
+    ".global _start",
+    "_start:",
+    "    mov rdi, [rsp]",      // argc
+    "    lea rsi, [rsp + 8]",  // argv
+    "    call _start_rust",
+    "    ud2",                  // unreachable
+);
+
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+unsafe extern "C" fn _start_rust(argc: isize, argv: *const *const u8) -> ! {
     unsafe extern "C" {
         fn main(argc: isize, argv: *const *const u8) -> isize;
     }
 
-    // No args/env on vibix yet; pass zeros.
-    let ret = unsafe { main(0, crate::ptr::null()) };
+    let ret = unsafe { main(argc, argv) };
 
     // exit_group(ret)
     unsafe {
