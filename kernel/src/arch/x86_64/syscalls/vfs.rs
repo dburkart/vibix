@@ -179,7 +179,7 @@ fn resolve_inode_as(
 /// concurrently. Absolute paths ignore `dfd` entirely (per POSIX) — the
 /// helper is still safe to call on them, and callers that know the
 /// path is absolute may skip the call to save the fd-table round trip.
-fn resolve_dirfd(dfd: i32) -> Result<Option<Arc<Dentry>>, i64> {
+pub(super) fn resolve_dirfd(dfd: i32) -> Result<Option<Arc<Dentry>>, i64> {
     if dfd == AT_FDCWD {
         return Ok(None);
     }
@@ -206,7 +206,7 @@ fn resolve_dirfd(dfd: i32) -> Result<Option<Arc<Dentry>>, i64> {
 /// the path is relative. `start = None` falls back to the caller's cwd
 /// (the `*at(AT_FDCWD)` and plain-path cases). Absolute paths reseat to
 /// the namespace root inside `path_walk` regardless of `start`.
-fn resolve_inode_at(
+pub(super) fn resolve_inode_at(
     start: Option<Arc<Dentry>>,
     path: &[u8],
     follow: bool,
@@ -302,7 +302,7 @@ fn install_fd(backend: Arc<dyn FileBackend>, flags: u32) -> i64 {
 /// empty path, a bare `/`, or anything whose final component is `.` /
 /// `..` / empty (trailing slash) — since `create(parent, leaf)` cannot
 /// act on them.
-fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), i64> {
+pub(super) fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), i64> {
     if path.is_empty() {
         return Err(ENOENT);
     }
