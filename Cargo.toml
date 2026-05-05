@@ -16,16 +16,16 @@ members = [
     # dispatches to its `bench-page-cache` binary.
     "bench/page-cache",
     "xtask",
-    "userspace/hello",
-    "userspace/init",
-    "userspace/pjdfstest_runner",
-    "userspace/repro_fork",
-    "userspace/shell_pipeline",
-    "userspace/vibix_abi",
-    "userspace/vibix_libc",
-    "userspace/vibix_libc_defs",
-    "userspace/ld_vibix",
-    "userspace/hello_dyn",
+    "base/init",
+    "base/vibix_abi",
+    "base/vibix_libc",
+    "base/vibix_libc_defs",
+    "base/ld_vibix",
+    "tests/userspace/hello",
+    "tests/userspace/hello_dyn",
+    "tests/userspace/pjdfstest_runner",
+    "tests/userspace/repro_fork",
+    "tests/userspace/shell_pipeline",
 ]
 # tests/pjdfstest is a vendored copy of saidsay-so/pjdfstest (2-clause BSD). It
 # is intentionally kept outside the workspace until #581 wires it into xtask —
@@ -38,7 +38,7 @@ members = [
 # `host-fuzz` feature; pulling it into the workspace would force the host
 # feature surface on the kernel-target build graph. `cargo xtask fuzz ext2`
 # drives it directly.
-exclude = ["tests/pjdfstest", "kernel/fuzz", "userspace/std_hello"]
+exclude = ["tests/pjdfstest", "kernel/fuzz", "tests/userspace/std_hello"]
 resolver = "2"
 
 [workspace.package]

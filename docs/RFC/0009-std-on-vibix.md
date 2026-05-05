@@ -251,7 +251,7 @@ Key choices:
 #### vibix_abi crate structure
 
 ```
-userspace/vibix_abi/
+base/vibix_abi/
 ├── Cargo.toml          # #![no_std], no deps
 └── src/
     ├── lib.rs          # pub mod syscall, alloc, thread, ...
@@ -268,7 +268,7 @@ userspace/vibix_abi/
 #### vibix_libc crate structure
 
 ```
-userspace/vibix_libc/
+base/vibix_libc/
 ├── Cargo.toml          # cdylib + staticlib, depends on vibix_abi
 ├── cbindgen.toml       # generates libc-compatible C headers
 └── src/
@@ -599,7 +599,7 @@ Porting it to vibix would give immediate ecosystem compatibility.
 musl introduces 100K lines of C that must be audited, cross-compiled,
 and maintained. The Rust-based approach (`vibix_libc`) is smaller,
 memory-safe, and can share syscall stubs with `vibix_abi`. The
-`ld-musl-x86_64.so.1` already present in `userspace/lib/` was
+`ld-musl-x86_64.so.1` already present in `base/lib/` was
 shipped for PT_INTERP testing (#762), not as a long-term libc
 strategy.
 

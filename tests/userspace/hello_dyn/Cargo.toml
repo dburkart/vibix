@@ -11,4 +11,4 @@ name = "userspace_hello_dyn"
 path = "src/main.rs"
 
 [dependencies]
-vibix_libc = { path = "../vibix_libc" }
+vibix_libc = { path = "../../../base/vibix_libc" }
