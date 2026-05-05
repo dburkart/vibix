@@ -128,6 +128,22 @@ pub fn expected_hash_path(workspace_root: &Path) -> PathBuf {
 /// yet (e.g. CI's first bootstrap run before the kernel-side mount
 /// plumbing lands in #577).
 pub fn build(workspace_root: &Path, init_src: Option<&Path>, update_hash: bool) -> R<PathBuf> {
+    build_with_extras(workspace_root, init_src, &[], update_hash)
+}
+
+/// Like [`build`], but also installs extra binaries into the image.
+///
+/// Each entry in `extra_bins` is `(host_path, image_path)` — e.g.
+/// `(&sh_bin, "/bin/sh")`. The host path must be whitespace-free (a
+/// debugfs limitation). The image path's parent directory must already
+/// exist in the fixture tree (currently: `/bin`, `/lib`, `/tmp`, `/dev`,
+/// `/etc`, `/etc/init`).
+pub fn build_with_extras(
+    workspace_root: &Path,
+    init_src: Option<&Path>,
+    extra_bins: &[(&Path, &str)],
+    update_hash: bool,
+) -> R<PathBuf> {
     let out = image_path(workspace_root);
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
@@ -147,7 +163,7 @@ pub fn build(workspace_root: &Path, init_src: Option<&Path>, update_hash: bool) 
     // `write` tokenises on whitespace, so paths with embedded spaces
     // would break) and makes the command transcript reproducible.
     let init_bin = stage_init(workspace_root, init_src)?;
-    run_debugfs_populate(&out, &init_bin)?;
+    run_debugfs_populate(&out, &init_bin, extra_bins)?;
 
     // Step 4: pin s_hash_seed in the superblock.
     pin_hash_seed(&out)?;
@@ -265,7 +281,7 @@ fn run_mkfs(image: &Path) -> R<()> {
 ///
 /// The `sif` (set inode field) command takes the field name verbatim;
 /// the field list is documented in `debugfs(8)`.
-fn run_debugfs_populate(image: &Path, init_bin: &Path) -> R<()> {
+fn run_debugfs_populate(image: &Path, init_bin: &Path, extra_bins: &[(&Path, &str)]) -> R<()> {
     let init_str = init_bin.to_str().ok_or("init path is not UTF-8")?;
     if init_str.chars().any(|c| c.is_whitespace()) {
         return Err(format!("init path contains whitespace: {init_str}").into());
@@ -291,6 +307,23 @@ fn run_debugfs_populate(image: &Path, init_bin: &Path) -> R<()> {
     script.push_str("sif /init uid 0\n");
     script.push_str("sif /init gid 0\n");
     stamp(&mut script, "/init");
+
+    // Install extra binaries (e.g. /bin/sh).
+    for (host_path, image_path) in extra_bins {
+        let host_str = host_path
+            .to_str()
+            .ok_or_else(|| format!("extra bin path is not UTF-8: {}", host_path.display()))?;
+        if host_str.chars().any(|c| c.is_whitespace()) {
+            return Err(format!("extra bin path contains whitespace: {host_str}").into());
+        }
+        // debugfs `write` takes (host_path, image_path_without_leading_slash).
+        let img_name = image_path.strip_prefix('/').unwrap_or(image_path);
+        script.push_str(&format!("write {host_str} {img_name}\n"));
+        script.push_str(&format!("sif {image_path} mode 0100755\n"));
+        script.push_str(&format!("sif {image_path} uid 0\n"));
+        script.push_str(&format!("sif {image_path} gid 0\n"));
+        stamp(&mut script, image_path);
+    }
 
     let mut child = Command::new("debugfs")
         .env("E2FSPROGS_FAKE_TIME", FIXED_EPOCH.to_string())

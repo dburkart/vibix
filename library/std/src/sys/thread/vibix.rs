@@ -108,7 +108,7 @@ impl Thread {
 
         // Allocate ThreadData on the heap.
         let data = Box::into_raw(Box::new(ThreadData {
-            child_tid: Atomic::new(0),
+            child_tid: Atomic::<u32>::new(0),
             stack_base,
             stack_size,
             init: Some(init),

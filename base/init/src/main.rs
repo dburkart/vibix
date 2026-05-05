@@ -104,6 +104,13 @@ const WAIT4_RETURN_MSG: &[u8] = b"init: wait4-return\n";
 /// then falls back to Limine boot modules (basename match).
 const HELLO_PATH: &[u8] = b"/boot/userspace_hello.elf\0";
 
+/// Path to the POSIX shell. Resolved via VFS from the ext2 rootfs;
+/// only available when booting with `root=/dev/vda`.
+const SH_PATH: &[u8] = b"/bin/sh\0";
+
+/// Smoke-test marker — emitted before exec-ing /bin/sh.
+const SH_LAUNCH_MSG: &[u8] = b"init: launching /bin/sh\n";
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Pre-write diagnostic marker — see #478. Emitted on fd=2 so it
@@ -213,6 +220,89 @@ pub extern "C" fn _start() -> ! {
         if waited == child_pid as i64 && exit_code == 0 {
             write(1, WAIT4_RETURN_MSG);
             write(1, DONE_MSG);
+        }
+    }
+
+    // Launch /bin/sh — the POSIX shell. This is only meaningful when
+    // the ext2 rootfs is mounted (root=/dev/vda), which places the sh
+    // binary at /bin/sh. When booting from the ISO-only path (no ext2),
+    // execve will fail and the child exits with status 1; init continues
+    // to its idle loop regardless.
+    write(1, SH_LAUNCH_MSG);
+
+    let sh_fork_ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 57u64 => sh_fork_ret,
+            lateout("rcx") _,
+            lateout("rdx") _,
+            lateout("rdi") _,
+            lateout("rsi") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    if sh_fork_ret == 0 {
+        // Child: exec /bin/sh.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 59u64 => _,   // execve
+                inlateout("rdi") SH_PATH.as_ptr() as u64 => _,  // path
+                inlateout("rsi") 0u64 => _,    // argv (NULL = empty)
+                inlateout("rdx") 0u64 => _,    // envp (NULL = empty)
+                lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        // execve only returns on failure — exit with status 1.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 60u64 => _,   // exit
+                inlateout("rdi") 1u64 => _,    // status 1 (exec failed)
+                lateout("rcx") _,
+                lateout("rdx") _,
+                lateout("rsi") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Parent: wait for the shell to exit, then idle.
+    if sh_fork_ret > 0 {
+        let sh_pid = sh_fork_ret as u64;
+        let mut sh_wstatus: i32 = 0;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 61u64 => _,                              // wait4
+                inlateout("rdi") sh_pid => _,                              // pid
+                inlateout("rsi") &mut sh_wstatus as *mut i32 as u64 => _, // *wstatus
+                inlateout("rdx") 0u64 => _,                               // options
+                inlateout("r10") 0u64 => _,                               // rusage
+                lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r11") _,
+                options(nostack),
+            );
         }
     }
 

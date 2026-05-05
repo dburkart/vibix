@@ -15,6 +15,7 @@ mod helpers;
 
 pub mod errno;
 pub mod fcntl;
+pub mod signal;
 pub mod stat;
 pub mod unistd;
 

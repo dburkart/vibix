@@ -1,5 +1,12 @@
 #![feature(restricted_std)]
 
+// Provide #[no_mangle] C-ABI shims for POSIX functions that the shell's
+// `extern "C"` declarations link against. On vibix, these delegate to
+// raw syscalls via `vibix_abi`. The module is excluded from host tests
+// which mock these symbols.
+#[cfg(not(test))]
+mod syscalls;
+
 mod builtins;
 mod exec;
 mod expand;
@@ -26,6 +33,9 @@ fn main() {
     env.arg0 = "sh".to_string();
 
     // Import environment variables from the process environment.
+    // On vibix, std::env::vars() is not yet supported (panics),
+    // so we skip import on that target. $PATH is set above.
+    #[cfg(not(target_os = "vibix"))]
     for (key, value) in std::env::vars() {
         env.set(&key, &value, Some(true));
     }
@@ -50,10 +60,11 @@ fn main() {
     use std::io::BufRead;
     let stdin = std::io::stdin();
 
-    // Detect if stdin is a terminal. On vibix, isatty may not be
-    // available via std, so we check the TERM variable or fall back
-    // to assuming interactive when stdin is not redirected.
-    let is_tty = std::env::var("TERM").is_ok();
+    // On vibix, the serial console is not a POSIX tty, so `isatty()`
+    // would return false even for the primary interactive session.
+    // Always treat stdin-mode as interactive to ensure the prompt
+    // appears over the serial console.
+    let is_tty = true;
 
     // Create the job table for interactive mode.
     let mut jobs = JobTable::new();

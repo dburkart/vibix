@@ -183,6 +183,12 @@ const SMOKE_MARKERS: &[&str] = &[
     // returned (this fires) vs. parent never woke (this missing).
     "init: wait4-return",
     "init: fork+exec+wait ok",
+    // #883: init launches /bin/sh after the hello fork+exec+wait cycle.
+    // The marker fires before the fork+exec, proving init reached the
+    // shell-launch code path. Whether execve succeeds depends on the
+    // ext2 rootfs having /bin/sh installed (guaranteed by the ext2
+    // image builder when build_userspace_sh() is wired in).
+    "init: launching /bin/sh",
 ];
 
 // Note: an earlier draft of #647 added a delta floor parsed out of
@@ -260,6 +266,7 @@ fn main() -> R<()> {
         }
         "shell-pipeline" => shell_pipeline(&opts)?,
         "std-hello" => std_hello(&opts)?,
+        "sh" => sh_test(&opts)?,
         "lint" => lint()?,
         "isr-audit" => isr_audit::run(&workspace_root())?,
         "nm-check" => {
@@ -441,7 +448,7 @@ fn main() -> R<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|std-hello|lint|isr-audit|nm-check|validate-target|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
+                "usage: cargo xtask [build|initrd|ext2-image|iso|run|test|test-unit|test-integration|smoke|pjdfstest|repro-fork|repro-fork-build|shell-pipeline|std-hello|sh|lint|isr-audit|nm-check|validate-target|bench|fuzz|clean] [--release] [--fault-test] [--panic-test] [--bench] [--fork-trace] [--shard=I/N (test-integration only)]"
             );
             std::process::exit(2);
         }
@@ -797,12 +804,6 @@ fn build_userspace_std_hello() -> R<PathBuf> {
 ///
 /// Uses the same out-of-tree `-Z build-std` approach as `std_hello`.
 /// The crate lives in `base/sh/` (base system program, not a test).
-///
-/// Not yet wired into `cargo xtask build` because the in-repo std fork
-/// has a pre-existing compile error on the vibix target (E0034 in
-/// `sys/thread/vibix.rs`). The function is ready to be called once that
-/// is resolved.
-#[allow(dead_code)]
 fn build_userspace_sh() -> R<PathBuf> {
     let ws = workspace_root();
     let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
@@ -1720,7 +1721,10 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
     let (disk, mut extra_cmdline): (PathBuf, Vec<String>) = match root_flag {
         Some("ext2") => {
             let init_bin = build_userspace_init()?;
-            let img = ext2_image::build(&workspace_root(), Some(&init_bin), true)?;
+            let sh_bin = build_userspace_sh()?;
+            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let img =
+                ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             println!("→ root=ext2: booting {}", img.display());
             (img, vec!["root=/dev/vda".to_string()])
         }
@@ -1733,7 +1737,10 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
         }
         None => {
             let init_bin = build_userspace_init()?;
-            let img = ext2_image::build(&workspace_root(), Some(&init_bin), true)?;
+            let sh_bin = build_userspace_sh()?;
+            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let img =
+                ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             (img, Vec::new())
         }
     };
@@ -2071,7 +2078,10 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     // binary to keep the smoke lane in sync with code changes.
     let kernel = build(opts)?;
     let userspace_init = build_userspace_init()?;
-    let disk = ext2_image::build(&workspace_root(), Some(&userspace_init), true)?;
+    let sh_bin = build_userspace_sh()?;
+    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    let disk =
+        ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix.iso");
     make_iso_with_cmdline(&kernel, &iso, "iso_root", "root=/dev/vda")?;
 
@@ -2825,6 +2835,147 @@ fn std_hello(opts: &BuildOpts) -> R<()> {
             Err(format!("std-hello: {msg}").into())
         }
         (false, None) => Err("std-hello: terminated with no success and no failure marker".into()),
+    }
+}
+
+/// Boot vibix with `/bin/sh` installed in the ext2 rootfs and verify
+/// that init launches the shell (issue #883).
+///
+/// The test builds the regular init (which fork+exec's `/bin/sh` after
+/// the hello cycle), builds the sh binary, installs both in the ext2
+/// image, and asserts that the `init: launching /bin/sh` marker
+/// appears on the serial console.
+fn sh_test(opts: &BuildOpts) -> R<()> {
+    use std::collections::VecDeque;
+    use std::io::BufRead as _;
+    use std::time::Instant;
+
+    const HARD_CAP: Duration = Duration::from_secs(120);
+    const SUCCESS_MARKER: &str = "init: launching /bin/sh";
+    const PANIC_MARKER: &str = "KERNEL PANIC:";
+
+    let kernel = build(opts)?;
+    let init_bin = build_userspace_init()?;
+    let sh_bin = build_userspace_sh()?;
+
+    // Install init as /init and sh as /bin/sh in the ext2 rootfs image.
+    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    let disk = ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
+    let iso = workspace_root().join("target").join("vibix-sh.iso");
+    make_iso_with_cmdline(&kernel, &iso, "iso_sh", "root=/dev/vda")?;
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M",
+            "q35",
+            "-cpu",
+            "max",
+            "-m",
+            "256M",
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .args(virtio_blk_args(&disk))
+        .arg("-cdrom")
+        .arg(&iso)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let hard_pid = pid;
+    let hard_watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(HARD_CAP) {
+            let _ = Command::new("kill").arg(hard_pid.to_string()).status();
+        }
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut success = false;
+    let mut failure: Option<String> = None;
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(64);
+    const TICK: Duration = Duration::from_millis(200);
+
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(line) => {
+                print!("{line}");
+                if tail.len() == 64 {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
+
+                if line.contains(PANIC_MARKER) {
+                    failure = Some(format!("kernel panic: {}", line.trim_end()));
+                    break;
+                }
+                if line.contains(SUCCESS_MARKER) {
+                    success = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if start.elapsed() > HARD_CAP {
+                    failure = Some(format!("hard cap exceeded ({HARD_CAP:?}) without success"));
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !success && failure.is_none() {
+                    failure = Some(format!("QEMU exited before `{SUCCESS_MARKER}` marker"));
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(cancel_tx);
+    let _ = hard_watchdog.join();
+    let _ = reader_handle.join();
+    let _ = child.wait();
+
+    match (success, failure) {
+        (true, _) => {
+            println!("→ sh: `{SUCCESS_MARKER}` in {:?} ✓", start.elapsed());
+            Ok(())
+        }
+        (false, Some(msg)) => {
+            eprintln!("--- captured serial (tail) ---");
+            for line in &tail {
+                eprint!("{line}");
+            }
+            eprintln!("------------------------------");
+            Err(format!("sh: {msg}").into())
+        }
+        (false, None) => Err("sh: terminated with no success and no failure marker".into()),
     }
 }
 
