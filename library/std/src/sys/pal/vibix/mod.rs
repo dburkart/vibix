@@ -8,6 +8,8 @@
 
 use crate::io;
 
+pub mod futex;
+
 pub fn unsupported<T>() -> io::Result<T> {
     Err(unsupported_err())
 }

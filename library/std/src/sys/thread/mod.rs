@@ -1,4 +1,8 @@
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+        pub use vibix::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
+    }
     target_os = "hermit" => {
         mod hermit;
         pub use hermit::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
