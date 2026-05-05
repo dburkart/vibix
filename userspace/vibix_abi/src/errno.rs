@@ -11,6 +11,18 @@ use core::cell::Cell;
 #[thread_local]
 pub static ERRNO: Cell<i32> = Cell::new(0);
 
+/// Return the current thread's errno value.
+#[inline]
+pub fn get_errno() -> i32 {
+    ERRNO.get()
+}
+
+/// Set the current thread's errno value.
+#[inline]
+pub fn set_errno(val: i32) {
+    ERRNO.set(val);
+}
+
 /// C-ABI-compatible accessor for errno's address.  This is what the libc
 /// crate's `__errno_location` resolves to.
 #[no_mangle]
