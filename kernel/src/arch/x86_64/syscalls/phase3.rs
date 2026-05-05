@@ -55,7 +55,6 @@ const FUTEX_WAKE_PRIVATE: u32 = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
 /// because clone(CLONE_VM) threads share the same page tables.
 static FUTEX_TABLE: Mutex<BTreeMap<usize, Vec<usize>>> = Mutex::new(BTreeMap::new());
 
-
 // ─── per-task clear_child_tid pointer ────────────────────���─────────────────
 
 /// Per-task `clear_child_tid` address, set by `set_tid_address` and
