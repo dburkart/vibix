@@ -79,7 +79,7 @@ hermit-abi = { version = "0.5.0", features = [
 ], public = true }
 
 [target.'cfg(target_os = "vibix")'.dependencies]
-vibix_abi = { path = "../../userspace/vibix_abi", features = [
+vibix_abi = { path = "../../base/vibix_abi", features = [
     'rustc-dep-of-std',
 ] }
 

@@ -106,7 +106,7 @@ jobs:
         with:
           # The fork/exec surface PR #206 introduced and epic #501 is
           # actively de-risking, plus the reproducer harness itself — a
-          # change to `scripts/repro-fork.sh`, `userspace/repro_fork/`,
+          # change to `scripts/repro-fork.sh`, `tests/userspace/repro_fork/`,
           # or the `repro-fork` xtask subcommand could silently
           # invalidate the soak, so it must trigger too.
           # Deliberately does NOT include this workflow file — a
@@ -120,7 +120,7 @@ jobs:
               - 'kernel/src/process/**'
               - 'xtask/src/main.rs'
               - 'scripts/repro-fork.sh'
-              - 'userspace/repro_fork/**'
+              - 'tests/userspace/repro_fork/**'
 
       - name: Decide
         id: decide

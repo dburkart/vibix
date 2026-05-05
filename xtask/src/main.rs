@@ -577,13 +577,13 @@ fn build_userspace_binary(package: &str, link_ld: &str) -> R<PathBuf> {
 }
 
 fn build_userspace_init() -> R<PathBuf> {
-    build_userspace_binary("userspace_init", "userspace/init/link.ld")
+    build_userspace_binary("userspace_init", "base/init/link.ld")
 }
 
 /// Build the hello binary — the exec() target for the fork+exec+wait test.
 /// Links at 0x400000 (lower half) just like init so load_user_elf accepts it.
 fn build_userspace_hello() -> R<PathBuf> {
-    build_userspace_binary("userspace_hello", "userspace/hello/link.ld")
+    build_userspace_binary("userspace_hello", "tests/userspace/hello/link.ld")
 }
 
 /// Build the fork-loop reproducer harness (issue #506).
@@ -592,7 +592,7 @@ fn build_userspace_hello() -> R<PathBuf> {
 /// this binary runs a tight fork+exec+wait loop as PID 1 to amplify the
 /// ~50 %-rate flake bisected to PR #206 into a deterministic repro.
 fn build_userspace_repro_fork() -> R<PathBuf> {
-    build_userspace_binary("userspace_repro_fork", "userspace/repro_fork/link.ld")
+    build_userspace_binary("userspace_repro_fork", "tests/userspace/repro_fork/link.ld")
 }
 
 /// Build the shell-pipeline integration binary (issue #462).
@@ -600,12 +600,12 @@ fn build_userspace_repro_fork() -> R<PathBuf> {
 /// Shipped as `userspace_init.elf` when `cargo xtask shell-pipeline` is
 /// used — the binary internally simulates `echo foo | cat | wc -c`
 /// using pipe2/fork/dup2/close/wait4 and prints `SHELL_PIPELINE_OK: 4`
-/// on success. See `userspace/shell_pipeline/src/main.rs` for the
+/// on success. See `tests/userspace/shell_pipeline/src/main.rs` for the
 /// rationale on why all three pipeline stages live in one binary.
 fn build_userspace_shell_pipeline() -> R<PathBuf> {
     build_userspace_binary(
         "userspace_shell_pipeline",
-        "userspace/shell_pipeline/link.ld",
+        "tests/userspace/shell_pipeline/link.ld",
     )
 }
 
@@ -614,7 +614,10 @@ fn build_userspace_shell_pipeline() -> R<PathBuf> {
 /// `cargo xtask pjdfstest`. Same link layout as `userspace_init` so
 /// the kernel's ELF loader doesn't need any new code paths.
 pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
-    build_userspace_binary("pjdfstest_runner", "userspace/pjdfstest_runner/link.ld")
+    build_userspace_binary(
+        "pjdfstest_runner",
+        "tests/userspace/pjdfstest_runner/link.ld",
+    )
 }
 
 /// Build the vibix dynamic linker (`ld-vibix.so`).
@@ -624,7 +627,7 @@ pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
 /// Uses `-C relocation-model=pic` and `-C link-arg=-shared` to get
 /// position-independent code in a shared-object container.
 fn build_ld_vibix() -> R<PathBuf> {
-    let link_ld = "userspace/ld_vibix/link.ld";
+    let link_ld = "base/ld_vibix/link.ld";
     let rustflags = [
         &format!("-C link-arg=-T{link_ld}"),
         "-C relocation-model=pic",
@@ -713,7 +716,7 @@ fn build_libc_so() -> R<PathBuf> {
 /// The kernel loads ld-vibix.so and transfers control to it, which then
 /// processes relocations and jumps to this binary's entry point.
 fn build_userspace_hello_dyn() -> R<PathBuf> {
-    let link_ld = "userspace/hello_dyn/link.ld";
+    let link_ld = "tests/userspace/hello_dyn/link.ld";
     let rustflags = [
         &format!("-C link-arg=-T{link_ld}"),
         "-C relocation-model=pic",
@@ -751,7 +754,7 @@ fn build_userspace_hello_dyn() -> R<PathBuf> {
 fn build_userspace_std_hello() -> R<PathBuf> {
     let ws = workspace_root();
     let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
-    let manifest = ws.join("userspace/std_hello/Cargo.toml");
+    let manifest = ws.join("tests/userspace/std_hello/Cargo.toml");
     let library_root = ws.join("library");
 
     let target_dir = ws.join("target");
@@ -1283,7 +1286,7 @@ fn ensure_initrd() -> R<PathBuf> {
                                                       // DIRS headers + 4 file headers + (3 small + LDSO_BLOCKS) data blocks + 2 end blocks.
     const EXPECTED_SIZE: u64 = (DIRS.len() as u64 + 4 + 3 + LDSO_BLOCKS + 2) * 512;
 
-    let ldso_src = workspace_root().join("userspace/lib/ld-musl-x86_64.so.1");
+    let ldso_src = workspace_root().join("base/lib/ld-musl-x86_64.so.1");
 
     // Size + magic aren't sufficient — changing MOTD_PAYLOAD to another
     // equal-or-shorter string would leave the old payload on disk (same
@@ -1551,7 +1554,7 @@ fn make_iso_inner(
     fs::copy(userspace_hello, iso_root.join("boot/userspace_hello.elf"))?;
     fs::copy(&initrd, iso_root.join("boot/rootfs.tar"))?;
     fs::copy(
-        workspace_root().join("userspace/lib/ld-musl-x86_64.so.1"),
+        workspace_root().join("base/lib/ld-musl-x86_64.so.1"),
         iso_root.join("boot/ld-musl-x86_64.so.1"),
     )?;
     // #764: stub dynamic-linker fixture for the dynlinker_stub integration test.
@@ -2275,7 +2278,7 @@ fn repro_fork_build(opts: &BuildOpts) -> R<PathBuf> {
 /// heartbeat-aware watchdog.  Issue #506 / epic #501.
 ///
 /// Replaces `/boot/userspace_init.elf` in the ISO with the
-/// `userspace_repro_fork` binary (see `userspace/repro_fork/`).  That
+/// `userspace_repro_fork` binary (see `tests/userspace/repro_fork/`).  That
 /// binary runs `CYCLES` fork+exec+wait iterations, emitting
 /// `repro: cycle K alive` every 50 cycles and `repro: fork loop
 /// complete` on success.  The loop in this function follows those
@@ -3687,6 +3690,7 @@ repro: starting fork loop cycles=500 hb=50
     fn repro_fork_default_cycles_is_500() {
         let source = std::fs::read_to_string(
             workspace_root()
+                .join("tests")
                 .join("userspace")
                 .join("repro_fork")
                 .join("src")
@@ -3701,7 +3705,7 @@ repro: starting fork loop cycles=500 hb=50
         // timing budget / this test."
         assert!(
             source.contains("None => 500,"),
-            "userspace/repro_fork/src/main.rs must keep the default CYCLES=500; \
+            "tests/userspace/repro_fork/src/main.rs must keep the default CYCLES=500; \
              if you genuinely need to change this, also update \
              .github/workflows/smoke-soak.yml timing budgets and issue #531's context"
         );
@@ -3720,6 +3724,7 @@ repro: starting fork loop cycles=500 hb=50
     fn repro_fork_syscall_blocks_clobber_all_sysv_caller_saved() {
         let source = std::fs::read_to_string(
             workspace_root()
+                .join("tests")
                 .join("userspace")
                 .join("repro_fork")
                 .join("src")

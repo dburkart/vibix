@@ -9,7 +9,7 @@ reproducer.
 
 ## What it does
 
-Replaces PID 1 with a userspace binary (`userspace/repro_fork/`) that runs
+Replaces PID 1 with a userspace binary (`tests/userspace/repro_fork/`) that runs
 a tight `fork → child execve → parent wait4` loop for `CYCLES` iterations
 (default 500).  Every 50 cycles it writes `repro: cycle K alive` to serial;
 every cycle it reads the TSC before and after and prints a watchdog
@@ -72,7 +72,7 @@ exits 0.  Failure: any of —
   to a large value for soak runs.  (Implemented as `option_env!` inside
   the binary, so cargo rebuilds when the value changes.)
 - The per-cycle TSC budget is a compile-time constant
-  (`STALL_TSC_BUDGET` in `userspace/repro_fork/src/main.rs`).  Bump it
+  (`STALL_TSC_BUDGET` in `tests/userspace/repro_fork/src/main.rs`).  Bump it
   if unaccelerated CI QEMU is hitting spurious watchdog trips on a
   healthy kernel.
 
@@ -105,7 +105,7 @@ invocation per iteration, with `SOAK_COUNT` iterations per job run
 Nightly `schedule` and manual `workflow_dispatch` runs exercise this
 path today; the `pull_request` trigger is still gated off while the
 fork flake is live (see #517).  Changes to this harness — either the
-wrapper script or `userspace/repro_fork/` — trigger the workflow's
+wrapper script or `tests/userspace/repro_fork/` — trigger the workflow's
 path filter so the soak runs on any PR that touches them.
 
   The harness amplifies opportunity to hit the hang; whether it trips
