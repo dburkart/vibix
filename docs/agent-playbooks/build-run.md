@@ -40,6 +40,24 @@ and compiles the host `limine` tool. That requires:
 - The normal kernel end-state is `hlt_loop()`, so QEMU idles until it is exited manually.
 - In an interactive terminal, exit QEMU with `Ctrl-a x`.
 
+## Base system programs
+
+Programs in `base/` are the shipped userspace — they must be written against the in-repo
+`std` fork (`library/std/`), not `#![no_std]`. The only exceptions are the low-level
+crates that live *below* `std` in the dependency stack (`vibix_abi`, `vibix_libc`,
+`vibix_libc_defs`, `ld_vibix`, `init`).
+
+New base programs are built out-of-workspace via `--manifest-path` with:
+
+- Target spec: `x86_64-unknown-vibix.json` (workspace root).
+- `-Z build-std=std,core,alloc,panic_abort -Z build-std-features=compiler-builtins-mem`.
+- `__CARGO_TESTS_ONLY_SRC_ROOT` pointing at `library/`.
+
+See `build_userspace_std_hello()` in `xtask/src/main.rs` for the reference pattern. Each
+new program needs a matching `build_<name>()` function wired into the ISO/rootfs assembly.
+
+See `base/README.md` for the full convention.
+
 ## Gotchas
 
 - Do not add `build-std` to `.cargo/config.toml`. Host tests rely on the normal sysroot
