@@ -102,7 +102,10 @@ fn run_layered(seed: u64, plan: FaultPlan) -> (i64, u32) {
 
     // T_FORK: parent dispatches sys_fork.
     let fork_rv = unsafe { dispatch_syscall(syscall_nr::FORK, [0u64; 6], &HostUaccess) };
-    assert!(fork_rv >= 2, "fork should return child pid >= 2; got {fork_rv}");
+    assert!(
+        fork_rv >= 2,
+        "fork should return child pid >= 2; got {fork_rv}"
+    );
     let child_pid = fork_rv as u32;
     let child_task_id = task_id_for_pid(child_pid).expect("child task id registered");
     assert!(child_task_id >= SYNTHETIC_TASK_ID_BASE);
@@ -128,7 +131,10 @@ fn run_layered(seed: u64, plan: FaultPlan) -> (i64, u32) {
     let wait4_args = [
         -1i64 as u64,
         (&mut wstatus_buf as *mut u32) as u64,
-        0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
     ];
     let wait4_rv = unsafe { dispatch_syscall(syscall_nr::WAIT4, wait4_args, &HostUaccess) };
 
@@ -198,10 +204,8 @@ fn layered_wstatus_encoding_is_correct_across_runs() {
     let expected_wstatus = (42u32 & 0xFF) << 8;
 
     for seed in [77, 123, 456] {
-        let plan = FaultPlan::from_entries(vec![(
-            T_EXIT,
-            FaultEvent::WakeupReorder { within_tick: 1 },
-        )]);
+        let plan =
+            FaultPlan::from_entries(vec![(T_EXIT, FaultEvent::WakeupReorder { within_tick: 1 })]);
         let (rv, wstatus) = std::thread::spawn(move || run_layered(seed, plan))
             .join()
             .expect("scenario thread");
