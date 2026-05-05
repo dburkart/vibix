@@ -1209,6 +1209,24 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
         }
 
+        // getpid() — return the current process PID.
+        GETPID => super::syscalls::phase1::sys_getpid(),
+
+        // exit_group(status) — terminate all threads in the process.
+        EXIT_GROUP => super::syscalls::phase1::sys_exit_group(a0 as i32),
+
+        // readv(fd, iov, iovcnt) — vectored read.
+        READV => super::syscalls::phase1::sys_readv(a0 as u32, a1 as usize, a2 as usize),
+
+        // writev(fd, iov, iovcnt) — vectored write.
+        WRITEV => super::syscalls::phase1::sys_writev(a0 as u32, a1 as usize, a2 as usize),
+
+        // clock_gettime(clk_id, tp) — read clock into timespec.
+        CLOCK_GETTIME => super::syscalls::phase1::sys_clock_gettime(a0, a1 as usize),
+
+        // getrandom(buf, len, flags) — fill buffer from CSPRNG.
+        GETRANDOM => super::syscalls::phase1::sys_getrandom(a0 as usize, a1 as usize, a2 as u32),
+
         _ => -38i64, // ENOSYS
     };
     // RFC 0006 / #718: syscall exit emit point. Records the same
@@ -2033,6 +2051,12 @@ pub mod syscall_nr {
     pub const GETGROUPS: u64 = 115;
     pub const SETGROUPS: u64 = 116;
     pub const ARCH_PRCTL: u64 = 158;
+    pub const GETPID: u64 = 39;
+    pub const READV: u64 = 19;
+    pub const WRITEV: u64 = 20;
+    pub const CLOCK_GETTIME: u64 = 228;
+    pub const EXIT_GROUP: u64 = 231;
+    pub const GETRANDOM: u64 = 318;
 }
 
 #[cfg(test)]
