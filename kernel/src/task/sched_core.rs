@@ -360,6 +360,100 @@ pub fn fork_current_task(
     Ok(child_id)
 }
 
+/// Create a new thread that shares the parent's address space and fd table.
+///
+/// Unlike `fork_current_task` which CoW-clones the address space, this
+/// function creates a thread (clone(CLONE_VM|CLONE_FILES|...)) that shares
+/// the same `Arc<RwLock<AddressSpace>>` and `Arc<Mutex<FileDescTable>>`.
+///
+/// `tls` is the FS base for the new thread (set by CLONE_SETTLS).
+///
+/// Returns the child task ID on success.
+pub fn clone_current_as_thread(
+    regs: &crate::fork_abi::ForkUserRegs,
+    tls: u64,
+) -> Result<usize, crate::mem::addrspace::ForkError> {
+    use alloc::sync::Arc;
+
+    // Snapshot parent state while holding SCHED.
+    let (
+        parent_address_space,
+        parent_cr3,
+        parent_fd_table,
+        parent_cwd,
+        parent_credentials,
+        parent_priority,
+        parent_affinity,
+        parent_fpu_ptr,
+    ) = {
+        let mut sched = SCHED.lock();
+        let cur = sched
+            .current
+            .as_mut()
+            .expect("clone_current_as_thread: no running task");
+        // Flush live FPU state.
+        unsafe {
+            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+        }
+        let parent_credentials = Arc::clone(&*cur.credentials.read());
+        (
+            Arc::clone(&cur.address_space),
+            cur.cr3,
+            Arc::clone(&cur.fd_table),
+            cur.cwd.clone(),
+            parent_credentials,
+            cur.priority,
+            cur.affinity,
+            &*cur.fpu as *const crate::arch::x86_64::fpu::FpuArea,
+        )
+    };
+
+    // For threads: share the same address space and fd table (no clone).
+    // The child gets tls as its FS base instead of the parent's.
+    let child = unsafe {
+        Task::new_forked(
+            regs,
+            parent_priority,
+            parent_affinity,
+            tls, // child's FS base = the TLS pointer passed via CLONE_SETTLS
+            0,   // no separate TLS region tracking for threads
+            0,
+            parent_fpu_ptr,
+            parent_address_space, // shared, not cloned
+            parent_cr3,           // same page table
+            parent_fd_table,      // shared, not cloned
+            parent_cwd,
+            parent_credentials,
+        )
+    }?;
+    let child_id = child.id;
+    let child_box = Box::new(child);
+    let new_prio = child_box.priority;
+    let mut sched = SCHED.lock();
+    sched.push_ready(child_box);
+    maybe_preempt_current_for_priority(&mut sched, new_prio);
+    Ok(child_id)
+}
+
+/// Voluntarily yield the current timeslice. Resets the slice counter to
+/// zero and invokes the preempt path, which will rotate to the next
+/// ready task at the same or higher priority, or continue running if
+/// there's nothing else ready.
+pub fn yield_current() {
+    // Set slice to zero so preempt_tick will rotate if a peer is ready.
+    // Then invoke preempt_tick directly to effect the switch without
+    // waiting for the next timer interrupt.
+    {
+        let mut sched = SCHED.lock();
+        if let Some(cur) = sched.current.as_mut() {
+            cur.slice_remaining_ms = 0;
+        }
+    }
+    // Call preempt_tick to perform the context switch if warranted.
+    // preempt_tick uses try_lock, so we must not hold SCHED here.
+    preempt_tick();
+}
+
 /// Return the `Arc<RwLock<AddressSpace>>` of the currently-running task.
 /// Used by the exec() syscall to clear and reload the address space.
 ///
@@ -1154,6 +1248,12 @@ pub fn current_growsdown_lookup(
 /// - The bootstrap task calls `exit` — it owns the kernel PML4 and the
 ///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
+    // CLONE_CHILD_CLEARTID: write 0 to the registered tidptr and wake
+    // one futex waiter (enables pthread_join). Must run before IRQs are
+    // disabled and before we drop to the next task, since we need to
+    // copy_to_user in the exiting task's address space.
+    crate::arch::x86_64::syscalls::phase3::perform_clear_child_tid(current_id());
+
     // Disable IRQs before acquiring SCHED so that IrqLock saves `false`
     // and restores `false` on guard drop — keeping IRQs masked through
     // the context_switch call below, which executes after the guard is

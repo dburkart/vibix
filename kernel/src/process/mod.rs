@@ -231,6 +231,12 @@ pub fn current_pid() -> u32 {
     table.pid_of.get(&task_id).copied().unwrap_or(0)
 }
 
+/// Return the parent PID of `pid`, or 0 if `pid` is not in the table.
+pub fn parent_pid_of(pid: u32) -> u32 {
+    let table = lock_table_with_soak_check("parent_pid_of");
+    table.by_pid.get(&pid).map(|e| e.parent_pid).unwrap_or(0)
+}
+
 /// Soak-loop ceiling for `try_lock` retries on TABLE before declaring
 /// "stuck spinning". Tuned high enough that ordinary contention (a few
 /// hundred ns of holder work) never trips, low enough that a wedged
