@@ -62,6 +62,10 @@ const KERNEL_BUILD_STD_ARGS: &[&str] = &[
 /// with `-Z build-std`). The JSON file lives at the workspace root.
 const VIBIX_USERSPACE_TARGET: &str = "x86_64-unknown-vibix.json";
 
+/// Custom target spec for vibix userspace shared libraries (PIC,
+/// dynamic-linking enabled). Used to build cdylib crate-type outputs.
+const VIBIX_USERSPACE_DYN_TARGET: &str = "x86_64-unknown-vibix-dyn.json";
+
 // QEMU process exit codes produced by `isa-debug-exit` writing our
 // QemuExitCode values. See kernel/src/test_harness.rs.
 const QEMU_EXIT_SUCCESS: i32 = 65; // (0x20 << 1) | 1
@@ -608,6 +612,130 @@ fn build_userspace_shell_pipeline() -> R<PathBuf> {
 /// the kernel's ELF loader doesn't need any new code paths.
 pub(crate) fn build_pjdfstest_runner() -> R<PathBuf> {
     build_userspace_binary("pjdfstest_runner", "userspace/pjdfstest_runner/link.ld")
+}
+
+/// Build the vibix dynamic linker (`ld-vibix.so`).
+///
+/// Produces an ET_DYN (shared object) ELF that the kernel loads at
+/// INTERP_LOAD_BASE when a binary has `PT_INTERP = /lib/ld-vibix.so`.
+/// Uses `-C relocation-model=pic` and `-C link-arg=-shared` to get
+/// position-independent code in a shared-object container.
+fn build_ld_vibix() -> R<PathBuf> {
+    let link_ld = "userspace/ld_vibix/link.ld";
+    let rustflags = [
+        &format!("-C link-arg=-T{link_ld}"),
+        "-C relocation-model=pic",
+        "-C link-arg=-shared",
+        "-C link-arg=-no-pie",
+        "-C no-redzone=yes",
+        "-C force-frame-pointers=yes",
+    ]
+    .join(" ");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .args(["build", "--package", "ld_vibix"])
+        .args(KERNEL_BUILD_STD_ARGS);
+    check(cmd.status()?)?;
+    let bin = workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join("ld_vibix");
+    if !bin.exists() {
+        return Err(format!("ld_vibix binary missing at {}", bin.display()).into());
+    }
+    // Rename to ld-vibix.so for clarity.
+    let so = workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join("ld-vibix.so");
+    fs::copy(&bin, &so)?;
+    strip_debug(&so)?;
+    Ok(so)
+}
+
+/// Build vibix_libc as a shared object (`libc.so`).
+///
+/// Produces an ET_DYN ELF suitable for dynamic linking. Uses the
+/// `x86_64-unknown-vibix-dyn.json` target spec (PIC, dynamic-linking
+/// enabled) so cdylib crate-type is accepted.
+fn build_libc_so() -> R<PathBuf> {
+    let rustflags = ["-C no-redzone=yes", "-C force-frame-pointers=yes"].join(" ");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .args([
+            "build",
+            "--package",
+            "vibix_libc",
+            "--features",
+            "panic-handler",
+        ])
+        .args([
+            "--target",
+            VIBIX_USERSPACE_DYN_TARGET,
+            "-Z",
+            "build-std=core,compiler_builtins,alloc",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "json-target-spec",
+        ]);
+    check(cmd.status()?)?;
+    // cdylib output is named libvibix_libc.so
+    let cdylib = workspace_root()
+        .join("target")
+        .join("x86_64-unknown-vibix-dyn")
+        .join("debug")
+        .join("libvibix_libc.so");
+    if !cdylib.exists() {
+        return Err(format!("libvibix_libc.so missing at {}", cdylib.display()).into());
+    }
+    // Copy to libc.so for the rootfs.
+    let so = workspace_root()
+        .join("target")
+        .join("x86_64-unknown-vibix-dyn")
+        .join("debug")
+        .join("libc.so");
+    fs::copy(&cdylib, &so)?;
+    strip_debug(&so)?;
+    Ok(so)
+}
+
+/// Build the dynamically-linked hello world test binary (`hello_dyn`).
+///
+/// Produces an ET_DYN executable with PT_INTERP = /lib/ld-vibix.so.
+/// The kernel loads ld-vibix.so and transfers control to it, which then
+/// processes relocations and jumps to this binary's entry point.
+fn build_userspace_hello_dyn() -> R<PathBuf> {
+    let link_ld = "userspace/hello_dyn/link.ld";
+    let rustflags = [
+        &format!("-C link-arg=-T{link_ld}"),
+        "-C relocation-model=pic",
+        "-C link-arg=-shared",
+        "-C link-arg=-no-pie",
+        "-C no-redzone=yes",
+        "-C force-frame-pointers=yes",
+    ]
+    .join(" ");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .args(["build", "--package", "userspace_hello_dyn"])
+        .args(KERNEL_BUILD_STD_ARGS);
+    check(cmd.status()?)?;
+    let bin = workspace_root()
+        .join("target")
+        .join(KERNEL_TARGET)
+        .join("debug")
+        .join("userspace_hello_dyn");
+    if !bin.exists() {
+        return Err(format!("userspace_hello_dyn missing at {}", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
 }
 
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
@@ -1377,6 +1505,13 @@ fn make_iso_inner(
     // #764: stub dynamic-linker fixture for the dynlinker_stub integration test.
     let stub_interp = generate_stub_interp()?;
     fs::copy(&stub_interp, iso_root.join("boot/stub_interp.elf"))?;
+    // #859: build and include the vibix dynamic linker, libc.so, and test binary.
+    let ld_vibix = build_ld_vibix()?;
+    fs::copy(&ld_vibix, iso_root.join("boot/ld-vibix.so"))?;
+    let libc_so = build_libc_so()?;
+    fs::copy(&libc_so, iso_root.join("boot/libc.so"))?;
+    let hello_dyn = build_userspace_hello_dyn()?;
+    fs::copy(&hello_dyn, iso_root.join("boot/userspace_hello_dyn.elf"))?;
     {
         let src = workspace_root().join("kernel/limine.conf");
         let dst = iso_root.join("boot/limine/limine.conf");

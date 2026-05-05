@@ -1,0 +1,14 @@
+[package]
+name = "userspace_hello_dyn"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Dynamically-linked hello world test binary for ld-vibix.so"
+
+[[bin]]
+name = "userspace_hello_dyn"
+path = "src/main.rs"
+
+[dependencies]
+vibix_libc = { path = "../vibix_libc" }

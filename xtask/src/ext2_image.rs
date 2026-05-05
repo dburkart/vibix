@@ -280,7 +280,7 @@ fn run_debugfs_populate(image: &Path, init_bin: &Path) -> R<()> {
     // FAKE_TIME but we belt-and-brace it so a future mkfs that stops
     // honouring E2FSPROGS_FAKE_TIME for the root dir wouldn't regress.
     stamp(&mut script, "/");
-    for dir in ["/bin", "/tmp", "/dev", "/etc", "/etc/init"] {
+    for dir in ["/bin", "/lib", "/tmp", "/dev", "/etc", "/etc/init"] {
         script.push_str(&format!("mkdir {dir}\n"));
         // set_current_time applies to the CWD-of-debugfs, not the file —
         // we use `sif` instead, which addresses the inode by path.

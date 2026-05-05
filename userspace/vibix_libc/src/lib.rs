@@ -20,3 +20,17 @@ pub mod unistd;
 
 /// Re-export the defs crate types for convenience.
 pub use vibix_abi;
+
+/// Panic handler for the cdylib build. When vibix_libc is linked as a
+/// shared library (cdylib), it needs its own panic handler. When linked
+/// as an rlib into a binary, the binary provides the panic handler instead.
+/// The `panic_handler` cfg is set by the build system when targeting cdylib.
+#[cfg(all(not(test), feature = "panic-handler"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Abort via exit(134) — SIGABRT-like exit code.
+    unsafe { vibix_abi::syscall!(60, 134) };
+    loop {
+        core::hint::spin_loop();
+    }
+}

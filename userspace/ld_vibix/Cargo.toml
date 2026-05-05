@@ -1,0 +1,11 @@
+[package]
+name = "ld_vibix"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Minimal Rust-based dynamic linker for vibix (eager binding)"
+
+[[bin]]
+name = "ld_vibix"
+path = "src/main.rs"

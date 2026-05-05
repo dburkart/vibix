@@ -9,7 +9,11 @@ description = "C-ABI shim that delegates to vibix_abi syscall wrappers"
 [lib]
 name = "vibix_libc"
 path = "src/lib.rs"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+panic-handler = []
 
 [dependencies]
 vibix_abi = { path = "../vibix_abi" }
