@@ -41,6 +41,10 @@ cfg_select! {
         mod uefi;
         use uefi as imp;
     }
+    target_os = "vibix" => {
+        mod vibix;
+        use vibix as imp;
+    }
     target_os = "vexos" => {
         mod vexos;
         use vexos as imp;

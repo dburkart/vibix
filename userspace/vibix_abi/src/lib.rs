@@ -9,5 +9,7 @@
 
 pub mod alloc;
 pub mod errno;
+pub mod fs;
+pub mod process;
 pub mod stdio;
 pub mod syscall;

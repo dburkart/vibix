@@ -177,6 +177,8 @@ pub mod solid;
 pub mod trusty;
 #[cfg(target_os = "uefi")]
 pub mod uefi;
+#[cfg(target_os = "vibix")]
+pub mod vibix;
 #[cfg(target_os = "vita")]
 pub mod vita;
 #[cfg(target_os = "vxworks")]
