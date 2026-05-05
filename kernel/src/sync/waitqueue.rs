@@ -117,13 +117,16 @@ impl WaitQueue {
     }
 
     /// Wake every currently-registered waiter.
+    ///
+    /// The WQ lock is held across the entire drain so no timer
+    /// preemption can interleave between popping a waiter and
+    /// calling `task::wake`. Lock order WQ.inner → SCHED is the
+    /// same direction as `wait_while` (which drops WQ before SCHED,
+    /// never the reverse), so no inversion. (#742)
     pub fn notify_all(&self) {
-        loop {
-            let tid = { self.inner.lock().pop_front() };
-            match tid {
-                Some(tid) => task::wake(tid),
-                None => return,
-            }
+        let mut q = self.inner.lock();
+        while let Some(tid) = q.pop_front() {
+            task::wake(tid);
         }
     }
 }
