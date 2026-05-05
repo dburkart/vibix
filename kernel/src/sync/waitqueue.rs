@@ -118,11 +118,12 @@ impl WaitQueue {
 
     /// Wake every currently-registered waiter.
     ///
-    /// The WQ lock is held across the entire drain so no timer
-    /// preemption can interleave between popping a waiter and
-    /// calling `task::wake`. Lock order WQ.inner → SCHED is the
-    /// same direction as `wait_while` (which drops WQ before SCHED,
-    /// never the reverse), so no inversion. (#742)
+    /// The WQ lock is held across the entire drain so no concurrent
+    /// `wait_while` enqueue can interleave between pops. On bare
+    /// metal, callers must also mask IRQs to prevent `preempt_tick`
+    /// from scheduling a woken waiter before all wakes complete —
+    /// see `mark_zombie`'s IRQ guard (#742). Lock order WQ.inner →
+    /// SCHED is safe (no path takes SCHED then WQ.inner).
     pub fn notify_all(&self) {
         let mut q = self.inner.lock();
         while let Some(tid) = q.pop_front() {

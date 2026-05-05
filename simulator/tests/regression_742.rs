@@ -90,8 +90,8 @@ fn build_config(seed: u64, plan: FaultPlan) -> SimulatorConfig {
     cfg
 }
 
-/// Run the layered fork/exec/wait scenario. Returns `(wait4_rv, wstatus)`.
-fn run_layered(seed: u64, plan: FaultPlan) -> (i64, u32) {
+/// Run the layered fork/exec/wait scenario. Returns `(child_pid, wait4_rv, wstatus)`.
+fn run_layered(seed: u64, plan: FaultPlan) -> (u32, i64, u32) {
     use simulator::syscall_seam::SYNTHETIC_TASK_ID_BASE;
 
     let cfg = build_config(seed, plan);
@@ -139,7 +139,7 @@ fn run_layered(seed: u64, plan: FaultPlan) -> (i64, u32) {
     let wait4_rv = unsafe { dispatch_syscall(syscall_nr::WAIT4, wait4_args, &HostUaccess) };
 
     sim.run_for(2);
-    (wait4_rv, wstatus_buf)
+    (child_pid, wait4_rv, wstatus_buf)
 }
 
 /// The layered fork/exec/wait scenario completes under the same
@@ -152,11 +152,14 @@ fn layered_wait4_completes_under_wakeup_reorder() {
     let plan =
         FaultPlan::from_entries(vec![(T_EXIT, FaultEvent::WakeupReorder { within_tick: 1 })]);
 
-    let (rv, wstatus) = std::thread::spawn(move || run_layered(seed, plan))
+    let (child_pid, rv, wstatus) = std::thread::spawn(move || run_layered(seed, plan))
         .join()
         .expect("scenario thread");
 
-    assert_eq!(rv, 2, "wait4 should return child pid 2; got {rv}");
+    assert_eq!(
+        rv, child_pid as i64,
+        "wait4 should return child pid {child_pid}; got {rv}"
+    );
     let expected = (42u32 & 0xFF) << 8;
     assert_eq!(
         wstatus, expected,
@@ -167,11 +170,14 @@ fn layered_wait4_completes_under_wakeup_reorder() {
 /// Baseline: no fault injection, the scenario completes cleanly.
 #[test]
 fn layered_wait4_completes_baseline() {
-    let (rv, wstatus) = std::thread::spawn(move || run_layered(42, FaultPlan::new()))
+    let (child_pid, rv, wstatus) = std::thread::spawn(move || run_layered(42, FaultPlan::new()))
         .join()
         .expect("scenario thread");
 
-    assert_eq!(rv, 2, "wait4 should return child pid 2; got {rv}");
+    assert_eq!(
+        rv, child_pid as i64,
+        "wait4 should return child pid {child_pid}; got {rv}"
+    );
     let expected = (42u32 & 0xFF) << 8;
     assert_eq!(wstatus, expected);
 }
@@ -181,7 +187,7 @@ fn layered_wait4_completes_baseline() {
 /// remain enqueued after notify_all returns.
 #[test]
 fn child_wait_queue_empty_after_rendezvous() {
-    let (rv, _) = std::thread::spawn(move || {
+    let (child_pid, rv, _) = std::thread::spawn(move || {
         let result = run_layered(99, FaultPlan::new());
         let count = CHILD_WAIT.waiter_count();
         assert_eq!(
@@ -193,7 +199,7 @@ fn child_wait_queue_empty_after_rendezvous() {
     .join()
     .expect("scenario thread");
 
-    assert_eq!(rv, 2);
+    assert_eq!(rv, child_pid as i64);
 }
 
 /// Determinism: the wstatus encoding is correct across runs.
@@ -206,11 +212,14 @@ fn layered_wstatus_encoding_is_correct_across_runs() {
     for seed in [77, 123, 456] {
         let plan =
             FaultPlan::from_entries(vec![(T_EXIT, FaultEvent::WakeupReorder { within_tick: 1 })]);
-        let (rv, wstatus) = std::thread::spawn(move || run_layered(seed, plan))
+        let (child_pid, rv, wstatus) = std::thread::spawn(move || run_layered(seed, plan))
             .join()
             .expect("scenario thread");
 
-        assert!(rv > 0, "wait4 should return a positive child pid; got {rv}");
+        assert_eq!(
+            rv, child_pid as i64,
+            "wait4 should return child pid {child_pid}; got {rv}"
+        );
         assert_eq!(
             wstatus, expected_wstatus,
             "seed {seed}: wstatus wrong: got {wstatus:#x}, expected {expected_wstatus:#x}"
