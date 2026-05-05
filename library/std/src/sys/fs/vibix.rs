@@ -203,21 +203,23 @@ impl Iterator for ReadDir {
             }
 
             let buf = &self.inner.buf[self.pos..];
-            if buf.len() < core::mem::size_of::<vfs::Dirent64>() + 1 {
+            let name_offset = core::mem::offset_of!(vfs::Dirent64, d_name);
+            if buf.len() < name_offset + 1 {
                 return None;
             }
 
-            // Safety: buffer was filled by getdents64, dirent64 is repr(C).
-            let dirent = unsafe { &*(buf.as_ptr() as *const vfs::Dirent64) };
+            // Use read_unaligned to avoid UB from misaligned reference to
+            // Dirent64 (the u8 buffer may not be 8-byte aligned at self.pos).
+            let dirent =
+                unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const vfs::Dirent64) };
             let reclen = dirent.d_reclen as usize;
-            if reclen == 0 || self.pos + reclen > self.inner.buf.len() {
+            if reclen == 0 || reclen <= name_offset || self.pos + reclen > self.inner.buf.len() {
                 return None;
             }
 
             self.pos += reclen;
 
             // The name starts after the fixed fields of dirent64.
-            let name_offset = core::mem::offset_of!(vfs::Dirent64, d_name);
             let name_bytes = &buf[name_offset..reclen];
             // Find the null terminator.
             let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
@@ -406,6 +408,9 @@ impl File {
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
+        if size > i64::MAX as u64 {
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "file size is too large"));
+        }
         cvt(unsafe { vfs::ftruncate(self.fd, size as i64) })?;
         Ok(())
     }
@@ -462,7 +467,15 @@ impl File {
 
     pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
         let (whence, offset) = match pos {
-            SeekFrom::Start(off) => (SEEK_SET, off as i64),
+            SeekFrom::Start(off) => {
+                if off > i64::MAX as u64 {
+                    return Err(io::const_error!(
+                        io::ErrorKind::InvalidInput,
+                        "seek position is too large"
+                    ));
+                }
+                (SEEK_SET, off as i64)
+            }
             SeekFrom::End(off) => (SEEK_END, off),
             SeekFrom::Current(off) => (SEEK_CUR, off),
         };
@@ -546,17 +559,24 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
             vfs::openat(AT_FDCWD, p.as_ptr() as *const u8, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
         })? as i32;
 
-        let mut buf = Vec::new();
-        let mut tmp = vec![0u8; 4096];
-        loop {
-            let n = cvt(unsafe { vfs::getdents64(fd, tmp.as_mut_ptr(), tmp.len()) })?;
-            if n == 0 {
-                break;
+        let result = (|| {
+            let mut buf = Vec::new();
+            let mut tmp = vec![0u8; 4096];
+            loop {
+                let n = cvt(unsafe { vfs::getdents64(fd, tmp.as_mut_ptr(), tmp.len()) })?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n as usize]);
             }
-            buf.extend_from_slice(&tmp[..n as usize]);
-        }
-        unsafe { vfs::close(fd); }
+            Ok(buf)
+        })();
 
+        unsafe {
+            vfs::close(fd);
+        }
+
+        let buf = result?;
         let root = path.to_path_buf();
         Ok(ReadDir { inner: Arc::new(InnerReadDir { root, buf }), pos: 0 })
     })

@@ -138,8 +138,15 @@ impl Command {
             // Child process.
             // Change directory if requested.
             if let Some(ref dir) = self.cwd {
-                let dir_c = CString::new(dir.as_bytes()).unwrap_or_default();
-                unsafe { vibix_abi::fs::chdir(dir_c.as_ptr() as *const u8) };
+                if let Ok(dir_c) = CString::new(dir.as_bytes()) {
+                    let ret = unsafe { vibix_abi::fs::chdir(dir_c.as_ptr() as *const u8) };
+                    if ret < 0 {
+                        unsafe { vproc::exit(127) };
+                    }
+                } else {
+                    // Path contains NUL byte -- cannot chdir.
+                    unsafe { vproc::exit(127) };
+                }
             }
 
             // exec
@@ -334,7 +341,14 @@ impl Process {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let mut status: i32 = 0;
         let ret = cvt(unsafe { vproc::wait4(self.pid as i32, &mut status, vproc::WNOHANG, 0) })?;
-        if ret == 0 { Ok(None) } else { Ok(Some(ExitStatus(status))) }
+        if ret == 0 {
+            Ok(None)
+        } else if ret == self.pid as i64 {
+            Ok(Some(ExitStatus(status)))
+        } else {
+            // Unexpected pid returned; treat as not yet exited.
+            Ok(None)
+        }
     }
 }
 
