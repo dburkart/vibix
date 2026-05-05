@@ -1,6 +1,7 @@
 #![feature(restricted_std)]
 
 mod lexer;
+mod parser;
 
 use lexer::{Lexer, Token};
 
