@@ -37,7 +37,7 @@
 //! |--------|---------|--------------|--------------|---------|---------|
 //! |      1 | write   | fd           | buf ptr      | len     | —       |
 //! |     57 | fork    | —            | —            | —       | —       |
-//! |     59 | execve  | path (0=ok)  | argv (0=ok)  | envp    | —       |
+//! |     59 | execve  | path         | argv (0=ok)  | envp    | —       |
 //! |     60 | exit    | status       | —            | —       | —       |
 //! |     61 | wait4   | pid          | *wstatus     | options | *rusage |
 //!
@@ -53,9 +53,10 @@
 //! rax=0; the parent gets the child PID.
 //!
 //! ### execve() invariants
-//! The kernel ignores path/argv/envp (rdi/rsi/rdx) for now: it loads the
-//! second Limine ramdisk module unconditionally.  If no second module is
-//! present, execve returns -ENOEXEC.  On success, the call never returns.
+//! The kernel resolves `path` via VFS (with a Limine-module basename
+//! fallback for boot-time binaries), copies `argv` and `envp` from
+//! userspace, and atomically replaces the calling process's image.
+//! On success the call never returns; on failure it returns a negative errno.
 //!
 //! ### wait4() invariants
 //! Blocks on a WaitQueue until a zombie child is reaped.  wstatus is a
@@ -99,6 +100,10 @@ const POST_WRITE_MSG: &[u8] = b"init: post-write marker\n";
 /// from the wait4 condvar park.
 const WAIT4_RETURN_MSG: &[u8] = b"init: wait4-return\n";
 
+/// Path to the hello binary. The kernel resolves this via VFS first,
+/// then falls back to Limine boot modules (basename match).
+const HELLO_PATH: &[u8] = b"/boot/userspace_hello.elf\0";
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Pre-write diagnostic marker — see #478. Emitted on fd=2 so it
@@ -131,15 +136,16 @@ pub extern "C" fn _start() -> ! {
     }
 
     if fork_ret == 0 {
-        // Child: exec the hello binary (execve ignores path/argv/envp,
-        // loads userspace_hello.elf from the ramdisk module).
+        // Child: exec the hello binary. The kernel resolves the path via
+        // VFS (or Limine-module basename fallback), copies argv/envp from
+        // userspace, and atomically replaces this process's image.
         unsafe {
             core::arch::asm!(
                 "syscall",
                 inlateout("rax") 59u64 => _,   // execve
-                inlateout("rdi") 0u64 => _,    // path (ignored)
-                inlateout("rsi") 0u64 => _,    // argv (ignored)
-                inlateout("rdx") 0u64 => _,    // envp (ignored)
+                inlateout("rdi") HELLO_PATH.as_ptr() as u64 => _,  // path
+                inlateout("rsi") 0u64 => _,    // argv (NULL = empty)
+                inlateout("rdx") 0u64 => _,    // envp (NULL = empty)
                 lateout("rcx") _,
                 lateout("r8") _,
                 lateout("r9") _,
