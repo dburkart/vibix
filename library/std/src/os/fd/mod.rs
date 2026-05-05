@@ -13,7 +13,7 @@ mod raw;
 mod owned;
 
 // Implementations for `AsRawFd` etc. for network types.
-#[cfg(not(target_os = "trusty"))]
+#[cfg(not(any(target_os = "trusty", target_os = "vibix")))]
 mod net;
 
 // Implementation of stdio file descriptor constants.

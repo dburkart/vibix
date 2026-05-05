@@ -1,0 +1,8 @@
+# Cross-compilation configuration for building pjdfstest for vibix.
+# The target spec JSON lives at the workspace root.
+
+[unstable]
+build-std = ["std", "core", "alloc", "panic_abort"]
+
+[build]
+target = "../../x86_64-unknown-vibix.json"

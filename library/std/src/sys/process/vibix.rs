@@ -44,6 +44,8 @@ pub enum Stdio {
     ParentStderr,
     #[allow(dead_code)]
     InheritFile(File),
+    #[allow(dead_code)]
+    InheritPipe(Pipe),
 }
 
 impl Command {
@@ -171,7 +173,7 @@ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
 
 impl From<ChildPipe> for Stdio {
     fn from(pipe: ChildPipe) -> Stdio {
-        pipe.diverge()
+        Stdio::InheritPipe(pipe)
     }
 }
 
@@ -393,11 +395,14 @@ pub type ChildPipe = Pipe;
 
 pub fn read_output(
     out: ChildPipe,
-    _stdout: &mut Vec<u8>,
-    _err: ChildPipe,
-    _stderr: &mut Vec<u8>,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    match out.diverge() {}
+    // Simple sequential read: read stdout to completion, then stderr.
+    out.read_to_end(stdout)?;
+    err.read_to_end(stderr)?;
+    Ok(())
 }
 
 pub fn getpid() -> u32 {

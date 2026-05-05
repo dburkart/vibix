@@ -4,6 +4,10 @@
 #![allow(missing_debug_implementations)]
 
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+        pub use self::vibix::*;
+    }
     unix => {
         mod unix;
         pub use self::unix::*;
@@ -19,10 +23,6 @@ cfg_select! {
     target_os = "hermit" => {
         mod hermit;
         pub use self::hermit::*;
-    }
-    target_os = "vibix" => {
-        mod vibix;
-        pub use self::vibix::*;
     }
     target_os = "motor" => {
         mod motor;

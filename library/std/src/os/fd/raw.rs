@@ -7,7 +7,7 @@ use hermit_abi as libc;
 #[cfg(target_os = "motor")]
 use moto_rt::libc;
 
-#[cfg(target_os = "motor")]
+#[cfg(any(target_os = "motor", target_os = "vibix"))]
 use super::owned::OwnedFd;
 #[cfg(not(target_os = "trusty"))]
 use crate::fs;

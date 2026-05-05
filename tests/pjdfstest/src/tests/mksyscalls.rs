@@ -2,9 +2,12 @@
 
 use std::{
     fs::{metadata, FileType},
-    os::unix::prelude::PermissionsExt,
     path::Path,
 };
+#[cfg(unix)]
+use std::os::unix::prelude::PermissionsExt;
+#[cfg(target_os = "vibix")]
+use std::os::vibix::fs::{MetadataExt, PermissionsExt};
 
 use nix::{
     sys::stat::{lstat, mode_t, Mode},

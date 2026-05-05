@@ -1,7 +1,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 cfg_select! {
-    unix => {
+    any(unix, target_os = "vibix") => {
         mod unix;
         pub use unix::{Pipe, pipe};
     }

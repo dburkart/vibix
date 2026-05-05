@@ -9,7 +9,10 @@
 
 use std::fs::symlink_metadata;
 use std::ops::{BitAnd, BitOr};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as StdMetadataExt;
+#[cfg(target_os = "vibix")]
+use std::os::vibix::fs::MetadataExt as StdMetadataExt;
 
 use std::{fs::metadata, path::Path};
 

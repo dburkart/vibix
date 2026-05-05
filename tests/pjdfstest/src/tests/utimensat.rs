@@ -1,7 +1,8 @@
-use std::{
-    fs::{metadata, symlink_metadata},
-    os::unix::fs::symlink,
-};
+use std::fs::{metadata, symlink_metadata};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(target_os = "vibix")]
+use std::os::vibix::fs::symlink;
 
 #[cfg(birthtime)]
 use crate::tests::birthtime_ts;

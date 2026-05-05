@@ -1,13 +1,13 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 cfg_select! {
-    any(target_family = "unix", target_os = "hermit", target_os = "wasi") => {
-        mod unix;
-        pub use unix::*;
-    }
     target_os = "vibix" => {
         mod vibix;
         pub use vibix::*;
+    }
+    any(target_family = "unix", target_os = "hermit", target_os = "wasi") => {
+        mod unix;
+        pub use unix::*;
     }
     target_os = "windows" => {
         mod windows;
