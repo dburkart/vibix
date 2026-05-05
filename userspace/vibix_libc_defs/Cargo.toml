@@ -1,0 +1,11 @@
+[package]
+name = "vibix_libc_defs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Type definitions and constants for vibix matching the Linux x86_64 ABI layout"
+
+[lib]
+name = "vibix_libc_defs"
+path = "src/lib.rs"

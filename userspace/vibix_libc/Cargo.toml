@@ -1,0 +1,15 @@
+[package]
+name = "vibix_libc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "C-ABI shim that delegates to vibix_abi syscall wrappers"
+
+[lib]
+name = "vibix_libc"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+vibix_abi = { path = "../vibix_abi" }

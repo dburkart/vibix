@@ -22,6 +22,8 @@ members = [
     "userspace/repro_fork",
     "userspace/shell_pipeline",
     "userspace/vibix_abi",
+    "userspace/vibix_libc",
+    "userspace/vibix_libc_defs",
 ]
 # tests/pjdfstest is a vendored copy of saidsay-so/pjdfstest (2-clause BSD). It
 # is intentionally kept outside the workspace until #581 wires it into xtask —
