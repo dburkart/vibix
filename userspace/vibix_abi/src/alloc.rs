@@ -62,8 +62,11 @@ unsafe impl GlobalAlloc for VibixAllocator {
             // Extend the program break.
             let result = unsafe { syscall::syscall1(SYS_BRK, new_brk as u64) } as usize;
             if result < new_brk {
-                // brk failed -- fall back to mmap.
-                return mmap_alloc(size);
+                // brk failed -- cannot grow the heap.  Return null (OOM).
+                // We intentionally do NOT fall back to mmap here because
+                // dealloc() uses the size threshold to decide whether to
+                // munmap(); a small mmap'd block would never be freed.
+                return ptr::null_mut();
             }
 
             // Try to commit our bump.  If another thread raced us, retry.
