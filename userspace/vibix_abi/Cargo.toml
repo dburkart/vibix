@@ -5,6 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+
+[features]
+rustc-dep-of-std = ["dep:core"]
+
 [lib]
 name = "vibix_abi"
 path = "src/lib.rs"
