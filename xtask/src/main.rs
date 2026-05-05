@@ -793,6 +793,55 @@ fn build_userspace_std_hello() -> R<PathBuf> {
     Ok(bin)
 }
 
+/// Build the `/bin/sh` binary — the vibix POSIX shell.
+///
+/// Uses the same out-of-tree `-Z build-std` approach as `std_hello`.
+/// The crate lives in `base/sh/` (base system program, not a test).
+///
+/// Not yet wired into `cargo xtask build` because the in-repo std fork
+/// has a pre-existing compile error on the vibix target (E0034 in
+/// `sys/thread/vibix.rs`). The function is ready to be called once that
+/// is resolved.
+#[allow(dead_code)]
+fn build_userspace_sh() -> R<PathBuf> {
+    let ws = workspace_root();
+    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
+    let manifest = ws.join("base/sh/Cargo.toml");
+    let library_root = ws.join("library");
+
+    let target_dir = ws.join("target");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ws)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .args([
+            "-Z",
+            "build-std=std,core,alloc,panic_abort",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "unstable-options",
+            "-Z",
+            "json-target-spec",
+            "--target",
+        ])
+        .arg(&target_spec);
+    check(cmd.status()?)?;
+
+    let bin = target_dir
+        .join("x86_64-unknown-vibix")
+        .join("debug")
+        .join("sh");
+    if !bin.exists() {
+        return Err(format!("sh binary missing at {} after build", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
 ///
 /// Produces an ET_DYN ELF64 with a single page-aligned PT_LOAD segment.

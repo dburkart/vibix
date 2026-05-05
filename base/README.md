@@ -40,3 +40,4 @@ Each new base program needs:
 | `vibix_libc_defs` | Shared type definitions | No (dep of std) |
 | `ld_vibix` | Dynamic linker | No (below std) |
 | `lib/` | Prebuilt shared objects (ld-musl stub) | N/A |
+| `sh` | POSIX shell (`/bin/sh`) | Yes |
