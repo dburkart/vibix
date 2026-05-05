@@ -3,6 +3,7 @@
 mod expand;
 mod lexer;
 mod parser;
+mod redirect;
 
 use lexer::{Lexer, Token};
 
