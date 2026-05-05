@@ -134,7 +134,7 @@ static mut LOADED_COUNT: usize = 0;
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
-        "mov rdi, rsp",  // pass stack pointer as arg
+        "mov rdi, rsp", // pass stack pointer as arg
         "call _dl_start",
         // _dl_start should not return, but if it does:
         "ud2",
@@ -197,7 +197,7 @@ unsafe fn parse_auxv(stack: *const u64) -> Auxv {
     let argc = *stack as usize;
     // Skip: argc, argv[0..argc], NULL, envp..., NULL
     let mut ptr = stack.add(1 + argc + 1); // past argv + NULL
-    // Skip envp
+                                           // Skip envp
     while *ptr != 0 {
         ptr = ptr.add(1);
     }
@@ -416,7 +416,11 @@ unsafe fn load_library(name: &[u8]) -> Option<LoadedObject> {
         return None;
     }
     ptr::copy_nonoverlapping(prefix.as_ptr(), path_buf.as_mut_ptr(), prefix.len());
-    ptr::copy_nonoverlapping(name.as_ptr(), path_buf.as_mut_ptr().add(prefix.len()), name.len());
+    ptr::copy_nonoverlapping(
+        name.as_ptr(),
+        path_buf.as_mut_ptr().add(prefix.len()),
+        name.len(),
+    );
     path_buf[prefix.len() + name.len()] = 0;
 
     // Open the file.
@@ -436,15 +440,7 @@ unsafe fn load_library(name: &[u8]) -> Option<LoadedObject> {
     let file_size = *(stat_buf.as_ptr().add(48) as *const i64) as u64;
 
     // mmap the entire file into memory for parsing.
-    let map_addr = syscall6(
-        SYS_MMAP,
-        0,
-        file_size,
-        PROT_READ,
-        MAP_PRIVATE,
-        fd as u64,
-        0,
-    );
+    let map_addr = syscall6(SYS_MMAP, 0, file_size, PROT_READ, MAP_PRIVATE, fd as u64, 0);
     syscall1(SYS_CLOSE, fd as u64);
 
     if map_addr < 0 || (map_addr as u64) > 0x7FFF_FFFF_FFFF {
