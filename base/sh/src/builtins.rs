@@ -26,16 +26,7 @@ use crate::expand::Environment;
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit"
-            | "export"
-            | "unset"
-            | "echo"
-            | "test"
-            | "["
-            | "read"
-            | "exec"
-            | "set"
-            | "."
+        "cd" | "exit" | "export" | "unset" | "echo" | "test" | "[" | "read" | "exec" | "set" | "."
     )
 }
 
@@ -85,11 +76,7 @@ fn builtin_cd(args: &[String], env: &mut Environment) -> i32 {
         }
     } else if args[0] == "-" {
         match env.get("OLDPWD") {
-            Some(d) if !d.is_empty() => {
-                let d = d.to_string();
-                println!("{d}");
-                d
-            }
+            Some(d) if !d.is_empty() => d.to_string(),
             _ => {
                 eprintln!("sh: cd: OLDPWD not set");
                 return 1;
@@ -99,7 +86,12 @@ fn builtin_cd(args: &[String], env: &mut Environment) -> i32 {
         args[0].clone()
     };
 
-    cd_chdir(&target, env)
+    let print_dir = args.first().map(|a| a.as_str()) == Some("-");
+    let status = cd_chdir(&target, env);
+    if status == 0 && print_dir {
+        println!("{target}");
+    }
+    status
 }
 
 /// Actually perform the chdir and update PWD/OLDPWD.
@@ -389,34 +381,53 @@ fn eval_test_binary_or_negation(args: &[String]) -> i32 {
     let op = &args[1];
     let right = &args[2];
 
-    let result = match op.as_str() {
-        "=" => left == right,
-        "!=" => left != right,
-        "-eq" => int_cmp(left, right, |a, b| a == b),
-        "-ne" => int_cmp(left, right, |a, b| a != b),
-        "-lt" => int_cmp(left, right, |a, b| a < b),
-        "-gt" => int_cmp(left, right, |a, b| a > b),
-        "-le" => int_cmp(left, right, |a, b| a <= b),
-        "-ge" => int_cmp(left, right, |a, b| a >= b),
+    match op.as_str() {
+        "=" => {
+            if left == right {
+                0
+            } else {
+                1
+            }
+        }
+        "!=" => {
+            if left != right {
+                0
+            } else {
+                1
+            }
+        }
+        "-eq" | "-ne" | "-lt" | "-gt" | "-le" | "-ge" => {
+            let cmp_fn: fn(i64, i64) -> bool = match op.as_str() {
+                "-eq" => |a, b| a == b,
+                "-ne" => |a, b| a != b,
+                "-lt" => |a, b| a < b,
+                "-gt" => |a, b| a > b,
+                "-le" => |a, b| a <= b,
+                "-ge" => |a, b| a >= b,
+                _ => unreachable!(),
+            };
+            match int_cmp(left, right, cmp_fn) {
+                Ok(true) => 0,
+                Ok(false) => 1,
+                Err(bad) => {
+                    eprintln!("sh: test: {bad}: integer expression expected");
+                    2
+                }
+            }
+        }
         _ => {
             eprintln!("sh: test: {op}: binary operator expected");
-            return 2;
+            2
         }
-    };
-    if result {
-        0
-    } else {
-        1
     }
 }
 
 /// Parse two strings as integers and apply a comparison function.
-/// Returns `false` if either parse fails.
-fn int_cmp(a: &str, b: &str, cmp: fn(i64, i64) -> bool) -> bool {
-    match (a.parse::<i64>(), b.parse::<i64>()) {
-        (Ok(ia), Ok(ib)) => cmp(ia, ib),
-        _ => false,
-    }
+/// Returns `Err` with the offending operand if either parse fails.
+fn int_cmp(a: &str, b: &str, cmp: fn(i64, i64) -> bool) -> Result<bool, String> {
+    let ia = a.parse::<i64>().map_err(|_| a.to_string())?;
+    let ib = b.parse::<i64>().map_err(|_| b.to_string())?;
+    Ok(cmp(ia, ib))
 }
 
 // File test implementations — runtime vs test stubs.
@@ -455,7 +466,9 @@ fn file_is_executable(_path: &str) -> bool {
 
 #[cfg(not(test))]
 fn file_has_size(path: &str) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 // Test stubs for file tests — always return false (no filesystem in
@@ -567,7 +580,12 @@ fn assign_read_fields(line: &str, args: &[String], env: &mut Environment) {
         } else {
             // Last variable gets the remainder.
             if i < fields.len() {
-                let remainder = fields[i..].join(&ifs[..1.min(ifs.len())]);
+                let sep = ifs
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
+                let remainder = fields[i..].join(&sep);
                 env.set(var, &remainder, None);
             } else {
                 env.set(var, "", None);
@@ -897,8 +915,7 @@ mod tests {
     #[test]
     fn is_builtin_recognizes_all() {
         for name in &[
-            "cd", "exit", "export", "unset", "echo", "test", "[", "read",
-            "exec", "set", ".",
+            "cd", "exit", "export", "unset", "echo", "test", "[", "read", "exec", "set", ".",
         ] {
             assert!(is_builtin(name), "expected {name} to be a builtin");
         }
