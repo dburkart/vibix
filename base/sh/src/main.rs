@@ -4,6 +4,7 @@ mod expand;
 mod glob;
 mod lexer;
 mod parser;
+mod redirect;
 
 use lexer::{Lexer, Token};
 
