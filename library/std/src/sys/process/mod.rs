@@ -1,4 +1,8 @@
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+        use vibix as imp;
+    }
     target_family = "unix" => {
         mod unix;
         use unix as imp;
@@ -14,10 +18,6 @@ cfg_select! {
     target_os = "motor" => {
         mod motor;
         use motor as imp;
-    }
-    target_os = "vibix" => {
-        mod vibix;
-        use vibix as imp;
     }
     _ => {
         mod unsupported;

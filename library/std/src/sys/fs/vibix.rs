@@ -8,6 +8,7 @@ use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::fs::TryLockError;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
+use crate::os::fd::{AsRawFd, FromRawFd};
 use crate::os::vibix::ffi::{OsStrExt, OsStringExt};
 use crate::path::{Path, PathBuf};
 use crate::sync::Arc;
@@ -15,6 +16,7 @@ pub use crate::sys::fs::common::Dir;
 use crate::sys::helpers::run_path_with_cstr;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
+use crate::sys::{AsInner, FromInner, IntoInner};
 
 use vibix_abi::fs::{
     self as vfs, AT_FDCWD, AT_SYMLINK_NOFOLLOW, DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN, O_APPEND,
@@ -28,14 +30,13 @@ fn cvt(ret: i64) -> io::Result<i64> {
 }
 
 pub struct File {
-    fd: i32,
+    fd: crate::sys::fd::FileDesc,
 }
 
-impl Drop for File {
-    fn drop(&mut self) {
-        unsafe {
-            vfs::close(self.fd);
-        }
+impl File {
+    fn raw_fd(&self) -> i32 {
+        use crate::os::fd::AsRawFd;
+        self.fd.as_raw_fd()
     }
 }
 
@@ -108,6 +109,10 @@ pub struct DirBuilder {
 // --- FileAttr ---
 
 impl FileAttr {
+    pub(crate) fn stat_ref(&self) -> &vfs::Stat {
+        &self.stat
+    }
+
     pub fn size(&self) -> u64 {
         self.stat.st_size as u64
     }
@@ -151,6 +156,12 @@ impl FilePermissions {
     #[allow(dead_code)]
     pub fn mode(&self) -> u32 {
         self.mode
+    }
+}
+
+impl FromInner<u32> for FilePermissions {
+    fn from_inner(mode: u32) -> FilePermissions {
+        FilePermissions { mode }
     }
 }
 
@@ -252,7 +263,7 @@ impl DirEntry {
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        lstat(&self.path())
+        run_path_with_cstr(&self.path(), &|p| lstat(p))
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -362,17 +373,17 @@ impl File {
         let flags = opts.get_access_mode()? | opts.get_creation_mode()? | O_CLOEXEC;
         let mode = if flags & O_CREAT != 0 { opts.mode } else { 0 };
         let fd = cvt(unsafe { vfs::openat(AT_FDCWD, path.as_ptr() as *const u8, flags, mode) })?;
-        Ok(File { fd: fd as i32 })
+        Ok(File { fd: unsafe { crate::sys::fd::FileDesc::from_raw_fd(fd as i32) } })
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         let mut stat = unsafe { core::mem::zeroed::<vfs::Stat>() };
-        cvt(unsafe { vfs::fstat(self.fd, &mut stat) })?;
+        cvt(unsafe { vfs::fstat(self.raw_fd(), &mut stat) })?;
         Ok(FileAttr { stat })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        cvt(unsafe { vfs::fsync(self.fd) })?;
+        cvt(unsafe { vfs::fsync(self.raw_fd()) })?;
         Ok(())
     }
 
@@ -411,12 +422,12 @@ impl File {
         if size > i64::MAX as u64 {
             return Err(io::const_error!(io::ErrorKind::InvalidInput, "file size is too large"));
         }
-        cvt(unsafe { vfs::ftruncate(self.fd, size as i64) })?;
+        cvt(unsafe { vfs::ftruncate(self.raw_fd(), size as i64) })?;
         Ok(())
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let ret = cvt(unsafe { vfs::read(self.fd, buf.as_mut_ptr(), buf.len()) })?;
+        let ret = cvt(unsafe { vfs::read(self.raw_fd(), buf.as_mut_ptr(), buf.len()) })?;
         Ok(ret as usize)
     }
 
@@ -435,7 +446,7 @@ impl File {
 
     pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
         let ret = cvt(unsafe {
-            vfs::read(self.fd, cursor.as_mut().as_mut_ptr() as *mut u8, cursor.capacity())
+            vfs::read(self.raw_fd(), cursor.as_mut().as_mut_ptr() as *mut u8, cursor.capacity())
         })?;
         // SAFETY: Exactly `ret` bytes have been filled.
         unsafe { cursor.advance(ret as usize) };
@@ -443,7 +454,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let ret = cvt(unsafe { vfs::write(self.fd, buf.as_ptr(), buf.len()) })?;
+        let ret = cvt(unsafe { vfs::write(self.raw_fd(), buf.as_ptr(), buf.len()) })?;
         Ok(ret as usize)
     }
 
@@ -479,7 +490,7 @@ impl File {
             SeekFrom::End(off) => (SEEK_END, off),
             SeekFrom::Current(off) => (SEEK_CUR, off),
         };
-        let ret = cvt(unsafe { vfs::lseek(self.fd, offset, whence) })?;
+        let ret = cvt(unsafe { vfs::lseek(self.raw_fd(), offset, whence) })?;
         Ok(ret as u64)
     }
 
@@ -492,12 +503,12 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        let new_fd = cvt(unsafe { vfs::fcntl(self.fd, vfs::F_DUPFD_CLOEXEC, 0) })?;
-        Ok(File { fd: new_fd as i32 })
+        let new_fd = cvt(unsafe { vfs::fcntl(self.raw_fd(), vfs::F_DUPFD_CLOEXEC, 0) })?;
+        Ok(File { fd: unsafe { crate::sys::fd::FileDesc::from_raw_fd(new_fd as i32) } })
     }
 
     pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
-        cvt(unsafe { vfs::fchmod(self.fd, perm.mode) })?;
+        cvt(unsafe { vfs::fchmod(self.raw_fd(), perm.mode) })?;
         Ok(())
     }
 
@@ -519,7 +530,7 @@ impl File {
         // For now, use the fd-based approach via utimensat with null path.
         // Actually, Linux allows utimensat(fd, NULL, ...) to operate on the fd.
         cvt(unsafe {
-            vfs::utimensat(self.fd, core::ptr::null(), ts.as_ptr(), 0)
+            vfs::utimensat(self.raw_fd(), core::ptr::null(), ts.as_ptr(), 0)
         })?;
         Ok(())
     }
@@ -527,7 +538,38 @@ impl File {
 
 impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("File").field("fd", &self.fd).finish()
+        f.debug_struct("File").field("fd", &self.raw_fd()).finish()
+    }
+}
+
+impl AsInner<crate::sys::fd::FileDesc> for File {
+    #[inline]
+    fn as_inner(&self) -> &crate::sys::fd::FileDesc {
+        &self.fd
+    }
+}
+
+impl IntoInner<crate::sys::fd::FileDesc> for File {
+    fn into_inner(self) -> crate::sys::fd::FileDesc {
+        self.fd
+    }
+}
+
+impl FromInner<crate::sys::fd::FileDesc> for File {
+    fn from_inner(fd: crate::sys::fd::FileDesc) -> File {
+        File { fd }
+    }
+}
+
+impl AsRawFd for File {
+    fn as_raw_fd(&self) -> crate::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl crate::os::fd::AsFd for File {
+    fn as_fd(&self) -> crate::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
@@ -559,7 +601,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
             vfs::openat(AT_FDCWD, p.as_ptr() as *const u8, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0)
         })? as i32;
 
-        let result = (|| {
+        let result: io::Result<Vec<u8>> = (|| {
             let mut buf = Vec::new();
             let mut tmp = vec![0u8; 4096];
             loop {
@@ -582,119 +624,93 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
     })
 }
 
-pub fn unlink(path: &Path) -> io::Result<()> {
-    run_path_with_cstr(path, &|p| {
-        cvt(unsafe { vfs::unlink(p.as_ptr() as *const u8) })?;
-        Ok(())
-    })
+pub fn unlink(p: &CStr) -> io::Result<()> {
+    cvt(unsafe { vfs::unlink(p.as_ptr() as *const u8) })?;
+    Ok(())
 }
 
-pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
-    run_path_with_cstr(old, &|old| {
-        run_path_with_cstr(new, &|new| {
-            cvt(unsafe { vfs::rename(old.as_ptr() as *const u8, new.as_ptr() as *const u8) })?;
-            Ok(())
-        })
-    })
+pub fn rename(old: &CStr, new: &CStr) -> io::Result<()> {
+    cvt(unsafe { vfs::rename(old.as_ptr() as *const u8, new.as_ptr() as *const u8) })?;
+    Ok(())
 }
 
-pub fn set_perm(path: &Path, perm: FilePermissions) -> io::Result<()> {
-    run_path_with_cstr(path, &|p| {
-        cvt(unsafe { vfs::chmod(p.as_ptr() as *const u8, perm.mode) })?;
-        Ok(())
-    })
+pub fn set_perm(p: &CStr, perm: FilePermissions) -> io::Result<()> {
+    cvt(unsafe { vfs::chmod(p.as_ptr() as *const u8, perm.mode) })?;
+    Ok(())
 }
 
-pub fn set_times(path: &Path, times: FileTimes) -> io::Result<()> {
-    run_path_with_cstr(path, &|p| {
-        let ts = times_to_timespec(&times);
-        cvt(unsafe {
-            vfs::utimensat(AT_FDCWD, p.as_ptr() as *const u8, ts.as_ptr(), 0)
-        })?;
-        Ok(())
-    })
+pub fn set_times(p: &CStr, times: FileTimes) -> io::Result<()> {
+    let ts = times_to_timespec(&times);
+    cvt(unsafe {
+        vfs::utimensat(AT_FDCWD, p.as_ptr() as *const u8, ts.as_ptr(), 0)
+    })?;
+    Ok(())
 }
 
-pub fn set_times_nofollow(path: &Path, times: FileTimes) -> io::Result<()> {
-    run_path_with_cstr(path, &|p| {
-        let ts = times_to_timespec(&times);
-        cvt(unsafe {
-            vfs::utimensat(
-                AT_FDCWD,
-                p.as_ptr() as *const u8,
-                ts.as_ptr(),
-                AT_SYMLINK_NOFOLLOW,
-            )
-        })?;
-        Ok(())
-    })
+pub fn set_times_nofollow(p: &CStr, times: FileTimes) -> io::Result<()> {
+    let ts = times_to_timespec(&times);
+    cvt(unsafe {
+        vfs::utimensat(
+            AT_FDCWD,
+            p.as_ptr() as *const u8,
+            ts.as_ptr(),
+            AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    Ok(())
 }
 
-pub fn rmdir(path: &Path) -> io::Result<()> {
-    run_path_with_cstr(path, &|p| {
-        cvt(unsafe { vfs::rmdir(p.as_ptr() as *const u8) })?;
-        Ok(())
-    })
+pub fn rmdir(p: &CStr) -> io::Result<()> {
+    cvt(unsafe { vfs::rmdir(p.as_ptr() as *const u8) })?;
+    Ok(())
 }
 
 pub fn remove_dir_all(path: &Path) -> io::Result<()> {
     crate::sys::fs::common::remove_dir_all(path)
 }
 
-pub fn readlink(path: &Path) -> io::Result<PathBuf> {
-    run_path_with_cstr(path, &|p| {
-        let mut buf = vec![0u8; 256];
-        loop {
-            let n =
-                cvt(unsafe { vfs::readlink(p.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) })?
-                    as usize;
-            if n < buf.len() {
-                buf.truncate(n);
-                return Ok(PathBuf::from(OsString::from_vec(buf)));
-            }
-            // Buffer was too small, double and retry.
-            buf.resize(buf.len() * 2, 0);
+pub fn readlink(p: &CStr) -> io::Result<PathBuf> {
+    let mut buf = vec![0u8; 256];
+    loop {
+        let n =
+            cvt(unsafe { vfs::readlink(p.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) })?
+                as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(OsString::from_vec(buf)));
         }
-    })
+        // Buffer was too small, double and retry.
+        buf.resize(buf.len() * 2, 0);
+    }
 }
 
-pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
-    run_path_with_cstr(original, &|original| {
-        run_path_with_cstr(link, &|link| {
-            cvt(unsafe {
-                vfs::symlink(original.as_ptr() as *const u8, link.as_ptr() as *const u8)
-            })?;
-            Ok(())
-        })
-    })
+pub fn symlink(original: &CStr, link: &CStr) -> io::Result<()> {
+    cvt(unsafe {
+        vfs::symlink(original.as_ptr() as *const u8, link.as_ptr() as *const u8)
+    })?;
+    Ok(())
 }
 
-pub fn link(src: &Path, dst: &Path) -> io::Result<()> {
-    run_path_with_cstr(src, &|src| {
-        run_path_with_cstr(dst, &|dst| {
-            cvt(unsafe { vfs::link(src.as_ptr() as *const u8, dst.as_ptr() as *const u8) })?;
-            Ok(())
-        })
-    })
+pub fn link(src: &CStr, dst: &CStr) -> io::Result<()> {
+    cvt(unsafe { vfs::link(src.as_ptr() as *const u8, dst.as_ptr() as *const u8) })?;
+    Ok(())
 }
 
-pub fn stat(path: &Path) -> io::Result<FileAttr> {
-    run_path_with_cstr(path, &|p| {
-        let mut st = unsafe { core::mem::zeroed::<vfs::Stat>() };
-        cvt(unsafe { vfs::stat(p.as_ptr() as *const u8, &mut st) })?;
-        Ok(FileAttr { stat: st })
-    })
+pub fn stat(p: &CStr) -> io::Result<FileAttr> {
+    let mut st = unsafe { core::mem::zeroed::<vfs::Stat>() };
+    cvt(unsafe { vfs::stat(p.as_ptr() as *const u8, &mut st) })?;
+    Ok(FileAttr { stat: st })
 }
 
-pub fn lstat(path: &Path) -> io::Result<FileAttr> {
-    run_path_with_cstr(path, &|p| {
-        let mut st = unsafe { core::mem::zeroed::<vfs::Stat>() };
-        cvt(unsafe { vfs::lstat(p.as_ptr() as *const u8, &mut st) })?;
-        Ok(FileAttr { stat: st })
-    })
+pub fn lstat(p: &CStr) -> io::Result<FileAttr> {
+    let mut st = unsafe { core::mem::zeroed::<vfs::Stat>() };
+    cvt(unsafe { vfs::lstat(p.as_ptr() as *const u8, &mut st) })?;
+    Ok(FileAttr { stat: st })
 }
 
-pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+pub fn canonicalize(p: &CStr) -> io::Result<PathBuf> {
+    use crate::os::vibix::ffi::OsStrExt as _;
+    let path = Path::new(OsStr::from_bytes(p.to_bytes()));
     // vibix does not have realpath; do a simple absolute-path resolution.
     let mut result = if path.is_absolute() {
         PathBuf::new()
@@ -713,9 +729,9 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
             crate::path::Component::Normal(c) => {
                 result.push(c);
                 // Check that the path component exists and resolve symlinks.
-                let meta = lstat(&result)?;
+                let meta = run_path_with_cstr(&result, &|cp| lstat(cp))?;
                 if meta.file_type().is_symlink() {
-                    let target = readlink(&result)?;
+                    let target = run_path_with_cstr(&result, &|cp| readlink(cp))?;
                     result.pop();
                     if target.is_absolute() {
                         result = target;
@@ -735,7 +751,7 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
-    match stat(path) {
+    match run_path_with_cstr(path, &|p| stat(p)) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -758,4 +774,37 @@ fn times_to_timespec(times: &FileTimes) -> [vfs::Timespec; 2] {
         ts[1] = vfs::Timespec { tv_sec: sec, tv_nsec: nsec };
     }
     ts
+}
+
+// --- Unix-compatible public API needed by os::unix::fs ---
+
+pub fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|p| {
+        let ret = unsafe { vfs::chown(p.as_ptr() as *const u8, uid, gid) };
+        if ret < 0 { Err(io::Error::from_raw_os_error(-ret as i32)) } else { Ok(()) }
+    })
+}
+
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> io::Result<()> {
+    let ret = unsafe { vfs::fchown(fd, uid, gid) };
+    if ret < 0 { Err(io::Error::from_raw_os_error(-ret as i32)) } else { Ok(()) }
+}
+
+pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|p| {
+        let ret = unsafe { vfs::lchown(p.as_ptr() as *const u8, uid, gid) };
+        if ret < 0 { Err(io::Error::from_raw_os_error(-ret as i32)) } else { Ok(()) }
+    })
+}
+
+pub fn chroot(_dir: &Path) -> io::Result<()> {
+    Err(io::const_error!(io::ErrorKind::Unsupported, "chroot not supported on vibix yet"))
+}
+
+pub fn mkfifo(_path: &Path, _mode: u32) -> io::Result<()> {
+    Err(io::const_error!(io::ErrorKind::Unsupported, "mkfifo not supported on vibix yet"))
+}
+
+pub(crate) fn debug_assert_fd_is_open(_fd: i32) {
+    // no-op on vibix for now
 }

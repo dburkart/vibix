@@ -1,8 +1,9 @@
 use std::{
     fs::{metadata, remove_dir, remove_file, symlink_metadata},
-    os::unix::prelude::FileTypeExt,
     path::Path,
 };
+#[cfg(unix)]
+use std::os::unix::prelude::FileTypeExt;
 
 use crate::{
     context::{FileType, TestContext},
@@ -21,7 +22,8 @@ use super::errors::{
 crate::test_case! {
     /// symlink creates symbolic links
     // symlink/00.t
-    create_symlink => [Regular, Dir, Block, Char, Fifo]
+    // FileType::{Block,Char,Fifo} trimmed for vibix (no device nodes / FIFOs).
+    create_symlink => [Regular, Dir]
 }
 fn create_symlink(ctx: &mut TestContext, ft: FileType) {
     let file = ctx.create(ft.clone()).unwrap();
@@ -35,9 +37,6 @@ fn create_symlink(ctx: &mut TestContext, ft: FileType) {
     assert!(match ft {
         FileType::Regular => follow_link_type.is_file(),
         FileType::Dir => follow_link_type.is_dir(),
-        FileType::Block => follow_link_type.is_block_device(),
-        FileType::Char => follow_link_type.is_char_device(),
-        FileType::Fifo => follow_link_type.is_fifo(),
         _ => unreachable!(),
     });
 

@@ -69,6 +69,9 @@ unsafe fn realloc_fallback(
 }
 
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+    }
     any(
         target_family = "unix",
         target_os = "wasi",
@@ -82,9 +85,6 @@ cfg_select! {
     }
     target_os = "hermit" => {
         mod hermit;
-    }
-    target_os = "vibix" => {
-        mod vibix;
     }
     target_os = "motor" => {
         mod motor;

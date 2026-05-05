@@ -1,6 +1,11 @@
 use std::fs::{metadata, symlink_metadata, FileType as StdFileType};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::prelude::{MetadataExt, RawFd};
+#[cfg(target_os = "vibix")]
+use std::os::vibix::fs::MetadataExt;
+#[cfg(target_os = "vibix")]
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use nix::errno::Errno;

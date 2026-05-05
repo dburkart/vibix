@@ -83,3 +83,5 @@ rustflags = [
 rustc-std-workspace-core = { path = 'rustc-std-workspace-core' }
 rustc-std-workspace-alloc = { path = 'rustc-std-workspace-alloc' }
 rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
+# vibix-patched libc with target_os = "vibix" support
+libc = { path = '../lib/libc' }

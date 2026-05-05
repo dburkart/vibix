@@ -83,16 +83,25 @@ mod platform {
     pub use crate::os::solaris::*;
     #[cfg(target_os = "vita")]
     pub use crate::os::vita::*;
+    #[cfg(target_os = "vibix")]
+    pub use crate::os::vibix::*;
     #[cfg(target_os = "vxworks")]
     pub use crate::os::vxworks::*;
 }
 
 pub mod ffi;
+#[cfg(not(target_os = "vibix"))]
 pub mod fs;
+#[cfg(target_os = "vibix")]
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use crate::os::vibix::fs;
 pub mod io;
+#[cfg(not(target_os = "vibix"))]
 pub mod net;
+#[cfg(not(target_os = "vibix"))]
 pub mod process;
 pub mod raw;
+#[cfg(not(target_os = "vibix"))]
 pub mod thread;
 
 /// A prelude for conveniently writing platform-specific code.
@@ -103,24 +112,33 @@ pub mod prelude {
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::ffi::{OsStrExt, OsStringExt};
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::fs::DirEntryExt;
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[stable(feature = "file_offset", since = "1.15.0")]
     pub use super::fs::FileExt;
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub use super::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    pub use super::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+    #[doc(no_inline)]
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub use super::fs::MetadataExt;
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[unstable(feature = "unix_send_signal", issue = "141975")]
     pub use super::process::ChildExt;
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::process::{CommandExt, ExitStatusExt};
+    #[cfg(not(target_os = "vibix"))]
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::thread::JoinHandleExt;

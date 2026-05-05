@@ -5,26 +5,27 @@
 
 use nix::{
     fcntl::OFlag,
-    sys::{
-        socket::{bind, socket, SockFlag, UnixAddr},
-        stat::{lstat, mknod, mode_t, umask, Mode, SFlag},
-    },
+    sys::stat::{lstat, mknod, mode_t, umask, Mode, SFlag},
     unistd::{
         getgroups, mkdir, mkfifo, pathconf, setegid, seteuid, setgroups, Gid, Group, Uid, User,
     },
 };
+#[cfg(unix)]
+use nix::sys::socket::{bind, socket, SockFlag, UnixAddr};
 
 use rand::distributions::{Alphanumeric, DistString};
 use std::{
     cell::Cell,
     fs::create_dir_all,
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, OwnedFd},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     thread,
     time::Duration,
 };
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use strum_macros::EnumIter;
 
 use crate::{
@@ -451,6 +452,7 @@ impl FileBuilder {
             FileType::Fifo => mkfifo(&path, mode),
             FileType::Block => mknod(&path, SFlag::S_IFBLK, mode, 0),
             FileType::Char => mknod(&path, SFlag::S_IFCHR, mode, 0),
+            #[cfg(unix)]
             FileType::Socket => {
                 let fd = socket(
                     nix::sys::socket::AddressFamily::Unix,
@@ -464,6 +466,10 @@ impl FileBuilder {
                     chmod(&path, mode)?;
                 }
                 Ok(())
+            }
+            #[cfg(not(unix))]
+            FileType::Socket => {
+                panic!("Socket creation not supported on this platform");
             }
             FileType::Symlink(target) => {
                 symlink(

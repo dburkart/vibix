@@ -6,6 +6,13 @@ use crate::path::{Path, PathBuf};
 pub mod common;
 
 cfg_select! {
+    target_os = "vibix" => {
+        mod vibix;
+        use vibix as imp;
+        pub use vibix::{chown, fchown, lchown, chroot, mkfifo};
+        pub(crate) use vibix::debug_assert_fd_is_open;
+        use crate::sys::helpers::run_path_with_cstr as with_native_path;
+    }
     any(target_family = "unix", target_os = "wasi") => {
         mod unix;
         use unix as imp;
@@ -41,10 +48,6 @@ cfg_select! {
         mod uefi;
         use uefi as imp;
     }
-    target_os = "vibix" => {
-        mod vibix;
-        use vibix as imp;
-    }
     target_os = "vexos" => {
         mod vexos;
         use vexos as imp;
@@ -56,7 +59,7 @@ cfg_select! {
 }
 
 // FIXME: Replace this with platform-specific path conversion functions.
-#[cfg(not(any(target_family = "unix", target_os = "windows", target_os = "wasi")))]
+#[cfg(not(any(target_family = "unix", target_os = "windows", target_os = "wasi", target_os = "vibix")))]
 #[inline]
 pub fn with_native_path<T>(path: &Path, f: &dyn Fn(&Path) -> io::Result<T>) -> io::Result<T> {
     f(path)

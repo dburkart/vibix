@@ -1,10 +1,13 @@
 use std::{
     ffi::OsStr,
     fs::metadata,
-    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
 };
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "vibix")]
+use std::os::vibix::ffi::OsStrExt;
 
 use nix::errno::Errno;
 
@@ -118,6 +121,7 @@ fn has_mount_cap(_: &Config, _: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn has_mount_cap(_: &Config, _: &Path) -> anyhow::Result<()> {
+    use nix::unistd::Uid;
     if !Uid::effective().is_root() {
         anyhow::bail!("process is not root, cannot mount dummy file system")
     }
