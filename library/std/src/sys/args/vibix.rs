@@ -34,7 +34,7 @@ pub fn args() -> Args {
         if ptr.is_null() {
             break;
         }
-        let cstr = unsafe { CStr::from_ptr(ptr) };
+        let cstr = unsafe { CStr::from_ptr(ptr.cast()) };
         vec.push(OsStringExt::from_vec(cstr.to_bytes().to_vec()));
     }
     Args::new(vec)
