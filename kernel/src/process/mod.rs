@@ -355,7 +355,22 @@ pub fn mark_zombie(pid: u32, status: i32) {
         // re-baseline tying both symptoms to the same race).
         EXIT_EVENT.fetch_add(1, Ordering::Release);
     }
+    // #742: mask interrupts across the notify so a timer preemption
+    // cannot interleave between the WQ pop and the task::wake call
+    // inside notify_all. Without this, a preempt_tick that fires in
+    // that window can schedule the parent before wake_pending is set,
+    // causing the parent to park with no pending wake.
+    #[cfg(target_os = "none")]
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    #[cfg(target_os = "none")]
+    x86_64::instructions::interrupts::disable();
+
     CHILD_WAIT.notify_all();
+
+    #[cfg(target_os = "none")]
+    if was_on {
+        x86_64::instructions::interrupts::enable();
+    }
 }
 
 /// Return the current value of the exit-event counter. `waitpid` uses
