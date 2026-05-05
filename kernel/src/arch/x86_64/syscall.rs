@@ -762,17 +762,12 @@ pub unsafe extern "C" fn syscall_dispatch(
             child_pid as i64
         }
 
-        // execve(path, argv, envp) — path and argv/envp are ignored; the
-        // kernel loads the `userspace_hello.elf` ramdisk module into a
-        // freshly-staged address space and atomically swaps it in on
-        // success. On failure the old address space is preserved so the
-        // caller continues running and observes the `-ENOEXEC` return.
+        // execve(path, argv, envp) — resolve the named binary from the
+        // VFS (or fall back to a Limine boot module), copy argv/envp from
+        // userspace, and atomically replace the calling process's image.
         EXECVE => {
-            let elf_bytes = match crate::mem::userspace_hello_elf_bytes() {
-                Some(b) => b,
-                None => return -8, // ENOEXEC — hello module not present
-            };
-            match exec_atomic(elf_bytes) {
+            // SAFETY: `a0` is a user pointer to a NUL-terminated path.
+            match unsafe { sys_execve(a0, a1, a2) } {
                 Ok(never) => match never {},
                 Err(e) => e,
             }
@@ -1298,6 +1293,21 @@ pub unsafe extern "C" fn syscall_dispatch(
 /// bounded by ELF size; tracked separately as a follow-up.)
 #[cfg(target_os = "none")]
 pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible, i64> {
+    exec_atomic_with_args(elf_bytes, &[], &[])
+}
+
+/// Atomic execve body with argv/envp: stage the new image into a fresh
+/// `AddressSpace` and only commit it once the load has fully succeeded.
+///
+/// `argv` and `envp` are slices of NUL-terminated byte strings that will
+/// be placed on the new process's stack in the standard System V AMD64
+/// layout.
+#[cfg(target_os = "none")]
+pub fn exec_atomic_with_args(
+    elf_bytes: &'static [u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<core::convert::Infallible, i64> {
     use crate::mem::addrspace::AddressSpace;
     use crate::mem::vmatree::{Share, Vma};
     use crate::mem::vmobject::{AnonObject, VmObject};
@@ -1385,11 +1395,13 @@ pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible
         phdr_count: image.phdr_count as u64,
         phdr_entsize: image.phdr_entsize as u64,
     };
-    let initial_rsp = crate::mem::auxv::write_initial_stack(
+    let initial_rsp = crate::mem::auxv::write_initial_stack_with_args(
         stack_phys,
         crate::init_process::USER_STACK_PAGE_VA,
         &auxv_params,
         &random_bytes,
+        argv,
+        envp,
     );
 
     // Install the FS base for the static TLS block allocated by the loader.
@@ -1411,6 +1423,172 @@ pub fn exec_atomic(elf_bytes: &'static [u8]) -> Result<core::convert::Infallible
     let effective_entry = image.interp_entry.unwrap_or(image.entry);
     // Never returns.
     unsafe { jump_to_ring3(effective_entry.as_u64(), initial_rsp) }
+}
+
+// -----------------------------------------------------------------------
+// sys_execve: path-aware execve(2) implementation
+// -----------------------------------------------------------------------
+
+/// Maximum number of argv/envp entries copied from userspace. This is a
+/// practical limit for early vibix; a future implementation can raise it
+/// once multi-page stacks are supported.
+const EXECVE_MAX_ARGS: usize = 64;
+
+/// Maximum total byte size of all argv + envp string data. Capped to
+/// fit within a single 4 KiB stack page alongside auxv/pointers.
+const EXECVE_MAX_ARG_BYTES: usize = 2048;
+
+/// Copy a NULL-terminated pointer array from userspace, reading each
+/// pointed-to NUL-terminated string. Returns a `Vec` of `Vec<u8>` where
+/// each inner Vec includes the trailing NUL byte. `max_count` caps the
+/// number of entries; `remaining_bytes` is decremented for each string's
+/// length and an error is returned if the total exceeds the budget.
+#[cfg(target_os = "none")]
+unsafe fn copy_string_array_from_user(
+    array_uva: usize,
+    max_count: usize,
+    remaining_bytes: &mut usize,
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, i64> {
+    use alloc::vec::Vec;
+
+    if array_uva == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    for i in 0..max_count {
+        // Read the i-th pointer from the array.
+        let mut ptr_val = 0u64;
+        let ptr_bytes = core::slice::from_raw_parts_mut(
+            &mut ptr_val as *mut u64 as *mut u8,
+            core::mem::size_of::<u64>(),
+        );
+        if let Err(e) = uaccess::copy_from_user(ptr_bytes, array_uva + i * 8) {
+            return Err(e.as_errno());
+        }
+        if ptr_val == 0 {
+            break; // NULL terminator
+        }
+
+        // Copy the NUL-terminated string from the pointer.
+        let mut s = Vec::new();
+        let str_uva = ptr_val as usize;
+        for j in 0..(*remaining_bytes + 1) {
+            let mut byte = 0u8;
+            if let Err(e) = uaccess::copy_from_user(core::slice::from_mut(&mut byte), str_uva + j) {
+                return Err(e.as_errno());
+            }
+            s.push(byte);
+            if byte == 0 {
+                break;
+            }
+            if j >= *remaining_bytes {
+                return Err(crate::fs::EINVAL); // E2BIG equivalent
+            }
+        }
+        let len = s.len();
+        if len > *remaining_bytes {
+            return Err(crate::fs::EINVAL);
+        }
+        *remaining_bytes -= len;
+        result.push(s);
+    }
+    Ok(result)
+}
+
+/// Path-aware `execve(path, argv, envp)` implementation.
+///
+/// 1. Copies the path string from userspace.
+/// 2. Resolves the binary via VFS (with Limine module fallback).
+/// 3. Copies argv/envp string arrays from userspace.
+/// 4. Delegates to `exec_atomic_with_args` which atomically replaces
+///    the calling process's address space.
+///
+/// Returns `Err(errno)` on failure; on success, never returns (the new
+/// image takes over).
+#[cfg(target_os = "none")]
+unsafe fn sys_execve(
+    path_uva: u64,
+    argv_uva: u64,
+    envp_uva: u64,
+) -> Result<core::convert::Infallible, i64> {
+    use crate::fs::vfs::path_walk::PATH_MAX;
+    use alloc::vec::Vec;
+
+    // 1. Copy path from userspace.
+    let mut path_buf: Vec<u8> = Vec::new();
+    path_buf
+        .try_reserve_exact(PATH_MAX + 1)
+        .map_err(|_| crate::fs::ENOMEM)?;
+    path_buf.resize(PATH_MAX + 1, 0u8);
+    let n = copy_path_from_user(path_uva as usize, &mut path_buf)?;
+    path_buf.truncate(n);
+
+    // 2. Resolve the binary. Try the VFS first; fall back to Limine
+    //    modules for boot-time binaries before the FS is fully mounted.
+    let elf_bytes: &'static [u8] = resolve_execve_binary(&path_buf)?;
+
+    // 3. Validate it looks like an ELF before copying args (fast reject).
+    if elf_bytes.len() < 4 || &elf_bytes[..4] != b"\x7fELF" {
+        return Err(crate::fs::ENOEXEC);
+    }
+
+    // 4. Copy argv and envp from userspace.
+    let mut arg_budget = EXECVE_MAX_ARG_BYTES;
+    let argv_vecs =
+        copy_string_array_from_user(argv_uva as usize, EXECVE_MAX_ARGS, &mut arg_budget)?;
+    let envp_vecs =
+        copy_string_array_from_user(envp_uva as usize, EXECVE_MAX_ARGS, &mut arg_budget)?;
+
+    // Build &[&[u8]] slices for the stack writer. Each inner slice
+    // includes the trailing NUL byte (required by the SysV ABI — argv
+    // strings must be NUL-terminated in the new stack).
+    let argv_refs: Vec<&[u8]> = argv_vecs.iter().map(|v| v.as_slice()).collect();
+    let envp_refs: Vec<&[u8]> = envp_vecs.iter().map(|v| v.as_slice()).collect();
+
+    exec_atomic_with_args(elf_bytes, &argv_refs, &envp_refs)
+}
+
+/// Resolve the execve binary path to a `&'static [u8]` ELF slice.
+///
+/// Resolution order:
+/// 1. VFS path walk (normal path once the filesystem is mounted).
+/// 2. Limine boot modules (basename suffix match) — works during early
+///    bootstrap before the VFS root is available.
+///
+/// The returned slice has `'static` lifetime because:
+/// - VFS path: the `Vec<u8>` from `read_all` is leaked (bounded by
+///   file size; same pattern as `read_interp_from_fs`).
+/// - Limine module: already `'static` (lives in boot memory).
+#[cfg(target_os = "none")]
+pub fn resolve_execve_binary(path: &[u8]) -> Result<&'static [u8], i64> {
+    // Try VFS first.
+    if crate::fs::vfs::root().is_some() {
+        match crate::shell::vfs_helpers::read_all(path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                // Leak the Vec to get &'static [u8]. The leaked memory
+                // is bounded by the file size and lives as long as the
+                // process (the demand-paged loader reads from it on
+                // page faults).
+                return Ok(&*bytes.leak());
+            }
+            Ok(_) => {} // empty file — fall through to module lookup
+            Err(e) if e == crate::fs::ENOENT => {} // not found in VFS — try modules
+            Err(e) => return Err(e), // other VFS error — propagate
+        }
+    }
+
+    // Fall back to Limine boot modules (basename match).
+    let basename = path
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map(|slash| &path[slash + 1..])
+        .unwrap_or(path);
+    if let Some(module_bytes) = crate::mem::elf::module_bytes_for_path(basename) {
+        return Ok(module_bytes);
+    }
+
+    Err(crate::fs::ENOENT)
 }
 
 /// Public wrapper around `copy_path_from_user` for use by the VFS

@@ -97,6 +97,10 @@ const SYS_WRITE: u64 = 1;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
+
+/// Path to the hello binary. The kernel resolves this via VFS first,
+/// then falls back to Limine boot modules (basename match).
+const HELLO_PATH: &[u8] = b"/boot/userspace_hello.elf\0";
 const SYS_WAIT4: u64 = 61;
 
 const STDOUT: u64 = 1;
@@ -152,7 +156,7 @@ pub extern "C" fn _start() -> ! {
                 core::arch::asm!(
                     "syscall",
                     inlateout("rax") SYS_EXECVE => _,
-                    inlateout("rdi") 0u64 => _,
+                    inlateout("rdi") HELLO_PATH.as_ptr() as u64 => _,
                     inlateout("rsi") 0u64 => _,
                     inlateout("rdx") 0u64 => _,
                     lateout("rcx") _,
