@@ -1723,12 +1723,8 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
             let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
-            let img = ext2_image::build_with_extras(
-                &workspace_root(),
-                Some(&init_bin),
-                &extras,
-                true,
-            )?;
+            let img =
+                ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             println!("→ root=ext2: booting {}", img.display());
             (img, vec!["root=/dev/vda".to_string()])
         }
@@ -1743,12 +1739,8 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
             let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
-            let img = ext2_image::build_with_extras(
-                &workspace_root(),
-                Some(&init_bin),
-                &extras,
-                true,
-            )?;
+            let img =
+                ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             (img, Vec::new())
         }
     };
@@ -2088,12 +2080,8 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let userspace_init = build_userspace_init()?;
     let sh_bin = build_userspace_sh()?;
     let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
-    let disk = ext2_image::build_with_extras(
-        &workspace_root(),
-        Some(&userspace_init),
-        &extras,
-        true,
-    )?;
+    let disk =
+        ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix.iso");
     make_iso_with_cmdline(&kernel, &iso, "iso_root", "root=/dev/vda")?;
 
@@ -2872,12 +2860,7 @@ fn sh_test(opts: &BuildOpts) -> R<()> {
 
     // Install init as /init and sh as /bin/sh in the ext2 rootfs image.
     let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
-    let disk = ext2_image::build_with_extras(
-        &workspace_root(),
-        Some(&init_bin),
-        &extras,
-        true,
-    )?;
+    let disk = ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix-sh.iso");
     make_iso_with_cmdline(&kernel, &iso, "iso_sh", "root=/dev/vda")?;
 
