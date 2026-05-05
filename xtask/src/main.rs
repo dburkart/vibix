@@ -3431,20 +3431,12 @@ repro: starting fork loop cycles=500 hb=50
 fn validate_vibix_target() -> R<()> {
     let spec_path = workspace_root().join(VIBIX_USERSPACE_TARGET);
     if !spec_path.exists() {
-        return Err(format!(
-            "target spec not found at {}",
-            spec_path.display()
-        )
-        .into());
+        return Err(format!("target spec not found at {}", spec_path.display()).into());
     }
 
     let contents = fs::read_to_string(&spec_path)?;
-    let spec: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
-        format!(
-            "target spec {} is not valid JSON: {e}",
-            spec_path.display()
-        )
-    })?;
+    let spec: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("target spec {} is not valid JSON: {e}", spec_path.display()))?;
 
     let obj = spec
         .as_object()
