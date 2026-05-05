@@ -759,10 +759,7 @@ fn build_userspace_std_hello() -> R<PathBuf> {
     cmd.current_dir(&ws)
         // Point -Z build-std at the in-repo std fork.
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
-        .args([
-            "build",
-            "--manifest-path",
-        ])
+        .args(["build", "--manifest-path"])
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target_dir)
@@ -787,11 +784,7 @@ fn build_userspace_std_hello() -> R<PathBuf> {
         .join("debug")
         .join("std_hello");
     if !bin.exists() {
-        return Err(format!(
-            "std_hello binary missing at {} after build",
-            bin.display()
-        )
-        .into());
+        return Err(format!("std_hello binary missing at {} after build", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
@@ -2768,10 +2761,7 @@ fn std_hello(opts: &BuildOpts) -> R<()> {
 
     match (success, failure) {
         (true, _) => {
-            println!(
-                "→ std-hello: `{SUCCESS_MARKER}` in {:?} ✓",
-                start.elapsed()
-            );
+            println!("→ std-hello: `{SUCCESS_MARKER}` in {:?} ✓", start.elapsed());
             Ok(())
         }
         (false, Some(msg)) => {
@@ -2782,9 +2772,7 @@ fn std_hello(opts: &BuildOpts) -> R<()> {
             eprintln!("------------------------------");
             Err(format!("std-hello: {msg}").into())
         }
-        (false, None) => {
-            Err("std-hello: terminated with no success and no failure marker".into())
-        }
+        (false, None) => Err("std-hello: terminated with no success and no failure marker".into()),
     }
 }
 
