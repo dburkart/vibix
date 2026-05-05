@@ -83,6 +83,8 @@ fn run_input(input: &str, env: &mut Environment) -> i32 {
     };
 
     let status = execute_list(&list, env);
-    env.last_status = status;
+    if status != EXIT_REQUESTED {
+        env.last_status = status;
+    }
     status
 }
