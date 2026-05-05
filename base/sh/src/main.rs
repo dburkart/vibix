@@ -37,6 +37,9 @@ fn main() {
             env.positional = args[4..].to_vec();
         }
         let status = run_input(input, &mut env);
+        if status == EXIT_REQUESTED {
+            std::process::exit(env.last_status);
+        }
         std::process::exit(status);
     }
 
@@ -69,6 +72,9 @@ fn main() {
             Err(_) => break,
         }
     }
+
+    // Exit with the last command's status (preserves status on stdin EOF).
+    std::process::exit(env.last_status);
 }
 
 /// Parse and execute a single input string.
