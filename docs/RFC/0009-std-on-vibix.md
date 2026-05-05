@@ -1,7 +1,7 @@
 ---
 rfc: 0009
 title: Rust std on vibix
-status: In Review
+status: Accepted
 created: 2026-05-05
 ---
 
@@ -641,33 +641,27 @@ the unix PAL, update the target JSON).
 ## Open Questions
 
 1. **Should `vibix_libc` be a static archive or shared object in
-   Phase 4?** Static is simpler (no dynamic linker needed) but
-   wastes memory when multiple processes run. The RFC recommends
-   static-first with a migration to shared in Phase 5, but the
-   exact trigger for this transition is TBD.
+   Phase 4?** *Resolved:* static archive in Phase 4, shared object
+   in Phase 5. The Phase 5 dynamic linker is the gating dependency.
 
-2. **How should the std fork be maintained?** Options: (a) vendor
-   a copy of `library/std/` in the vibix repo, (b) maintain a
-   separate fork repo, (c) use cargo's `[patch]` to overlay vibix
-   modules. Option (a) is simplest for a hobby OS. The vendored
-   copy can track nightly via periodic rebases.
+2. **How should the std fork be maintained?** *Deferred to
+   implementation.* Options: (a) vendor `library/std/` in the vibix
+   repo, (b) separate fork repo, (c) cargo `[patch]`. Option (a)
+   is recommended for initial bringup.
 
 3. **Should `vibix_abi` define its own allocator or reuse an existing
-   one?** Phase 1 uses a simple brk/mmap allocator. Phase 3+ could
-   benefit from a thread-aware allocator. The choice between a custom
-   allocator, dlmalloc, or mimalloc is deferred to implementation.
+   one?** *Deferred to implementation.* Phase 1 uses a simple
+   brk/mmap allocator. Thread-aware allocator choice deferred to
+   Phase 3.
 
-4. **What is the minimum `nix` crate version that works?** The
-   vendored pjdfstest uses `nix 0.29`. The `libc` crate fork must
-   provide all types and constants that `nix 0.29` references for
-   the `x86_64-unknown-vibix` target. A precise audit is needed
-   during Phase 4 implementation.
+4. **What is the minimum `nix` crate version that works?** *Deferred
+   to implementation.* Requires a symbol-level audit of nix 0.29
+   against the vibix libc crate fork during Phase 4.
 
 5. **When should vibix migrate from custom PAL to `target_family =
-   "unix"`?** The RFC recommends after Phase 4 when `vibix_libc`
-   is feature-complete. The trigger is: all pjdfstest cases pass
-   with the custom PAL, and the unix PAL produces identical results
-   when swapped in.
+   "unix"`?** *Deferred to implementation.* Trigger: all pjdfstest
+   cases pass with the custom PAL, and the unix PAL produces
+   identical results when swapped in.
 
 ## Implementation Roadmap
 
