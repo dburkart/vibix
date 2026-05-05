@@ -31,8 +31,31 @@ pub fn abort_internal() -> ! {
 
 // SAFETY: must be called only once during runtime initialization.
 pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {
-    // Nothing to initialize yet. Args/env handling is deferred to later phases.
 }
 
 // SAFETY: must be called only once during runtime cleanup.
 pub unsafe fn cleanup() {}
+
+/// Entry point for vibix userspace binaries.
+///
+/// The kernel loads ELF binaries with entry point set to `_start`.
+/// Since vibix has no CRT, std provides the entry point directly.
+/// `main` is the symbol rustc generates that calls `lang_start`.
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _start() -> ! {
+    unsafe extern "C" {
+        fn main(argc: isize, argv: *const *const u8) -> isize;
+    }
+
+    // No args/env on vibix yet; pass zeros.
+    let ret = unsafe { main(0, crate::ptr::null()) };
+
+    // exit_group(ret)
+    unsafe {
+        vibix_abi::syscall::syscall1(231, ret as u64);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
