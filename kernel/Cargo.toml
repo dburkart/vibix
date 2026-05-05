@@ -581,3 +581,7 @@ harness = false
 [[test]]
 name = "tls_context_switch"
 harness = false
+
+[[test]]
+name = "execve_path_resolve"
+harness = false
