@@ -1,5 +1,9 @@
 #![feature(restricted_std)]
 
+// Provides C-ABI symbols (fork, pipe, dup2, etc.) that the shell's
+// `extern "C"` blocks reference, backed by vibix_abi syscalls.
+mod syscalls;
+
 mod builtins;
 mod exec;
 mod expand;
