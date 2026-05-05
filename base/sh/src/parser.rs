@@ -353,6 +353,7 @@ impl<'a> Parser<'a> {
             // Check for fd-number + redirect-op pattern.
             if let Token::Word(w) = &self.current {
                 if let Some(fd) = try_parse_fd(w) {
+                    let fd_word = w.clone();
                     self.bump()?;
                     if is_redirect_token(&self.current) {
                         let op = self.parse_redirect_op()?;
@@ -364,11 +365,10 @@ impl<'a> Parser<'a> {
                         });
                         continue;
                     }
-                    // Not a redirect — stop. The digit word is part of
-                    // whatever comes next; we can't un-consume it but
-                    // for subshell redirects this is fine since we only
-                    // expect redirects here.
-                    break;
+                    // After a subshell, only redirects are valid here.
+                    // A consumed fd word without a redirect operator is
+                    // a syntax error.
+                    return Err(ParseError::UnexpectedToken(fd_word));
                 }
             }
             if is_redirect_token(&self.current) {
@@ -998,6 +998,32 @@ mod tests {
         match err {
             ParseError::Lex(LexError::UnterminatedSingleQuote) => {}
             other => panic!("expected lex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stray_digit_after_subshell_is_error() {
+        // `(echo) 2` — "2" is not followed by a redirect operator,
+        // so it should be a syntax error rather than silently dropped.
+        let err = ast_err("(echo) 2");
+        match err {
+            ParseError::UnexpectedToken(w) => assert_eq!(w, "2"),
+            other => panic!("expected UnexpectedToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subshell_with_fd_redirect() {
+        // `(echo) 2> err` — fd-number redirect after subshell should work.
+        let list = ast("(echo) 2> err");
+        match &list.pipelines[0].commands[0] {
+            Command::Subshell { redirects, .. } => {
+                assert_eq!(redirects.len(), 1);
+                assert_eq!(redirects[0].fd, Some(2));
+                assert_eq!(redirects[0].op, RedirectOp::Output);
+                assert_eq!(redirects[0].target, "err");
+            }
+            _ => panic!("expected Subshell"),
         }
     }
 
