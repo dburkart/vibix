@@ -1248,6 +1248,12 @@ pub fn current_growsdown_lookup(
 /// - The bootstrap task calls `exit` — it owns the kernel PML4 and the
 ///   inherited boot stack, neither of which the reaper may reclaim.
 pub fn exit() -> ! {
+    // CLONE_CHILD_CLEARTID: write 0 to the registered tidptr and wake
+    // one futex waiter (enables pthread_join). Must run before IRQs are
+    // disabled and before we drop to the next task, since we need to
+    // copy_to_user in the exiting task's address space.
+    crate::arch::x86_64::syscalls::phase3::perform_clear_child_tid(current_id());
+
     // Disable IRQs before acquiring SCHED so that IrqLock saves `false`
     // and restores `false` on guard drop — keeping IRQs masked through
     // the context_switch call below, which executes after the guard is

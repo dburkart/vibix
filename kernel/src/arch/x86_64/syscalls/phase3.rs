@@ -177,31 +177,40 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32, _timeout: u64, _uaddr2: u64, _
 }
 
 /// FUTEX_WAIT: if `*uaddr == val`, block the calling thread on `uaddr`.
+///
+/// The value-check and enqueue are performed atomically under the
+/// FUTEX_TABLE lock to prevent the TOCTOU race where a FUTEX_WAKE
+/// fires between the value comparison and the enqueue.
 fn futex_wait(uaddr: usize, expected: u32) -> i64 {
-    // Validate the user pointer (4 bytes, naturally aligned for atomicity).
+    // Validate the user pointer (4 bytes).
     if let Err(e) = uaccess::check_user_range(uaddr, 4) {
         return e.as_errno();
     }
 
-    // Read the current value atomically.
-    let mut buf = [0u8; 4];
-    match unsafe { uaccess::copy_from_user(&mut buf, uaddr) } {
-        Ok(()) => {}
-        Err(e) => return e.as_errno(),
-    }
-    let current_val = u32::from_ne_bytes(buf);
-
-    // If the value doesn't match, return EAGAIN (spurious wake semantics).
-    if current_val != expected {
-        return -11; // EAGAIN
-    }
-
-    // Enqueue ourselves on this futex address.
     let tid = crate::task::current_id();
+
+    // Hold the FUTEX_TABLE lock across the value read AND the enqueue
+    // so that a concurrent FUTEX_WAKE cannot slip between them.
     {
         let mut table = FUTEX_TABLE.lock();
+
+        // Read the current value from userspace.
+        let mut buf = [0u8; 4];
+        match unsafe { uaccess::copy_from_user(&mut buf, uaddr) } {
+            Ok(()) => {}
+            Err(e) => return e.as_errno(),
+        }
+        let current_val = u32::from_ne_bytes(buf);
+
+        // If the value doesn't match, return EAGAIN (spurious wake).
+        if current_val != expected {
+            return -11; // EAGAIN
+        }
+
+        // Enqueue ourselves on this futex address.
         table.entry(uaddr).or_default().push(tid);
     }
+    // Lock dropped before parking — we must not block while holding it.
 
     // Park. The wake side will call task::wake(tid).
     crate::task::block_current();
@@ -270,6 +279,28 @@ pub fn sys_set_tid_address(tidptr: usize) -> i64 {
     }
     // Return the caller's TID. In vibix, TID == PID from the process table.
     crate::process::current_pid() as i64
+}
+
+/// Called from the task exit path to handle CLONE_CHILD_CLEARTID semantics.
+///
+/// If the exiting task has a registered `clear_child_tid` pointer:
+/// 1. Write 0 to `*tidptr` in userspace.
+/// 2. Perform a futex wake on that address (wakes one waiter).
+///
+/// This enables `pthread_join` which waits on the child's TID location
+/// to become 0.
+pub fn perform_clear_child_tid(task_id: usize) {
+    let tidptr = CLEAR_CHILD_TID.lock().remove(&task_id);
+    if let Some(addr) = tidptr {
+        // Write 0 to the user address. Ignore errors (task may have
+        // already unmapped the page).
+        if uaccess::check_user_range(addr, 4).is_ok() {
+            let zero = 0u32.to_ne_bytes();
+            let _ = unsafe { uaccess::copy_to_user(addr, &zero) };
+        }
+        // Wake one waiter on this futex address (pthread_join polls here).
+        futex_wake(addr, 1);
+    }
 }
 
 /// `gettid()` — return the thread ID of the calling thread.
