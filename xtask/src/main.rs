@@ -860,6 +860,46 @@ fn build_userspace_ls() -> R<PathBuf> {
     build_userspace_std_bin("base/ls/Cargo.toml", "ls")
 }
 
+/// Build the `/bin/stat` binary — display file status.
+fn build_userspace_stat() -> R<PathBuf> {
+    build_userspace_std_bin("base/stat/Cargo.toml", "stat")
+}
+
+/// Build the `/bin/cp` binary — copy files.
+fn build_userspace_cp() -> R<PathBuf> {
+    build_userspace_std_bin("base/cp/Cargo.toml", "cp")
+}
+
+/// Build the `/bin/mv` binary — move/rename files.
+fn build_userspace_mv() -> R<PathBuf> {
+    build_userspace_std_bin("base/mv/Cargo.toml", "mv")
+}
+
+/// Build the `/bin/rm` binary — remove files.
+fn build_userspace_rm() -> R<PathBuf> {
+    build_userspace_std_bin("base/rm/Cargo.toml", "rm")
+}
+
+/// Build the `/bin/mkdir` binary — create directories.
+fn build_userspace_mkdir() -> R<PathBuf> {
+    build_userspace_std_bin("base/mkdir/Cargo.toml", "mkdir")
+}
+
+/// Build the `/bin/rmdir` binary — remove empty directories.
+fn build_userspace_rmdir() -> R<PathBuf> {
+    build_userspace_std_bin("base/rmdir/Cargo.toml", "rmdir")
+}
+
+/// Build the `/bin/touch` binary — create empty files.
+fn build_userspace_touch() -> R<PathBuf> {
+    build_userspace_std_bin("base/touch/Cargo.toml", "touch")
+}
+
+/// Build the `/bin/uname` binary — print system information.
+fn build_userspace_uname() -> R<PathBuf> {
+    build_userspace_std_bin("base/uname/Cargo.toml", "uname")
+}
+
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
 ///
 /// Produces an ET_DYN ELF64 with a single page-aligned PT_LOAD segment.
@@ -1741,10 +1781,26 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
             let sh_bin = build_userspace_sh()?;
             let cat_bin = build_userspace_cat()?;
             let ls_bin = build_userspace_ls()?;
+            let stat_bin = build_userspace_stat()?;
+            let cp_bin = build_userspace_cp()?;
+            let mv_bin = build_userspace_mv()?;
+            let rm_bin = build_userspace_rm()?;
+            let mkdir_bin = build_userspace_mkdir()?;
+            let rmdir_bin = build_userspace_rmdir()?;
+            let touch_bin = build_userspace_touch()?;
+            let uname_bin = build_userspace_uname()?;
             let extras: Vec<(&Path, &str)> = vec![
                 (&sh_bin, "/bin/sh"),
                 (&cat_bin, "/bin/cat"),
                 (&ls_bin, "/bin/ls"),
+                (&stat_bin, "/bin/stat"),
+                (&cp_bin, "/bin/cp"),
+                (&mv_bin, "/bin/mv"),
+                (&rm_bin, "/bin/rm"),
+                (&mkdir_bin, "/bin/mkdir"),
+                (&rmdir_bin, "/bin/rmdir"),
+                (&touch_bin, "/bin/touch"),
+                (&uname_bin, "/bin/uname"),
             ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
@@ -1763,10 +1819,26 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
             let sh_bin = build_userspace_sh()?;
             let cat_bin = build_userspace_cat()?;
             let ls_bin = build_userspace_ls()?;
+            let stat_bin = build_userspace_stat()?;
+            let cp_bin = build_userspace_cp()?;
+            let mv_bin = build_userspace_mv()?;
+            let rm_bin = build_userspace_rm()?;
+            let mkdir_bin = build_userspace_mkdir()?;
+            let rmdir_bin = build_userspace_rmdir()?;
+            let touch_bin = build_userspace_touch()?;
+            let uname_bin = build_userspace_uname()?;
             let extras: Vec<(&Path, &str)> = vec![
                 (&sh_bin, "/bin/sh"),
                 (&cat_bin, "/bin/cat"),
                 (&ls_bin, "/bin/ls"),
+                (&stat_bin, "/bin/stat"),
+                (&cp_bin, "/bin/cp"),
+                (&mv_bin, "/bin/mv"),
+                (&rm_bin, "/bin/rm"),
+                (&mkdir_bin, "/bin/mkdir"),
+                (&rmdir_bin, "/bin/rmdir"),
+                (&touch_bin, "/bin/touch"),
+                (&uname_bin, "/bin/uname"),
             ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
@@ -2110,10 +2182,26 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let sh_bin = build_userspace_sh()?;
     let cat_bin = build_userspace_cat()?;
     let ls_bin = build_userspace_ls()?;
+    let stat_bin = build_userspace_stat()?;
+    let cp_bin = build_userspace_cp()?;
+    let mv_bin = build_userspace_mv()?;
+    let rm_bin = build_userspace_rm()?;
+    let mkdir_bin = build_userspace_mkdir()?;
+    let rmdir_bin = build_userspace_rmdir()?;
+    let touch_bin = build_userspace_touch()?;
+    let uname_bin = build_userspace_uname()?;
     let extras: Vec<(&Path, &str)> = vec![
         (&sh_bin, "/bin/sh"),
         (&cat_bin, "/bin/cat"),
         (&ls_bin, "/bin/ls"),
+        (&stat_bin, "/bin/stat"),
+        (&cp_bin, "/bin/cp"),
+        (&mv_bin, "/bin/mv"),
+        (&rm_bin, "/bin/rm"),
+        (&mkdir_bin, "/bin/mkdir"),
+        (&rmdir_bin, "/bin/rmdir"),
+        (&touch_bin, "/bin/touch"),
+        (&uname_bin, "/bin/uname"),
     ];
     let disk =
         ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;
@@ -2894,12 +2982,28 @@ fn sh_test(opts: &BuildOpts) -> R<()> {
     let sh_bin = build_userspace_sh()?;
     let cat_bin = build_userspace_cat()?;
     let ls_bin = build_userspace_ls()?;
+    let stat_bin = build_userspace_stat()?;
+    let cp_bin = build_userspace_cp()?;
+    let mv_bin = build_userspace_mv()?;
+    let rm_bin = build_userspace_rm()?;
+    let mkdir_bin = build_userspace_mkdir()?;
+    let rmdir_bin = build_userspace_rmdir()?;
+    let touch_bin = build_userspace_touch()?;
+    let uname_bin = build_userspace_uname()?;
 
-    // Install init as /init and sh/cat/ls as /bin/* in the ext2 rootfs image.
+    // Install init as /init and sh/cat/ls/etc. as /bin/* in the ext2 rootfs image.
     let extras: Vec<(&Path, &str)> = vec![
         (&sh_bin, "/bin/sh"),
         (&cat_bin, "/bin/cat"),
         (&ls_bin, "/bin/ls"),
+        (&stat_bin, "/bin/stat"),
+        (&cp_bin, "/bin/cp"),
+        (&mv_bin, "/bin/mv"),
+        (&rm_bin, "/bin/rm"),
+        (&mkdir_bin, "/bin/mkdir"),
+        (&rmdir_bin, "/bin/rmdir"),
+        (&touch_bin, "/bin/touch"),
+        (&uname_bin, "/bin/uname"),
     ];
     let disk = ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix-sh.iso");
