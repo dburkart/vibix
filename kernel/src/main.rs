@@ -70,44 +70,46 @@ pub extern "C" fn _start() -> ! {
     // ext2 instead of falling back to the auto-probe (issue #631).
     // Defaults to `RootArgs::auto()` when no cmdline is delivered, which
     // preserves the pre-#577 behaviour of "try ext2 → tarfs → ramfs".
-    let root_args = if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
-        let bytes = cmdline_resp.cmdline().to_bytes();
-        if !bytes.is_empty() {
+    let (root_args, kernel_shell) =
+        if let Some(cmdline_resp) = vibix::boot::KERNEL_CMDLINE_REQUEST.get_response() {
+            let bytes = cmdline_resp.cmdline().to_bytes();
+            if !bytes.is_empty() {
+                serial_println!(
+                    "cmdline: {:?}",
+                    core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+                );
+            }
+            let root_args = vibix::boot_cmdline::parse(bytes);
             serial_println!(
-                "cmdline: {:?}",
-                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+                "rootfs: source={:?} flags={:#x} explicit_ro={:?}",
+                root_args.source,
+                root_args.mount_flags.0,
+                root_args.explicit_ro,
             );
-        }
-        let root_args = vibix::boot_cmdline::parse(bytes);
-        serial_println!(
-            "rootfs: source={:?} flags={:#x} explicit_ro={:?}",
-            root_args.source,
-            root_args.mount_flags.0,
-            root_args.explicit_ro,
-        );
 
-        if vibix::block::writeback::parse_cmdline(bytes) {
-            serial_println!(
-                "writeback: cadence configured to {} s ({})",
-                vibix::block::writeback::configured_secs(),
-                if vibix::block::writeback::is_disabled() {
-                    "disabled"
-                } else {
-                    "enabled"
-                },
-            );
+            if vibix::block::writeback::parse_cmdline(bytes) {
+                serial_println!(
+                    "writeback: cadence configured to {} s ({})",
+                    vibix::block::writeback::configured_secs(),
+                    if vibix::block::writeback::is_disabled() {
+                        "disabled"
+                    } else {
+                        "enabled"
+                    },
+                );
+            } else {
+                serial_println!(
+                    "writeback: using default cadence ({} s)",
+                    vibix::block::writeback::DEFAULT_INTERVAL_SECS,
+                );
+            }
+
+            let kernel_shell = vibix::boot_cmdline::shell_kernel(bytes);
+            (root_args, kernel_shell)
         } else {
-            serial_println!(
-                "writeback: using default cadence ({} s)",
-                vibix::block::writeback::DEFAULT_INTERVAL_SECS,
-            );
-        }
-
-        root_args
-    } else {
-        serial_println!("cmdline: not provided by bootloader");
-        vibix::boot_cmdline::RootArgs::auto()
-    };
+            serial_println!("cmdline: not provided by bootloader");
+            (vibix::boot_cmdline::RootArgs::auto(), false)
+        };
 
     vibix::arch::init_apic(rsdp_ptr, hhdm_offset);
     match vibix::hpet::init() {
@@ -248,7 +250,19 @@ pub extern "C" fn _start() -> ! {
     }
 
     vibix::task::init();
-    vibix::task::spawn(vibix::shell::run);
+
+    // Print the boot banner unconditionally — smoke tests assert on the
+    // `banner: vibix <version>` marker. Previously the banner was emitted
+    // inside `shell::run`, but now that the kernel shell is optional we
+    // print it from `_start` so it fires on every boot.
+    vibix::shell::banner::print_banner();
+
+    if kernel_shell {
+        serial_println!("kernel shell: enabled via shell=kernel");
+        vibix::task::spawn(vibix::shell::run);
+    } else {
+        serial_println!("kernel shell: disabled (pass shell=kernel to enable)");
+    }
     vibix::task::spawn(cursor_blink_task);
 
     // Launch PID 1: load the init ELF into a user-space address space

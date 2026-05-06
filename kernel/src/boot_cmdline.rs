@@ -178,6 +178,28 @@ pub fn parse(cmdline: &[u8]) -> RootArgs {
     out
 }
 
+/// Returns `true` when the cmdline contains `shell=kernel`.
+///
+/// When present the kernel spawns the built-in interactive shell task;
+/// otherwise the shell is skipped so serial/keyboard input is available
+/// for userspace `/bin/sh`.
+pub fn shell_kernel(cmdline: &[u8]) -> bool {
+    let mut i = 0;
+    while i < cmdline.len() {
+        while i < cmdline.len() && is_ws(cmdline[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < cmdline.len() && !is_ws(cmdline[i]) {
+            i += 1;
+        }
+        if &cmdline[start..i] == b"shell=kernel" {
+            return true;
+        }
+    }
+    false
+}
+
 fn strip_prefix<'a>(token: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if token.len() >= prefix.len() && &token[..prefix.len()] == prefix {
         Some(&token[prefix.len()..])
@@ -360,6 +382,22 @@ mod tests {
         // `rootflags_extra=ro` must not be read as `rootflags=`.
         let r = parse(b"rootflags_extra=ro");
         assert_eq!(r.explicit_ro, None);
+    }
+
+    #[test]
+    fn shell_kernel_present() {
+        assert!(shell_kernel(b"shell=kernel"));
+        assert!(shell_kernel(b"root=/dev/vda shell=kernel"));
+        assert!(shell_kernel(b"shell=kernel writeback_secs=5"));
+        assert!(shell_kernel(b"root=ext2 shell=kernel rootflags=ro"));
+    }
+
+    #[test]
+    fn shell_kernel_absent() {
+        assert!(!shell_kernel(b""));
+        assert!(!shell_kernel(b"root=/dev/vda"));
+        assert!(!shell_kernel(b"shell=user"));
+        assert!(!shell_kernel(b"xshell=kernel"));
     }
 
     #[test]
