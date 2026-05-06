@@ -800,14 +800,16 @@ fn build_userspace_std_hello() -> R<PathBuf> {
     Ok(bin)
 }
 
-/// Build the `/bin/sh` binary — the vibix POSIX shell.
+/// Build a standalone base-system binary (e.g. sh, cat, ls) using the
+/// out-of-tree `-Z build-std` approach with the in-repo std fork.
 ///
-/// Uses the same out-of-tree `-Z build-std` approach as `std_hello`.
-/// The crate lives in `base/sh/` (base system program, not a test).
-fn build_userspace_sh() -> R<PathBuf> {
+/// `manifest_rel` is the manifest path relative to the workspace root
+/// (e.g. `"base/sh/Cargo.toml"`). `bin_name` is the expected output
+/// binary name under `target/x86_64-unknown-vibix/debug/`.
+fn build_userspace_std_bin(manifest_rel: &str, bin_name: &str) -> R<PathBuf> {
     let ws = workspace_root();
     let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
-    let manifest = ws.join("base/sh/Cargo.toml");
+    let manifest = ws.join(manifest_rel);
     let library_root = ws.join("library");
 
     let target_dir = ws.join("target");
@@ -835,12 +837,27 @@ fn build_userspace_sh() -> R<PathBuf> {
     let bin = target_dir
         .join("x86_64-unknown-vibix")
         .join("debug")
-        .join("sh");
+        .join(bin_name);
     if !bin.exists() {
-        return Err(format!("sh binary missing at {} after build", bin.display()).into());
+        return Err(format!("{bin_name} binary missing at {} after build", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
+}
+
+/// Build the `/bin/sh` binary — the vibix POSIX shell.
+fn build_userspace_sh() -> R<PathBuf> {
+    build_userspace_std_bin("base/sh/Cargo.toml", "sh")
+}
+
+/// Build the `/bin/cat` binary — concatenate files to stdout.
+fn build_userspace_cat() -> R<PathBuf> {
+    build_userspace_std_bin("base/cat/Cargo.toml", "cat")
+}
+
+/// Build the `/bin/ls` binary — list directory contents.
+fn build_userspace_ls() -> R<PathBuf> {
+    build_userspace_std_bin("base/ls/Cargo.toml", "ls")
 }
 
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
@@ -1722,7 +1739,13 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
         Some("ext2") => {
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
-            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let cat_bin = build_userspace_cat()?;
+            let ls_bin = build_userspace_ls()?;
+            let extras: Vec<(&Path, &str)> = vec![
+                (&sh_bin, "/bin/sh"),
+                (&cat_bin, "/bin/cat"),
+                (&ls_bin, "/bin/ls"),
+            ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             println!("→ root=ext2: booting {}", img.display());
@@ -1738,7 +1761,13 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
         None => {
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
-            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let cat_bin = build_userspace_cat()?;
+            let ls_bin = build_userspace_ls()?;
+            let extras: Vec<(&Path, &str)> = vec![
+                (&sh_bin, "/bin/sh"),
+                (&cat_bin, "/bin/cat"),
+                (&ls_bin, "/bin/ls"),
+            ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             (img, Vec::new())
@@ -2079,7 +2108,13 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let kernel = build(opts)?;
     let userspace_init = build_userspace_init()?;
     let sh_bin = build_userspace_sh()?;
-    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    let cat_bin = build_userspace_cat()?;
+    let ls_bin = build_userspace_ls()?;
+    let extras: Vec<(&Path, &str)> = vec![
+        (&sh_bin, "/bin/sh"),
+        (&cat_bin, "/bin/cat"),
+        (&ls_bin, "/bin/ls"),
+    ];
     let disk =
         ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix.iso");
@@ -2857,9 +2892,15 @@ fn sh_test(opts: &BuildOpts) -> R<()> {
     let kernel = build(opts)?;
     let init_bin = build_userspace_init()?;
     let sh_bin = build_userspace_sh()?;
+    let cat_bin = build_userspace_cat()?;
+    let ls_bin = build_userspace_ls()?;
 
-    // Install init as /init and sh as /bin/sh in the ext2 rootfs image.
-    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    // Install init as /init and sh/cat/ls as /bin/* in the ext2 rootfs image.
+    let extras: Vec<(&Path, &str)> = vec![
+        (&sh_bin, "/bin/sh"),
+        (&cat_bin, "/bin/cat"),
+        (&ls_bin, "/bin/ls"),
+    ];
     let disk = ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix-sh.iso");
     make_iso_with_cmdline(&kernel, &iso, "iso_sh", "root=/dev/vda")?;
