@@ -843,6 +843,92 @@ fn build_userspace_sh() -> R<PathBuf> {
     Ok(bin)
 }
 
+/// Build the `/bin/cat` binary — concatenate files to stdout.
+///
+/// Uses the same out-of-tree `-Z build-std` approach as `build_userspace_sh`.
+/// The crate lives in `base/cat/` (base system program).
+fn build_userspace_cat() -> R<PathBuf> {
+    let ws = workspace_root();
+    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
+    let manifest = ws.join("base/cat/Cargo.toml");
+    let library_root = ws.join("library");
+
+    let target_dir = ws.join("target");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ws)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .args([
+            "-Z",
+            "build-std=std,core,alloc,panic_abort",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "unstable-options",
+            "-Z",
+            "json-target-spec",
+            "--target",
+        ])
+        .arg(&target_spec);
+    check(cmd.status()?)?;
+
+    let bin = target_dir
+        .join("x86_64-unknown-vibix")
+        .join("debug")
+        .join("cat");
+    if !bin.exists() {
+        return Err(format!("cat binary missing at {} after build", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
+/// Build the `/bin/ls` binary — list directory contents.
+///
+/// Uses the same out-of-tree `-Z build-std` approach as `build_userspace_sh`.
+/// The crate lives in `base/ls/` (base system program).
+fn build_userspace_ls() -> R<PathBuf> {
+    let ws = workspace_root();
+    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
+    let manifest = ws.join("base/ls/Cargo.toml");
+    let library_root = ws.join("library");
+
+    let target_dir = ws.join("target");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ws)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .args([
+            "-Z",
+            "build-std=std,core,alloc,panic_abort",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "unstable-options",
+            "-Z",
+            "json-target-spec",
+            "--target",
+        ])
+        .arg(&target_spec);
+    check(cmd.status()?)?;
+
+    let bin = target_dir
+        .join("x86_64-unknown-vibix")
+        .join("debug")
+        .join("ls");
+    if !bin.exists() {
+        return Err(format!("ls binary missing at {} after build", bin.display()).into());
+    }
+    strip_debug(&bin)?;
+    Ok(bin)
+}
+
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.
 ///
 /// Produces an ET_DYN ELF64 with a single page-aligned PT_LOAD segment.
@@ -1722,7 +1808,13 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
         Some("ext2") => {
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
-            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let cat_bin = build_userspace_cat()?;
+            let ls_bin = build_userspace_ls()?;
+            let extras: Vec<(&Path, &str)> = vec![
+                (&sh_bin, "/bin/sh"),
+                (&cat_bin, "/bin/cat"),
+                (&ls_bin, "/bin/ls"),
+            ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             println!("→ root=ext2: booting {}", img.display());
@@ -1738,7 +1830,13 @@ fn run_with_root(opts: &BuildOpts, root_flag: Option<&str>, cmdline_extras: &[&s
         None => {
             let init_bin = build_userspace_init()?;
             let sh_bin = build_userspace_sh()?;
-            let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+            let cat_bin = build_userspace_cat()?;
+            let ls_bin = build_userspace_ls()?;
+            let extras: Vec<(&Path, &str)> = vec![
+                (&sh_bin, "/bin/sh"),
+                (&cat_bin, "/bin/cat"),
+                (&ls_bin, "/bin/ls"),
+            ];
             let img =
                 ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
             (img, Vec::new())
@@ -2079,7 +2177,13 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let kernel = build(opts)?;
     let userspace_init = build_userspace_init()?;
     let sh_bin = build_userspace_sh()?;
-    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    let cat_bin = build_userspace_cat()?;
+    let ls_bin = build_userspace_ls()?;
+    let extras: Vec<(&Path, &str)> = vec![
+        (&sh_bin, "/bin/sh"),
+        (&cat_bin, "/bin/cat"),
+        (&ls_bin, "/bin/ls"),
+    ];
     let disk =
         ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix.iso");
@@ -2857,9 +2961,15 @@ fn sh_test(opts: &BuildOpts) -> R<()> {
     let kernel = build(opts)?;
     let init_bin = build_userspace_init()?;
     let sh_bin = build_userspace_sh()?;
+    let cat_bin = build_userspace_cat()?;
+    let ls_bin = build_userspace_ls()?;
 
-    // Install init as /init and sh as /bin/sh in the ext2 rootfs image.
-    let extras: Vec<(&Path, &str)> = vec![(&sh_bin, "/bin/sh")];
+    // Install init as /init and sh/cat/ls as /bin/* in the ext2 rootfs image.
+    let extras: Vec<(&Path, &str)> = vec![
+        (&sh_bin, "/bin/sh"),
+        (&cat_bin, "/bin/cat"),
+        (&ls_bin, "/bin/ls"),
+    ];
     let disk = ext2_image::build_with_extras(&workspace_root(), Some(&init_bin), &extras, true)?;
     let iso = workspace_root().join("target").join("vibix-sh.iso");
     make_iso_with_cmdline(&kernel, &iso, "iso_sh", "root=/dev/vda")?;
