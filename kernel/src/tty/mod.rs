@@ -13,6 +13,7 @@
 //!
 //! See `docs/RFC/0003-pipes-poll-tty.md` for the design rationale.
 
+pub mod framebuffer;
 pub mod ntty;
 pub mod ps2;
 pub mod ring;
@@ -257,8 +258,16 @@ impl Default for Tty {
 /// A real multi-tty world (pty, serial[N], vt[N]) arrives with #374/#403 —
 /// until then every legacy `/dev/*` open refers to the same `Arc<Tty>` so
 /// session/pgrp identity is shared across fds as POSIX expects.
+///
+/// The driver is [`framebuffer::DualDriver`], which writes to both serial
+/// (for CI smoke markers) and the framebuffer (for on-screen display).
 #[cfg(target_os = "none")]
-pub static CONSOLE_TTY: Lazy<Arc<Tty>> = Lazy::new(|| Arc::new(Tty::new()));
+pub static CONSOLE_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
+    Arc::new(Tty::with_driver(
+        Arc::new(framebuffer::DualDriver),
+        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+    ))
+});
 
 /// Return the shared console tty.
 #[cfg(target_os = "none")]
