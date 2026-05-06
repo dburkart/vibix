@@ -579,17 +579,35 @@ step starts:
 **Partial-failure rollback.** If step 3 fails (e.g., extending the
 parent directory hits `ENOSPC`), the driver must roll back step 1 — free
 the inode bit and restore `bg_free_inodes_count` — under the same
-`sync_dirty_buffer` discipline, before returning the error. If the
-rollback itself fails mid-sequence (I/O error during rollback), the
-driver clears `s_state = EXT2_ERROR_FS` and force-ROs the mount; the
-on-disk leak is explicit, `e2fsck -fy` is required. This is the same
-posture Linux ext2 takes: the valid-FS flag is the contract that says
-"a clean umount saw a consistent image." A crash *between* steps does
-not cause corruption because the ordering ensures `e2fsck` sees either
-(a) bitmap set, inode zero-populated, no dirent → the inode is a leaked
-free slot (cheap to reap), or (b) all three set → live file. The
-ordering *never* produces a dirent pointing at a not-yet-populated or
-freed inode.
+`sync_dirty_buffer` discipline, before returning the error.
+
+**Force-RO on uncertain `sync_dirty_buffer` (#806).** A
+`sync_dirty_buffer` returning `Err` does **not** prove the bytes never
+reached disk — the device may have committed the write and failed on
+the ack path. Freeing the underlying block in the caller would risk
+double-allocation: the (still-durable) on-disk inode/indirect slot
+points at a bitmap-free block, and a subsequent allocation could
+re-hand-out the same physical block. The policy is therefore
+centralised in the **buffer cache itself**: `BlockCache::sync_dirty_buffer`
+atomically trips the filesystem-level `force_ro_latch` on any device
+write failure. Subsequent calls to `Ext2Super::is_writable()` return
+`false`, causing every write-path entry point (`write`, `create`,
+`setattr`, `link`, `rename`, `unlink`, `writepage`) to refuse with
+`EROFS`. Recovery requires `umount` + `e2fsck -fy`. Call sites that
+previously performed "free + restore" on sync failure now guard that
+rollback behind `is_writable()` — if the mount is force-RO (i.e. the
+failure was a sync error), the rollback is skipped and the bitmap leak
+is left for `e2fsck` to reclaim safely.
+
+If the rollback itself fails mid-sequence (I/O error during rollback),
+the force-RO latch is already set by the cache; `e2fsck -fy` is
+required. This is the same posture Linux ext2 takes: the valid-FS flag
+is the contract that says "a clean umount saw a consistent image." A
+crash *between* steps does not cause corruption because the ordering
+ensures `e2fsck` sees either (a) bitmap set, inode zero-populated, no
+dirent → the inode is a leaked free slot (cheap to reap), or (b) all
+three set → live file. The ordering *never* produces a dirent pointing
+at a not-yet-populated or freed inode.
 
 The same discipline applies to `rename` (§rename below) and to
 `Ext2Inode::setattr`-for-truncate: allocations and frees in a cross-
@@ -1009,6 +1027,15 @@ permits either of two values, we pick one and commit.
     at the entry, so a hostile dirent with `inode == 0` that somehow
     slipped past the tombstone skip cannot index the inode table at a
     negative offset.
+- **Force-RO on uncertain sync (#806).** A `sync_dirty_buffer` failure
+  does not prove the bytes never reached disk; freeing the block in the
+  caller would risk double-allocation (two on-disk objects alias the
+  same physical block). The buffer cache itself trips the `force_ro_latch`
+  on any device-write failure, and every write-path entry point gates on
+  `is_writable()` (returns `EROFS` after latch). This is the same
+  posture the bitmap paths already adopted (§Write Ordering); #806
+  extended it uniformly to all `sync_dirty_buffer` call sites. Recovery
+  is `umount` + `e2fsck -fy`.
 - **Fast-symlink path confusion.** The inline-read path for fast
   symlinks is gated on `S_ISLNK(i_mode) && i_blocks == 0 && i_size <= 60`
   — all three. Relying only on `i_blocks == 0` would let a crafted

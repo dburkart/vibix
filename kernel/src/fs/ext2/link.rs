@@ -65,7 +65,7 @@ use alloc::sync::Arc;
 
 use super::create::{add_link, read_inode_slot, validate_name, write_new_inode};
 use super::disk::{Ext2Inode as DiskInode, EXT2_FT_SYMLINK, EXT2_N_BLOCKS};
-use super::fs::{Ext2MountFlags, Ext2Super};
+use super::fs::Ext2Super;
 use super::ialloc::{alloc_inode, free_inode};
 use super::inode::{iget, Ext2Inode};
 use super::symlink::EXT2_FAST_SYMLINK_MAX;
@@ -107,9 +107,7 @@ pub fn link(
     target: &Inode,
     name: &[u8],
 ) -> Result<(), i64> {
-    if super_.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_.is_writable() {
         return Err(EROFS);
     }
     validate_name(name)?;
@@ -211,9 +209,7 @@ pub fn symlink(
     name: &[u8],
     target: &[u8],
 ) -> Result<Arc<Inode>, i64> {
-    if super_.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_.is_writable() {
         return Err(EROFS);
     }
     validate_name(name)?;
@@ -319,7 +315,10 @@ pub fn symlink(
     match outcome {
         Ok(inode) => Ok(inode),
         Err(e) => {
-            if !linked {
+            if !linked && super_.is_writable() {
+                // Only roll back when the mount is still writable.
+                // After a sync failure the force-RO latch is set and
+                // freeing would risk double-allocation (issue #806).
                 if let Some(blk) = data_block {
                     let _ = super::balloc::free_block(super_, blk);
                 }

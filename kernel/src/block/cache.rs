@@ -229,6 +229,13 @@ pub struct BlockCache {
     /// Cap beyond which eviction must start reclaiming. Observed by
     /// `bread` when deciding whether to run a CLOCK-Pro sweep.
     max_buffers: usize,
+    /// Optional force-RO latch wired in by the filesystem layer.  When
+    /// set, `sync_dirty_buffer` atomically stores `true` on any device
+    /// write failure.  This centralises the "uncertain durability →
+    /// force-RO" policy in the buffer cache instead of requiring every
+    /// call site to decide independently (RFC 0004 §Write Ordering,
+    /// §Security — issue #806).
+    sync_error_latch: SpinLock<Option<Arc<AtomicBool>>>,
 }
 
 impl BlockCache {
@@ -269,6 +276,7 @@ impl BlockCache {
             }),
             dirty: SpinLock::new(BTreeSet::new()),
             max_buffers,
+            sync_error_latch: SpinLock::new(None),
         })
     }
 
@@ -312,6 +320,18 @@ impl BlockCache {
     /// when deciding whether to sweep.
     pub fn max_buffers(&self) -> usize {
         self.max_buffers
+    }
+
+    /// Install a force-RO latch that `sync_dirty_buffer` will
+    /// atomically set on any device write failure.  The filesystem
+    /// layer calls this once at mount time, passing the same
+    /// `Arc<AtomicBool>` that backs `Ext2Super::force_ro_latch`.
+    ///
+    /// RFC 0004 §Write Ordering / §Security (issue #806): centralises
+    /// the "uncertain durability → force-RO" policy so call sites do
+    /// not individually decide whether to latch.
+    pub fn set_sync_error_latch(&self, latch: Arc<AtomicBool>) {
+        *self.sync_error_latch.lock() = Some(latch);
     }
 
     /// Return a cloned reference to the backing device. The VFS / ext2
@@ -687,6 +707,18 @@ impl BlockCache {
             }
             Err(e) => {
                 bh.state.fetch_and(!STATE_LOCKED_IO, Ordering::AcqRel);
+                // Trip the filesystem-level force-RO latch if one has
+                // been installed.  A `sync_dirty_buffer` returning Err
+                // does not prove the bytes never reached disk — the
+                // device may have committed the write and failed on the
+                // ack path.  Freeing the underlying block in the caller
+                // would risk double-allocation; the only safe posture
+                // is to latch the mount read-only so `e2fsck` can
+                // recover.  RFC 0004 §Write Ordering / §Security
+                // (issue #806).
+                if let Some(latch) = self.sync_error_latch.lock().as_ref() {
+                    latch.store(true, Ordering::Release);
+                }
                 Err(e)
             }
         }

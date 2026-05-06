@@ -445,12 +445,15 @@ impl AddressSpaceOps for Ext2Aops {
         })();
 
         if let Err(e) = result {
-            // Roll back every allocation we did this call. Any data
-            // already overlaid into a *pre-existing* block stays —
-            // it's the caller's bytes against a block they already
-            // owned; clobbering it would lose work the caller
-            // committed. Only freshly-allocated blocks are returned.
-            rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            // Roll back only when the mount is still writable —
+            // i.e. the failure was ENOSPC or similar, NOT a sync
+            // error that already latched the mount RO (issue #806).
+            // After a sync failure, freeing blocks would risk
+            // double-allocation; the bitmap leak is safe and e2fsck
+            // reclaims it.
+            if super_ref.is_writable() {
+                rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            }
             return Err(e);
         }
 
@@ -485,21 +488,16 @@ impl AddressSpaceOps for Ext2Aops {
         // through its parent.
         if let Err(e) = flush_inode_slot(&super_ref, ext2_inode.ino, &meta) {
             // The inode-slot flush failed *after* every data block
-            // landed. Free the freshly-allocated blocks so the
-            // bitmap / counters don't leak, and revert every field we
-            // bumped above so the in-memory meta matches the pre-call
-            // state — the user sees the failure via the returned
-            // errno; subsequent `getattr` against this inode must not
-            // observe phantom-extended size/blocks.
-            //
-            // (Caveat: `sync_dirty_buffer` returning Err does not
-            // strictly prove the on-disk inode slot is unchanged. The
-            // codebase-wide convention — `write_file_at`,
-            // `setattr`, `link`, `create` — is the same "free + restore"
-            // posture; tightening to a force-RO latch on uncertain-
-            // durability is tracked as a follow-up rather than fixed
-            // piecemeal here.)
-            rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            // landed.  If the mount is still writable (e.g. a non-
+            // sync error such as a bad inode slot offset), free the
+            // freshly-allocated blocks so the bitmap / counters
+            // don't leak.  If the mount is now force-RO (sync
+            // failure tripped the latch — issue #806), do NOT free:
+            // the data blocks are already on disk and a free would
+            // risk double-allocation.
+            if super_ref.is_writable() {
+                rollback_allocations(&super_ref, &mut meta.i_block, &events);
+            }
             meta.size = old_size;
             meta.i_blocks = old_i_blocks;
             meta.mtime = old_mtime;
@@ -1065,26 +1063,12 @@ fn ensure_inner_indirect(
         data[off..off + 4].copy_from_slice(&child.to_le_bytes());
     }
     super_.cache.mark_dirty(&bh);
-    if let Err(e) = super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO) {
-        // Linking the child into the parent failed at sync time. The
-        // child is allocated but unreachable; free it before
-        // surfacing. We don't push the InnerIndirect event because
-        // the on-disk parent slot was never persisted (we just
-        // mutated the in-memory cache page; the next `bread` of
-        // `parent_blk` will re-read the on-disk pre-link state if
-        // the cache evicts and refills, but if the dirty page sticks
-        // in cache the unflushed mutation would be a real leak —
-        // call `mark_clean` would be ideal but the cache surface
-        // doesn't expose one; revert the byte mutation in-place
-        // instead).
-        {
-            let mut data = bh.data.write();
-            let off = (index as usize) * 4;
-            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
-        let _ = free_block(super_, child);
-        return Err(e);
-    }
+    // sync_dirty_buffer trips the force-RO latch on failure
+    // (issue #806); the caller must NOT free the child block
+    // because the write may have reached disk — freeing would
+    // risk double-allocation.  Returning EIO is sufficient; the
+    // mount is now read-only and e2fsck will reclaim any leak.
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
     events.push(AllocEvent::InnerIndirect {
         parent_blk,
         index,
@@ -1123,15 +1107,9 @@ fn ensure_leaf(
         data[off..off + 4].copy_from_slice(&data_blk.to_le_bytes());
     }
     super_.cache.mark_dirty(&bh);
-    if let Err(e) = super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO) {
-        {
-            let mut data = bh.data.write();
-            let off = (index as usize) * 4;
-            data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
-        let _ = free_block(super_, data_blk);
-        return Err(e);
-    }
+    // Same rationale as ensure_inner_indirect: do not free on sync
+    // failure — the cache already latched RO (issue #806).
+    super_.cache.sync_dirty_buffer(&bh).map_err(|_| EIO)?;
     events.push(AllocEvent::InnerIndirect {
         parent_blk,
         index,
@@ -1176,13 +1154,11 @@ fn read_indirect_slot(
 /// §Write Ordering).
 fn alloc_and_zero(super_: &Arc<Ext2Super>, hint_group: u32) -> Result<u32, i64> {
     let blk = alloc_block(super_, Some(hint_group))?;
-    if let Err(e) = zero_block(super_, blk) {
-        // Zeroing failed — return the block to the bitmap so we
-        // don't leak. The caller will see the I/O errno and surface
-        // it.
-        let _ = free_block(super_, blk);
-        return Err(e);
-    }
+    // zero_block's sync_dirty_buffer trips force-RO on failure
+    // (issue #806).  Do NOT free the block — the zero-write may
+    // have reached disk and a free would risk double-allocation.
+    // The bitmap leak is safe; e2fsck reclaims it.
+    zero_block(super_, blk)?;
     Ok(blk)
 }
 

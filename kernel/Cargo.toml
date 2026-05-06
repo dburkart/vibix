@@ -482,6 +482,11 @@ harness = false
 required-features = ["ext2"]
 
 [[test]]
+name = "ext2_force_ro_sync"
+harness = false
+required-features = ["ext2"]
+
+[[test]]
 name = "ext2_unlink"
 harness = false
 required-features = ["ext2"]

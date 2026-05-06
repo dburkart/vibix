@@ -79,6 +79,9 @@ pub struct RamDisk {
     storage: Mutex<Vec<u8>>,
     writes: AtomicU32,
     read_only: AtomicBool,
+    /// When non-zero, `write_at` returns `BlockError::Io` once
+    /// `writes` reaches this threshold (issue #806 — force-RO test).
+    fail_after: AtomicU32,
 }
 
 #[allow(dead_code)]
@@ -99,6 +102,7 @@ impl RamDisk {
             storage: Mutex::new(bytes.to_vec()),
             writes: AtomicU32::new(0),
             read_only: AtomicBool::new(false),
+            fail_after: AtomicU32::new(0),
         })
     }
 
@@ -112,6 +116,7 @@ impl RamDisk {
             storage: Mutex::new(vec![0u8; bytes]),
             writes: AtomicU32::new(0),
             read_only: AtomicBool::new(false),
+            fail_after: AtomicU32::new(0),
         })
     }
 
@@ -126,6 +131,12 @@ impl RamDisk {
     /// Lets RO tests assert `writes() == 0`.
     pub fn writes(&self) -> u32 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Arm the device to return `BlockError::Io` on every `write_at`
+    /// once the write counter reaches `n`.  Pass 0 to disarm.
+    pub fn set_fail_after(&self, n: u32) {
+        self.fail_after.store(n, Ordering::Relaxed);
     }
 
     /// Copy `buf.len()` bytes out of the backing storage starting at
@@ -177,6 +188,13 @@ impl BlockDevice for RamDisk {
         let bs = self.block_size as u64;
         if buf.is_empty() || (buf.len() as u64) % bs != 0 || offset % bs != 0 {
             return Err(BlockError::BadAlign);
+        }
+        // Issue #806: fail-after injection.  Once the cumulative
+        // write counter reaches the armed threshold every subsequent
+        // write_at returns Io to simulate a device error.
+        let limit = self.fail_after.load(Ordering::Relaxed);
+        if limit != 0 && self.writes.load(Ordering::Relaxed) >= limit {
+            return Err(BlockError::DeviceError);
         }
         let mut storage = self.storage.lock();
         let end = offset

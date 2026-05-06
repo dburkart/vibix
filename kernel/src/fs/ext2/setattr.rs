@@ -35,7 +35,7 @@ use alloc::vec;
 use super::disk::{
     Ext2Inode as DiskInode, EXT2_INODE_SIZE_V0, EXT2_N_BLOCKS, RO_COMPAT_LARGE_FILE,
 };
-use super::fs::{Ext2MountFlags, Ext2Super};
+use super::fs::Ext2Super;
 use super::indirect::{
     Geometry, EXT2_DIND_BLOCK, EXT2_DIRECT_BLOCKS, EXT2_IND_BLOCK, EXT2_TIND_BLOCK,
 };
@@ -69,9 +69,7 @@ use crate::fs::{EFBIG, EINVAL, EIO, EISDIR, EROFS};
 pub fn setattr(ext2_inode: &Ext2Inode, inode: &Inode, attr: &SetAttr) -> Result<(), i64> {
     let super_ref = ext2_inode.super_ref.upgrade().ok_or(EIO)?;
 
-    if super_ref.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_ref.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_ref.is_writable() {
         return Err(EROFS);
     }
 

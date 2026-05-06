@@ -45,7 +45,7 @@ use super::disk::{
     EXT2_INODE_SIZE_V0, EXT2_SUPERBLOCK_SIZE,
 };
 use super::file::build_metadata_map;
-use super::fs::{Ext2MountFlags, Ext2Super, SUPERBLOCK_BYTE_OFFSET};
+use super::fs::{Ext2Super, SUPERBLOCK_BYTE_OFFSET};
 use super::indirect::{resolve_block, Geometry, WalkError};
 use super::inode::{iget, Ext2Inode};
 
@@ -500,9 +500,7 @@ fn unlink_common(
     expect_dir: bool,
 ) -> Result<(), i64> {
     let super_ = parent_dir.super_ref.upgrade().ok_or(EIO)?;
-    if super_.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_.is_writable() {
         return Err(EROFS);
     }
 
