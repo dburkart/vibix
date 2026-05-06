@@ -607,6 +607,10 @@ impl FileDescTable {
 #[cfg(target_os = "none")]
 pub struct SerialBackend {
     termios: spin::Mutex<crate::tty::termios::Termios>,
+    /// Tracks `O_NONBLOCK` so `read` can return `EAGAIN` instead of
+    /// blocking. Synchronised by [`FileBackend::set_flags`] when
+    /// userspace calls `fcntl(F_SETFL)`.
+    nonblocking: core::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "none")]
@@ -614,6 +618,7 @@ impl SerialBackend {
     pub const fn new() -> Self {
         Self {
             termios: spin::Mutex::new(crate::tty::termios::Termios::sane()),
+            nonblocking: core::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -627,11 +632,14 @@ impl Default for SerialBackend {
 
 #[cfg(target_os = "none")]
 impl FileBackend for SerialBackend {
-    /// Non-blocking read: drains whatever bytes are currently in the RX ring.
+    /// Blocking read from the console TTY's N_TTY line discipline.
     ///
-    /// Returns `EAGAIN` (`-11`) if no bytes are available. Callers that need
-    /// blocking semantics must re-try in a loop (the blocking wait-queue path
-    /// lives in a future `read` syscall extension).
+    /// Drains committed data from the N_TTY raw ring (fed by both the
+    /// serial UART and PS/2 keyboard). Blocks on `tty.read_wait` when
+    /// no committed data is available, unless `O_NONBLOCK` is set on
+    /// the open file description (in which case returns `EAGAIN`).
+    ///
+    /// EOF (Ctrl-D on an empty line) causes a 0-byte return per POSIX.
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
         let caller = crate::process::current_pid();
         let tty = crate::tty::console_tty();
@@ -641,15 +649,31 @@ impl FileBackend for SerialBackend {
             // SA_RESTART, otherwise -EINTR.
             return Err(rc);
         }
-        for (i, byte) in buf.iter_mut().enumerate() {
-            match crate::serial::try_read_byte() {
-                Some(b) => *byte = b,
-                None => {
-                    return if i == 0 { Err(EAGAIN) } else { Ok(i) };
-                }
-            }
+        if buf.is_empty() {
+            return Ok(0);
         }
-        Ok(buf.len())
+        loop {
+            // Try to drain committed data from the ldisc.
+            if tty.ldisc.has_data() {
+                let n = tty.ldisc.read(buf);
+                return Ok(n);
+            }
+            // No data — check whether we should block.
+            if self.nonblocking.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(EAGAIN);
+            }
+            // Block: register on the tty's read wait-queue, re-check
+            // under the registration (wait-latching invariant), then park.
+            let tid = crate::task::current_id();
+            let tok = tty.read_wait.register_wait(tid);
+            if tty.ldisc.has_data() {
+                tty.read_wait.cancel(tok);
+                continue;
+            }
+            crate::task::block_current();
+            tty.read_wait.cancel(tok);
+            // Loop back — data (or EOF) should now be available.
+        }
     }
 
     /// Write path acquires `COM1.lock()` inside `without_interrupts` via
@@ -673,6 +697,13 @@ impl FileBackend for SerialBackend {
         // bypassing the framebuffer entirely.
         let n = tty.driver.write(buf);
         Ok(n)
+    }
+
+    fn set_flags(&self, new_flags: u32) {
+        self.nonblocking.store(
+            new_flags & flags::O_NONBLOCK != 0,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, i64> {
