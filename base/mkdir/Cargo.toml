@@ -1,0 +1,14 @@
+[package]
+name = "mkdir"
+version = "0.1.0"
+edition = "2021"
+authors = ["vibix hackers"]
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "mkdir"
+path = "src/main.rs"
+
+# Standalone package — not part of the main workspace. Built with
+# `-Z build-std` against the in-repo std fork (see xtask build).
+[workspace]
