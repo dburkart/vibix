@@ -24,7 +24,7 @@ use crate::tty::TtyDriver;
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
 #[cfg(target_os = "none")]
-use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
 #[cfg(target_os = "none")]
 use spin::{Lazy, Mutex};
 
@@ -90,13 +90,31 @@ fn ps2_softirq_drain() {
 
 #[cfg(target_os = "none")]
 fn decode_and_forward(code: u8) {
-    let key = {
+    let (key, shifted) = {
         let mut kbd = DECODER.lock();
-        match kbd.add_byte(code) {
+        let k = match kbd.add_byte(code) {
             Ok(Some(event)) => kbd.process_keyevent(event),
             _ => None,
-        }
+        };
+        let s = kbd.get_modifiers().is_shifted();
+        (k, s)
     };
+
+    // Shift+PgUp/PgDn scrolls the framebuffer without forwarding to
+    // userspace — mirrors the kernel shell's scrollback handling
+    // (shell/mod.rs:76-84) so scrollback works even when the shell is
+    // not running.
+    if let Some(DecodedKey::RawKey(kc @ (KeyCode::PageUp | KeyCode::PageDown))) = key {
+        if shifted {
+            match kc {
+                KeyCode::PageUp => crate::framebuffer::scroll_view_up_page(),
+                KeyCode::PageDown => crate::framebuffer::scroll_view_down_page(),
+                _ => {}
+            }
+            return;
+        }
+    }
+
     let Some(DecodedKey::Unicode(c)) = key else {
         return;
     };
