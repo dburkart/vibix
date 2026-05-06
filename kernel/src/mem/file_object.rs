@@ -49,6 +49,7 @@
 //!   They construct an `Arc<FileObject>` with the same fields this
 //!   module defines; nothing here depends on those drivers.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -127,6 +128,14 @@ pub struct FileObject {
     /// Population is deferred to #739/#746 — the CoW resolver wiring;
     /// this module exposes only the storage and a query helper.
     private_frames: BlockingMutex<BTreeMap<u64, u64>>,
+
+    /// Optional guard dropped when this `FileObject` is dropped.
+    /// Used by filesystem drivers (e.g. ext2) to pin the inode against
+    /// orphan finalization while a mapping derived from it is still
+    /// alive. The guard's `Drop` impl decrements the driver's
+    /// `map_count` and, if appropriate, triggers deferred orphan
+    /// finalization. See issue #811.
+    _mmap_guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl FileObject {
@@ -153,6 +162,30 @@ impl FileObject {
         open_mode: u32,
         exec_allowed: bool,
     ) -> Arc<Self> {
+        Self::new_with_guard(
+            cache,
+            file_offset_pages,
+            len_pages,
+            share,
+            open_mode,
+            exec_allowed,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`], but accepts an optional mmap guard that is
+    /// dropped when this `FileObject` is dropped. Filesystem drivers
+    /// use this to pin the inode against orphan finalization while a
+    /// mapping exists. See issue #811.
+    pub fn new_with_guard(
+        cache: Arc<PageCache>,
+        file_offset_pages: u64,
+        len_pages: usize,
+        share: Share,
+        open_mode: u32,
+        exec_allowed: bool,
+        mmap_guard: Option<Box<dyn Send + Sync>>,
+    ) -> Arc<Self> {
         // Validate the file-page window: `file_offset_pages + len_pages`
         // must not wrap. Lookups below combine the two via `pgoff_of`,
         // and a wrapped sum would index unrelated cache entries instead
@@ -173,6 +206,7 @@ impl FileObject {
             open_mode,
             exec_allowed,
             private_frames: BlockingMutex::new(BTreeMap::new()),
+            _mmap_guard: mmap_guard,
         })
     }
 
@@ -299,6 +333,12 @@ impl FileObject {
             // same reason as open_mode.
             exec_allowed: self.exec_allowed,
             private_frames: BlockingMutex::new(BTreeMap::new()),
+            // The clone is a post-fork private copy; the originating
+            // process's open_count (bumped at fork via dup_fd) covers
+            // orphan-finalization deferral. No separate mmap guard
+            // needed — the parent's guard (or the child's own
+            // open_count) prevents premature finalization.
+            _mmap_guard: None,
         })
     }
 }

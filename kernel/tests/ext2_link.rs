@@ -198,6 +198,7 @@ fn make_ext2_inode_from_disk(
         block_map: BlockingRwLock::new(None),
         unlinked: AtomicBool::new(false),
         open_count: AtomicU32::new(0),
+        map_count: AtomicU32::new(0),
     }
 }
 
