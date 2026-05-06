@@ -203,8 +203,5 @@ fn subsequent_write_returns_erofs() {
         err2 == EROFS || err2 == EIO,
         "second write should return EROFS or EIO, got {err2}"
     );
-    assert!(
-        !super_arc.is_writable(),
-        "mount must remain force-RO"
-    );
+    assert!(!super_arc.is_writable(), "mount must remain force-RO");
 }
