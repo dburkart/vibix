@@ -5,6 +5,7 @@ mod syscalls;
 
 use std::env;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
 
 fn stat_path(path: &str) -> u8 {
@@ -26,9 +27,10 @@ fn stat_path(path: &str) -> u8 {
 
     println!("  File: {path}");
     println!("  Size: {}", meta.len());
-    println!(" Type: {file_type}");
-    println!("Inode: unknown");
-    println!("Links: unknown");
+    println!("  Type: {file_type}");
+    println!("  Mode: {:o}", meta.mode());
+    println!(" Inode: {}", meta.ino());
+    println!(" Links: {}", meta.nlink());
 
     0
 }

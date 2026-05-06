@@ -27,7 +27,7 @@ unsafe fn raw1(nr: u64, a0: u64) -> i64 {
             lateout("r8") _,
             lateout("r9") _,
             lateout("r10") _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     ret
