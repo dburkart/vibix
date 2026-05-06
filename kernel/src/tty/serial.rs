@@ -1,19 +1,17 @@
-//! 16550 serial UART rx path routed through [`Tty`] + [`LineDiscipline`].
+//! 16550 serial UART rx path routed through the shared console
+//! [`Tty`](super::Tty) + [`NTtyLdisc`](super::ntty::NTtyLdisc).
 //!
-//! Issue #406. The hardware ISR in
+//! Issue #406 / #898. The hardware ISR in
 //! [`crate::arch::x86_64::interrupts::serial_interrupt`] calls
 //! [`crate::serial::drain_rx_hardware`], which pulls bytes out of the
 //! UART FIFO into the legacy [`crate::serial::RX_RING`] and, in
 //! parallel, into [`SERIAL_RX_RING`] via [`push_byte_from_isr`]. On the
 //! next [`crate::task::softirq::drain`] tick the registered handler
 //! drains the ring and forwards every byte into
-//! `tty.ldisc.receive_byte(&tty, b)`.
+//! `console_tty().ldisc.receive_byte(...)`.
 //!
-//! The default line discipline is [`PassthroughLdisc::new`], which drops
-//! bytes on the floor. This keeps behaviour identical to the pre-#406
-//! world (shell / kernel consumers still read bytes via
-//! [`crate::serial::try_read_byte`]) while establishing the pipe that
-//! N_TTY (#375) will hook into once it lands.
+//! Both serial and PS/2 feed the same [`CONSOLE_TTY`](super::CONSOLE_TTY)
+//! so userspace sees a single stdin regardless of input source.
 //!
 //! RTS flow control: when the ring first crosses [`WATERMARK_HIGH`] the
 //! ISR-side path clears MCR.RTS to backpressure a peer that honours
@@ -22,8 +20,11 @@
 //! this is effectively a no-op in our default test setup — the logic is
 //! exercised against real hardware.
 
-use crate::tty::ring::{DeferredByteRing, WATERMARK_HIGH};
+use crate::tty::ring::DeferredByteRing;
 use crate::tty::TtyDriver;
+
+#[cfg(target_os = "none")]
+use crate::tty::ring::WATERMARK_HIGH;
 
 #[cfg(target_os = "none")]
 use alloc::sync::Arc;
@@ -34,10 +35,6 @@ use x86_64::instructions::port::Port;
 
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
-#[cfg(target_os = "none")]
-use crate::tty::ntty::{KernelSignalDispatch, NTtyLdisc, SignalDispatch};
-#[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, Tty};
 #[cfg(target_os = "none")]
 use spin::Lazy;
 
@@ -78,20 +75,14 @@ impl TtyDriver for SerialDriver {
     }
 }
 
+/// Return the console tty that serial input feeds into.
+///
+/// This is the same [`CONSOLE_TTY`](super::CONSOLE_TTY) that PS/2
+/// keyboard input feeds and that userspace reads from — both input
+/// sources share a single N_TTY line discipline.
 #[cfg(target_os = "none")]
-static SERIAL_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
-    let dispatch: Arc<dyn SignalDispatch> = Arc::new(KernelSignalDispatch);
-    Arc::new(Tty::with_driver(
-        Arc::new(SerialDriver),
-        Arc::new(NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
-    ))
-});
-
-/// Accessor for the global serial tty. Lazy-initialised; safe to call
-/// after [`init`] has run, and tolerable before.
-#[cfg(target_os = "none")]
-pub fn tty() -> Arc<Tty> {
-    SERIAL_TTY.clone()
+pub fn tty() -> Arc<super::Tty> {
+    super::console_tty()
 }
 
 /// Called from [`crate::serial::drain_rx_hardware`] per FIFO byte.
@@ -124,7 +115,7 @@ pub fn push_byte_from_isr(byte: u8) {
 /// not allocate or block.
 #[cfg(target_os = "none")]
 fn serial_softirq_drain() {
-    let tty = SERIAL_TTY.clone();
+    let tty = super::console_tty();
     while let Some(b) = SERIAL_RX_RING.pop() {
         tty.ldisc.receive_byte(&tty, b);
     }
@@ -139,11 +130,12 @@ fn serial_softirq_drain() {
     }
 }
 
-/// Boot-time wiring. Forces [`SERIAL_TTY`] initialisation and registers
-/// the soft-IRQ drain handler. Must be called before IRQ4 is unmasked.
+/// Boot-time wiring. Forces [`CONSOLE_TTY`](super::CONSOLE_TTY)
+/// initialisation and registers the soft-IRQ drain handler. Must be
+/// called before IRQ4 is unmasked.
 #[cfg(target_os = "none")]
 pub fn init() {
-    Lazy::force(&SERIAL_TTY);
+    Lazy::force(&super::CONSOLE_TTY);
     softirq::register(SoftIrq::SerialRx, serial_softirq_drain);
 }
 
