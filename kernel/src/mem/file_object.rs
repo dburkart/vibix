@@ -162,7 +162,15 @@ impl FileObject {
         open_mode: u32,
         exec_allowed: bool,
     ) -> Arc<Self> {
-        Self::new_with_guard(cache, file_offset_pages, len_pages, share, open_mode, exec_allowed, None)
+        Self::new_with_guard(
+            cache,
+            file_offset_pages,
+            len_pages,
+            share,
+            open_mode,
+            exec_allowed,
+            None,
+        )
     }
 
     /// Like [`Self::new`], but accepts an optional mmap guard that is
