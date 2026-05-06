@@ -800,14 +800,16 @@ fn build_userspace_std_hello() -> R<PathBuf> {
     Ok(bin)
 }
 
-/// Build the `/bin/sh` binary — the vibix POSIX shell.
+/// Build a standalone base-system binary (e.g. sh, cat, ls) using the
+/// out-of-tree `-Z build-std` approach with the in-repo std fork.
 ///
-/// Uses the same out-of-tree `-Z build-std` approach as `std_hello`.
-/// The crate lives in `base/sh/` (base system program, not a test).
-fn build_userspace_sh() -> R<PathBuf> {
+/// `manifest_rel` is the manifest path relative to the workspace root
+/// (e.g. `"base/sh/Cargo.toml"`). `bin_name` is the expected output
+/// binary name under `target/x86_64-unknown-vibix/debug/`.
+fn build_userspace_std_bin(manifest_rel: &str, bin_name: &str) -> R<PathBuf> {
     let ws = workspace_root();
     let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
-    let manifest = ws.join("base/sh/Cargo.toml");
+    let manifest = ws.join(manifest_rel);
     let library_root = ws.join("library");
 
     let target_dir = ws.join("target");
@@ -835,98 +837,27 @@ fn build_userspace_sh() -> R<PathBuf> {
     let bin = target_dir
         .join("x86_64-unknown-vibix")
         .join("debug")
-        .join("sh");
+        .join(bin_name);
     if !bin.exists() {
-        return Err(format!("sh binary missing at {} after build", bin.display()).into());
+        return Err(format!("{bin_name} binary missing at {} after build", bin.display()).into());
     }
     strip_debug(&bin)?;
     Ok(bin)
+}
+
+/// Build the `/bin/sh` binary — the vibix POSIX shell.
+fn build_userspace_sh() -> R<PathBuf> {
+    build_userspace_std_bin("base/sh/Cargo.toml", "sh")
 }
 
 /// Build the `/bin/cat` binary — concatenate files to stdout.
-///
-/// Uses the same out-of-tree `-Z build-std` approach as `build_userspace_sh`.
-/// The crate lives in `base/cat/` (base system program).
 fn build_userspace_cat() -> R<PathBuf> {
-    let ws = workspace_root();
-    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
-    let manifest = ws.join("base/cat/Cargo.toml");
-    let library_root = ws.join("library");
-
-    let target_dir = ws.join("target");
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&ws)
-        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
-        .args(["build", "--manifest-path"])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&target_dir)
-        .args([
-            "-Z",
-            "build-std=std,core,alloc,panic_abort",
-            "-Z",
-            "build-std-features=compiler-builtins-mem",
-            "-Z",
-            "unstable-options",
-            "-Z",
-            "json-target-spec",
-            "--target",
-        ])
-        .arg(&target_spec);
-    check(cmd.status()?)?;
-
-    let bin = target_dir
-        .join("x86_64-unknown-vibix")
-        .join("debug")
-        .join("cat");
-    if !bin.exists() {
-        return Err(format!("cat binary missing at {} after build", bin.display()).into());
-    }
-    strip_debug(&bin)?;
-    Ok(bin)
+    build_userspace_std_bin("base/cat/Cargo.toml", "cat")
 }
 
 /// Build the `/bin/ls` binary — list directory contents.
-///
-/// Uses the same out-of-tree `-Z build-std` approach as `build_userspace_sh`.
-/// The crate lives in `base/ls/` (base system program).
 fn build_userspace_ls() -> R<PathBuf> {
-    let ws = workspace_root();
-    let target_spec = ws.join(VIBIX_USERSPACE_TARGET);
-    let manifest = ws.join("base/ls/Cargo.toml");
-    let library_root = ws.join("library");
-
-    let target_dir = ws.join("target");
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&ws)
-        .env("__CARGO_TESTS_ONLY_SRC_ROOT", &library_root)
-        .args(["build", "--manifest-path"])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&target_dir)
-        .args([
-            "-Z",
-            "build-std=std,core,alloc,panic_abort",
-            "-Z",
-            "build-std-features=compiler-builtins-mem",
-            "-Z",
-            "unstable-options",
-            "-Z",
-            "json-target-spec",
-            "--target",
-        ])
-        .arg(&target_spec);
-    check(cmd.status()?)?;
-
-    let bin = target_dir
-        .join("x86_64-unknown-vibix")
-        .join("debug")
-        .join("ls");
-    if !bin.exists() {
-        return Err(format!("ls binary missing at {} after build", bin.display()).into());
-    }
-    strip_debug(&bin)?;
-    Ok(bin)
+    build_userspace_std_bin("base/ls/Cargo.toml", "ls")
 }
 
 /// Generate a minimal stub dynamic-linker ELF for the #764 integration test.

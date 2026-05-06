@@ -6,7 +6,7 @@ mod syscalls;
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::process;
+use std::process::ExitCode;
 
 fn cat_reader<R: Read>(mut reader: R, stdout: &mut io::StdoutLock<'_>) -> io::Result<()> {
     let mut buf = [0u8; 4096];
@@ -20,11 +20,11 @@ fn cat_reader<R: Read>(mut reader: R, stdout: &mut io::StdoutLock<'_>) -> io::Re
     Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let mut status = 0;
+    let mut status: u8 = 0;
 
     if args.len() <= 1 {
         // No arguments: read stdin to stdout.
@@ -32,7 +32,7 @@ fn main() {
         let stdin = stdin.lock();
         if let Err(e) = cat_reader(stdin, &mut stdout) {
             eprintln!("cat: {e}");
-            process::exit(1);
+            return ExitCode::from(1);
         }
     } else {
         for path in &args[1..] {
@@ -60,5 +60,5 @@ fn main() {
         }
     }
 
-    process::exit(status);
+    ExitCode::from(status)
 }

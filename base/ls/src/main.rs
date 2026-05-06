@@ -5,9 +5,9 @@ mod syscalls;
 
 use std::env;
 use std::fs;
-use std::process;
+use std::process::ExitCode;
 
-fn list_dir(path: &str) -> i32 {
+fn list_dir(path: &str) -> u8 {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(e) => {
@@ -21,10 +21,7 @@ fn list_dir(path: &str) -> i32 {
         match entry {
             Ok(entry) => {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let is_dir = entry
-                    .file_type()
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or(false);
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 names.push((name, is_dir));
             }
             Err(e) => {
@@ -47,9 +44,9 @@ fn list_dir(path: &str) -> i32 {
     0
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    let mut status = 0;
+    let mut status: u8 = 0;
 
     if args.len() <= 1 {
         status = list_dir(".");
@@ -69,5 +66,5 @@ fn main() {
         }
     }
 
-    process::exit(status);
+    ExitCode::from(status)
 }
