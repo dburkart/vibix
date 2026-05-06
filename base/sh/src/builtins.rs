@@ -1093,7 +1093,11 @@ fn builtin_bg(args: &[String], env: &mut Environment, jobs: &mut JobTable) -> i3
 ///
 /// - `pwd` — print `$PWD`. If `$PWD` is unset, fall back to
 ///   `std::env::current_dir()`.
-fn builtin_pwd(_args: &[String], env: &mut Environment) -> i32 {
+fn builtin_pwd(args: &[String], env: &mut Environment) -> i32 {
+    if !args.is_empty() {
+        eprintln!("sh: pwd: too many arguments");
+        return 2;
+    }
     if let Some(pwd) = env.get("PWD") {
         println!("{pwd}");
     } else {
@@ -1117,6 +1121,11 @@ fn builtin_pwd(_args: &[String], env: &mut Environment) -> i32 {
 /// these sequences.
 fn builtin_clear() -> i32 {
     print!("\x1b[2J\x1b[H");
+    use std::io::Write;
+    if std::io::stdout().flush().is_err() {
+        eprintln!("sh: clear: write error");
+        return 1;
+    }
     0
 }
 
@@ -1952,6 +1961,14 @@ mod tests {
         // PWD is not set — should fall back to std::env::current_dir()
         let status = builtin_pwd(&args(&[]), &mut e);
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn pwd_rejects_extra_args() {
+        let mut e = env();
+        e.set("PWD", "/home/user", None);
+        let status = builtin_pwd(&args(&["extra"]), &mut e);
+        assert_eq!(status, 2);
     }
 
     #[test]
