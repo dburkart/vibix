@@ -39,7 +39,8 @@ mod kernel_side {
     pub fn run() -> ! {
         serial_println!("shell: prompt online");
         SHELL_ONLINE.store(true, Ordering::SeqCst);
-        super::banner::print_banner();
+        // Banner is now printed unconditionally from `_start` so smoke
+        // tests see it even when the kernel shell is not spawned.
         prompt();
 
         let mut editor = LineEditor::new();
