@@ -667,8 +667,12 @@ impl FileBackend for SerialBackend {
         if let Some(rc) = crate::tty::tty_check_tostop(&tty, caller) {
             return Err(rc);
         }
-        crate::serial::write_bytes(buf);
-        Ok(buf.len())
+        // Write through the console TTY's driver so output reaches both
+        // the serial port (CI smoke markers) and the framebuffer (on-screen
+        // display). Previously this called `serial::write_bytes` directly,
+        // bypassing the framebuffer entirely.
+        let n = tty.driver.write(buf);
+        Ok(n)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<i64, i64> {
