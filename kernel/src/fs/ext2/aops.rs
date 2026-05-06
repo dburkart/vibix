@@ -699,7 +699,19 @@ impl AddressSpaceOps for Ext2Aops {
                         // need to pin the strong reference here, the
                         // upcoming `readpage` will re-`bread` and
                         // observe the cache hit.
-                        let _ = super_ref.cache.bread(super_ref.device_id, abs as u64);
+                        //
+                        // On device error, stop the prefetch walk — a
+                        // failing device is unlikely to succeed on the
+                        // next block, and continuing would just spin
+                        // through more errors. The upcoming `readpage`
+                        // will surface the faithful errno on demand.
+                        if super_ref
+                            .cache
+                            .bread(super_ref.device_id, abs as u64)
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     Ok(None) => {
                         // Sparse hole — `readpage` zero-fills inline,

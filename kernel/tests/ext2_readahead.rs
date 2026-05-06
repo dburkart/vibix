@@ -350,19 +350,21 @@ fn readahead_sparse_holes_dont_warm_phantom_blocks() {
     // Page 1: all holes — readahead must complete without panicking
     // and without trying to bread any made-up block. We can't probe
     // "no phantom block was warmed" directly (we don't know what
-    // absolute block a phantom would have been), so the contract is
-    // expressed by the impl's `Ok(None)` arm: no bread is issued.
-    // The smoke check is "the call returns" + "the cache len didn't
-    // grow more than a small constant" (it can grow by metadata-map
-    // breads on the indirect walk, but those would have happened
-    // anyway).
-    let _len_before = super_arc.cache.len();
+    // absolute block a phantom would have been), but we *can* assert
+    // that the cache residency count doesn't change: the indirect
+    // walker for sparse.bin page 1 walks through blocks that are
+    // already warm from the page-0 readahead above, so no new
+    // metadata breads are issued either. An equality check on
+    // `cache.len()` is the tightest observable contract: sparse holes
+    // must not inflate residency.
+    let len_before = super_arc.cache.len();
     aops.readahead(1, 1);
-    // No assertion on `len_after` — the indirect walker may bread
-    // the indirect-pointer block as it traverses. The contract is
-    // that `Ok(None)` (sparse) does not turn into a `bread` of
-    // some phantom data block — and that's enforced by code review
-    // of the impl, not by an external observable.
+    let len_after = super_arc.cache.len();
+    assert_eq!(
+        len_before, len_after,
+        "readahead over sparse holes must not change buffer-cache residency \
+         (before {len_before}, after {len_after})"
+    );
 
     drop(ext2_inode);
     drop(_inode);
