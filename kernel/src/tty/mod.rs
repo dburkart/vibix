@@ -140,6 +140,18 @@ pub trait LineDiscipline: Send + Sync {
 
     /// Called when the discipline is being torn down or swapped out.
     fn close(&self, tty: &Tty);
+
+    /// Drain committed bytes into `buf`. Returns the number of bytes
+    /// read, or `0` for EOF. The default returns `0` (no data).
+    fn read(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    /// Returns `true` when committed data (or an EOF marker) is ready
+    /// for a reader. The default returns `false`.
+    fn has_data(&self) -> bool {
+        false
+    }
 }
 
 /// Trivial passthrough line discipline — a no-op placeholder.

@@ -236,6 +236,75 @@ impl NTty {
         self.state.lock().raw.len()
     }
 
+    /// Drain up to `buf.len()` committed bytes from the raw ring.
+    ///
+    /// Returns the number of bytes copied into `buf`. Returns `0` when
+    /// the read reaches an EOF boundary (Ctrl-D on an empty line) — the
+    /// caller should interpret this as EOF per POSIX.
+    ///
+    /// In canonical mode, a single `read` never crosses a line boundary:
+    /// the drain stops at the first `\n` (included in the output) or at
+    /// an EOF position marker (not included). In raw mode there are no
+    /// boundaries; the drain simply copies whatever is available.
+    pub fn read(&self, buf: &mut [u8]) -> usize {
+        let mut st = self.state.lock();
+        // Check for an EOF boundary at the current head position first.
+        // This handles Ctrl-D on an empty line (head == tail, eof_pos
+        // == head) and Ctrl-D after data (eof_pos == tail after the
+        // payload has been drained by a prior read).
+        if let Some(eof) = st.raw.eof_pos {
+            if st.raw.head == eof {
+                st.raw.eof_pos = None;
+                return 0;
+            }
+        }
+        if st.raw.len() == 0 {
+            return 0;
+        }
+        let mut n = 0;
+        while n < buf.len() {
+            if st.raw.head == st.raw.tail {
+                break;
+            }
+            // Check for EOF boundary before consuming the next byte.
+            if let Some(eof) = st.raw.eof_pos {
+                if st.raw.head == eof {
+                    // EOF boundary reached — clear it and return what
+                    // we have (which may be 0, signalling EOF to the caller).
+                    st.raw.eof_pos = None;
+                    break;
+                }
+            }
+            let b = st.raw.buf[st.raw.head & (RAW_RING_CAP - 1)];
+            st.raw.head = st.raw.head.wrapping_add(1);
+            buf[n] = b;
+            n += 1;
+            // In canonical mode, stop after a newline delimiter.
+            if b == b'\n' {
+                break;
+            }
+        }
+        n
+    }
+
+    /// Returns `true` when the raw ring has committed data available
+    /// for a reader, including an EOF boundary at the current head
+    /// position (which would cause `read` to return 0).
+    pub fn has_data(&self) -> bool {
+        let st = self.state.lock();
+        if st.raw.head != st.raw.tail {
+            return true;
+        }
+        // An EOF boundary at head==tail means Ctrl-D on empty line;
+        // the reader should observe it as a 0-byte read.
+        if let Some(eof) = st.raw.eof_pos {
+            if st.raw.head == eof {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Signal-aware entry point. Must be called before the hot
     /// `receive_byte` path when a [`JobControl`] is available (i.e. for
     /// any tty that has a controlling session) so Ctrl-C / Ctrl-\ /
@@ -453,6 +522,18 @@ impl NTtyLdisc {
     pub fn ntty(&self) -> &NTty {
         &self.ntty
     }
+
+    /// Drain committed bytes from the N_TTY raw ring into `buf`.
+    /// See [`NTty::read`] for semantics.
+    pub fn read(&self, buf: &mut [u8]) -> usize {
+        self.ntty.read(buf)
+    }
+
+    /// Returns `true` when committed data (or an EOF boundary) is
+    /// available for a reader. See [`NTty::has_data`].
+    pub fn has_data(&self) -> bool {
+        self.ntty.has_data()
+    }
 }
 
 /// Wake adapter that drives a [`crate::poll::WaitQueue`] from the
@@ -508,6 +589,14 @@ impl super::LineDiscipline for NTtyLdisc {
     }
 
     fn close(&self, _tty: &super::Tty) {}
+
+    fn read(&self, buf: &mut [u8]) -> usize {
+        self.ntty.read(buf)
+    }
+
+    fn has_data(&self) -> bool {
+        self.ntty.has_data()
+    }
 }
 
 #[cfg(test)]
@@ -1131,5 +1220,95 @@ mod tests {
         );
         assert_eq!(n.state.lock().line.len, 3);
         assert_eq!(w.count(), 0);
+    }
+
+    // ── NTty::read / has_data tests (#899) ──────────────────────────
+
+    #[test]
+    fn read_drains_committed_line() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        for &b in b"hello\n" {
+            n.canon_input(&t, b, &w);
+        }
+        assert!(n.has_data());
+        let mut buf = [0u8; 64];
+        let got = n.read(&mut buf);
+        assert_eq!(&buf[..got], b"hello\n");
+        assert!(!n.has_data());
+    }
+
+    #[test]
+    fn read_stops_at_newline_boundary() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        for &b in b"abc\ndef\n" {
+            n.canon_input(&t, b, &w);
+        }
+        let mut buf = [0u8; 64];
+        let got = n.read(&mut buf);
+        assert_eq!(&buf[..got], b"abc\n");
+        // Second line still available.
+        assert!(n.has_data());
+        let got2 = n.read(&mut buf);
+        assert_eq!(&buf[..got2], b"def\n");
+        assert!(!n.has_data());
+    }
+
+    #[test]
+    fn read_eof_returns_zero() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        // Ctrl-D on empty line: commit with no payload and eof_pos set.
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        assert!(n.has_data());
+        let mut buf = [0u8; 64];
+        let got = n.read(&mut buf);
+        assert_eq!(got, 0, "EOF must return 0 bytes");
+        assert!(!n.has_data());
+    }
+
+    #[test]
+    fn read_eof_after_data_returns_data_then_eof() {
+        let n = NTty::new();
+        let t = termios_canon();
+        let w = NullWake;
+        // "hi" + Ctrl-D: commit "hi" with eof boundary.
+        for &b in b"hi" {
+            n.canon_input(&t, b, &w);
+        }
+        n.canon_input(&t, t.c_cc[VEOF], &w);
+        let mut buf = [0u8; 64];
+        let got = n.read(&mut buf);
+        assert_eq!(&buf[..got], b"hi");
+        // Next read hits the EOF boundary.
+        assert!(n.has_data());
+        let got2 = n.read(&mut buf);
+        assert_eq!(got2, 0);
+    }
+
+    #[test]
+    fn read_empty_returns_zero() {
+        let n = NTty::new();
+        assert!(!n.has_data());
+        let mut buf = [0u8; 64];
+        assert_eq!(n.read(&mut buf), 0);
+    }
+
+    #[test]
+    fn read_raw_mode_drains_all_available() {
+        let n = NTty::new();
+        let t = termios_raw();
+        let w = NullWake;
+        for &b in b"xyz" {
+            n.canon_input(&t, b, &w);
+        }
+        assert!(n.has_data());
+        let mut buf = [0u8; 64];
+        let got = n.read(&mut buf);
+        assert_eq!(&buf[..got], b"xyz");
     }
 }
