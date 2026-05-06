@@ -1,7 +1,8 @@
-//! Integration test: `NTtyLdisc` is wired into PS/2 + serial rx so a byte
-//! arriving via `tty.ldisc.receive_byte()` actually drives the N_TTY
-//! state machine — generates SIGINT for VINTR and commits canonical-mode
-//! lines into the raw ring (#474).
+//! Integration test: `NTtyLdisc` is wired into the shared console tty
+//! that PS/2 + serial rx both feed, so a byte arriving via
+//! `tty.ldisc.receive_byte()` actually drives the N_TTY state machine —
+//! generates SIGINT for VINTR and commits canonical-mode lines into the
+//! raw ring (#474 / #898).
 
 #![no_std]
 #![no_main]
@@ -78,29 +79,27 @@ fn pending_bits_for_pid(pid: u32) -> u64 {
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
-/// The PS/2 console tty must have an NTtyLdisc attached, not the
-/// passthrough — this is the actual wiring the issue is about.
+/// The PS/2 path must return the shared console tty which has an
+/// NTtyLdisc attached, not a passthrough.
 fn ps2_ldisc_is_ntty() {
     let tty = vibix::tty::ps2::tty();
-    // Push a byte that has no special meaning under default termios, then
-    // observe behaviour: PassthroughLdisc::receive_byte was a no-op (no
-    // observable side effect), NTtyLdisc on a default tty has no fg pgrp
-    // and ICANON on, so the byte should flow into the line buffer (no
-    // raw-ring commit yet, no signal). The test for "wiring is real" is
-    // simply that the call doesn't panic and that the next subtests pass
-    // against an equivalent locally-constructed NTtyLdisc.
+    // Both ps2::tty() and serial::tty() now return console_tty(),
+    // which is initialised with NTtyLdisc. Push a byte and confirm no
+    // panic — deeper assertions happen in the locally-constructed
+    // NTtyLdisc subtests below.
     tty.ldisc.receive_byte(&tty, b'a');
-    // Idempotent + no panic is the only assertion we make here — the
-    // global ttys carry no test pgrp set up, so a deeper assertion
-    // would be racy with whatever other tests left behind. The fact
-    // that we got a non-PassthroughLdisc into PS2_TTY is verified at
-    // compile time by serial_ldisc_is_ntty's symmetrical assertion
-    // and by the type-driven dispatch the caller relies on.
 }
 
 fn serial_ldisc_is_ntty() {
     let tty = vibix::tty::serial::tty();
     tty.ldisc.receive_byte(&tty, b'a');
+    // Both sources must return the same Arc<Tty> — they share one
+    // console tty so userspace sees a single stdin.
+    let ps2 = vibix::tty::ps2::tty();
+    assert!(
+        Arc::ptr_eq(&tty, &ps2),
+        "serial::tty() and ps2::tty() must return the same console tty"
+    );
 }
 
 /// Pushing VINTR through the public `ldisc.receive_byte` surface — i.e.

@@ -259,13 +259,17 @@ impl Default for Tty {
 /// until then every legacy `/dev/*` open refers to the same `Arc<Tty>` so
 /// session/pgrp identity is shared across fds as POSIX expects.
 ///
-/// The driver is [`framebuffer::DualDriver`], which writes to both serial
-/// (for CI smoke markers) and the framebuffer (for on-screen display).
+/// Uses [`NTtyLdisc`](ntty::NTtyLdisc) so bytes arriving from both the
+/// serial UART and the PS/2 keyboard flow through the canonical-mode /
+/// ISIG / echo pipeline. Output (echo, `write()`) goes through
+/// [`DualDriver`](framebuffer::DualDriver) to both serial and
+/// framebuffer.
 #[cfg(target_os = "none")]
 pub static CONSOLE_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
+    let dispatch: Arc<dyn ntty::SignalDispatch> = Arc::new(ntty::KernelSignalDispatch);
     Arc::new(Tty::with_driver(
         Arc::new(framebuffer::DualDriver),
-        Arc::new(PassthroughLdisc::new()) as Arc<dyn LineDiscipline>,
+        Arc::new(ntty::NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
     ))
 });
 

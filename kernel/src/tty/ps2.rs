@@ -1,37 +1,28 @@
-//! PS/2 keyboard rx path routed through [`Tty`] + [`LineDiscipline`].
+//! PS/2 keyboard rx path routed through the shared console
+//! [`Tty`](super::Tty) + [`NTtyLdisc`](super::ntty::NTtyLdisc).
 //!
-//! Issue #405. The hardware ISR in
+//! Issue #405 / #898. The hardware ISR in
 //! [`crate::arch::x86_64::interrupts::keyboard_interrupt`] calls
 //! [`push_scancode_from_isr`], which pushes the raw scancode byte into a
 //! [`DeferredByteRing`] and latches `SoftIrq::PS2Rx`. On the next
 //! [`crate::task::softirq::drain`] tick the registered handler drains the
 //! ring, feeds each scancode through a `pc_keyboard` state machine, and
 //! forwards every decoded Unicode byte (UTF-8) into
-//! `tty.ldisc.receive_byte(&tty, b)`.
+//! `console_tty().ldisc.receive_byte(...)`.
 //!
-//! The default line discipline is [`PassthroughLdisc::new`], which drops
-//! bytes on the floor. This keeps behaviour identical to the pre-#405
-//! world (the shell still reads keystrokes via [`crate::input`]'s
-//! untouched SCANCODES ring) while establishing the pipe that N_TTY
-//! (#375) will hook into once it lands.
+//! Both PS/2 and serial feed the same [`CONSOLE_TTY`](super::CONSOLE_TTY)
+//! so userspace sees a single stdin regardless of input source.
 //!
 //! A second `pc_keyboard::Keyboard` instance lives here rather than
 //! sharing the one in [`crate::input`]; the shell-side consumer and the
 //! softirq drainer must not contend on a single decoder's modifier
-//! state. This duplication goes away when N_TTY replaces the shell's
-//! direct `input::read_key` consumer.
+//! state.
 
 use crate::tty::ring::DeferredByteRing;
 use crate::tty::TtyDriver;
 
 #[cfg(target_os = "none")]
 use crate::task::softirq::{self, SoftIrq};
-#[cfg(target_os = "none")]
-use crate::tty::ntty::{KernelSignalDispatch, NTtyLdisc, SignalDispatch};
-#[cfg(target_os = "none")]
-use crate::tty::{LineDiscipline, Tty};
-#[cfg(target_os = "none")]
-use alloc::sync::Arc;
 #[cfg(target_os = "none")]
 use pc_keyboard::{layouts::Us104Key, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 #[cfg(target_os = "none")]
@@ -56,15 +47,6 @@ impl TtyDriver for Ps2Driver {
 }
 
 #[cfg(target_os = "none")]
-static PS2_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
-    let dispatch: Arc<dyn SignalDispatch> = Arc::new(KernelSignalDispatch);
-    Arc::new(Tty::with_driver(
-        Arc::new(Ps2Driver),
-        Arc::new(NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
-    ))
-});
-
-#[cfg(target_os = "none")]
 static DECODER: Lazy<Mutex<Keyboard<Us104Key, ScancodeSet1>>> = Lazy::new(|| {
     Mutex::new(Keyboard::new(
         ScancodeSet1::new(),
@@ -73,19 +55,23 @@ static DECODER: Lazy<Mutex<Keyboard<Us104Key, ScancodeSet1>>> = Lazy::new(|| {
     ))
 });
 
-/// Accessor for the global PS/2 tty. Lazy-initialised; safe to call
-/// after [`init`] has run, and tolerable before (tests may touch it).
+/// Return the console tty that PS/2 keyboard input feeds into.
+///
+/// This is the same [`CONSOLE_TTY`](super::CONSOLE_TTY) that serial
+/// input feeds and that userspace reads from — both input sources
+/// share a single N_TTY line discipline.
 #[cfg(target_os = "none")]
-pub fn tty() -> Arc<Tty> {
-    PS2_TTY.clone()
+pub fn tty() -> alloc::sync::Arc<super::Tty> {
+    super::console_tty()
 }
 
 /// Called from the keyboard ISR after
 /// [`crate::input::push_scancode_from_isr`]. Pushes the raw scancode
 /// byte into [`PS2_RX_RING`] and latches `SoftIrq::PS2Rx`; any subsequent
 /// `softirq::drain` tick picks it up. Scancodes that can't fit are
-/// silently dropped — this is a best-effort observation path. The
-/// authoritative rx buffer for the shell is still `input::SCANCODES`.
+/// silently dropped. The legacy `input::SCANCODES` ring is still fed in
+/// parallel for the kernel shell; see `input.rs` for the dual-consumer
+/// note.
 #[cfg(target_os = "none")]
 pub fn push_scancode_from_isr(code: u8) {
     let _ = PS2_RX_RING.push(code);
@@ -114,20 +100,22 @@ fn decode_and_forward(code: u8) {
     let Some(DecodedKey::Unicode(c)) = key else {
         return;
     };
-    let tty = PS2_TTY.clone();
+    let tty = super::console_tty();
     let mut buf = [0u8; 4];
     for &b in c.encode_utf8(&mut buf).as_bytes() {
         tty.ldisc.receive_byte(&tty, b);
     }
 }
 
-/// Boot-time wiring. Forces [`PS2_TTY`] initialisation and registers the
-/// soft-IRQ drain handler. Must be called before the PS/2 IRQ is
-/// unmasked (see [`softirq::register`] docs for the "register before
-/// enabling the IRQ" convention).
+/// Boot-time wiring. Forces [`CONSOLE_TTY`](super::CONSOLE_TTY) and the
+/// scancode decoder, then registers the soft-IRQ drain handler. Must be
+/// called before the PS/2 IRQ is unmasked (see [`softirq::register`]
+/// docs for the "register before enabling the IRQ" convention).
 #[cfg(target_os = "none")]
 pub fn init() {
-    Lazy::force(&PS2_TTY);
+    // Ensure the shared console tty is initialised before the ISR can
+    // fire — the drain handler references it on every tick.
+    Lazy::force(&super::CONSOLE_TTY);
     Lazy::force(&DECODER);
     softirq::register(SoftIrq::PS2Rx, ps2_softirq_drain);
 }
