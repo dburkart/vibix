@@ -17,6 +17,9 @@
 //! - `set` — set/unset shell options and positional parameters.
 //! - `.` (dot/source) — execute commands from a file in the current
 //!   environment.
+//! - `pwd` — print the current working directory.
+//! - `clear` — clear the terminal screen.
+//! - `help` — list builtins or show help for a specific builtin.
 
 use crate::expand::Environment;
 use crate::job::JobTable;
@@ -40,6 +43,9 @@ pub fn is_builtin(name: &str) -> bool {
             | "jobs"
             | "fg"
             | "bg"
+            | "pwd"
+            | "clear"
+            | "help"
     )
 }
 
@@ -67,6 +73,9 @@ pub fn run_builtin(name: &str, args: &[String], env: &mut Environment) -> i32 {
         "exec" => builtin_exec(args, env),
         "set" => builtin_set(args, env),
         "." => builtin_dot(args, env),
+        "pwd" => builtin_pwd(args, env),
+        "clear" => builtin_clear(),
+        "help" => builtin_help(args),
         // Job-control builtins without a job table — this path should
         // not normally be taken (exec.rs dispatches them via
         // run_job_builtin instead), but handle gracefully.
@@ -1078,6 +1087,87 @@ fn builtin_bg(args: &[String], env: &mut Environment, jobs: &mut JobTable) -> i3
     0
 }
 
+// ── pwd ───────────────────────────────────────────────────────────
+
+/// Print the current working directory.
+///
+/// - `pwd` — print `$PWD`. If `$PWD` is unset, fall back to
+///   `std::env::current_dir()`.
+fn builtin_pwd(_args: &[String], env: &mut Environment) -> i32 {
+    if let Some(pwd) = env.get("PWD") {
+        println!("{pwd}");
+    } else {
+        match std::env::current_dir() {
+            Ok(p) => println!("{}", p.display()),
+            Err(e) => {
+                eprintln!("sh: pwd: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+// ── clear ─────────────────────────────────────────────────────────
+
+/// Clear the terminal screen.
+///
+/// Writes the ANSI escape sequence to clear the screen and move the
+/// cursor to the home position. The kernel's VT100 parser handles
+/// these sequences.
+fn builtin_clear() -> i32 {
+    print!("\x1b[2J\x1b[H");
+    0
+}
+
+// ── help ──────────────────────────────────────────────────────────
+
+/// Static table of (name, short_desc, long_desc) for each builtin.
+const BUILTIN_HELP: &[(&str, &str, &str)] = &[
+    ("cd", "Change the working directory.", "cd [DIR]\n  cd        — go to $HOME.\n  cd -      — go to $OLDPWD and print the new directory.\n  cd DIR    — go to DIR.\n  Updates $OLDPWD and $PWD."),
+    ("exit", "Exit the shell.", "exit [N]\n  Exit the shell with status N (default: $?)."),
+    ("export", "Mark variables for export.", "export [NAME[=VALUE] ...]\n  export          — list all exported variables.\n  export NAME     — mark NAME for export.\n  export NAME=VAL — set NAME to VAL and mark for export."),
+    ("unset", "Remove shell variables.", "unset [-fv] NAME ...\n  -v  Unset variables (default).\n  -f  Unset functions (not yet supported)."),
+    ("echo", "Print arguments to stdout.", "echo [-n] [ARG ...]\n  -n  Suppress trailing newline."),
+    ("test", "Evaluate conditional expressions.", "test EXPR\n  Evaluate EXPR and return 0 (true) or 1 (false).\n  Supports string, integer, and file tests."),
+    ("[", "Evaluate conditional expressions.", "[ EXPR ]\n  Same as test, but requires a closing ]."),
+    ("read", "Read a line from stdin.", "read [VAR ...]\n  read          — read into $REPLY.\n  read VAR      — read entire line into VAR.\n  read A B C    — split on IFS; last var gets remainder."),
+    ("exec", "Replace the shell with a command.", "exec [CMD [ARG ...]]\n  Replace the shell process with CMD.\n  With no CMD, redirections apply to the shell itself."),
+    ("set", "Set shell options or positional parameters.", "set [OPTION | -- ARG ...]\n  set          — list all variables.\n  set -e / +e  — enable/disable errexit.\n  set -x / +x  — enable/disable xtrace.\n  set -- A B   — set positional parameters."),
+    (".", "Execute commands from a file.", ". FILE [ARG ...]\n  Read and execute commands from FILE in the current\n  shell environment."),
+    ("jobs", "List active jobs.", "jobs\n  Print one line per active job showing its number,\n  status, and the original command string."),
+    ("fg", "Bring a job to the foreground.", "fg [%N]\n  fg      — bring the current job to the foreground.\n  fg %N   — bring job N to the foreground."),
+    ("bg", "Resume a stopped job in the background.", "bg [%N]\n  bg      — resume the current stopped job.\n  bg %N   — resume job N in the background."),
+    ("pwd", "Print the current working directory.", "pwd\n  Print the value of $PWD. If $PWD is unset, fall back\n  to the OS current directory."),
+    ("clear", "Clear the terminal screen.", "clear\n  Write ANSI escape sequences to clear the screen and\n  move the cursor to the home position."),
+    ("help", "Display help for builtins.", "help [BUILTIN]\n  help          — list all builtins with short descriptions.\n  help BUILTIN  — show detailed help for BUILTIN."),
+];
+
+/// Display help for builtins.
+///
+/// - `help` — list all builtins with one-line descriptions.
+/// - `help NAME` — show detailed help for a specific builtin.
+fn builtin_help(args: &[String]) -> i32 {
+    if args.is_empty() {
+        println!("Shell builtins:");
+        for (name, short, _) in BUILTIN_HELP {
+            println!("  {name:10} {short}");
+        }
+        return 0;
+    }
+
+    let name = args[0].as_str();
+    for (n, _short, long) in BUILTIN_HELP {
+        if *n == name {
+            println!("{long}");
+            return 0;
+        }
+    }
+
+    eprintln!("sh: help: no help for `{name}'");
+    1
+}
+
 // ── Job spec parsing ──────────────────────────────────────────────
 
 /// Parse a job specification like `%1` or `1` into a job ID.
@@ -1843,6 +1933,105 @@ mod tests {
         let mut jobs = JobTable::new();
         // jobs with empty table should succeed
         let status = run_job_builtin("jobs", &args(&[]), &mut e, &mut jobs);
+        assert_eq!(status, 0);
+    }
+
+    // ── pwd ────────────────────────────────────────────────────────
+
+    #[test]
+    fn pwd_prints_env_pwd() {
+        let mut e = env();
+        e.set("PWD", "/home/user", None);
+        let status = builtin_pwd(&args(&[]), &mut e);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn pwd_fallback_when_unset() {
+        let mut e = env();
+        // PWD is not set — should fall back to std::env::current_dir()
+        let status = builtin_pwd(&args(&[]), &mut e);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn is_builtin_recognizes_pwd() {
+        assert!(is_builtin("pwd"));
+    }
+
+    #[test]
+    fn dispatch_pwd() {
+        let mut e = env();
+        e.set("PWD", "/tmp", None);
+        let status = run_builtin("pwd", &args(&[]), &mut e);
+        assert_eq!(status, 0);
+    }
+
+    // ── clear ──────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_returns_zero() {
+        let status = builtin_clear();
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn is_builtin_recognizes_clear() {
+        assert!(is_builtin("clear"));
+    }
+
+    #[test]
+    fn dispatch_clear() {
+        let mut e = env();
+        let status = run_builtin("clear", &args(&[]), &mut e);
+        assert_eq!(status, 0);
+    }
+
+    // ── help ───────────────────────────────────────────────────────
+
+    #[test]
+    fn help_no_args_lists_all() {
+        let status = builtin_help(&args(&[]));
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn help_known_builtin() {
+        let status = builtin_help(&args(&["cd"]));
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn help_unknown_builtin() {
+        let status = builtin_help(&args(&["nosuch"]));
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn help_each_builtin_has_entry() {
+        // Verify every builtin recognized by is_builtin has a help entry.
+        let known = [
+            "cd", "exit", "export", "unset", "echo", "test", "[", "read",
+            "exec", "set", ".", "jobs", "fg", "bg", "pwd", "clear", "help",
+        ];
+        for name in &known {
+            assert_eq!(
+                builtin_help(&args(&[name])),
+                0,
+                "missing help entry for `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn is_builtin_recognizes_help() {
+        assert!(is_builtin("help"));
+    }
+
+    #[test]
+    fn dispatch_help() {
+        let mut e = env();
+        let status = run_builtin("help", &args(&[]), &mut e);
         assert_eq!(status, 0);
     }
 }
