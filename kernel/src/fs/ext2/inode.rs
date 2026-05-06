@@ -177,9 +177,9 @@ pub struct Ext2Inode {
     /// Driver-side outstanding-opens refcount. Bumped by
     /// [`FileOps::open`] (one per successful `OpenFile::new`) and
     /// decremented by [`FileOps::release`] (one per `OpenFile::Drop`).
-    /// When [`unlinked`](Self::unlinked) is set and this count
-    /// transitions from one to zero, the `release` hook calls
-    /// [`super::orphan_finalize::finalize`] directly to drive the
+    /// When [`unlinked`](Self::unlinked) is set and **both** this count
+    /// and [`map_count`](Self::map_count) are zero, the `release` hook
+    /// calls [`super::orphan_finalize::finalize`] directly to drive the
     /// RFC 0004 §Final-close sequence — bypassing the VFS
     /// `gc_queue`/`evict_inode` indirection that would otherwise be
     /// blocked by the orphan-list `Arc<Inode>` pin (chicken-and-egg:
@@ -188,6 +188,15 @@ pub struct Ext2Inode {
     /// trigger eviction). See issue #638 / RFC 0004 §Wiring the
     /// production trigger.
     pub open_count: AtomicU32,
+    /// Outstanding mmap refcount. Bumped by [`FileOps::mmap`] (one per
+    /// `FileObject` constructed) and decremented by
+    /// [`Ext2MmapGuard::drop`] (one per `FileObject` dropped). This
+    /// pins the inode against orphan finalization independently of
+    /// `open_count` — a `FileObject` can outlive its originating
+    /// `OpenFile`, so `unlink() + mmap() + close()` must not trigger
+    /// finalize while a mapping can still fault through the cache.
+    /// See issue #811.
+    pub map_count: AtomicU32,
 }
 
 impl Ext2Inode {
@@ -199,6 +208,63 @@ impl Ext2Inode {
             block_map: BlockingRwLock::new(None),
             unlinked: AtomicBool::new(false),
             open_count: AtomicU32::new(0),
+            map_count: AtomicU32::new(0),
+        }
+    }
+
+    /// Try to run orphan finalization if both `open_count` and
+    /// `map_count` have reached zero and the inode is unlinked.
+    /// Called from [`Self::release`] and from [`Ext2MmapGuard::drop`].
+    fn try_finalize_orphan(&self) {
+        if self.open_count.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        if self.map_count.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        if !self.unlinked.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(super_arc) = self.super_ref.upgrade() else {
+            // Mount is mid-teardown; the orphan-list pin will be
+            // released when the per-super state drops, and any leaked
+            // on-disk state is recovered by mount-replay on the next
+            // boot.
+            return;
+        };
+        if let Err(e) = super::orphan_finalize::finalize(&super_arc, self.ino) {
+            crate::kwarn!(
+                "ext2: finalize ino {}: errno={}, leaving pin for replay",
+                self.ino,
+                e,
+            );
+        }
+    }
+}
+
+/// Guard that pins an ext2 inode's `map_count` for the lifetime of a
+/// `FileObject`. When this guard is dropped (via the `FileObject`'s
+/// `_mmap_guard` field), `map_count` is decremented and orphan
+/// finalization is attempted if both counts have reached zero. See
+/// issue #811.
+pub struct Ext2MmapGuard {
+    ext2_inode: alloc::sync::Arc<Ext2Inode>,
+}
+
+impl Ext2MmapGuard {
+    /// Create a new guard, bumping `map_count` by one.
+    pub fn new(ext2_inode: alloc::sync::Arc<Ext2Inode>) -> Self {
+        ext2_inode.map_count.fetch_add(1, Ordering::SeqCst);
+        Self { ext2_inode }
+    }
+}
+
+impl Drop for Ext2MmapGuard {
+    fn drop(&mut self) {
+        let prev = self.ext2_inode.map_count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "Ext2MmapGuard::drop: map_count underflow");
+        if prev == 1 {
+            self.ext2_inode.try_finalize_orphan();
         }
     }
 }
@@ -473,10 +539,10 @@ impl FileOps for Ext2Inode {
     }
 
     /// Decrement the outstanding-opens refcount. If the count
-    /// transitions from one to zero AND the inode is unlinked
-    /// (i.e. on the per-mount [`OrphanList`]), drive the RFC 0004
-    /// §Final-close sequence synchronously via
-    /// [`super::orphan_finalize::finalize`].
+    /// transitions from one to zero AND [`map_count`](Self::map_count)
+    /// is also zero AND the inode is unlinked (i.e. on the per-mount
+    /// [`OrphanList`]), drive the RFC 0004 §Final-close sequence
+    /// synchronously via [`super::orphan_finalize::finalize`].
     ///
     /// This is the in-kernel production trigger for orphan-finalize
     /// (issue #638). The VFS `gc_queue` / `evict_inode` indirection
@@ -501,29 +567,10 @@ impl FileOps for Ext2Inode {
         if prev != 1 {
             return;
         }
-        // Last close. If the inode is unlinked, run finalize. The
-        // `unlinked` atomic is set by `unlink::push_on_orphan_list`'s
-        // caller before the orphan-list pin is installed, so reading
-        // `true` here is sufficient evidence that the orphan_list
-        // entry exists (or will be observed by `finalize`'s ENOENT
-        // path otherwise — idempotent).
-        if !self.unlinked.load(Ordering::SeqCst) {
-            return;
-        }
-        let Some(super_arc) = self.super_ref.upgrade() else {
-            // Mount is mid-teardown; the orphan-list pin will be
-            // released when the per-super state drops, and any leaked
-            // on-disk state is recovered by mount-replay on the next
-            // boot.
-            return;
-        };
-        if let Err(e) = super::orphan_finalize::finalize(&super_arc, self.ino) {
-            crate::kwarn!(
-                "ext2: open_count→0 finalize ino {}: errno={}, leaving pin for replay",
-                self.ino,
-                e,
-            );
-        }
+        // Last close — but mappings may still be live. Defer orphan
+        // finalization until every `FileObject` derived from this
+        // inode has been dropped (map_count reaches zero). Issue #811.
+        self.try_finalize_orphan();
     }
 
     /// Build a [`FileObject`] (RFC 0007 §FileObject) for an `mmap(2)`
@@ -638,13 +685,28 @@ impl FileOps for Ext2Inode {
             })
             .unwrap_or(false);
 
-        let fo = crate::mem::file_object::FileObject::new(
+        // Build an mmap guard that pins `map_count` for the lifetime
+        // of the returned `FileObject`. This prevents orphan finalization
+        // from running while the mapping can still page-fault through the
+        // cache — issue #811.
+        let guard = {
+            let super_ref = self.super_ref.upgrade().ok_or(EIO)?;
+            let ecache = super_ref.ext2_inode_cache.lock();
+            let ext2_arc = ecache
+                .get(&self.ino)
+                .and_then(alloc::sync::Weak::upgrade)
+                .ok_or(EIO)?;
+            Ext2MmapGuard::new(ext2_arc)
+        };
+
+        let fo = crate::mem::file_object::FileObject::new_with_guard(
             cache,
             file_offset_pages,
             len_pages,
             share,
             open_mode,
             exec_allowed,
+            Some(alloc::boxed::Box::new(guard)),
         );
         Ok(fo as alloc::sync::Arc<dyn crate::mem::vmobject::VmObject>)
     }

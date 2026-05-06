@@ -215,6 +215,11 @@ fn mmap_returns_file_object_against_lazy_page_cache() {
     assert_eq!(obj1.len_pages(), Some(1));
     assert_eq!(obj2.len_pages(), Some(1));
 
+    // Drop mapped objects before the open file / inode / superblock so
+    // the mmap guard's map_count decrement fires while the mount is
+    // still live. Issue #811.
+    drop(obj1);
+    drop(obj2);
     drop(of);
     drop(inode);
     sb.ops.unmount();
