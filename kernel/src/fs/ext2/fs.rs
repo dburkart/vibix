@@ -479,7 +479,7 @@ impl FileSystem for Ext2Fs {
             sb_disk: spin::Mutex::new(sb_after_stamp),
             bgdt: spin::Mutex::new(bgdt),
             ext2_flags,
-            force_ro_latch: AtomicBool::new(false),
+            force_ro_latch: Arc::new(AtomicBool::new(false)),
             owner: self.self_ref.clone(),
             inode_cache: super::inode::new_inode_cache(),
             ext2_inode_cache: super::inode::new_ext2_inode_cache(),
@@ -487,6 +487,14 @@ impl FileSystem for Ext2Fs {
             alloc_mutex: spin::Mutex::new(()),
             self_ref: weak.clone(),
         });
+
+        // Wire the force-RO latch into the buffer cache so that
+        // `sync_dirty_buffer` trips it on any device-write failure
+        // (issue #806).  Must happen after `super_ops` is constructed
+        // because the `Arc<AtomicBool>` lives inside `Ext2Super`.
+        super_ops
+            .cache
+            .set_sync_error_latch(Arc::clone(&super_ops.force_ro_latch));
 
         let sb = Arc::new(SuperBlock::new(
             fs_id,
@@ -580,10 +588,15 @@ pub struct Ext2Super {
     pub ext2_flags: Ext2MountFlags,
     /// Runtime force-RO latch. Set by write paths that detect on-disk
     /// inconsistency (RFC 0004 §Security: e.g. block-bitmap double-free
-    /// → EIO + force-RO). Once `true`, [`Self::is_writable`] returns
-    /// `false` so subsequent writes refuse with [`EROFS`]. The latch is
-    /// a one-way set; clearing requires re-mount.
-    pub force_ro_latch: AtomicBool,
+    /// → EIO + force-RO) **and** by the buffer cache on any
+    /// `sync_dirty_buffer` device-write failure (issue #806). Once
+    /// `true`, [`Self::is_writable`] returns `false` so subsequent
+    /// writes refuse with [`EROFS`]. The latch is a one-way set;
+    /// clearing requires re-mount.
+    ///
+    /// Wrapped in `Arc` so the same `AtomicBool` can be shared with
+    /// [`BlockCache::set_sync_error_latch`].
+    pub force_ro_latch: Arc<AtomicBool>,
     /// Back-reference to the owning factory so `unmount` can clear the
     /// single-mount latch. `Weak` breaks the `Ext2Fs → SuperBlock →
     /// Ext2Super → Ext2Fs` cycle.

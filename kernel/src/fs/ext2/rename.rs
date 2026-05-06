@@ -62,7 +62,7 @@ use super::disk::{
     EXT2_FT_BLKDEV, EXT2_FT_CHRDEV, EXT2_FT_DIR, EXT2_FT_FIFO, EXT2_FT_REG_FILE, EXT2_FT_SOCK,
     EXT2_FT_SYMLINK,
 };
-use super::fs::{Ext2MountFlags, Ext2Super};
+use super::fs::Ext2Super;
 use super::inode::{iget, Ext2Inode};
 use super::unlink::{
     decrement_used_dirs, dir_is_empty, ext2_inode_from_vfs, locate_dirent, now_secs,
@@ -237,9 +237,7 @@ pub fn rename(
     new_name: &[u8],
 ) -> Result<(), i64> {
     let super_ = old_parent.super_ref.upgrade().ok_or(EIO)?;
-    if super_.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_.is_writable() {
         return Err(EROFS);
     }
 

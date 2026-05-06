@@ -70,7 +70,7 @@ use super::balloc::alloc_block;
 use super::disk::{
     Ext2Inode as DiskInode, EXT2_INODE_SIZE_V0, EXT2_N_BLOCKS, RO_COMPAT_LARGE_FILE,
 };
-use super::fs::{Ext2MountFlags, Ext2Super};
+use super::fs::Ext2Super;
 use super::indirect::{
     resolve_block, Geometry, MetadataMap, WalkError, EXT2_DIND_BLOCK, EXT2_DIRECT_BLOCKS,
     EXT2_IND_BLOCK, EXT2_TIND_BLOCK,
@@ -670,9 +670,7 @@ pub fn write_file_at(
 
     let super_ref = ext2_inode.super_ref.upgrade().ok_or(EIO)?;
 
-    if super_ref.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_ref.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_ref.is_writable() {
         return Err(EROFS);
     }
     if buf.is_empty() {

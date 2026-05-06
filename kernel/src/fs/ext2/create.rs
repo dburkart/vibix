@@ -78,7 +78,7 @@ use super::disk::{
     EXT2_FT_CHRDEV, EXT2_FT_DIR, EXT2_FT_FIFO, EXT2_FT_REG_FILE, EXT2_FT_SOCK, EXT2_INODE_SIZE_V0,
     EXT2_N_BLOCKS,
 };
-use super::fs::{Ext2MountFlags, Ext2Super};
+use super::fs::Ext2Super;
 use super::ialloc::{alloc_inode, free_inode};
 use super::inode::{iget, Ext2Inode};
 
@@ -237,9 +237,7 @@ fn create_common(
     name: &[u8],
     nn: NewNode,
 ) -> Result<Arc<Inode>, i64> {
-    if super_.ext2_flags.contains(Ext2MountFlags::RDONLY)
-        || super_.ext2_flags.contains(Ext2MountFlags::FORCED_RDONLY)
-    {
+    if !super_.is_writable() {
         return Err(EROFS);
     }
     validate_name(name)?;
@@ -374,11 +372,18 @@ fn create_common(
                 // stale parent `i_links_count`; it cannot reconcile a
                 // dirent whose target inode has been handed back to the
                 // allocator under concurrent reads.
-            } else {
+            } else if super_.is_writable() {
                 // Pre-link unwind: free the data block first (if we
                 // allocated one for a dir), then the inode. Log-and-
                 // drop secondary failures — we already have an error
                 // to propagate.
+                //
+                // Guard: only roll back when the mount is still
+                // writable. If a sync_dirty_buffer failure already
+                // tripped the force-RO latch (issue #806), the bytes
+                // may be on disk and freeing would risk double-
+                // allocation. The bitmap leak is safe; e2fsck
+                // reclaims it.
                 if let Some(blk) = dir_block {
                     let _ = super::balloc::free_block(super_, blk);
                 }
@@ -530,7 +535,10 @@ pub(super) fn add_link(
     // Install the record at offset 0 with rec_len spanning the whole
     // block (so the next insert can split the slack cleanly).
     if let Err(e) = stamp_fresh_dir_block(super_, new_blk, child_ino, file_type, name, block_size) {
-        let _ = super::balloc::free_block(super_, new_blk);
+        // Only free if the mount is still writable (issue #806).
+        if super_.is_writable() {
+            let _ = super::balloc::free_block(super_, new_blk);
+        }
         return Err(e);
     }
 
@@ -542,7 +550,9 @@ pub(super) fn add_link(
     if let Err(e) =
         patch_parent_inode_block(super_, parent, free_idx, new_blk, new_size, block_size)
     {
-        let _ = super::balloc::free_block(super_, new_blk);
+        if super_.is_writable() {
+            let _ = super::balloc::free_block(super_, new_blk);
+        }
         return Err(e);
     }
 
