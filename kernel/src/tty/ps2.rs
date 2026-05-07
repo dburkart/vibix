@@ -56,11 +56,16 @@ impl TtyDriver for Ps2Driver {
 }
 
 #[cfg(target_os = "none")]
-static PS2_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
+static PS2_LDISC: Lazy<Arc<NTtyLdisc>> = Lazy::new(|| {
     let dispatch: Arc<dyn SignalDispatch> = Arc::new(KernelSignalDispatch);
+    Arc::new(NTtyLdisc::new(dispatch))
+});
+
+#[cfg(target_os = "none")]
+static PS2_TTY: Lazy<Arc<Tty>> = Lazy::new(|| {
     Arc::new(Tty::with_driver(
         Arc::new(Ps2Driver),
-        Arc::new(NTtyLdisc::new(dispatch)) as Arc<dyn LineDiscipline>,
+        PS2_LDISC.clone() as Arc<dyn LineDiscipline>,
     ))
 });
 
@@ -78,6 +83,18 @@ static DECODER: Lazy<Mutex<Keyboard<Us104Key, ScancodeSet1>>> = Lazy::new(|| {
 #[cfg(target_os = "none")]
 pub fn tty() -> Arc<Tty> {
     PS2_TTY.clone()
+}
+
+/// Pop a single committed byte from the PS/2 TTY's N_TTY raw ring.
+#[cfg(target_os = "none")]
+pub fn try_read_byte() -> Option<u8> {
+    PS2_LDISC.ntty().try_read_byte()
+}
+
+/// Number of committed bytes available for reading.
+#[cfg(target_os = "none")]
+pub fn reader_len() -> usize {
+    PS2_LDISC.ntty().reader_len()
 }
 
 /// Called from the keyboard ISR after

@@ -1,15 +1,16 @@
 //! Standard I/O helpers for vibix userspace.
 //!
-//! Provides `write_stdout` and `write_stderr` using the `writev` syscall
-//! (nr 20), which is the vectored-write primitive that std's `Stdout`/`Stderr`
-//! implementations call through.
+//! Provides `read_stdin`, `write_stdout` and `write_stderr` using the
+//! `readv`/`writev` syscalls (nr 19/20).
 
 use crate::syscall;
 
-/// `writev` syscall number (Linux x86_64).
+/// Syscall numbers (Linux x86_64).
+const SYS_READV: u64 = 19;
 const SYS_WRITEV: u64 = 20;
 
 /// Standard file descriptors.
+const STDIN_FD: u64 = 0;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
 
@@ -18,6 +19,16 @@ const STDERR_FD: u64 = 2;
 struct IoVec {
     iov_base: *const u8,
     iov_len: usize,
+}
+
+/// Read from stdin into `buf`. Returns the number of bytes read, or a
+/// negative errno on failure.
+pub fn read_stdin(buf: &mut [u8]) -> i64 {
+    let iov = IoVec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    unsafe { syscall::syscall3(SYS_READV, STDIN_FD, &iov as *const IoVec as u64, 1) }
 }
 
 /// Write `buf` to stdout.  Returns the number of bytes written, or a negative

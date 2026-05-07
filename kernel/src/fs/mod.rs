@@ -627,29 +627,45 @@ impl Default for SerialBackend {
 
 #[cfg(target_os = "none")]
 impl FileBackend for SerialBackend {
-    /// Non-blocking read: drains whatever bytes are currently in the RX ring.
+    /// Blocking read from the PS/2 keyboard's N_TTY line discipline.
     ///
-    /// Returns `EAGAIN` (`-11`) if no bytes are available. Callers that need
-    /// blocking semantics must re-try in a loop (the blocking wait-queue path
-    /// lives in a future `read` syscall extension).
+    /// Drains committed bytes from the N_TTY raw ring. If no data is
+    /// available, blocks on the TTY's read wait-queue until N_TTY
+    /// commits a line (canonical mode) or a byte (raw mode).
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
         let caller = crate::process::current_pid();
         let tty = crate::tty::console_tty();
         if let Some(rc) = crate::tty::tty_check_sigttin(&tty, caller) {
-            // KERN_ERESTARTSYS is honoured by the syscall trampoline
-            // (see `signal::check_and_deliver_signals`): restart on
-            // SA_RESTART, otherwise -EINTR.
             return Err(rc);
         }
-        for (i, byte) in buf.iter_mut().enumerate() {
-            match crate::serial::try_read_byte() {
-                Some(b) => *byte = b,
-                None => {
-                    return if i == 0 { Err(EAGAIN) } else { Ok(i) };
+        let ps2 = crate::tty::ps2::tty();
+        loop {
+            let mut i = 0;
+            while i < buf.len() {
+                match crate::tty::ps2::try_read_byte() {
+                    Some(b) => {
+                        buf[i] = b;
+                        i += 1;
+                    }
+                    None => break,
                 }
             }
+            if i > 0 {
+                return Ok(i);
+            }
+            if let Some(b) = crate::serial::try_read_byte() {
+                buf[0] = b;
+                return Ok(1);
+            }
+            let tid = crate::task::current_id();
+            let tok = ps2.read_wait.register_wait(tid);
+            if crate::tty::ps2::reader_len() > 0 {
+                ps2.read_wait.cancel(tok);
+                continue;
+            }
+            crate::task::block_current();
+            ps2.read_wait.cancel(tok);
         }
-        Ok(buf.len())
     }
 
     /// Write path acquires `COM1.lock()` inside `without_interrupts` via
@@ -668,6 +684,13 @@ impl FileBackend for SerialBackend {
             return Err(rc);
         }
         crate::serial::write_bytes(buf);
+        if let Ok(s) = core::str::from_utf8(buf) {
+            crate::framebuffer::_print(format_args!("{}", s));
+        } else {
+            for &b in buf {
+                crate::framebuffer::_print(format_args!("{}", b as char));
+            }
+        }
         Ok(buf.len())
     }
 

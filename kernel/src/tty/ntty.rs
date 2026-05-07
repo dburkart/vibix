@@ -14,6 +14,29 @@ use super::termios::{
 };
 use super::JobControl;
 
+#[cfg(target_os = "none")]
+use core::fmt::Write;
+
+/// Echo a string to the framebuffer console. Uses `try_lock` to avoid
+/// deadlocking when called from soft-IRQ context.
+#[cfg(target_os = "none")]
+fn fb_echo_str(s: &str) {
+    if let Some(mut guard) = crate::framebuffer::CONSOLE.try_lock() {
+        if let Some(c) = guard.as_mut() {
+            let _ = c.write_str(s);
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+fn fb_echo_byte(b: u8) {
+    if let Some(mut guard) = crate::framebuffer::CONSOLE.try_lock() {
+        if let Some(c) = guard.as_mut() {
+            let _ = c.write_char(b as char);
+        }
+    }
+}
+
 // Signal numbers mirrored here to keep `tty` buildable on host (the
 // real `crate::signal` module is gated on `target_os = "none"`). These
 // values must match `kernel/src/signal/mod.rs`.
@@ -234,6 +257,18 @@ impl NTty {
     /// drains previously-committed lines.
     pub fn reader_len(&self) -> usize {
         self.state.lock().raw.len()
+    }
+
+    /// Pop a single committed byte from the raw ring, or `None` if empty.
+    pub fn try_read_byte(&self) -> Option<u8> {
+        let mut st = self.state.lock();
+        if st.raw.len() == 0 {
+            return None;
+        }
+        let idx = st.raw.head & (RAW_RING_CAP - 1);
+        let b = st.raw.buf[idx];
+        st.raw.head = st.raw.head.wrapping_add(1);
+        Some(b)
     }
 
     /// Signal-aware entry point. Must be called before the hot
@@ -491,6 +526,20 @@ impl super::LineDiscipline for NTtyLdisc {
             byte,
         );
         if let Some(b) = surviving {
+            // Echo the byte to the tty output if ECHO is set.
+            #[cfg(target_os = "none")]
+            if termios.c_lflag & ECHO != 0 {
+                if b == b'\n' && termios.c_oflag & ONLCR != 0 {
+                    crate::serial::write_bytes(b"\r\n");
+                    fb_echo_str("\n");
+                } else if matches_cc(&termios, VERASE, b) {
+                    crate::serial::write_bytes(b"\x08 \x08");
+                    fb_echo_str("\x08 \x08");
+                } else {
+                    crate::serial::write_bytes(&[b]);
+                    fb_echo_byte(b);
+                }
+            }
             #[cfg(any(test, target_os = "none"))]
             {
                 let wake = WaitQueueWake(&tty.read_wait);

@@ -13,12 +13,21 @@ impl Stdin {
 }
 
 impl io::Read for Stdin {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        // Stdin reading not yet implemented.
-        Ok(0)
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let ret = vibix_abi::stdio::read_stdin(buf);
+        if ret < 0 {
+            Err(io::Error::from_raw_os_error(-ret as i32))
+        } else {
+            Ok(ret as usize)
+        }
     }
 
-    fn read_vectored(&mut self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        for buf in bufs {
+            if !buf.is_empty() {
+                return self.read(buf);
+            }
+        }
         Ok(0)
     }
 
