@@ -39,46 +39,35 @@ pub unsafe fn cleanup() {}
 
 /// Entry point for vibix userspace binaries.
 ///
-/// The kernel loads ELF binaries with entry point set to `_start`.
-/// Since vibix has no CRT, std provides the entry point directly.
-/// `main` is the symbol rustc generates that calls `lang_start`.
-///
 /// The kernel writes the standard SysV AMD64 initial stack layout:
-///   [rsp]       = argc
-///   [rsp + 8]   = argv[0]
-///   ...
-///   [rsp + 8*argc] = argv[argc-1]
-///   [rsp + 8*(argc+1)] = NULL (argv terminator)
-///   followed by envp and auxv.
+///   [rsp] = argc, [rsp+8..] = argv[], NULL, envp[], NULL, auxv[].
 ///
-/// We use `global_asm!` to emit a raw entry stub that reads argc/argv
-/// from the stack before any Rust prologue can disturb rsp, then calls
-/// `_start_rust(argc, argv)`.
+/// `main` is the C-level shim rustc generates; it calls `lang_start`
+/// which calls the PAL `init()` and then the user's `fn main()`.
+/// After `main` returns we call `exit_group`.
+///
+/// The naked attribute prevents the compiler from inserting a prologue
+/// that would shift rsp before we read the initial stack layout.
 #[cfg(not(test))]
-core::arch::global_asm!(
-    ".global _start",
-    "_start:",
-    "    mov rdi, [rsp]",      // argc
-    "    lea rsi, [rsp + 8]",  // argv
-    "    call _start_rust",
-    "    ud2",                  // unreachable
-);
-
-#[cfg(not(test))]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-unsafe extern "C" fn _start_rust(argc: isize, argv: *const *const u8) -> ! {
+extern "C" fn _start() -> ! {
     unsafe extern "C" {
         fn main(argc: isize, argv: *const *const u8) -> isize;
     }
-
-    let ret = unsafe { main(argc, argv) };
-
-    // exit_group(ret)
     unsafe {
-        vibix_abi::syscall::syscall1(231, ret as u64);
-    }
-    loop {
-        core::hint::spin_loop();
+        core::arch::naked_asm!(
+            // Read argc/argv from the initial stack
+            "mov rdi, [rsp]",
+            "lea rsi, [rsp + 8]",
+            "call {main}",
+            // exit_group(ret)
+            "mov rdi, rax",
+            "mov rax, 231",
+            "syscall",
+            "ud2",
+            main = sym main,
+        )
     }
 }
 

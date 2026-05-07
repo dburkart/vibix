@@ -1347,16 +1347,38 @@ pub fn exec_atomic_with_args(
         .insert_existing_frame(0, stack_frame.start_address().as_u64())
         .expect("execve: freshly-mapped user stack frame cannot be saturated");
     let stack_start = crate::init_process::USER_STACK_PAGE_VA as usize;
-    let stack_vma = Vma::new(
+    let stack_top = crate::init_process::USER_STACK_TOP as usize;
+    let mut stack_vma = Vma::new(
         stack_start,
-        stack_start + 4096,
+        stack_top,
         0x3,
         stack_flags.bits(),
         Share::Private,
         stack_obj as alloc::sync::Arc<dyn VmObject>,
         0,
     );
+    stack_vma.vma_flags = crate::mem::vmatree::VMA_GROWSDOWN;
     new_aspace.insert(stack_vma);
+
+    {
+        use crate::mem::pf::DEFAULT_STACK_RLIMIT;
+        let max_stack_bottom = (stack_top as u64)
+            .saturating_sub(DEFAULT_STACK_RLIMIT)
+            .saturating_sub(4096) as usize;
+        let guard_top = max_stack_bottom + 4096;
+        let guard_obj = AnonObject::new(Some(0));
+        let mut guard_vma = Vma::new(
+            max_stack_bottom,
+            guard_top,
+            0,
+            0,
+            Share::Private,
+            guard_obj as alloc::sync::Arc<dyn VmObject>,
+            0,
+        );
+        guard_vma.vma_flags = crate::mem::vmatree::VMA_STACK_GUARD;
+        new_aspace.insert(guard_vma);
+    }
 
     // 4. Commit. After this point we cannot fail back to the caller —
     //    the old address space is still alive on the task until we

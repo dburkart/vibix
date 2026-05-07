@@ -121,7 +121,9 @@ const PAGE_SIZE_ELF: u64 = 4096;
 pub fn compute_tls_layout(region_start: u64, info: &TlsInfo) -> (u64, u64, u64) {
     let align = if info.align < 2 { 1 } else { info.align };
     let tdata_start = (region_start + align - 1) & !(align - 1);
-    let tcb_va = tdata_start + info.total_size;
+    // TCB must be at least 8-byte aligned (contains a u64 self-pointer
+    // and FS-relative accesses assume natural alignment).
+    let tcb_va = (tdata_start + info.total_size + 7) & !7;
     let region_end = (tcb_va + TCB_SIZE + PAGE_SIZE_ELF - 1) & !(PAGE_SIZE_ELF - 1);
     let total_pages = (region_end - region_start) / PAGE_SIZE_ELF;
     (tdata_start - region_start, tcb_va, total_pages)

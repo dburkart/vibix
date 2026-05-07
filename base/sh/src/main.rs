@@ -77,7 +77,9 @@ fn main() {
         eprint!("$ ");
     }
 
-    for line in stdin.lock().lines() {
+    let locked = stdin.lock();
+
+    for line in locked.lines() {
         match line {
             Ok(input) => {
                 if input.is_empty() {
@@ -100,7 +102,9 @@ fn main() {
                     eprint!("$ ");
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                break;
+            }
         }
     }
 

@@ -180,8 +180,19 @@ pub fn write_initial_stack_with_args(
         argv_vas[i] = stack_page_user_va + offset as u64;
     }
 
-    // Align offset down to 8 bytes for the pointer/auxv array.
-    offset &= !7;
+    // SysV AMD64 ABI: rsp must be 16-byte aligned at process entry.
+    // We push a known number of 8-byte words below this point (auxv pairs,
+    // envp/argv pointer arrays + NULLs, and argc).  If that total is odd
+    // the final rsp would land on 8-mod-16, so we start at 8-mod-16 here
+    // to compensate.
+    let argc = argv.len().min(MAX_STRINGS);
+    let envp_count = envp.len().min(MAX_STRINGS);
+    let total_words = 16 /* auxv pairs */ + 1 /* envp NULL */ + envp_count
+        + 1 /* argv NULL */ + argc + 1 /* argc */;
+    offset &= !15; // 16-byte align
+    if total_words % 2 != 0 {
+        offset -= 8;
+    }
 
     // 3. Build auxv pairs (tag, value) top-down.
     push_u64(0, &mut offset); // AT_NULL value
@@ -210,14 +221,12 @@ pub fn write_initial_stack_with_args(
 
     // 4. envp pointer array (NULL-terminated).
     push_u64(0, &mut offset);
-    let envp_count = envp.len().min(MAX_STRINGS);
     for i in (0..envp_count).rev() {
         push_u64(envp_vas[i], &mut offset);
     }
 
     // 5. argv pointer array (NULL-terminated).
     push_u64(0, &mut offset);
-    let argc = argv.len().min(MAX_STRINGS);
     for i in (0..argc).rev() {
         push_u64(argv_vas[i], &mut offset);
     }
@@ -261,6 +270,10 @@ mod tests {
         buf[4096 - 16..4096].copy_from_slice(random_bytes);
         offset -= 16;
 
+        // 16-byte align (19 words = odd, so start at 8-mod-16)
+        offset &= !15;
+        offset -= 8;
+
         push(0, buf, &mut offset); // AT_NULL value
         push(AT_NULL, buf, &mut offset);
         push(STACK_PAGE_SIZE, buf, &mut offset);
@@ -299,6 +312,9 @@ mod tests {
 
         let rsp_offset =
             build_layout_into_buf(&mut page, stack_page_user_va, &params, &random_bytes);
+
+        let rsp = stack_page_user_va + rsp_offset as u64;
+        assert_eq!(rsp % 16, 0, "initial rsp must be 16-byte aligned (SysV ABI)");
 
         // argc == 0
         let argc = u64::from_le_bytes(page[rsp_offset..rsp_offset + 8].try_into().unwrap());
@@ -370,8 +386,14 @@ mod tests {
             argv_vas[i] = stack_page_user_va + offset as u64;
         }
 
-        // Align to 8.
-        offset &= !7;
+        // 16-byte align for SysV ABI.
+        let argc = argv.len().min(MAX_STRINGS);
+        let envp_count = envp.len().min(MAX_STRINGS);
+        let total_words = 16 + 1 + envp_count + 1 + argc + 1;
+        offset &= !15;
+        if total_words % 2 != 0 {
+            offset -= 8;
+        }
 
         // Auxv.
         push(0, buf, &mut offset);
@@ -393,14 +415,12 @@ mod tests {
 
         // envp pointers.
         push(0, buf, &mut offset);
-        let envp_count = envp.len().min(MAX_STRINGS);
         for i in (0..envp_count).rev() {
             push(envp_vas[i], buf, &mut offset);
         }
 
         // argv pointers.
         push(0, buf, &mut offset);
-        let argc = argv.len().min(MAX_STRINGS);
         for i in (0..argc).rev() {
             push(argv_vas[i], buf, &mut offset);
         }
@@ -437,6 +457,9 @@ mod tests {
             argv,
             envp,
         );
+
+        let rsp = stack_page_user_va + rsp_offset as u64;
+        assert_eq!(rsp % 16, 0, "initial rsp must be 16-byte aligned (SysV ABI)");
 
         // argc == 2
         let argc = u64::from_le_bytes(page[rsp_offset..rsp_offset + 8].try_into().unwrap());

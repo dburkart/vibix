@@ -115,7 +115,7 @@ pub fn open_inode(inode: &Arc<Inode>, dentry: &Arc<Dentry>) -> Result<Arc<OpenFi
 /// keep callers honest — a kernel-side `cp` or `cat` should stream
 /// instead (see [`stream_copy`]). Returns `EFBIG` if the source
 /// exceeds the cap.
-pub const READ_ALL_MAX: usize = 1 * 1024 * 1024;
+pub const READ_ALL_MAX: usize = 4 * 1024 * 1024;
 
 pub fn read_all(path: &[u8]) -> Result<Vec<u8>, i64> {
     let r = resolve(path, /* follow */ true)?;
