@@ -9,7 +9,11 @@ use crate::syscall;
 /// `writev` syscall number (Linux x86_64).
 const SYS_WRITEV: u64 = 20;
 
+/// `read` syscall number (Linux x86_64).
+const SYS_READ: u64 = 0;
+
 /// Standard file descriptors.
+const STDIN_FD: u64 = 0;
 const STDOUT_FD: u64 = 1;
 const STDERR_FD: u64 = 2;
 
@@ -30,6 +34,19 @@ pub fn write_stdout(buf: &[u8]) -> i64 {
 /// errno on failure.
 pub fn write_stderr(buf: &[u8]) -> i64 {
     writev(STDERR_FD, buf)
+}
+
+/// Read from stdin into `buf`. Returns the number of bytes read, or a negative
+/// errno on failure. Returns 0 on EOF.
+pub fn read_stdin(buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall::syscall3(
+            SYS_READ,
+            STDIN_FD,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
 }
 
 /// Issue a `writev` syscall with a single iovec entry.
