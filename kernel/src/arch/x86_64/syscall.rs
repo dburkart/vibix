@@ -918,6 +918,13 @@ pub unsafe extern "C" fn syscall_dispatch(
         // kill(pid, sig) — send signal to process.
         KILL => crate::signal::sys_kill(a0, a1),
 
+        // sigpending(set) — return the set of pending signals.
+        SIGPENDING => crate::signal::sys_sigpending(a0),
+
+        // sigsuspend(mask) — atomically replace signal mask, suspend until
+        // a signal is delivered, then restore the original mask.
+        SIGSUSPEND => crate::signal::sys_sigsuspend(a0),
+
         // ioctl(fd, cmd, arg) — device-specific control. Only the tty-like
         // `SerialBackend` handles non-trivial `cmd`s today; all other
         // backends inherit the `-ENOTTY` default.
@@ -2349,6 +2356,8 @@ pub mod syscall_nr {
     pub const GETRUSAGE: u64 = 98;
     pub const SETRLIMIT: u64 = 160;
     pub const PRLIMIT64: u64 = 302;
+    pub const SIGPENDING: u64 = 127;
+    pub const SIGSUSPEND: u64 = 130;
     pub const FUTEX: u64 = 202;
     pub const SET_TID_ADDRESS: u64 = 218;
 }
@@ -2405,6 +2414,8 @@ mod tests {
         assert_eq!(syscall_nr::SIGACTION, 13, "SYS_rt_sigaction must be 13");
         assert_eq!(syscall_nr::SIGPROCMASK, 14, "SYS_rt_sigprocmask must be 14");
         assert_eq!(syscall_nr::KILL, 62, "SYS_kill must be 62");
+        assert_eq!(syscall_nr::SIGPENDING, 127, "SYS_rt_sigpending must be 127");
+        assert_eq!(syscall_nr::SIGSUSPEND, 130, "SYS_rt_sigsuspend must be 130");
 
         // Poll / select
         assert_eq!(syscall_nr::POLL, 7, "SYS_poll must be 7");
