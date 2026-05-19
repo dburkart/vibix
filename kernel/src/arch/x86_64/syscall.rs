@@ -1269,6 +1269,20 @@ pub unsafe extern "C" fn syscall_dispatch(
         // set_tid_address(tidptr) — set clear_child_tid pointer, return TID.
         SET_TID_ADDRESS => super::syscalls::phase3::sys_set_tid_address(a0 as usize),
 
+        // getrlimit(resource, *rlim) — read resource limit (issue #927).
+        GETRLIMIT => super::syscalls::resource::sys_getrlimit(a0 as u32, a1 as usize),
+
+        // getrusage(who, *rusage) — read resource usage (issue #928).
+        GETRUSAGE => super::syscalls::resource::sys_getrusage(a0 as i32, a1 as usize),
+
+        // setrlimit(resource, *rlim) — write resource limit (issue #927).
+        SETRLIMIT => super::syscalls::resource::sys_setrlimit(a0 as u32, a1 as usize),
+
+        // prlimit64(pid, resource, *new_rlim, *old_rlim) — get/set limit (issue #927).
+        PRLIMIT64 => {
+            super::syscalls::resource::sys_prlimit64(a0 as u32, a1 as u32, a2 as usize, a3 as usize)
+        }
+
         _ => -38i64, // ENOSYS
     };
     // RFC 0006 / #718: syscall exit emit point. Records the same
@@ -2292,6 +2306,10 @@ pub mod syscall_nr {
     pub const CLONE: u64 = 56;
     pub const GETPPID: u64 = 110;
     pub const GETTID: u64 = 186;
+    pub const GETRLIMIT: u64 = 97;
+    pub const GETRUSAGE: u64 = 98;
+    pub const SETRLIMIT: u64 = 160;
+    pub const PRLIMIT64: u64 = 302;
     pub const FUTEX: u64 = 202;
     pub const SET_TID_ADDRESS: u64 = 218;
 }
@@ -2436,5 +2454,11 @@ mod tests {
         assert_eq!(syscall_nr::UNAME, 63, "SYS_uname must be 63");
         assert_eq!(syscall_nr::RENAME, 82, "SYS_rename must be 82");
         assert_eq!(syscall_nr::RENAMEAT, 264, "SYS_renameat must be 264");
+
+        // Resource limits / usage (issues #927, #928)
+        assert_eq!(syscall_nr::GETRLIMIT, 97, "SYS_getrlimit must be 97");
+        assert_eq!(syscall_nr::GETRUSAGE, 98, "SYS_getrusage must be 98");
+        assert_eq!(syscall_nr::SETRLIMIT, 160, "SYS_setrlimit must be 160");
+        assert_eq!(syscall_nr::PRLIMIT64, 302, "SYS_prlimit64 must be 302");
     }
 }

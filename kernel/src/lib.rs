@@ -43,7 +43,7 @@ macro_rules! fork_trace {
     ($($arg:tt)*) => {};
 }
 
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, target_os = "none", feature = "sched-mock"))]
 pub mod abi;
 #[cfg(any(test, target_os = "none"))]
 pub mod block;

@@ -9,3 +9,5 @@
 #![allow(non_camel_case_types)] // POSIX type names intentionally mirror C.
 
 pub mod posix_types;
+pub mod rlimit;
+pub mod rusage;
