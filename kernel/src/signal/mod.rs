@@ -204,6 +204,12 @@ pub struct SignalState {
     /// `SA_RESTART` is honoured today; other bits round-trip through
     /// `sigaction(2)` but are otherwise ignored.
     pub sa_flags: [u64; NSIG as usize],
+    /// Saved signal mask for `sigsuspend(2)`.  When `Some(mask)`, the
+    /// signal delivery path uses this as the `uc_sigmask` in the
+    /// `SigFrame` so that `sigreturn` restores the original mask
+    /// rather than the temporary one installed by `sigsuspend`.
+    /// Cleared after use.
+    pub saved_mask: Option<u64>,
 }
 
 impl SignalState {
@@ -217,6 +223,7 @@ impl SignalState {
             blocked: 0,
             dispositions,
             sa_flags: [0; NSIG as usize],
+            saved_mask: None,
         }
     }
 
@@ -243,6 +250,14 @@ impl SignalState {
         self.pending &= !bit;
         // Convert bit position back to 1-indexed signal number.
         Some(bit.trailing_zeros() as u8 + 1)
+    }
+
+    /// Return true if at least one signal is both pending and deliverable
+    /// (not blocked, or SIGKILL/SIGSTOP).
+    pub fn has_deliverable(&self) -> bool {
+        let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+        let deliverable = self.pending & (!self.blocked | unblockable);
+        deliverable != 0
     }
 
     /// Apply `sigprocmask(how, set)` and return the old mask.
@@ -439,6 +454,107 @@ pub fn sys_kill(pid: u64, sig: u64) -> i64 {
         return -3; // ESRCH — process group kill not implemented
     }
     raise_signal_on_pid(pid as u32, sig)
+}
+
+/// `sigpending(set_uva)` — return the set of signals that are both pending
+/// and blocked for the calling process.
+///
+/// `set_uva` is a user pointer to a `sigset_t` (u64 on Linux x86_64).
+/// On success the kernel writes the pending-and-blocked bitmap there.
+///
+/// # Safety
+/// `set_uva` is validated via `uaccess`.
+pub unsafe fn sys_sigpending(set_uva: u64) -> i64 {
+    if set_uva == 0 {
+        return -14; // EFAULT
+    }
+    let task_id = crate::task::current_id();
+    let result = crate::process::with_signal_state_for_task(task_id, |state| {
+        // POSIX: sigpending returns the intersection of pending and blocked.
+        let pending_blocked = state.pending & state.blocked;
+        if uaccess::copy_to_user(set_uva as usize, &pending_blocked.to_ne_bytes()).is_err() {
+            return -14i64; // EFAULT
+        }
+        0i64
+    });
+    result.unwrap_or(-3) // ESRCH
+}
+
+/// Per-task wait queue used by `sigsuspend`.  Tasks park here and are
+/// woken by [`raise_signal_on_task`] (which calls `task::wake`).
+///
+/// We use the same wake mechanism as the rest of the kernel: when a
+/// signal is raised on a task, `task::wake(task_id)` is called, which
+/// sets `wake_pending` and unblocks the task. The `WaitQueue` here
+/// gives `sigsuspend` a place to park; the `cond` closure checks
+/// whether a deliverable signal is pending under the temporary mask.
+pub static SIGSUSPEND_WAIT: crate::sync::WaitQueue = crate::sync::WaitQueue::new();
+
+/// `sigsuspend(mask_uva)` — atomically replace the signal mask, suspend
+/// until a signal is delivered, then restore the original mask.
+///
+/// Always returns `-EINTR` (via `KERN_ERESTARTSYS` so the trampoline's
+/// signal-delivery path runs before the syscall result reaches
+/// userspace).
+///
+/// `mask_uva` is a user pointer to a `sigset_t` (u64).
+///
+/// # Safety
+/// `mask_uva` is validated via `uaccess`.
+pub unsafe fn sys_sigsuspend(mask_uva: u64) -> i64 {
+    if mask_uva == 0 {
+        return -14; // EFAULT
+    }
+    // Read the temporary mask from user space.
+    let mut buf = [0u8; 8];
+    if uaccess::copy_from_user(&mut buf, mask_uva as usize).is_err() {
+        return -14; // EFAULT
+    }
+    let temp_mask = u64::from_ne_bytes(buf);
+
+    let task_id = crate::task::current_id();
+    let unblockable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+
+    // Atomically: save old mask, install temporary mask, record
+    // saved_mask so the signal-delivery path writes the original
+    // mask into the SigFrame's uc_sigmask.
+    let swapped = crate::process::with_signal_state_for_task(task_id, |state| {
+        let old_mask = state.blocked;
+        state.blocked = temp_mask & !unblockable;
+        state.saved_mask = Some(old_mask);
+    });
+    if swapped.is_none() {
+        return -3; // ESRCH
+    }
+
+    // Block until a signal is deliverable under the temporary mask.
+    SIGSUSPEND_WAIT.wait_while(|| {
+        crate::process::with_signal_state_for_task(task_id, |state| {
+            !state.has_deliverable()
+        })
+        .unwrap_or(false) // if process gone, stop waiting
+    });
+
+    // Do NOT restore the original mask here.  Restoring before
+    // `check_and_deliver_signals` runs would re-block the wake signal
+    // under the original mask, so `pop_next_pending` would return
+    // `None` and the syscall would livelock on restart.
+    //
+    // Instead, `deliver_signal` consumes `saved_mask` to fill the
+    // SigFrame's `uc_sigmask` (handler path — sigreturn restores it)
+    // or directly restores `blocked` from it (Ignore / non-terminate
+    // Default paths).  Both paths ensure the pre-sigsuspend mask is
+    // eventually reinstated without re-blocking the wake signal
+    // before delivery.
+
+    // Return KERN_ERESTARTSYS so check_and_deliver_signals picks up
+    // the now-deliverable signal and either delivers a handler or
+    // applies the default action. The restart_decision classifier
+    // will convert this to -EINTR when a handler is installed
+    // without SA_RESTART.  With SA_RESTART the handler runs and the
+    // syscall restarts — matching POSIX semantics where sigsuspend
+    // always returns -1/EINTR after a caught signal.
+    crate::tty::KERN_ERESTARTSYS
 }
 
 // ── Delivery from exception handlers (IRETQ path) ─────────────────────────
@@ -855,9 +971,17 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
     // Capture the pre-delivery mask and block the signal in one lock window.
     // The pre-delivery mask is what sigreturn must restore; capturing it before
     // setting the block bit ensures uc_sigmask in the frame is correct.
+    //
+    // When `saved_mask` is `Some` (set by `sigsuspend`), the frame's
+    // `uc_sigmask` must be the *original* mask that was saved before
+    // `sigsuspend` installed the temporary one. This way `sigreturn`
+    // restores the process to its pre-sigsuspend signal mask rather than
+    // the ephemeral temporary mask. The `saved_mask` is consumed (taken)
+    // here so a second delivery in the same syscall-return window does
+    // not re-use a stale value.
     let (disp, pre_block_mask) =
         match crate::process::with_signal_state_for_task(task_id, |state| {
-            let pre = state.blocked;
+            let pre = state.saved_mask.take().unwrap_or(state.blocked);
             state.blocked |= sig_bit(sig);
             (state.dispositions[(sig - 1) as usize], pre)
         }) {
@@ -867,15 +991,19 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
 
     match disp {
         Disposition::Ignore => {
-            // Unblock the signal again (we blocked it above).
+            // Restore the mask to the pre-delivery state.  When
+            // sigsuspend is in effect, `pre_block_mask` is the
+            // *original* mask (from `saved_mask`), so this restores
+            // the pre-sigsuspend mask. Otherwise it just undoes the
+            // signal-blocking we added above.
             let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-                state.blocked &= !sig_bit(sig);
+                state.blocked = pre_block_mask;
                 ()
             });
         }
         Disposition::Default => {
             let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-                state.blocked &= !sig_bit(sig);
+                state.blocked = pre_block_mask;
                 ()
             });
             match default_action(sig) {
@@ -1262,5 +1390,76 @@ mod tests {
         s.sa_flags[(SIGTTOU - 1) as usize] = SA_RESTART;
         assert_eq!(s.sa_flags[(SIGTTOU - 1) as usize], SA_RESTART);
         assert_eq!(s.sa_flags[(SIGTERM - 1) as usize], 0);
+    }
+
+    // ── has_deliverable ──────────────────────────────────────────────
+
+    #[test]
+    fn has_deliverable_empty() {
+        let s = SignalState::new();
+        assert!(!s.has_deliverable());
+    }
+
+    #[test]
+    fn has_deliverable_pending_unblocked() {
+        let mut s = SignalState::new();
+        s.raise(SIGUSR1);
+        assert!(s.has_deliverable());
+    }
+
+    #[test]
+    fn has_deliverable_pending_blocked() {
+        let mut s = SignalState::new();
+        s.raise(SIGUSR1);
+        s.blocked = sig_bit(SIGUSR1);
+        assert!(!s.has_deliverable());
+    }
+
+    #[test]
+    fn has_deliverable_sigkill_bypasses_block() {
+        let mut s = SignalState::new();
+        s.raise(SIGKILL);
+        s.blocked = !0u64;
+        assert!(s.has_deliverable());
+    }
+
+    // ── saved_mask (sigsuspend support) ──────────────────────────────
+
+    #[test]
+    fn saved_mask_starts_none() {
+        let s = SignalState::new();
+        assert!(s.saved_mask.is_none());
+    }
+
+    #[test]
+    fn saved_mask_roundtrip() {
+        let mut s = SignalState::new();
+        s.saved_mask = Some(sig_bit(SIGUSR1) | sig_bit(SIGUSR2));
+        assert_eq!(s.saved_mask, Some(sig_bit(SIGUSR1) | sig_bit(SIGUSR2)));
+    }
+
+    #[test]
+    fn saved_mask_take_clears() {
+        let mut s = SignalState::new();
+        s.saved_mask = Some(sig_bit(SIGTERM));
+        let taken = s.saved_mask.take();
+        assert_eq!(taken, Some(sig_bit(SIGTERM)));
+        assert!(s.saved_mask.is_none());
+    }
+
+    // ── sigpending semantics (pending & blocked) ─────────────────────
+
+    #[test]
+    fn pending_and_blocked_intersection() {
+        let mut s = SignalState::new();
+        s.raise(SIGUSR1);
+        s.raise(SIGUSR2);
+        s.raise(SIGTERM);
+        s.blocked = sig_bit(SIGUSR1) | sig_bit(SIGTERM);
+        // sigpending returns the intersection of pending and blocked.
+        let result = s.pending & s.blocked;
+        assert_eq!(result, sig_bit(SIGUSR1) | sig_bit(SIGTERM));
+        // SIGUSR2 is pending but not blocked, so not in sigpending.
+        assert_eq!(result & sig_bit(SIGUSR2), 0);
     }
 }

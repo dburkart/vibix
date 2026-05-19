@@ -590,3 +590,7 @@ harness = false
 [[test]]
 name = "execve_path_resolve"
 harness = false
+
+[[test]]
+name = "syscall_sigsuspend_sigpending"
+harness = false
