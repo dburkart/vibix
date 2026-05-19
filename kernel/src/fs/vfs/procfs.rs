@@ -56,7 +56,7 @@ const INO_MEMINFO: u64 = 2;
 const INO_CPUINFO: u64 = 3;
 const INO_VERSION: u64 = 4;
 const INO_SELF: u64 = 5; // "self" symlink-like directory
-// Per-pid entries start here:
+                         // Per-pid entries start here:
 const PID_DIR_INO_BASE: u64 = 1024;
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ fn gen_uptime() -> String {
     let ns = crate::time::uptime_ns();
     let secs = ns / 1_000_000_000;
     let frac = (ns % 1_000_000_000) / 10_000_000; // centiseconds
-    // idle time = uptime (no idle task accounting yet)
+                                                  // idle time = uptime (no idle task accounting yet)
     let mut s = String::with_capacity(32);
     let _ = write!(s, "{}.{:02} {}.{:02}\n", secs, frac, secs, frac);
     s
@@ -362,11 +362,7 @@ impl FileOps for ProcfsDirFileOps {
         maybe_emit!(self.meminfo_ino, 8 /* DT_REG */, b"meminfo");
         maybe_emit!(self.cpuinfo_ino, 8 /* DT_REG */, b"cpuinfo");
         maybe_emit!(self.version_ino, 8 /* DT_REG */, b"version");
-        maybe_emit!(
-            self.ino_base + INO_SELF,
-            10 /* DT_LNK */,
-            b"self"
-        );
+        maybe_emit!(self.ino_base + INO_SELF, 10 /* DT_LNK */, b"self");
 
         // Per-pid directories.
         for &pid in &pids {
@@ -446,8 +442,7 @@ impl InodeOps for ProcPidDirOps {
             b"cmdline" => {
                 // Use a distinct ino — offset by a large amount to avoid
                 // collisions with the status file.
-                let ino =
-                    self.ino_base + PID_DIR_INO_BASE + 0x8_0000 + (self.pid as u64) * 2;
+                let ino = self.ino_base + PID_DIR_INO_BASE + 0x8_0000 + (self.pid as u64) * 2;
                 let ops = Arc::new(ProcPidFileOps {
                     pid: self.pid,
                     kind: PidFileKind::Cmdline,
@@ -492,8 +487,7 @@ impl FileOps for ProcPidDirOps {
         let mut pos: u64 = 0;
 
         let status_ino = self.ino_base + PID_DIR_INO_BASE + (self.pid as u64) * 2 + 1;
-        let cmdline_ino =
-            self.ino_base + PID_DIR_INO_BASE + 0x8_0000 + (self.pid as u64) * 2;
+        let cmdline_ino = self.ino_base + PID_DIR_INO_BASE + 0x8_0000 + (self.pid as u64) * 2;
 
         macro_rules! maybe_emit {
             ($ino:expr, $d_type:expr, $name:expr) => {{
@@ -621,27 +615,26 @@ impl FileSystem for ProcFs {
         let ino_base = alloc_ino_base();
 
         let sb = Arc::new_cyclic(|weak_sb: &Weak<SuperBlock>| {
-            let mk_static =
-                |ino_off: u64, entry: ProcEntry| -> Arc<Inode> {
-                    let ops = Arc::new(ProcfsStaticOps {
-                        entry,
-                        sb: weak_sb.clone(),
-                    });
-                    let meta = InodeMeta {
-                        mode: 0o444,
-                        nlink: 1,
-                        blksize: 4096,
-                        ..Default::default()
-                    };
-                    Arc::new(Inode::new(
-                        ino_base + ino_off,
-                        weak_sb.clone(),
-                        ops.clone() as Arc<dyn InodeOps>,
-                        ops as Arc<dyn FileOps>,
-                        InodeKind::Reg,
-                        meta,
-                    ))
+            let mk_static = |ino_off: u64, entry: ProcEntry| -> Arc<Inode> {
+                let ops = Arc::new(ProcfsStaticOps {
+                    entry,
+                    sb: weak_sb.clone(),
+                });
+                let meta = InodeMeta {
+                    mode: 0o444,
+                    nlink: 1,
+                    blksize: 4096,
+                    ..Default::default()
                 };
+                Arc::new(Inode::new(
+                    ino_base + ino_off,
+                    weak_sb.clone(),
+                    ops.clone() as Arc<dyn InodeOps>,
+                    ops as Arc<dyn FileOps>,
+                    InodeKind::Reg,
+                    meta,
+                ))
+            };
 
             let uptime_inode = mk_static(INO_UPTIME, ProcEntry::Uptime);
             let meminfo_inode = mk_static(INO_MEMINFO, ProcEntry::Meminfo);
@@ -923,7 +916,11 @@ mod tests {
         assert!(n > 0);
         // At minimum we have: . .. uptime meminfo cpuinfo version self
         // plus any live pids. Cookie should be >= 7.
-        assert!(cookie >= 7, "expected at least 7 entries, got cookie={}", cookie);
+        assert!(
+            cookie >= 7,
+            "expected at least 7 entries, got cookie={}",
+            cookie
+        );
     }
 
     // ------------------------------------------------------------------

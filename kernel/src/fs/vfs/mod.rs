@@ -66,7 +66,6 @@ pub use backend::VfsBackend;
 pub use dentry::{ChildState, DFlags, Dentry, MountEdge, MountFlags, PinnedDentry};
 pub use devfs::DevFs;
 pub use gc_queue::{gc_drain, gc_drain_for, gc_overflow_count, gc_pending_count};
-pub use procfs::ProcFs;
 pub use init::{init, root};
 pub use inode::{Inode, InodeKind, InodeMeta, InodeState};
 pub use mount_resolve::resolve_block_device;
@@ -79,6 +78,7 @@ pub use ops::{
 pub use path_walk::{
     path_walk, Last, LookupFlags, MountResolver, NameIdata, NullMountResolver, Path, PATH_MAX,
 };
+pub use procfs::ProcFs;
 pub use ramfs::RamFs;
 pub use registry::{is_registered, lookup_and_build, register_filesystem, FsFactory};
 pub use super_block::{SbActiveGuard, SbFlags, SuperBlock};

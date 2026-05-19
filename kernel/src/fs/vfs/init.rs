@@ -614,7 +614,11 @@ mod tests {
         let dev_dname = super::super::DString::try_from_bytes(b"dev").unwrap();
         let tmp_dname = super::super::DString::try_from_bytes(b"tmp").unwrap();
         let proc_dname = super::super::DString::try_from_bytes(b"proc").unwrap();
-        for (dname, label) in [(&dev_dname, "dev"), (&tmp_dname, "tmp"), (&proc_dname, "proc")] {
+        for (dname, label) in [
+            (&dev_dname, "dev"),
+            (&tmp_dname, "tmp"),
+            (&proc_dname, "proc"),
+        ] {
             let state = children
                 .get(dname)
                 .unwrap_or_else(|| panic!("/{} should be registered under root.children", label));
