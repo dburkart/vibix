@@ -167,7 +167,9 @@ enum ProcEntry {
 }
 
 /// Generate `/proc/self/status` (or `/proc/<pid>/status`) content.
-fn gen_status(pid: usize) -> String {
+///
+/// Returns `Err(ENOENT)` when the pid no longer exists in the task table.
+fn gen_status(pid: usize) -> Result<String, i64> {
     let mut s = String::with_capacity(256);
     let mut found = false;
     crate::task::for_each_task(|info| {
@@ -187,14 +189,18 @@ fn gen_status(pid: usize) -> String {
             let _ = write!(s, "Threads:\t1\n");
         }
     });
-    if !found {
-        // Task may have exited between lookup and read; return empty.
+    if found {
+        Ok(s)
+    } else {
+        Err(ENOENT)
     }
-    s
 }
 
 /// Generate `/proc/<pid>/cmdline` content (NUL-terminated).
-fn gen_cmdline(pid: usize) -> Vec<u8> {
+///
+/// Returns `Err(ENOENT)` when the pid no longer exists in the task table,
+/// so the caller can surface the error rather than returning an empty read.
+fn gen_cmdline(pid: usize) -> Result<Vec<u8>, i64> {
     // vibix does not yet track argv per task; return the task name
     // as a single NUL-terminated argument.
     let mut found = false;
@@ -208,9 +214,9 @@ fn gen_cmdline(pid: usize) -> Vec<u8> {
         let name = alloc::format!("vibix-task-{}", pid);
         v.extend_from_slice(name.as_bytes());
         v.push(0); // NUL terminator
-        v
+        Ok(v)
     } else {
-        Vec::new()
+        Err(ENOENT)
     }
 }
 
@@ -362,7 +368,7 @@ impl FileOps for ProcfsDirFileOps {
         maybe_emit!(self.meminfo_ino, 8 /* DT_REG */, b"meminfo");
         maybe_emit!(self.cpuinfo_ino, 8 /* DT_REG */, b"cpuinfo");
         maybe_emit!(self.version_ino, 8 /* DT_REG */, b"version");
-        maybe_emit!(self.ino_base + INO_SELF, 10 /* DT_LNK */, b"self");
+        maybe_emit!(self.ino_base + INO_SELF, 4 /* DT_DIR */, b"self");
 
         // Per-pid directories.
         for &pid in &pids {
@@ -541,11 +547,11 @@ impl FileOps for ProcPidFileOps {
     fn read(&self, _f: &OpenFile, buf: &mut [u8], off: u64) -> Result<usize, i64> {
         match self.kind {
             PidFileKind::Status => {
-                let content = gen_status(self.pid);
+                let content = gen_status(self.pid)?;
                 read_from_bytes(content.as_bytes(), buf, off)
             }
             PidFileKind::Cmdline => {
-                let content = gen_cmdline(self.pid);
+                let content = gen_cmdline(self.pid)?;
                 read_from_bytes(&content, buf, off)
             }
         }
