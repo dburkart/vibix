@@ -381,14 +381,12 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
     // Restore FPU state from fpstate if present (#151).
     if frame.fpstate != 0 {
         let fpu_size = fpu::area_size();
-        if uaccess::check_user_range(frame.fpstate as usize, fpu_size).is_ok() {
-            let mut fpu_buf = fpu::FpuArea::new_initialized();
-            let fpu_bytes = fpu_buf.as_bytes_mut();
-            if uaccess::copy_from_user(fpu_bytes, frame.fpstate as usize).is_ok() {
-                fpu::clear_ts();
-                fpu::restore(&fpu_buf);
-            }
-        }
+        uaccess::check_user_range(frame.fpstate as usize, fpu_size).map_err(|_| ())?;
+        let mut fpu_buf = fpu::FpuArea::new_initialized();
+        let fpu_bytes = fpu_buf.as_bytes_mut();
+        uaccess::copy_from_user(fpu_bytes, frame.fpstate as usize).map_err(|_| ())?;
+        fpu::clear_ts();
+        fpu::restore(&fpu_buf);
     }
 
     Ok(RestoredRegs {

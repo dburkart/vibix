@@ -335,12 +335,10 @@ pub fn fork_current_task(
         // and holding SCHED excludes any aliasing save from context_switch.
         crate::fork_trace!("fork-trace: [fork_current_task] → fpu::save(parent)");
         unsafe {
-            // Lazy FPU (#151): clear TS before saving so we don't trap.
-            // If the parent hasn't touched the FPU, its FpuArea still
-            // holds the canonical image from init, which is correct to
-            // inherit. If it has, the live registers need to be flushed.
-            fpu::clear_ts();
-            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            if fpu::fpu_owner() == cur.id {
+                fpu::clear_ts();
+                crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            }
         }
         crate::fork_trace!("fork-trace: [fork_current_task] ← fpu::save(parent)");
         // Snapshot the parent's credentials Arc under the rwlock. POSIX
@@ -479,10 +477,11 @@ pub fn clone_current_as_thread(
             .current
             .as_mut()
             .expect("clone_current_as_thread: no running task");
-        // Flush live FPU state. Clear TS first for lazy FPU (#151).
         unsafe {
-            fpu::clear_ts();
-            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            if fpu::fpu_owner() == cur.id {
+                fpu::clear_ts();
+                crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            }
         }
         let parent_credentials = Arc::clone(&*cur.credentials.read());
         (
