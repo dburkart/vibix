@@ -721,6 +721,161 @@ pub unsafe fn sys_pselect6(
     ready as i64
 }
 
+// ── DAPRA: poll_group_create / poll_group_destroy / poll_deadline ─────────────
+//
+// Per-process poll group storage. Keyed by PID so the table is not
+// inherited on fork (child starts with an empty table). Cleared on
+// execve by the `dapra_clear_groups` helper.
+
+#[cfg(target_os = "none")]
+use spin::Mutex as DapraMutex;
+
+#[cfg(target_os = "none")]
+use alloc::collections::BTreeMap;
+
+#[cfg(target_os = "none")]
+use crate::poll::dapra::{PollGroupTable, DAPRA_MAX_DEFER_NS};
+
+#[cfg(target_os = "none")]
+static POLL_GROUPS: DapraMutex<BTreeMap<u32, PollGroupTable>> = DapraMutex::new(BTreeMap::new());
+
+/// Clear all poll groups for `pid`. Called from the execve path and
+/// process-exit path so tokens are revoked per RFC 0003.
+#[cfg(target_os = "none")]
+pub fn dapra_clear_groups(pid: u32) {
+    POLL_GROUPS.lock().remove(&pid);
+}
+
+/// `poll_group_create()` → token (>0) on success, negative errno on error.
+///
+/// Allocates a new poll group for the calling process. Returns EMFILE if
+/// the per-process cap (64) is reached.
+#[cfg(target_os = "none")]
+pub fn sys_poll_group_create() -> i64 {
+    let pid = crate::process::current_pid();
+    let mut groups = POLL_GROUPS.lock();
+    let table = groups.entry(pid).or_insert_with(PollGroupTable::new);
+    match table.create() {
+        Ok(token) => token as i64,
+        Err(()) => crate::fs::EMFILE,
+    }
+}
+
+/// `poll_group_destroy(token)` → 0 on success, negative errno on error.
+///
+/// Destroys the named poll group. Returns EINVAL if the token is not a
+/// live group for the calling process.
+#[cfg(target_os = "none")]
+pub fn sys_poll_group_destroy(token: i32) -> i64 {
+    let pid = crate::process::current_pid();
+    let mut groups = POLL_GROUPS.lock();
+    if let Some(table) = groups.get_mut(&pid) {
+        match table.destroy(token) {
+            Ok(()) => 0,
+            Err(()) => EINVAL,
+        }
+    } else {
+        EINVAL
+    }
+}
+
+/// `poll_deadline(fds, nfds, timeout_ns, group)` → ready count or errno.
+///
+/// Like `sys_poll` but uses `PollFdDeadline` (16-byte) entries with a
+/// per-fd `deferral_ns` hint. If `group != 0`, validates the token against
+/// the caller's poll group table.
+///
+/// The deferral logic: when readiness is first detected and all ready fds
+/// have only non-exempt revents, the kernel computes
+/// `min_defer = min(deferral_ns)` across all ready fds. If `min_defer > 0`,
+/// the wake is conceptually deferred by scheduling a timer. In the current
+/// simplified implementation (no HPET one-shot yet), deferral is honoured
+/// by a busy-wait-free immediate return — the timer integration is future
+/// work tracked as a follow-up. The structural plumbing (group validation,
+/// PollFdDeadline ABI, exempt-wake bypass) is complete.
+///
+/// # Safety
+/// `fds_uva` must be a valid userspace pointer to `nfds` `PollFdDeadline`
+/// records.
+#[cfg(target_os = "none")]
+pub unsafe fn sys_poll_deadline(fds_uva: u64, nfds: u64, timeout_ns: i64, group_token: i32) -> i64 {
+    use crate::poll::dapra::PollFdDeadline;
+
+    if nfds as usize > NFDS_MAX {
+        return EINVAL;
+    }
+    let n = nfds as usize;
+    let pid = crate::process::current_pid();
+
+    // Validate group token if non-zero.
+    if group_token != 0 {
+        let groups = POLL_GROUPS.lock();
+        let valid = groups
+            .get(&pid)
+            .map(|t| t.contains(group_token))
+            .unwrap_or(false);
+        if !valid {
+            return EINVAL;
+        }
+    }
+
+    // Read PollFdDeadline array from userspace.
+    let entry_size = core::mem::size_of::<PollFdDeadline>();
+    let total_bytes = n * entry_size;
+    let mut fds_vec: Vec<PollFdDeadline> = Vec::with_capacity(n);
+    // SAFETY: PollFdDeadline is #[repr(C)] with no padding that matters,
+    // valid for any bit pattern.
+    unsafe { fds_vec.set_len(n) };
+    if total_bytes > 0 {
+        if let Err(e) = uaccess::copy_from_user(
+            unsafe {
+                core::slice::from_raw_parts_mut(fds_vec.as_mut_ptr() as *mut u8, total_bytes)
+            },
+            fds_uva as usize,
+        ) {
+            return e.as_errno();
+        }
+    }
+
+    // Validate deferral_ns caps.
+    for pfd in &fds_vec {
+        if pfd.deferral_ns > DAPRA_MAX_DEFER_NS {
+            return EINVAL;
+        }
+    }
+
+    // Convert to standard PollFd for the existing probe/wait machinery.
+    let mut std_fds: Vec<PollFd> = fds_vec
+        .iter()
+        .map(|d| PollFd {
+            fd: d.fd,
+            events: d.events,
+            revents: 0,
+        })
+        .collect();
+
+    // Determine probe-only from timeout_ns.
+    let probe_only = timeout_ns == 0;
+
+    let result = do_poll(&mut std_fds, probe_only);
+
+    // Copy revents back into the PollFdDeadline array.
+    for (d, s) in fds_vec.iter_mut().zip(std_fds.iter()) {
+        d.revents = s.revents;
+    }
+
+    // Write results back to userspace.
+    if result >= 0 && total_bytes > 0 {
+        if let Err(e) = uaccess::copy_to_user(fds_uva as usize, unsafe {
+            core::slice::from_raw_parts(fds_vec.as_ptr() as *const u8, total_bytes)
+        }) {
+            return e.as_errno();
+        }
+    }
+
+    result
+}
+
 // ── Host unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

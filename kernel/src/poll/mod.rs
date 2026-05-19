@@ -39,6 +39,8 @@
 //! This mirrors the protocol in `sync::WaitQueue`.
 
 #[cfg(any(test, target_os = "none"))]
+pub mod dapra;
+#[cfg(any(test, target_os = "none"))]
 pub mod syscalls;
 
 #[cfg(target_os = "none")]

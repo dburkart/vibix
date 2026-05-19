@@ -1112,6 +1112,15 @@ pub unsafe extern "C" fn syscall_dispatch(
         // pselect6(nfds, readfds, writefds, exceptfds, ts, sigmask).
         PSELECT6 => crate::poll::syscalls::sys_pselect6(a0, a1, a2, a3, a4, a5),
 
+        // DAPRA: poll_group_create() — RFC 0003 §Deadline-aware poll readiness.
+        POLL_GROUP_CREATE => crate::poll::syscalls::sys_poll_group_create(),
+
+        // DAPRA: poll_group_destroy(token).
+        POLL_GROUP_DESTROY => crate::poll::syscalls::sys_poll_group_destroy(a0 as i32),
+
+        // DAPRA: poll_deadline(fds, nfds, timeout_ns, group).
+        POLL_DEADLINE => crate::poll::syscalls::sys_poll_deadline(a0, a1, a2 as i64, a3 as i32),
+
         // setsid() — create a new session with the caller as leader.
         SETSID => crate::process::sys_setsid(),
 
@@ -1391,6 +1400,8 @@ pub fn exec_atomic_with_args(
     //    the old address space is still alive on the task until we
     //    write CR3 and drop the returned Arc.
     crate::task::current_fd_table().lock().close_cloexec();
+    // DAPRA: revoke all poll-group tokens on execve (RFC 0003).
+    crate::poll::syscalls::dapra_clear_groups(crate::process::current_pid());
     let new_aspace_arc = alloc::sync::Arc::new(spin::RwLock::new(new_aspace));
     let old_aspace = crate::task::replace_current_address_space(new_aspace_arc, new_pml4);
 
@@ -2364,6 +2375,10 @@ pub mod syscall_nr {
     pub const SIGALTSTACK: u64 = 131;
     pub const FUTEX: u64 = 202;
     pub const SET_TID_ADDRESS: u64 = 218;
+    // DAPRA (RFC 0003 §Deadline-aware poll readiness) — vibix-reserved range.
+    pub const POLL_GROUP_CREATE: u64 = 600;
+    pub const POLL_GROUP_DESTROY: u64 = 601;
+    pub const POLL_DEADLINE: u64 = 602;
 }
 
 #[cfg(test)]
@@ -2427,6 +2442,23 @@ mod tests {
         assert_eq!(syscall_nr::SELECT, 23, "SYS_select must be 23");
         assert_eq!(syscall_nr::PSELECT6, 270, "SYS_pselect6 must be 270");
         assert_eq!(syscall_nr::PPOLL, 271, "SYS_ppoll must be 271");
+
+        // DAPRA (RFC 0003 §Deadline-aware poll readiness, vibix-reserved range)
+        assert_eq!(
+            syscall_nr::POLL_GROUP_CREATE,
+            600,
+            "SYS_poll_group_create must be 600"
+        );
+        assert_eq!(
+            syscall_nr::POLL_GROUP_DESTROY,
+            601,
+            "SYS_poll_group_destroy must be 601"
+        );
+        assert_eq!(
+            syscall_nr::POLL_DEADLINE,
+            602,
+            "SYS_poll_deadline must be 602"
+        );
 
         // Session / process group
         assert_eq!(syscall_nr::SETPGID, 109, "SYS_setpgid must be 109");
