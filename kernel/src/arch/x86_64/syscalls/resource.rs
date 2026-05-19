@@ -32,7 +32,10 @@ pub fn sys_getrlimit(resource: u32, rlim_uva: usize) -> i64 {
     match crate::process::get_rlimit(pid, resource) {
         Some(lim) => {
             let bytes = unsafe {
-                core::slice::from_raw_parts(&lim as *const Rlimit as *const u8, core::mem::size_of::<Rlimit>())
+                core::slice::from_raw_parts(
+                    &lim as *const Rlimit as *const u8,
+                    core::mem::size_of::<Rlimit>(),
+                )
             };
             match unsafe { uaccess::copy_to_user(rlim_uva, bytes) } {
                 Ok(()) => 0,

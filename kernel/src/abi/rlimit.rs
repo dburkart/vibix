@@ -120,10 +120,7 @@ mod tests {
     fn defaults_are_sane() {
         let tbl = RlimitTable::defaults();
         assert_eq!(tbl.limits[RLIMIT_NOFILE as usize].rlim_cur, 1024);
-        assert_eq!(
-            tbl.limits[RLIMIT_STACK as usize].rlim_cur,
-            8 * 1024 * 1024
-        );
+        assert_eq!(tbl.limits[RLIMIT_STACK as usize].rlim_cur, 8 * 1024 * 1024);
         assert_eq!(tbl.limits[RLIMIT_AS as usize].rlim_cur, RLIM_INFINITY);
         assert_eq!(tbl.limits[RLIMIT_CORE as usize].rlim_cur, 0);
     }
