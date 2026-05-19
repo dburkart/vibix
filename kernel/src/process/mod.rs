@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicU32, AtomicU32 as ExitEvent, Ordering};
 
 use spin::{Lazy, Mutex};
 
+use crate::abi::rlimit::RlimitTable;
 use crate::signal::SignalState;
 use crate::sync::WaitQueue;
 // `tty` is bare-metal-only (it touches `arch::x86_64::*` for the PS/2
@@ -73,6 +74,11 @@ pub struct ProcessEntry {
     pub session_id: SessionId,
     /// POSIX process-group id. Always equal to the pgrp leader's pid.
     pub pgrp_id: ProcessGroupId,
+    /// Per-process resource limits (RLIMIT_NOFILE, RLIMIT_STACK, etc.).
+    /// Inherited on fork; read by getrlimit / prlimit64, written by
+    /// setrlimit / prlimit64. Not enforced yet — stored so user-visible
+    /// queries return plausible values (issue #927).
+    pub rlimits: RlimitTable,
     /// Controlling terminal, if any. Cleared by `setsid`; `TIOCSCTTY`
     /// (#376) acquires one; shared by every member of a session via
     /// `Arc` so the tty outlives the session leader until every
@@ -143,6 +149,7 @@ pub fn register_init(task_id: usize) {
             signals: Arc::new(Mutex::new(SignalState::new())),
             session_id: 1,
             pgrp_id: 1,
+            rlimits: RlimitTable::defaults(),
             #[cfg(target_os = "none")]
             controlling_tty: None,
         },
@@ -171,17 +178,24 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
     let mut t = lock_table_with_soak_check("register");
     crate::fork_trace!("fork-trace: [process::register] TABLE locked");
     #[cfg(target_os = "none")]
-    let (session_id, pgrp_id, controlling_tty) = t
+    let (session_id, pgrp_id, controlling_tty, parent_rlimits) = t
         .by_pid
         .get(&parent_pid)
-        .map(|p| (p.session_id, p.pgrp_id, p.controlling_tty.clone()))
-        .unwrap_or((pid, pid, None));
+        .map(|p| {
+            (
+                p.session_id,
+                p.pgrp_id,
+                p.controlling_tty.clone(),
+                p.rlimits.clone(),
+            )
+        })
+        .unwrap_or((pid, pid, None, RlimitTable::defaults()));
     #[cfg(not(target_os = "none"))]
-    let (session_id, pgrp_id) = t
+    let (session_id, pgrp_id, parent_rlimits) = t
         .by_pid
         .get(&parent_pid)
-        .map(|p| (p.session_id, p.pgrp_id))
-        .unwrap_or((pid, pid));
+        .map(|p| (p.session_id, p.pgrp_id, p.rlimits.clone()))
+        .unwrap_or((pid, pid, RlimitTable::defaults()));
     t.by_pid.insert(
         pid,
         ProcessEntry {
@@ -193,6 +207,7 @@ pub fn register(task_id: usize, parent_pid: u32) -> u32 {
             signals: Arc::new(Mutex::new(SignalState::new())),
             session_id,
             pgrp_id,
+            rlimits: parent_rlimits,
             #[cfg(target_os = "none")]
             controlling_tty,
         },
@@ -464,6 +479,33 @@ pub fn update_task_id(pid: u32, new_task_id: usize) {
         entry.task_id = new_task_id;
     }
     t.pid_of.insert(new_task_id, pid);
+}
+
+// ── Resource-limit accessors ──────────────────────────────────────────
+//
+// These run on both host (unit-test) and bare-metal paths because the
+// rlimit table is a plain `[Rlimit; 16]` with no arch dependency.
+
+use crate::abi::rlimit::Rlimit;
+
+/// Read the rlimit for `resource` on process `pid`.
+/// Returns `None` if pid is not found or resource is out of range.
+pub fn get_rlimit(pid: u32, resource: u32) -> Option<Rlimit> {
+    let t = lock_table_with_soak_check("get_rlimit");
+    t.by_pid
+        .get(&pid)
+        .and_then(|e| e.rlimits.get(resource).copied())
+}
+
+/// Write the rlimit for `resource` on process `pid`.
+/// Returns the old value on success, or `None` if pid is not found or
+/// resource is out of range.
+pub fn set_rlimit(pid: u32, resource: u32, new: Rlimit) -> Option<Rlimit> {
+    let mut t = lock_table_with_soak_check("set_rlimit");
+    let entry = t.by_pid.get_mut(&pid)?;
+    let old = entry.rlimits.get(resource).copied()?;
+    entry.rlimits.set(resource, new);
+    Some(old)
 }
 
 // Bare-metal-only block: tty/session helpers, the signal-mask
@@ -905,6 +947,7 @@ pub mod test_helpers {
                 signals: Arc::new(Mutex::new(SignalState::new())),
                 session_id,
                 pgrp_id,
+                rlimits: RlimitTable::defaults(),
                 controlling_tty: None,
             },
         );
