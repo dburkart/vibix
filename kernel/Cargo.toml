@@ -592,6 +592,10 @@ name = "execve_path_resolve"
 harness = false
 
 [[test]]
+name = "sa_restart_tostop_e2e"
+harness = false
+
+[[test]]
 name = "syscall_sigsuspend_sigpending"
 harness = false
 
