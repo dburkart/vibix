@@ -8,6 +8,7 @@
 //! | `/`        | ramfs  | synthesised                   |
 //! | `/dev`     | devfs  | synthesised                   |
 //! | `/tmp`     | ramfs  | synthesised                   |
+//! | `/proc`    | procfs | synthesised                   |
 //!
 //! On bare-metal, if a `rootfs.tar` module is present in the Limine
 //! config, TarFs is mounted at `/` instead of RamFs. `/dev` and `/tmp`
@@ -40,7 +41,7 @@ use super::mount_table::{alloc_fs_id, mount};
 use super::ops::{FileOps, FileSystem, InodeOps, MountSource, SetAttr, Stat, StatFs, SuperOps};
 use super::registry::register_filesystem;
 use super::super_block::{SbFlags, SuperBlock};
-use super::{DevFs, RamFs, TarFs};
+use super::{DevFs, ProcFs, RamFs, TarFs};
 
 /// Global namespace root. Populated by [`init`]; `None` before the
 /// kernel has run boot-time VFS setup. Consumers who need to start a
@@ -145,6 +146,13 @@ pub fn init_with(args: crate::boot_cmdline::RootArgs) {
         Arc::new(RamFs) as Arc<dyn super::ops::FileSystem>,
     );
     crate::serial_println!("vfs: mounted ramfs at /tmp");
+
+    mount_child(
+        &root,
+        b"proc",
+        Arc::new(ProcFs) as Arc<dyn super::ops::FileSystem>,
+    );
+    crate::serial_println!("vfs: mounted procfs at /proc");
 }
 
 /// Try each root-filesystem candidate in priority order, returning the
@@ -417,6 +425,14 @@ fn register_builtin_filesystems() {
         "tarfs",
         Box::new(|_src| Ok(TarFs::new_arc() as Arc<dyn FileSystem>)),
     );
+    register_filesystem(
+        "procfs",
+        Box::new(|_src| Ok(Arc::new(ProcFs) as Arc<dyn FileSystem>)),
+    );
+    register_filesystem(
+        "proc",
+        Box::new(|_src| Ok(Arc::new(ProcFs) as Arc<dyn FileSystem>)),
+    );
     #[cfg(feature = "ext2")]
     register_filesystem(
         "ext2",
@@ -567,6 +583,21 @@ mod tests {
     }
 
     #[test]
+    fn proc_mount_is_present_in_root_children() {
+        let _g = TEST_LOCK.lock();
+        clear_root();
+        init();
+        let r = root().expect("root populated");
+        let root_inode = r.inode.read().as_ref().cloned().expect("positive");
+
+        let proc = root_inode
+            .ops
+            .lookup(&root_inode, b"proc")
+            .expect("ramfs /proc directory exists");
+        assert_eq!(proc.kind, InodeKind::Dir);
+    }
+
+    #[test]
     fn mount_child_dentries_survive_via_parent_children() {
         // Regression: `mount()` stores only a `Weak<Dentry>` on the
         // mountpoint, so the child dentry produced by `mount_child`
@@ -582,7 +613,8 @@ mod tests {
         let children = r.children.read();
         let dev_dname = super::super::DString::try_from_bytes(b"dev").unwrap();
         let tmp_dname = super::super::DString::try_from_bytes(b"tmp").unwrap();
-        for (dname, label) in [(&dev_dname, "dev"), (&tmp_dname, "tmp")] {
+        let proc_dname = super::super::DString::try_from_bytes(b"proc").unwrap();
+        for (dname, label) in [(&dev_dname, "dev"), (&tmp_dname, "tmp"), (&proc_dname, "proc")] {
             let state = children
                 .get(dname)
                 .unwrap_or_else(|| panic!("/{} should be registered under root.children", label));

@@ -114,6 +114,7 @@ const SMOKE_MARKERS: &[&str] = &[
     "vfs: mounted ext2 (virtio-blk) at /",
     "vfs: mounted devfs at /dev",
     "vfs: mounted ramfs at /tmp",
+    "vfs: mounted procfs at /proc",
     "vfs: init_with consumed cmdline RootArgs",
     "vibix online.",
     "interrupts enabled",
