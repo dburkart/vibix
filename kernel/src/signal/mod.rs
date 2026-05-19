@@ -31,8 +31,6 @@
 //!
 //! ## Limitations (known, tracked as follow-ups)
 //!
-//! - FPU state (`fpstate_ptr` in `SigFrame`) is always null — signals
-//!   delivered to a task using SSE/x87 will see corrupted FP registers.
 //! - `SA_RESTART` is honoured both on the bare-restart path (no handler)
 //!   and on the handler path: the syscall arg registers (rax, rdi, rsi,
 //!   rdx, r10, r8, r9) are captured into the `SigFrame` at delivery and

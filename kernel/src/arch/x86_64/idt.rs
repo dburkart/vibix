@@ -67,6 +67,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
                 as u64,
         ));
     }
+    idt.device_not_available
+        .set_handler_fn(device_not_available);
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
     idt.general_protection_fault
         .set_handler_fn(general_protection);
@@ -109,6 +111,21 @@ fn panic_smap_violation(addr: u64) -> ! {
 fn panic_rsvd_corruption(addr: u64) -> ! {
     serial_println!("EXCEPTION: #PF RSVD corruption addr={:#x}", addr);
     hang();
+}
+
+/// `#NM` — Device Not Available. Fired when a task executes an FPU/SSE/AVX
+/// instruction while CR0.TS is set. The lazy FPU save mechanism sets TS on
+/// every context switch; this handler clears it and restores the task's
+/// saved FPU state on first use.
+extern "x86-interrupt" fn device_not_available(_frame: InterruptStackFrame) {
+    // SAFETY: we are in the #NM handler, which fires because CR0.TS was
+    // set by the context-switch lazy-save path. Clearing TS and restoring
+    // the FPU state is the correct response.
+    let ok = unsafe { crate::arch::x86_64::fpu::handle_device_not_available() };
+    if !ok {
+        serial_println!("EXCEPTION: #NM (device not available) — unexpected");
+        hang();
+    }
 }
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
