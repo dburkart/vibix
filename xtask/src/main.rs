@@ -184,6 +184,20 @@ const SMOKE_MARKERS: &[&str] = &[
     // returned (this fires) vs. parent never woke (this missing).
     "init: wait4-return",
     "init: fork+exec+wait ok",
+    // #382: end-to-end PT_INTERP smoke test. Init fork+exec's the
+    // dynamically-linked hello_dyn binary, which has PT_INTERP =
+    // /lib/ld-vibix.so. The kernel loads the interpreter, processes
+    // relocations, and jumps to hello_dyn's _start. Three markers
+    // localize the dynamic-linking path:
+    //   - "init: launching dynamic binary" — init reached the dyn
+    //     fork+exec code path (emitted before the fork).
+    //   - "hello_dyn: hello from dynamically-linked binary" — the
+    //     dynamic binary actually ran to its write() syscall.
+    //   - "init: dynamic fork+exec+wait ok" — the parent reaped the
+    //     dynamic child successfully (exit code 0).
+    "init: launching dynamic binary",
+    "hello_dyn: hello from dynamically-linked binary",
+    "init: dynamic fork+exec+wait ok",
     // #883: init launches /bin/sh after the hello fork+exec+wait cycle.
     // The marker fires before the fork+exec, proving init reached the
     // shell-launch code path. Whether execve succeeds depends on the
@@ -2191,6 +2205,12 @@ fn smoke(opts: &BuildOpts) -> R<()> {
     let rmdir_bin = build_userspace_rmdir()?;
     let touch_bin = build_userspace_touch()?;
     let uname_bin = build_userspace_uname()?;
+    // #382: build the dynamic-linking stack (ld-vibix.so, libc.so, hello_dyn)
+    // and install into the ext2 rootfs so init can fork+exec hello_dyn as an
+    // end-to-end PT_INTERP smoke test.
+    let ld_vibix_bin = build_ld_vibix()?;
+    let libc_so_bin = build_libc_so()?;
+    let hello_dyn_bin = build_userspace_hello_dyn()?;
     let extras: Vec<(&Path, &str)> = vec![
         (&sh_bin, "/bin/sh"),
         (&cat_bin, "/bin/cat"),
@@ -2203,6 +2223,9 @@ fn smoke(opts: &BuildOpts) -> R<()> {
         (&rmdir_bin, "/bin/rmdir"),
         (&touch_bin, "/bin/touch"),
         (&uname_bin, "/bin/uname"),
+        (&ld_vibix_bin, "/lib/ld-vibix.so"),
+        (&libc_so_bin, "/lib/libc.so"),
+        (&hello_dyn_bin, "/bin/hello_dyn"),
     ];
     let disk =
         ext2_image::build_with_extras(&workspace_root(), Some(&userspace_init), &extras, true)?;

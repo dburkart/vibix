@@ -136,6 +136,12 @@ static mut LOADED_COUNT: usize = 0;
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
         "mov rdi, rsp", // pass stack pointer as arg
+        // Declare _dl_start as hidden so the assembler emits a direct
+        // PC-relative `call` instead of routing through the PLT/GOT.
+        // At this point the GOT has not been relocated (self_relocate
+        // runs inside _dl_start), so an indirect jump through the GOT
+        // would land on an unrelocated address and page-fault.
+        ".hidden _dl_start",
         "call _dl_start",
         // _dl_start should not return, but if it does:
         "ud2",
@@ -259,9 +265,12 @@ unsafe fn self_relocate() {
         return;
     }
 
-    // Walk .dynamic to find DT_RELA, DT_RELASZ.
+    // Walk .dynamic to find DT_RELA, DT_RELASZ, DT_SYMTAB, DT_JMPREL, DT_PLTRELSZ.
     let mut rela_off: u64 = 0;
     let mut rela_sz: u64 = 0;
+    let mut symtab_off: u64 = 0;
+    let mut jmprel_off: u64 = 0;
+    let mut jmprel_sz: u64 = 0;
     let mut d = dyn_ptr as *const elf::Elf64Dyn;
     loop {
         let tag = (*d).d_tag;
@@ -269,8 +278,11 @@ unsafe fn self_relocate() {
             break; // DT_NULL
         }
         match tag {
-            7 => rela_off = (*d).d_val, // DT_RELA
-            8 => rela_sz = (*d).d_val,  // DT_RELASZ
+            7 => rela_off = (*d).d_val,    // DT_RELA
+            8 => rela_sz = (*d).d_val,     // DT_RELASZ
+            6 => symtab_off = (*d).d_val,  // DT_SYMTAB
+            23 => jmprel_off = (*d).d_val, // DT_JMPREL
+            2 => jmprel_sz = (*d).d_val,   // DT_PLTRELSZ
             _ => {}
         }
         d = d.add(1);
@@ -279,6 +291,13 @@ unsafe fn self_relocate() {
     if rela_off == 0 || rela_sz == 0 {
         return;
     }
+
+    // Compute the runtime symtab pointer (needed for GLOB_DAT / R_X86_64_64).
+    let symtab_ptr = if symtab_off != 0 {
+        (base + symtab_off) as *const elf::Elf64Sym
+    } else {
+        core::ptr::null()
+    };
 
     let rela_ptr = (base + rela_off) as *const elf::Elf64Rela;
     let count = rela_sz / core::mem::size_of::<elf::Elf64Rela>() as u64;
@@ -293,7 +312,46 @@ unsafe fn self_relocate() {
                 let target = (base + r.r_offset) as *mut u64;
                 *target = base.wrapping_add(r.r_addend as u64);
             }
+            elf::R_X86_64_GLOB_DAT | elf::R_X86_64_JUMP_SLOT | elf::R_X86_64_64 => {
+                // *target = base + sym.st_value + addend
+                // All symbols are defined within this shared object
+                // (ld-vibix.so has no external dependencies), so
+                // the runtime address is simply base + st_value.
+                if !symtab_ptr.is_null() {
+                    let sym_idx = (r.r_info >> 32) as usize;
+                    let sym = &*symtab_ptr.add(sym_idx);
+                    let target = (base + r.r_offset) as *mut u64;
+                    *target = base
+                        .wrapping_add(sym.st_value)
+                        .wrapping_add(r.r_addend as u64);
+                }
+            }
             _ => {}
+        }
+    }
+
+    // Also process DT_JMPREL (PLT relocations) if present.
+    if jmprel_off != 0 && jmprel_sz != 0 && !symtab_ptr.is_null() {
+        let jmprel_ptr = (base + jmprel_off) as *const elf::Elf64Rela;
+        let jmp_count = jmprel_sz / core::mem::size_of::<elf::Elf64Rela>() as u64;
+        for i in 0..jmp_count {
+            let r = &*jmprel_ptr.add(i as usize);
+            let r_type = (r.r_info & 0xFFFF_FFFF) as u32;
+            match r_type {
+                elf::R_X86_64_JUMP_SLOT | elf::R_X86_64_GLOB_DAT | elf::R_X86_64_64 => {
+                    let sym_idx = (r.r_info >> 32) as usize;
+                    let sym = &*symtab_ptr.add(sym_idx);
+                    let target = (base + r.r_offset) as *mut u64;
+                    *target = base
+                        .wrapping_add(sym.st_value)
+                        .wrapping_add(r.r_addend as u64);
+                }
+                elf::R_X86_64_RELATIVE => {
+                    let target = (base + r.r_offset) as *mut u64;
+                    *target = base.wrapping_add(r.r_addend as u64);
+                }
+                _ => {}
+            }
         }
     }
 }

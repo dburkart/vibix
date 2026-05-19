@@ -6,7 +6,11 @@
 //!    which prints "hello: hello from execed child" and exits(0).
 //! 3. The parent calls wait4() to collect the child's exit status, then
 //!    prints "init: fork+exec+wait ok".
-//! 4. Fork+exec `/bin/sh` as an interactive login shell with a minimal
+//! 4. Fork+exec `/bin/hello_dyn` — a dynamically-linked binary with
+//!    PT_INTERP = /lib/ld-vibix.so. The kernel loads the interpreter,
+//!    which processes relocations and jumps to the binary's entry point.
+//!    Prints "init: dynamic fork+exec+wait ok" on success (#382).
+//! 5. Fork+exec `/bin/sh` as an interactive login shell with a minimal
 //!    environment (HOME, PATH, TERM, PS1). Respawns the shell if it exits.
 //!
 //! Syscall ABI (Linux x86_64 convention used by the vibix kernel):
@@ -105,6 +109,17 @@ const WAIT4_RETURN_MSG: &[u8] = b"init: wait4-return\n";
 /// Path to the hello binary. The kernel resolves this via VFS first,
 /// then falls back to Limine boot modules (basename match).
 const HELLO_PATH: &[u8] = b"/boot/userspace_hello.elf\0";
+
+/// Path to the dynamically-linked hello binary. Uses PT_INTERP to load
+/// ld-vibix.so as the dynamic interpreter. Resolved via VFS from the
+/// ext2 rootfs; only available when booting with `root=/dev/vda`.
+const HELLO_DYN_PATH: &[u8] = b"/bin/hello_dyn\0";
+
+/// Smoke-test marker — emitted before exec-ing the dynamic binary (#382).
+const DYN_LAUNCH_MSG: &[u8] = b"init: launching dynamic binary\n";
+
+/// Emitted after the dynamic binary's fork+exec+wait succeeds (#382).
+const DYN_DONE_MSG: &[u8] = b"init: dynamic fork+exec+wait ok\n";
 
 /// Path to the POSIX shell. Resolved via VFS from the ext2 rootfs;
 /// only available when booting with `root=/dev/vda`.
@@ -225,6 +240,96 @@ pub extern "C" fn _start() -> ! {
         if waited == child_pid as i64 && exit_code == 0 {
             write(1, WAIT4_RETURN_MSG);
             write(1, DONE_MSG);
+        }
+    }
+
+    // #382: fork+exec the dynamically-linked hello binary. This exercises
+    // the full PT_INTERP path end-to-end: the kernel detects the
+    // PT_INTERP segment, loads /lib/ld-vibix.so at INTERP_LOAD_BASE,
+    // transfers control to the interpreter, which processes relocations
+    // and jumps to hello_dyn's _start. The binary writes its marker to
+    // serial and exits. On success init prints "init: dynamic
+    // fork+exec+wait ok", which the smoke lane asserts on.
+    write(1, DYN_LAUNCH_MSG);
+
+    let dyn_fork_ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 57u64 => dyn_fork_ret,
+            lateout("rcx") _,
+            lateout("rdx") _,
+            lateout("rdi") _,
+            lateout("rsi") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("r10") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    if dyn_fork_ret == 0 {
+        // Child: exec the dynamically-linked binary.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 59u64 => _,   // execve
+                inlateout("rdi") HELLO_DYN_PATH.as_ptr() as u64 => _,  // path
+                inlateout("rsi") 0u64 => _,    // argv (NULL = empty)
+                inlateout("rdx") 0u64 => _,    // envp (NULL = empty)
+                lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        // execve only returns on failure — exit with an error code.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 60u64 => _,   // exit
+                inlateout("rdi") 1u64 => _,    // status 1 (exec failed)
+                lateout("rcx") _,
+                lateout("rdx") _,
+                lateout("rsi") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Parent: wait for the dynamic child to exit.
+    if dyn_fork_ret > 0 {
+        let dyn_pid = dyn_fork_ret as u64;
+        let mut dyn_wstatus: i32 = 0;
+        let dyn_waited: i64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 61u64 => dyn_waited,                          // wait4
+                inlateout("rdi") dyn_pid => _,                                  // pid
+                inlateout("rsi") &mut dyn_wstatus as *mut i32 as u64 => _,     // *wstatus
+                inlateout("rdx") 0u64 => _,                                    // options
+                inlateout("r10") 0u64 => _,                                    // rusage
+                lateout("rcx") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        let dyn_exit_code = (dyn_wstatus >> 8) & 0xFF;
+        if dyn_waited == dyn_pid as i64 && dyn_exit_code == 0 {
+            write(1, DYN_DONE_MSG);
         }
     }
 

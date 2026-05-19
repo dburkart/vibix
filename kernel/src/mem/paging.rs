@@ -488,6 +488,34 @@ pub fn translate_in_pml4(
     }
 }
 
+/// Update the PTE flags for an already-mapped page in `pml4_frame`.
+///
+/// Returns `Ok(())` if the page was present and its flags were updated,
+/// or `Err(())` if the page is not mapped. Used by the ELF loader when
+/// two LOAD segments share the same page (after page-align-down) to
+/// widen permissions — e.g. upgrading an R-only ELF-header page to R+E
+/// when the subsequent .text segment is executable.
+pub fn update_flags_in_pml4(
+    pml4_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    new_flags: PageTableFlags,
+) -> Result<(), ()> {
+    let hhdm = HHDM_OFFSET
+        .lock()
+        .expect("paging::init must run before update_flags_in_pml4");
+    let l4 = unsafe { pml4_as_mut(pml4_frame, hhdm) };
+    let mut mapper = unsafe { OffsetPageTable::new(l4, hhdm) };
+    // SAFETY: we only update flags, the mapped frame and page-table
+    // hierarchy remain unchanged.
+    unsafe {
+        mapper
+            .update_flags(page, new_flags)
+            .map_err(|_| ())?
+            .flush();
+    }
+    Ok(())
+}
+
 /// Unmap `page` from `pml4_frame` and return its backing frame to the
 /// global allocator. Mirrors [`unmap_and_free`] for the
 /// arbitrary-PML4 case.

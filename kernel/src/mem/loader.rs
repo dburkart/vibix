@@ -712,18 +712,36 @@ fn register_demand_vmas(
 
     let mut segments = 0usize;
     let mut image_end = 0u64;
+    // Track the highest VMA end so we can detect and skip page-level
+    // overlaps between adjacent segments (common in ET_DYN shared
+    // objects where the ELF header segment and the text segment share
+    // their first file page).
+    let mut vma_ceiling: u64 = 0;
 
     for seg in parsed_elf.load_segments() {
-        let effective_vaddr = seg
+        let raw_effective_vaddr = seg
             .vaddr
             .as_u64()
             .checked_add(base_offset)
             .ok_or(LoadError::SegmentNotLowerHalf)?;
-        if effective_vaddr >= UPPER_HALF_START {
+        if raw_effective_vaddr >= UPPER_HALF_START {
             return Err(LoadError::SegmentNotLowerHalf);
         }
+
+        // Shared libraries (ET_DYN) may have non-page-aligned p_vaddr
+        // values (e.g. the text segment follows immediately after the
+        // ELF header within the same file page). Linux rounds p_vaddr
+        // and p_offset down to page boundaries and adjusts the mapped
+        // sizes up to compensate. We do the same so that ld-vibix.so
+        // and other shared objects load correctly. Issue #382.
+        let page_misalign = raw_effective_vaddr & (PAGE_SIZE - 1);
+        let effective_vaddr = raw_effective_vaddr - page_misalign;
+        let adj_filesz = seg.filesz + page_misalign;
+        let adj_memsz = seg.memsz + page_misalign;
+        let adj_file_offset = seg.file_offset - page_misalign;
+
         let seg_end_unaligned = effective_vaddr
-            .checked_add(seg.memsz)
+            .checked_add(adj_memsz)
             .ok_or(LoadError::SegmentNotLowerHalf)?;
         if seg_end_unaligned > UPPER_HALF_START {
             return Err(LoadError::SegmentNotLowerHalf);
@@ -732,31 +750,68 @@ fn register_demand_vmas(
         if seg_end >= USER_VA_END {
             return Err(LoadError::SegmentEndsAtUserVaEnd);
         }
-        if effective_vaddr & (PAGE_SIZE - 1) != 0 {
-            return Err(LoadError::SegmentNotPageAligned);
-        }
+
+        // When page-alignment causes this segment's VMA start to fall
+        // below the previous segment's VMA end, clip the overlap so the
+        // VMA tree doesn't panic on duplicate ranges. The later (larger)
+        // segment's mapping takes precedence for the overlapping pages.
+        let vma_start = core::cmp::max(effective_vaddr, vma_ceiling);
+        // How many pages of the overlap we're skipping at the front.
+        let skip_pages = ((vma_start - effective_vaddr) / PAGE_SIZE) as usize;
 
         let prot_pte =
             (seg.flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits();
 
+        // When an overlap was clipped, the earlier segment's VMA already
+        // covers the shared page(s) but may have narrower permissions
+        // (e.g. R-only for the ELF header page vs R+E for the .text
+        // segment that starts mid-page). Upgrade the overlapping region's
+        // PTE flags to the union so the fault handler installs PTEs with
+        // sufficient permissions for both segments. Issue #382.
+        //
+        // Permission merging must handle x86_64 inverted NO_EXECUTE: the
+        // NX bit *denies* execution when set, so the merged flags must
+        // clear NX if *either* segment allows execution (AND the NX bits,
+        // OR everything else).
+        if skip_pages > 0 {
+            let overlap_start = effective_vaddr as usize;
+            let overlap_end = vma_start as usize;
+            if let Some(existing) = aspace.find(overlap_start) {
+                let nx = PageTableFlags::NO_EXECUTE.bits();
+                // OR all positive-grant bits, AND the negative-grant NX bit.
+                let merged_pte =
+                    (existing.prot_pte | prot_pte) & !(nx) | (existing.prot_pte & prot_pte & nx);
+                let merged_user = existing.prot_user | 0x3;
+                if merged_pte != existing.prot_pte {
+                    aspace.vmas.change_protection(
+                        overlap_start,
+                        overlap_end,
+                        merged_user,
+                        merged_pte,
+                    );
+                }
+            }
+        }
+
         // --- File-backed prefix VMA ---
         //
-        // Covers `[effective_vaddr .. effective_vaddr + file_pages * PAGE_SIZE)`.
+        // Covers `[vma_start .. vma_start + (file_pages - skip_pages) * PAGE_SIZE)`.
         // The `file_offset_pages` points into the cache at the page-aligned
         // start of `p_offset`, and `len_pages` is the page-aligned file size.
-        let file_pages = seg.filesz.div_ceil(PAGE_SIZE) as usize;
-        if file_pages > 0 {
-            let file_offset_pages = seg.file_offset / PAGE_SIZE;
+        let file_pages = adj_filesz.div_ceil(PAGE_SIZE) as usize;
+        let eff_file_pages = file_pages.saturating_sub(skip_pages);
+        if eff_file_pages > 0 {
+            let file_offset_pages = adj_file_offset / PAGE_SIZE + skip_pages as u64;
             let file_obj = FileObject::new(
                 cache.clone(),
                 file_offset_pages,
-                file_pages,
+                eff_file_pages,
                 Share::Private,
                 0o2,  // O_RDWR snapshot — the loader has full access
                 true, // exec_allowed — loader is mapping an executable
             );
-            let file_start = effective_vaddr as usize;
-            let file_end = file_start + file_pages * PAGE_SIZE as usize;
+            let file_start = vma_start as usize;
+            let file_end = file_start + eff_file_pages * PAGE_SIZE as usize;
             let file_vma = Vma::new(
                 file_start,
                 file_end,
@@ -774,10 +829,11 @@ fn register_demand_vmas(
         // When `p_memsz > p_filesz`, the remaining pages are zero-fill.
         // This is the `.bss` section (or alignment padding). Backed by
         // an `AnonObject` so the first fault returns a zeroed page.
-        let total_pages = seg.memsz.div_ceil(PAGE_SIZE) as usize;
-        if total_pages > file_pages {
-            let bss_page_count = total_pages - file_pages;
-            let bss_start = effective_vaddr as usize + file_pages * PAGE_SIZE as usize;
+        let total_pages = adj_memsz.div_ceil(PAGE_SIZE) as usize;
+        let eff_total_pages = total_pages.saturating_sub(skip_pages);
+        if eff_total_pages > eff_file_pages {
+            let bss_page_count = eff_total_pages - eff_file_pages;
+            let bss_start = vma_start as usize + eff_file_pages * PAGE_SIZE as usize;
             let bss_end = bss_start + bss_page_count * PAGE_SIZE as usize;
             let bss_obj = AnonObject::new(Some(bss_page_count));
             let bss_vma = Vma::new(
@@ -794,6 +850,9 @@ fn register_demand_vmas(
 
         if seg_end > image_end {
             image_end = seg_end;
+        }
+        if seg_end > vma_ceiling {
+            vma_ceiling = seg_end;
         }
         segments += 1;
     }
@@ -862,32 +921,37 @@ fn map_user_segment(
     pml4: PhysFrame<Size4KiB>,
     base_offset: u64,
 ) -> Result<(), (LoadError, u64)> {
-    let effective_vaddr = seg
+    let raw_effective_vaddr = seg
         .vaddr
         .as_u64()
         .checked_add(base_offset)
         .ok_or((LoadError::SegmentNotLowerHalf, 0))?;
-    if effective_vaddr >= UPPER_HALF_START {
+    if raw_effective_vaddr >= UPPER_HALF_START {
         return Err((LoadError::SegmentNotLowerHalf, 0));
     }
+
+    // Page-align vaddr down and adjust sizes/offset (see register_demand_vmas).
+    let page_misalign = raw_effective_vaddr & (PAGE_SIZE - 1);
+    let effective_vaddr = raw_effective_vaddr - page_misalign;
+    let adj_filesz = seg.filesz + page_misalign;
+    let adj_memsz = seg.memsz + page_misalign;
+    let adj_file_offset = seg.file_offset - page_misalign;
+
     // Reject segments whose virtual range overflows or crosses the
     // lower-half ceiling. Without this check, a large `p_memsz` could
     // push later pages into non-canonical space, panicking in
     // `VirtAddr::new()` during the mapping loop.
     if effective_vaddr
-        .checked_add(seg.memsz)
+        .checked_add(adj_memsz)
         .map_or(true, |end| end > UPPER_HALF_START)
     {
         return Err((LoadError::SegmentNotLowerHalf, 0));
     }
-    if effective_vaddr & (PAGE_SIZE - 1) != 0 {
-        return Err((LoadError::SegmentNotPageAligned, 0));
-    }
 
-    let file_end = seg.file_offset + seg.filesz;
-    let src = &bytes[seg.file_offset as usize..file_end as usize];
+    let file_end = adj_file_offset + adj_filesz;
+    let src = &bytes[adj_file_offset as usize..file_end as usize];
 
-    let page_count = seg.memsz.div_ceil(PAGE_SIZE);
+    let page_count = adj_memsz.div_ceil(PAGE_SIZE);
     let hhdm = paging::hhdm_offset();
 
     // Add USER_ACCESSIBLE to every flag set derived from the ELF flags so
@@ -899,9 +963,53 @@ fn map_user_segment(
         let va = VirtAddr::new(effective_vaddr + i * PAGE_SIZE);
         let page = Page::<Size4KiB>::containing_address(va);
         // map_in_pml4 allocates a fresh zeroed frame and installs it in
-        // pml4 (not the global kernel mapper).
+        // pml4 (not the global kernel mapper). If the page is already
+        // mapped (overlapping segments after page-align-down), skip it
+        // — the earlier segment's content is already in place.
         let frame = match paging::map_in_pml4(pml4, page, flags) {
             Ok(f) => f,
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {
+                // The page is already mapped by a previous overlapping
+                // segment (common after page-align-down). Two things
+                // must happen:
+                //
+                // 1. **Upgrade PTE flags** so that both segments'
+                //    permissions are satisfied (e.g. R-only header page
+                //    → R+E when the overlapping .text segment is
+                //    executable). NX-aware: AND the NX bits, OR
+                //    everything else.
+                //
+                // 2. **Copy this segment's file content** into the
+                //    already-mapped frame. The earlier segment's
+                //    filesz may not cover the full page (e.g. the
+                //    first LOAD covers only 0..0x249, leaving
+                //    0x249..0xFFF as zeroes, but the second LOAD's
+                //    .text starts at 0x250 and must be copied in).
+                if let Some((existing_frame, existing_flags)) = paging::translate_in_pml4(pml4, va)
+                {
+                    let nx = PageTableFlags::NO_EXECUTE;
+                    let merged = (existing_flags | flags) - nx | (existing_flags & flags & nx);
+                    if merged != existing_flags {
+                        let _ = paging::update_flags_in_pml4(pml4, page, merged);
+                    }
+                    // Copy file content into the overlapping page.
+                    let offset_in_seg = i * PAGE_SIZE;
+                    if offset_in_seg < adj_filesz {
+                        let copy_off = offset_in_seg as usize;
+                        let remaining = (adj_filesz - offset_in_seg) as usize;
+                        let n = remaining.min(PAGE_SIZE as usize);
+                        let dst_base = hhdm + existing_frame.start_address().as_u64();
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src.as_ptr().add(copy_off),
+                                dst_base.as_mut_ptr::<u8>(),
+                                n,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             Err(e) => return Err((LoadError::MapFailed(e), mapped)),
         };
         mapped += 1;
@@ -914,9 +1022,9 @@ fn map_user_segment(
             // The frame is already zeroed by map_in_pml4, but we still
             // copy file bytes in to overlay the .bss tail.
             let offset_in_seg = i * PAGE_SIZE;
-            if offset_in_seg < seg.filesz {
+            if offset_in_seg < adj_filesz {
                 let copy_off = offset_in_seg as usize;
-                let remaining = (seg.filesz - offset_in_seg) as usize;
+                let remaining = (adj_filesz - offset_in_seg) as usize;
                 let n = remaining.min(PAGE_SIZE as usize);
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(copy_off),
