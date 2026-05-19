@@ -1597,10 +1597,7 @@ pub fn resolve_execve_binary(path: &[u8]) -> Result<&'static [u8], i64> {
                 }
 
                 // Read the file contents.
-                let of = crate::shell::vfs_helpers::open_inode(
-                    &resolved.inode,
-                    &resolved.dentry,
-                )?;
+                let of = crate::shell::vfs_helpers::open_inode(&resolved.inode, &resolved.dentry)?;
                 let mut out = alloc::vec::Vec::new();
                 let mut off: u64 = 0;
                 let mut chunk = [0u8; 512];
@@ -1621,7 +1618,7 @@ pub fn resolve_execve_binary(path: &[u8]) -> Result<&'static [u8], i64> {
                 // empty file — fall through to module lookup
             }
             Err(e) if e == crate::fs::ENOENT => {} // not found in VFS — try modules
-            Err(e) => return Err(e),                // other VFS error — propagate
+            Err(e) => return Err(e),               // other VFS error — propagate
         }
     }
 

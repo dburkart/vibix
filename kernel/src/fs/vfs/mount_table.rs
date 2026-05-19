@@ -887,13 +887,8 @@ mod tests {
         drain_table();
         let target = make_dir_dentry();
         let fs = make_fs();
-        let edge = mount(
-            MountSource::None,
-            &target,
-            fs.clone(),
-            MountFlags::NOEXEC,
-        )
-        .expect("mount with NOEXEC");
+        let edge = mount(MountSource::None, &target, fs.clone(), MountFlags::NOEXEC)
+            .expect("mount with NOEXEC");
         let flags = mount_flags_for_sb(&edge.super_block);
         assert!(flags.contains(MountFlags::NOEXEC));
         unmount(&target, UmountFlags::default()).expect("unmount");
