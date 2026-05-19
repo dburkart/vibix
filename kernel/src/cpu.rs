@@ -68,8 +68,9 @@ pub struct Features {
     leaf7_ecx: u32, // reserved for future features
     #[allow(dead_code)]
     leaf7_edx: u32, // reserved for future features
-    ext_edx: u32, // leaf 0x8000_0001 EDX
-    ext_ecx: u32, // leaf 0x8000_0001 ECX
+    ext_edx: u32,     // leaf 0x8000_0001 EDX
+    ext_ecx: u32,     // leaf 0x8000_0001 ECX
+    leafd_1_eax: u32, // leaf 0xD sub-leaf 1, EAX (XSAVEOPT etc.)
 }
 
 impl Features {
@@ -85,6 +86,23 @@ impl Features {
         ext_edx: u32,
         ext_ecx: u32,
     ) -> Self {
+        Self::from_raw_extended(
+            leaf1_edx, leaf1_ecx, leaf7_ebx, leaf7_ecx, leaf7_edx, ext_edx, ext_ecx, 0,
+        )
+    }
+
+    /// Construct from raw CPUID leaf values including extended XSAVE
+    /// sub-leaf fields.
+    pub const fn from_raw_extended(
+        leaf1_edx: u32,
+        leaf1_ecx: u32,
+        leaf7_ebx: u32,
+        leaf7_ecx: u32,
+        leaf7_edx: u32,
+        ext_edx: u32,
+        ext_ecx: u32,
+        leafd_1_eax: u32,
+    ) -> Self {
         Self {
             leaf1_edx,
             leaf1_ecx,
@@ -93,6 +111,7 @@ impl Features {
             leaf7_edx,
             ext_edx,
             ext_ecx,
+            leafd_1_eax,
         }
     }
 
@@ -119,6 +138,8 @@ impl Features {
             // Extended leaf 0x8000_0001
             Feature::Rdtscp => self.ext_edx & (1 << 27) != 0,
             Feature::Lzcnt => self.ext_ecx & (1 << 5) != 0,
+            // Leaf 0xD, sub-leaf 1, EAX
+            Feature::Xsaveopt => self.leafd_1_eax & (1 << 0) != 0,
         }
     }
 }
@@ -162,6 +183,8 @@ pub enum Feature {
     Rdrand,
     /// RDSEED instruction — leaf 7 sub-leaf 0, EBX bit 18.
     Rdseed,
+    /// XSAVEOPT instruction — leaf 0xD sub-leaf 1, EAX bit 0.
+    Xsaveopt,
 }
 
 /// Return `true` if the CPU supports `f`.
@@ -203,7 +226,17 @@ pub fn init() {
         (0u32, 0u32)
     };
 
-    let features = Features::from_raw(l1.edx, l1.ecx, l7_ebx, l7_ecx, l7_edx, lext_edx, lext_ecx);
+    // Leaf 0xD, sub-leaf 1 — XSAVE extended features (XSAVEOPT, etc.).
+    // Only available when XSAVE is supported (leaf 1 ECX bit 26).
+    let ld_1_eax = if l1.ecx & (1 << 26) != 0 && max_std >= 0xD {
+        __cpuid_count(0xD, 1).eax
+    } else {
+        0u32
+    };
+
+    let features = Features::from_raw_extended(
+        l1.edx, l1.ecx, l7_ebx, l7_ecx, l7_edx, lext_edx, lext_ecx, ld_1_eax,
+    );
     FEATURES.call_once(|| features);
 
     // CPU brand string lives in extended leaves 0x80000002..4, each
@@ -278,6 +311,9 @@ pub fn init() {
     if features.has(Feature::Rdseed) {
         crate::serial_print!(" RDSEED");
     }
+    if features.has(Feature::Xsaveopt) {
+        crate::serial_print!(" XSAVEOPT");
+    }
     crate::serial_println!();
 }
 
@@ -292,7 +328,8 @@ mod tests {
         // Leaf 7 EBX: FSGSBASE (0), AVX2 (5), SMEP (7), SMAP (20)
         // Ext EDX:    RDTSCP (27)
         // Ext ECX:    LZCNT (5)
-        let f = Features::from_raw(
+        // Leaf 0xD sub-leaf 1 EAX: XSAVEOPT (0)
+        let f = Features::from_raw_extended(
             (1 << 16) | (1 << 25) | (1 << 26), // leaf1_edx
             (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 28) | (1 << 30), // leaf1_ecx
             (1 << 0) | (1 << 5) | (1 << 7) | (1 << 18) | (1 << 20), // leaf7_ebx
@@ -300,6 +337,7 @@ mod tests {
             0,                                 // leaf7_edx
             1 << 27,                           // ext_edx
             1 << 5,                            // ext_ecx
+            1 << 0,                            // leafd_1_eax (XSAVEOPT)
         );
 
         assert!(f.has(Feature::Sse));
@@ -318,6 +356,7 @@ mod tests {
         assert!(f.has(Feature::Lzcnt));
         assert!(f.has(Feature::Rdrand));
         assert!(f.has(Feature::Rdseed));
+        assert!(f.has(Feature::Xsaveopt));
     }
 
     #[test]

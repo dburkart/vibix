@@ -20,7 +20,7 @@
 //!   restart_flag: u64       — kernel-private: non-zero iff this frame
 //!                             interrupted an ERESTARTSYS-ed syscall that
 //!                             must be replayed at sigreturn (#522)
-//!   fpstate:   u64          — NULL (FPU state not saved; known limitation)
+//!   fpstate:   u64          — pointer to saved FPU/SSE/AVX state (#151)
 //! ```
 //!
 //! Total size: 8+4+4+128+8+8+24+184+8+8+8 = 392 bytes.
@@ -50,6 +50,8 @@
 //!   R10 (a3) → 2,   R8  (a4) → 0, R9  (a5) → 1.
 
 use core::mem;
+
+use crate::arch::x86_64::fpu;
 
 /// Index of key registers in `SigFrame::gregs`.
 const REG_R8: usize = 0;
@@ -105,7 +107,9 @@ pub struct SigFrame {
     /// field lives where Linux keeps `__reserved[8]`; userspace is not
     /// expected to read or modify it (issue #522).
     pub restart_flag: u64,
-    /// Pointer to saved FPU state.  Always NULL in this implementation.
+    /// Pointer to saved FPU/SSE/AVX state on the user stack. Points at
+    /// a 64-byte-aligned save area above the `SigFrame`, sized to the
+    /// runtime XSAVE or FXSAVE area. Restored by `sigreturn(2)` (#151).
     pub fpstate: u64,
     /// Inline sigreturn trampoline code.
     pub trampoline_code: [u8; 9],
@@ -169,6 +173,12 @@ pub struct SavedSyscallRegs {
 /// receives control via the `pretcode` return-address slot, so no extra
 /// adjustment is needed).
 ///
+/// FPU state (#151): saves the current FPU/SSE/AVX register state onto the
+/// user stack above the `SigFrame` and sets `fpstate` to point at it. The
+/// signal handler runs with a clean FPU (the live registers are left as-is
+/// since the kernel is soft-float and userspace will see whatever was last
+/// saved). On `sigreturn`, the state is restored from `fpstate`.
+///
 /// Returns `Ok(new_rsp)` or `Err(())` if the frame could not be written (bad
 /// user pointer).
 ///
@@ -185,16 +195,35 @@ pub unsafe fn push_signal_frame(
 ) -> Result<u64, ()> {
     use crate::arch::x86_64::uaccess;
 
-    // Align the frame bottom to 16 bytes, then subtract 8 so that RSP is
-    // `8 mod 16` at handler entry (x86-64 ABI requirement at CALL).
+    let fpu_size = fpu::area_size() as u64;
+
+    // Layout on the user stack (growing downward):
+    //   [user_rsp]
+    //   [FPU save area - fpu_size bytes, 64-byte aligned]  <-- fpstate_addr
+    //   [SigFrame]                                          <-- frame_addr
+    //
+    // First, reserve space for the FPU area and align to 64 bytes.
+    let fpu_top = user_rsp.checked_sub(fpu_size).ok_or(())?;
+    let fpstate_addr = fpu_top & !63u64; // 64-byte aligned
+
+    // Then reserve the SigFrame below the FPU area.
     let frame_size = mem::size_of::<SigFrame>() as u64;
-    let frame_top = user_rsp.checked_sub(frame_size).ok_or(())?;
+    let frame_top = fpstate_addr.checked_sub(frame_size).ok_or(())?;
+    // Align so RSP is `8 mod 16` at handler entry.
     let frame_addr = (frame_top & !15u64).wrapping_sub(8);
 
-    // Validate the user address range before writing.
-    if uaccess::check_user_range(frame_addr as usize, frame_size as usize).is_err() {
+    // Validate the entire user address range (frame + FPU area).
+    let total_size = (user_rsp - frame_addr) as usize;
+    if uaccess::check_user_range(frame_addr as usize, total_size).is_err() {
         return Err(());
     }
+
+    // Save the current FPU state to a kernel-side buffer, then copy to
+    // the user stack. Clear CR0.TS first so we don't trap.
+    let mut fpu_buf = fpu::FpuArea::new_initialized();
+    fpu::clear_ts();
+    fpu::save(&mut fpu_buf);
+    uaccess::copy_to_user(fpstate_addr as usize, fpu_buf.as_bytes()).map_err(|_| ())?;
 
     // Build the frame in kernel memory, then copy it to user space.
     let mut frame = SigFrame {
@@ -208,7 +237,7 @@ pub unsafe fn push_signal_frame(
         gregs: [0u64; 23],
         uc_sigmask: saved_mask,
         restart_flag: if restart_pending { 1 } else { 0 },
-        fpstate: 0,
+        fpstate: fpstate_addr,
         trampoline_code: SIGRETURN_TRAMPOLINE,
         _trampoline_pad: [0u8; 7],
     };
@@ -221,14 +250,6 @@ pub unsafe fn push_signal_frame(
     frame.gregs[REG_EFLAGS] = saved_rflags;
     frame.gregs[REG_RSP] = user_rsp;
 
-    // Save the Linux syscall-ABI registers so `sigreturn(2)` can replay
-    // an SA_RESTART-ed syscall with the original (nr, a0..a5). Without
-    // these, a user handler that clobbers any of rax/rdi/rsi/rdx/r10/r8/r9
-    // would corrupt the restarted syscall (issue #522). The gregs slots
-    // are populated unconditionally so gdb / a friendly userspace can
-    // still observe the pre-handler syscall arguments, but `sigreturn`
-    // only writes them back into the kernel context when
-    // `restart_flag` is non-zero.
     frame.gregs[REG_RAX] = syscall_regs.rax;
     frame.gregs[REG_RDI] = syscall_regs.rdi;
     frame.gregs[REG_RSI] = syscall_regs.rsi;
@@ -266,13 +287,26 @@ pub unsafe fn push_fault_signal_frame(
 ) -> Result<u64, ()> {
     use crate::arch::x86_64::uaccess;
 
+    let fpu_size = fpu::area_size() as u64;
+
+    // Reserve FPU area above the frame (same layout as push_signal_frame).
+    let fpu_top = user_rsp.checked_sub(fpu_size).ok_or(())?;
+    let fpstate_addr = fpu_top & !63u64;
+
     let frame_size = mem::size_of::<SigFrame>() as u64;
-    let frame_top = user_rsp.checked_sub(frame_size).ok_or(())?;
+    let frame_top = fpstate_addr.checked_sub(frame_size).ok_or(())?;
     let frame_addr = (frame_top & !15u64).wrapping_sub(8);
 
-    if uaccess::check_user_range(frame_addr as usize, frame_size as usize).is_err() {
+    let total_size = (user_rsp - frame_addr) as usize;
+    if uaccess::check_user_range(frame_addr as usize, total_size).is_err() {
         return Err(());
     }
+
+    // Save FPU state (#151).
+    let mut fpu_buf = fpu::FpuArea::new_initialized();
+    fpu::clear_ts();
+    fpu::save(&mut fpu_buf);
+    uaccess::copy_to_user(fpstate_addr as usize, fpu_buf.as_bytes()).map_err(|_| ())?;
 
     let mut frame = SigFrame {
         pretcode: frame_addr + mem::offset_of!(SigFrame, trampoline_code) as u64,
@@ -285,7 +319,7 @@ pub unsafe fn push_fault_signal_frame(
         gregs: [0u64; 23],
         uc_sigmask: saved_mask,
         restart_flag: 0,
-        fpstate: 0,
+        fpstate: fpstate_addr,
         trampoline_code: SIGRETURN_TRAMPOLINE,
         _trampoline_pad: [0u8; 7],
     };
@@ -300,11 +334,6 @@ pub unsafe fn push_fault_signal_frame(
     frame.gregs[REG_RIP] = saved_rip;
     frame.gregs[REG_EFLAGS] = saved_rflags;
     frame.gregs[REG_RSP] = user_rsp;
-    // Fault path does not resume an interrupted SYSCALL — the interrupted
-    // code is user code at `saved_rip`, not a syscall. Leave the syscall
-    // arg gregs as zero AND `restart_flag` as zero, so a (malicious or
-    // defensive) sigreturn cannot synthesize a SYSCALL-arg reload on the
-    // fault-recovery path.
 
     let frame_bytes =
         core::slice::from_raw_parts(&frame as *const SigFrame as *const u8, frame_size as usize);
@@ -315,6 +344,8 @@ pub unsafe fn push_fault_signal_frame(
 
 /// Restore register context from a `SigFrame` at `frame_addr` on the user
 /// stack.
+///
+/// Also restores FPU state from `fpstate` if it is non-NULL (#151).
 ///
 /// Returns the saved `[rip, rflags, rsp, saved_mask]` or `Err(())` if the
 /// frame cannot be read.
@@ -345,6 +376,17 @@ pub unsafe fn restore_signal_frame(frame_addr: u64) -> Result<RestoredRegs, ()> 
     }
     if uaccess::check_user_range(rsp as usize, 1).is_err() {
         return Err(());
+    }
+
+    // Restore FPU state from fpstate if present (#151).
+    if frame.fpstate != 0 {
+        let fpu_size = fpu::area_size();
+        uaccess::check_user_range(frame.fpstate as usize, fpu_size).map_err(|_| ())?;
+        let mut fpu_buf = fpu::FpuArea::new_initialized();
+        let fpu_bytes = fpu_buf.as_bytes_mut();
+        uaccess::copy_from_user(fpu_bytes, frame.fpstate as usize).map_err(|_| ())?;
+        fpu::clear_ts();
+        fpu::restore(&fpu_buf);
     }
 
     Ok(RestoredRegs {

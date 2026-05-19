@@ -117,6 +117,90 @@ unsafe fn restore_fs_base(task: &Task) {
 /// single PIT tick — every tick is a rescheduling opportunity.
 pub(crate) const DEFAULT_SLICE_MS: u32 = 10;
 
+/// Lazy FPU save/restore on context switch (#151).
+///
+/// Save is lazy: only performed if the outgoing task actually used the
+/// FPU (it is the current FPU owner — meaning `#NM` fired and restored
+/// its state at some point during its timeslice).
+///
+/// Restore is deferred via CR0.TS: the incoming task's first FPU/SSE/AVX
+/// instruction triggers `#NM`, whose handler clears TS, restores the
+/// task's state from its `FpuArea`, and records it as the new FPU owner.
+/// If the incoming task never touches the FPU during its timeslice, no
+/// restore happens at all.
+///
+/// The pointer to the incoming task's `FpuArea` is stashed in a global
+/// (`PENDING_FPU_RESTORE`) so the `#NM` handler can find it without
+/// taking the scheduler lock.
+///
+/// Special case: if the incoming task is already the FPU owner (switched
+/// out and back in without any other task touching the FPU), just clear
+/// TS — the registers are still correct.
+///
+/// # Safety
+/// - IRQs must be disabled.
+/// - `prev_fpu` / `next_fpu` must point at valid, stable `FpuArea`s.
+/// - `fpu::init()` must have run.
+unsafe fn lazy_fpu_switch(
+    prev_id: usize,
+    prev_fpu: *mut fpu::FpuArea,
+    next_id: usize,
+    next_fpu: *const fpu::FpuArea,
+) {
+    let owner = fpu::fpu_owner();
+
+    // If the outgoing task is the FPU owner, save its live register state.
+    if owner == prev_id {
+        fpu::save(&mut *prev_fpu);
+    }
+
+    if owner == next_id {
+        // The incoming task still owns the FPU registers — no restore
+        // needed. Clear TS so it can use them immediately.
+        fpu::clear_ts();
+    } else {
+        // Stash the pointer for the `#NM` handler, then set TS so the
+        // first FPU instruction triggers the lazy restore.
+        PENDING_FPU_RESTORE.store(next_fpu as usize, Ordering::Relaxed);
+        PENDING_FPU_TASK_ID.store(next_id, Ordering::Relaxed);
+        fpu::set_ts();
+    }
+}
+
+/// Pointer to the `FpuArea` that the `#NM` handler should restore from.
+/// Written by [`lazy_fpu_switch`] during context switch, read by
+/// [`crate::arch::x86_64::fpu::handle_device_not_available`].
+///
+/// Only meaningful while CR0.TS is set (between `lazy_fpu_switch` and
+/// the subsequent `#NM`). Zero means "no pending restore" and the `#NM`
+/// handler treats it as unexpected.
+static PENDING_FPU_RESTORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Task ID corresponding to [`PENDING_FPU_RESTORE`].
+static PENDING_FPU_TASK_ID: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Called by the `#NM` handler to perform the deferred FPU restore.
+///
+/// Returns `true` if a pending restore was performed, `false` if the
+/// `#NM` was unexpected (no pending restore stashed).
+///
+/// # Safety
+/// Must be called from the `#NM` exception handler with IRQs disabled.
+pub unsafe fn do_lazy_fpu_restore() -> bool {
+    let ptr = PENDING_FPU_RESTORE.swap(0, Ordering::Relaxed);
+    if ptr == 0 {
+        return false;
+    }
+    let task_id = PENDING_FPU_TASK_ID.load(Ordering::Relaxed);
+    let area = &*(ptr as *const fpu::FpuArea);
+    fpu::clear_ts();
+    fpu::restore(area);
+    fpu::set_fpu_owner(task_id);
+    true
+}
+
 static SCHED: Lazy<IrqLock<Scheduler>> = Lazy::new(|| IrqLock::new(Scheduler::new()));
 
 /// Victims produced by [`exit`] waiting for the reaper task to reclaim
@@ -251,7 +335,10 @@ pub fn fork_current_task(
         // and holding SCHED excludes any aliasing save from context_switch.
         crate::fork_trace!("fork-trace: [fork_current_task] → fpu::save(parent)");
         unsafe {
-            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            if fpu::fpu_owner() == cur.id {
+                fpu::clear_ts();
+                crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            }
         }
         crate::fork_trace!("fork-trace: [fork_current_task] ← fpu::save(parent)");
         // Snapshot the parent's credentials Arc under the rwlock. POSIX
@@ -390,9 +477,11 @@ pub fn clone_current_as_thread(
             .current
             .as_mut()
             .expect("clone_current_as_thread: no running task");
-        // Flush live FPU state.
         unsafe {
-            crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            if fpu::fpu_owner() == cur.id {
+                fpu::clear_ts();
+                crate::arch::x86_64::fpu::save(&mut cur.fpu);
+            }
         }
         let parent_credentials = Arc::clone(&*cur.credentials.read());
         (
@@ -1273,7 +1362,7 @@ pub fn exit() -> ! {
     // released. IrqLock cannot be used end-to-end here because the
     // guard drop would re-enable IRQs before context_switch.
     interrupts::disable();
-    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_task_ptr) = {
+    let (prev_rsp_ptr, next_rsp, next_cr3, next_fpu_ptr, next_task_ptr, sched_current_id_snapshot) = {
         let mut sched = SCHED.lock();
         // Exiting the bootstrap task would reap the kernel PML4 and
         // the inherited boot stack — neither of which we own. Reject
@@ -1328,12 +1417,14 @@ pub fn exit() -> ! {
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         drop(victims);
         let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
+        let next_id = sched.current.as_ref().unwrap().id;
         (
             prev_rsp_ptr,
             next_rsp,
             next_cr3,
             next_fpu_ptr,
             next_task_ptr,
+            next_id,
         )
     };
     // Poke the reaper before we switch away. `notify_all` takes
@@ -1345,9 +1436,14 @@ pub fn exit() -> ! {
     // next_fpu_ptr points into a Box<FpuArea> pinned by the scheduler.
     // We intentionally skip `fpu::save` and `save_fs_base` — the
     // exiting task is doomed and its state will never be restored.
+    // Invalidate the FPU owner since the exiting task is going away.
     unsafe {
         restore_fs_base(&*next_task_ptr);
+        // Clear the FPU owner — the exiting task's state is being discarded.
+        fpu::clear_fpu_owner();
         fpu::restore(&*next_fpu_ptr);
+        fpu::set_fpu_owner(sched_current_id_snapshot);
+        fpu::clear_ts();
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
     unreachable!("task::exit returned from context_switch");
@@ -1539,10 +1635,6 @@ pub fn preempt_tick() {
     // valid; the helper only performs atomic / live-TSS writes and
     // does not take any other lock.
     set_active_syscall_stack(sched.current.as_ref().unwrap());
-    // Grab a raw pointer to the incoming task's FPU area while we
-    // still hold the mutable borrow; we'll dereference it after the
-    // lock is dropped.
-    let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
     sched.push_ready(prev);
     // The push above put `prev` at the back of its priority's queue;
     // retrieve the pointer through the bank to keep the Box-stability
@@ -1555,29 +1647,24 @@ pub fn preempt_tick() {
     let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
     let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
     let prev_task_ptr: *mut Task = &mut **prev_ref;
+    let prev_task_id = prev_ref.id;
+    let next_task_id = sched.current.as_ref().unwrap().id;
+    let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
     let next_task_ptr: *const Task = &**sched.current.as_ref().unwrap();
     drop(sched);
 
-    // SAFETY: `prev_rsp_ptr` / `prev_fpu_ptr` / `next_fpu_ptr` point
-    // into heap-allocated `FpuArea` / `usize` fields behind Box<Task>
-    // values in the scheduler — the Box indirection pins those
-    // allocations across VecDeque or BTreeMap rebalances (rebalancing
-    // moves the Box, not the heap-allocated Task). IRQs are already
-    // masked inside the ISR, so no other scheduler path can race us
-    // between lock drop and the context switch. `next_cr3` is a valid
-    // PML4 whose upper half mirrors the kernel PML4 (by construction
-    // in `Task::new` / `Task::bootstrap`). `fpu::init()` ran during
-    // `arch::init`, so fxsave64/fxrstor64 are legal on this CPU.
-    // `prev_task_ptr` / `next_task_ptr` point at the same stable heap
-    // Tasks for the MSR_FS_BASE save/restore (#831).
+    // Lazy FPU save/restore (#151): only save if this task actually used
+    // the FPU (CR0.TS is clear, meaning #NM already fired and we restored
+    // for this task). Only restore if the incoming task is not already the
+    // FPU owner; otherwise just clear TS.
+    //
+    // SAFETY: IRQs are masked inside the ISR. prev/next pointers target
+    // stable heap memory (Box indirection pins across rebalances).
+    // fpu::init() ran during arch::init.
     unsafe {
         save_fs_base(&mut *prev_task_ptr);
-        fpu::save(&mut *prev_fpu_ptr);
+        lazy_fpu_switch(prev_task_id, prev_fpu_ptr, next_task_id, next_fpu_ptr);
         restore_fs_base(&*next_task_ptr);
-        fpu::restore(&*next_fpu_ptr);
-        // Note: SYSCALL/TSS stack pointers were armed above under the
-        // SCHED lock via `set_active_syscall_stack`; see the helper for
-        // why this consolidation exists (#505).
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 }
@@ -1630,6 +1717,8 @@ pub fn block_current() {
         next_fpu_ptr,
         next_rsp,
         next_cr3,
+        prev_task_id,
+        next_task_id,
         prev_task_ptr,
         next_task_ptr,
     ) = {
@@ -1667,11 +1756,6 @@ pub fn block_current() {
         let prev_id = prev.id;
         let next_rsp = next.rsp;
         let next_cr3 = next.cr3.start_address().as_u64();
-        // RFC 0006 / #718: emit `TaskBlocked` for the parking task and
-        // `TaskScheduled` for its successor. The block reason here is
-        // `Wait` because `block_current` is the WaitQueue / blocking-
-        // primitive park path; tick-deadline parks go through
-        // `sleep_ms` and emit `Sleep` separately before reaching here.
         crate::sched_mock_trace!(SchedMockEvent::TaskBlocked {
             id: prev_id,
             reason: SchedMockBlockReason::Wait,
@@ -1681,22 +1765,15 @@ pub fn block_current() {
         crate::sched_mock_trace!(SchedMockEvent::TaskScheduled {
             id: sched.current.as_ref().unwrap().id,
         });
-        // Arm SYSCALL/TSS for the incoming task's own per-task kernel
-        // stack under the SCHED lock; see `set_active_syscall_stack`
-        // for why this consolidation exists (#505).
         set_active_syscall_stack(sched.current.as_ref().unwrap());
         let next_fpu_ptr: *const fpu::FpuArea = &*sched.current.as_ref().unwrap().fpu;
+        let next_task_id = sched.current.as_ref().unwrap().id;
         sched.parked.insert(prev_id, prev);
 
         let prev_ref = sched
             .parked
             .get_mut(&prev_id)
             .expect("just inserted into parked");
-        // SAFETY: `prev_ref` is `&mut Box<Task>`; the Box heap-allocates
-        // the Task, so `&mut prev_ref.rsp` / `&mut *prev_ref.fpu` point
-        // at stable memory that survives any BTreeMap rebalance
-        // (rebalancing moves the Box, not the heap-allocated Task it
-        // points at). Same invariant as preempt_tick's ready-queue push.
         let prev_rsp_ptr: *mut usize = &mut prev_ref.rsp as *mut usize;
         let prev_fpu_ptr: *mut fpu::FpuArea = &mut *prev_ref.fpu;
         let prev_task_ptr: *mut Task = &mut **prev_ref;
@@ -1708,23 +1785,17 @@ pub fn block_current() {
             next_fpu_ptr,
             next_rsp,
             next_cr3,
+            prev_id,
+            next_task_id,
             prev_task_ptr,
             next_task_ptr,
         )
     };
 
-    // SAFETY: IRQs are masked, the SCHED lock is dropped so the
-    // incoming task can re-enter the scheduler, and prev_rsp_ptr /
-    // prev_fpu_ptr / next_fpu_ptr target stable heap memory (see the
-    // insert comment above). `next_cr3` is a valid per-task PML4 (see
-    // preempt_tick). `fpu::init()` ran during `arch::init`.
-    // `prev_task_ptr` / `next_task_ptr` target stable heap Tasks for
-    // the MSR_FS_BASE save/restore (#831).
     unsafe {
         save_fs_base(&mut *prev_task_ptr);
-        fpu::save(&mut *prev_fpu_ptr);
+        lazy_fpu_switch(prev_task_id, prev_fpu_ptr, next_task_id, next_fpu_ptr);
         restore_fs_base(&*next_task_ptr);
-        fpu::restore(&*next_fpu_ptr);
         context_switch(prev_rsp_ptr, next_rsp, next_cr3);
     }
 
