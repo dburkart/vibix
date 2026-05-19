@@ -33,8 +33,18 @@ pub use priority::{
 };
 
 use super::scheduler::Scheduler;
+use super::task::Task;
+
+/// Opaque handle for a newly-created child task that has not yet been
+/// placed on the scheduler's ready queue. Returned by [`fork_current_task`]
+/// and [`clone_current_as_thread`]; consumed by [`make_child_runnable`].
+///
+/// This type intentionally hides `Box<Task>` (which is `pub(super)`) so
+/// that callers outside the `task` module can hold and pass it without
+/// accessing `Task` internals.
+pub struct ForkChild(Box<Task>);
 use super::switch::context_switch;
-use super::task::{Task, TaskState};
+use super::task::TaskState;
 
 use crate::arch::x86_64::fpu;
 use crate::serial_println;
@@ -181,8 +191,14 @@ pub fn spawn_and_get_id(entry: fn() -> !) -> usize {
 }
 
 /// Clone the current task's address space and fd table for a fork child,
-/// allocate a new kernel stack, push the child onto the ready queue, and
-/// return the child's task ID.
+/// allocate a new kernel stack, and return the child task (boxed) along
+/// with its task ID — **without** pushing it onto the ready queue.
+///
+/// The caller must call [`make_child_runnable`] to enqueue the child
+/// after performing any bookkeeping (e.g. `process::register`) that must
+/// complete before the child can be scheduled. This two-phase protocol
+/// closes the race window where a child could run and exit before being
+/// registered in the process table (#921).
 ///
 /// `regs` carries the ring-3 register state saved by the SYSCALL entry
 /// before invoking `syscall_dispatch` — full GPR set so the child sees
@@ -191,7 +207,7 @@ pub fn spawn_and_get_id(entry: fn() -> !) -> usize {
 /// (#690).
 pub fn fork_current_task(
     regs: &crate::fork_abi::ForkUserRegs,
-) -> Result<usize, crate::mem::addrspace::ForkError> {
+) -> Result<(usize, ForkChild), crate::mem::addrspace::ForkError> {
     use alloc::sync::Arc;
     use spin::{Mutex, RwLock};
 
@@ -335,29 +351,11 @@ pub fn fork_current_task(
         "fork-trace: [fork_current_task] ← Task::new_forked() child_id={}",
         child_id
     );
-    let child_box = Box::new(child);
-    let new_prio = child_box.priority;
-    crate::fork_trace!("fork-trace: [fork_current_task] → SCHED.lock() for push_ready");
-    let mut sched = SCHED.lock();
     crate::fork_trace!(
-        "fork-trace: [fork_current_task] SCHED locked; push_ready child_id={} prio={}",
-        child_id,
-        new_prio
-    );
-    sched.push_ready(child_box);
-    maybe_preempt_current_for_priority(&mut sched, new_prio);
-    // RFC 0006 / #718: record the fork transition. Parent id read
-    // through the snapshot we already took above; on a successful
-    // fork the child's id is what `Task::new_forked` minted.
-    crate::sched_mock_trace!(SchedMockEvent::TaskForked {
-        parent: sched.current.as_ref().map(|t| t.id).unwrap_or(usize::MAX),
-        child: child_id,
-    });
-    crate::fork_trace!(
-        "fork-trace: [fork_current_task exit] returning child_id={}",
+        "fork-trace: [fork_current_task exit] returning child_id={} (not yet runnable)",
         child_id
     );
-    Ok(child_id)
+    Ok((child_id, ForkChild(Box::new(child))))
 }
 
 /// Create a new thread that shares the parent's address space and fd table.
@@ -368,11 +366,12 @@ pub fn fork_current_task(
 ///
 /// `tls` is the FS base for the new thread (set by CLONE_SETTLS).
 ///
-/// Returns the child task ID on success.
+/// Returns `(child_task_id, Box<Task>)` without enqueueing the child.
+/// The caller must call [`make_child_runnable`] after registration (#921).
 pub fn clone_current_as_thread(
     regs: &crate::fork_abi::ForkUserRegs,
     tls: u64,
-) -> Result<usize, crate::mem::addrspace::ForkError> {
+) -> Result<(usize, ForkChild), crate::mem::addrspace::ForkError> {
     use alloc::sync::Arc;
 
     // Snapshot parent state while holding SCHED.
@@ -427,12 +426,26 @@ pub fn clone_current_as_thread(
         )
     }?;
     let child_id = child.id;
-    let child_box = Box::new(child);
-    let new_prio = child_box.priority;
+    Ok((child_id, ForkChild(Box::new(child))))
+}
+
+/// Enqueue a child task (returned by [`fork_current_task`] or
+/// [`clone_current_as_thread`]) onto the ready queue, making it
+/// schedulable. Must be called only after any required bookkeeping
+/// (e.g. `process::register`) so the child can look itself up in the
+/// process table when it runs (#921).
+pub fn make_child_runnable(child: ForkChild) {
+    let inner = child.0;
+    let _child_id = inner.id;
+    let new_prio = inner.priority;
     let mut sched = SCHED.lock();
-    sched.push_ready(child_box);
+    sched.push_ready(inner);
     maybe_preempt_current_for_priority(&mut sched, new_prio);
-    Ok(child_id)
+    // RFC 0006 / #718: record the fork transition.
+    crate::sched_mock_trace!(SchedMockEvent::TaskForked {
+        parent: sched.current.as_ref().map(|t| t.id).unwrap_or(usize::MAX),
+        child: _child_id,
+    });
 }
 
 /// Voluntarily yield the current timeslice. Resets the slice counter to

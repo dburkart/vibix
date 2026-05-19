@@ -133,17 +133,16 @@ pub fn sys_clone(
 
     // For CLONE_VM threads: share the parent's address space and fd table
     // (no CoW fork). Use clone_current_as_thread which shares Arc refs.
-    let child_task_id = match crate::task::clone_current_as_thread(&regs, tls) {
-        Ok(id) => id,
+    let (child_task_id, child_task) = match crate::task::clone_current_as_thread(&regs, tls) {
+        Ok(pair) => pair,
         Err(_) => return -12, // ENOMEM
     };
 
-    // Register in the process table. For CLONE_THREAD the child shares
-    // the parent's PID (it's a thread), but gets a unique TID. In vibix's
-    // current model, task_id == TID and we register a process entry so
-    // that current_pid() works for the child. The child's PID == parent's PID.
+    // Register in the process table BEFORE making the child runnable so
+    // that current_pid() returns a valid PID when the child runs (#921).
     let parent_pid = crate::process::current_pid();
     let child_tid = crate::process::register(child_task_id, parent_pid);
+    crate::task::make_child_runnable(child_task);
 
     // CLONE_PARENT_SETTID: write child TID to parent's memory.
     if clone_flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
