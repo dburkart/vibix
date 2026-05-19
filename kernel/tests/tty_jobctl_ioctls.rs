@@ -1,9 +1,10 @@
-//! Integration test: controlling-terminal job-control ioctls (#432).
+//! Integration test: controlling-terminal job-control ioctls (#432, #929).
 //!
 //! Exercises `tty::tiocsctty_for` / `tiocspgrp_for` / `tiocgpgrp_for` /
 //! `tiocgsid_for` / `tiocnotty_for` / `acquire_ctty_on_open` against the
-//! process-table test helpers. End-to-end ring-3 ioctl dispatch is
-//! covered once userspace has `tcsetpgrp` helpers.
+//! process-table test helpers. The `tcsetpgrp_tcgetpgrp_round_trip` test
+//! validates the kernel-side path that the libc `tcsetpgrp`/`tcgetpgrp`
+//! wrappers (#929) call through.
 
 #![no_std]
 #![no_main]
@@ -118,6 +119,14 @@ fn run_tests() {
         (
             "acquire_ctty_on_open_noop_when_tty_already_attached",
             &(acquire_ctty_on_open_noop_when_tty_already_attached as fn()),
+        ),
+        (
+            "tcsetpgrp_tcgetpgrp_round_trip",
+            &(tcsetpgrp_tcgetpgrp_round_trip as fn()),
+        ),
+        (
+            "tcsetpgrp_enotty_on_no_session",
+            &(tcsetpgrp_enotty_on_no_session as fn()),
         ),
     ];
     serial_println!("running {} tests", tests.len());
@@ -328,4 +337,45 @@ fn acquire_ctty_on_open_noop_when_tty_already_attached() {
     assert!(acquire_ctty_on_open(7, &tty));
     assert!(!acquire_ctty_on_open(9, &tty));
     assert_eq!(tty.ctrl.lock().session, Some(7));
+}
+
+/// Simulates the fork + setpgrp + tcsetpgrp / tcgetpgrp round-trip that
+/// a shell performs when placing a child into its own foreground pgrp.
+///
+/// Setup: session leader pid=7, child pid=8 in pgrp 8 (same session).
+/// After tcsetpgrp(tty, 8), tcgetpgrp(tty) must return 8.
+fn tcsetpgrp_tcgetpgrp_round_trip() {
+    h::reset_table();
+    // Session leader (pid 7, sid 7, pgrp 7)
+    h::insert(7, 0, 7, 7);
+    // Forked child placed into its own pgrp (pid 8, sid 7, pgrp 8)
+    h::insert(8, 7, 7, 8);
+
+    let tty = fresh_tty();
+    // Attach tty to session 7
+    assert_eq!(tiocsctty_for(7, &tty, false, false), 0);
+
+    // Initially foreground pgrp should be the session leader's
+    assert_eq!(tiocgpgrp_for(&tty), 7);
+
+    // tcsetpgrp: move foreground to child's pgrp
+    assert_eq!(tiocspgrp_for(7, &tty, 8), 0);
+
+    // tcgetpgrp: verify the round-trip
+    assert_eq!(tiocgpgrp_for(&tty), 8);
+
+    // Move it back to the session leader's pgrp
+    assert_eq!(tiocspgrp_for(7, &tty, 7), 0);
+    assert_eq!(tiocgpgrp_for(&tty), 7);
+}
+
+/// tcsetpgrp on a tty with no session attached must return ENOTTY,
+/// and tcgetpgrp must also return ENOTTY.
+fn tcsetpgrp_enotty_on_no_session() {
+    h::reset_table();
+    h::insert(7, 0, 7, 7);
+    let tty = fresh_tty();
+    // No tiocsctty_for — tty has no session
+    assert_eq!(tiocspgrp_for(7, &tty, 7), h::ENOTTY_I64);
+    assert_eq!(tiocgpgrp_for(&tty), h::ENOTTY_I64);
 }

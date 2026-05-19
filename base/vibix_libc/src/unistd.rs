@@ -1,6 +1,6 @@
 //! Unix-style operations: read, write, close, link, unlink, symlink, readlink,
 //! mkdir, rmdir, rename, getcwd, chdir, fork, dup, dup2, pipe, access,
-//! setpgid, wait4.
+//! setpgid, tcgetpgrp, tcsetpgrp, wait4.
 
 use crate::helpers::syscall_ret;
 use vibix_abi::syscall;
@@ -9,6 +9,7 @@ use vibix_abi::syscall;
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_CLOSE: u64 = 3;
+const SYS_IOCTL: u64 = 16;
 const SYS_ACCESS: u64 = 21;
 const SYS_PIPE: u64 = 22;
 const SYS_DUP: u64 = 32;
@@ -25,6 +26,10 @@ const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_SETPGID: u64 = 109;
+
+// ioctl request codes for terminal job control (Linux values).
+const TIOCGPGRP: u64 = 0x540F;
+const TIOCSPGRP: u64 = 0x5410;
 
 /// Read from a file descriptor.
 ///
@@ -207,5 +212,35 @@ pub unsafe extern "C" fn setpgid(pid: i32, pgid: i32) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn wait4(pid: i32, wstatus: *mut i32, options: i32, rusage: *mut u8) -> i32 {
     let ret = syscall!(SYS_WAIT4, pid, wstatus, options, rusage);
+    syscall_ret(ret) as i32
+}
+
+/// Get the foreground process group ID of the terminal referred to by `fd`.
+///
+/// Returns the foreground process group ID on success, or -1 on error
+/// (with errno set). Returns `ENOTTY` if `fd` does not refer to a terminal.
+///
+/// POSIX.1-2017 §tcgetpgrp. Implemented via `ioctl(fd, TIOCGPGRP, &pgid)`.
+#[no_mangle]
+pub unsafe extern "C" fn tcgetpgrp(fd: i32) -> i32 {
+    let mut pgrp: i32 = 0;
+    let ret = syscall!(SYS_IOCTL, fd, TIOCGPGRP, &mut pgrp as *mut i32);
+    if ret < 0 {
+        vibix_abi::errno::ERRNO.set((-ret) as i32);
+        return -1;
+    }
+    pgrp
+}
+
+/// Set the foreground process group ID of the terminal referred to by `fd`.
+///
+/// Returns 0 on success, or -1 on error (with errno set). Returns `ENOTTY`
+/// if `fd` does not refer to a terminal, or `EPERM` if the caller's session
+/// does not match the terminal's session.
+///
+/// POSIX.1-2017 §tcsetpgrp. Implemented via `ioctl(fd, TIOCSPGRP, &pgrp)`.
+#[no_mangle]
+pub unsafe extern "C" fn tcsetpgrp(fd: i32, pgrp: i32) -> i32 {
+    let ret = syscall!(SYS_IOCTL, fd, TIOCSPGRP, &pgrp as *const i32);
     syscall_ret(ret) as i32
 }
