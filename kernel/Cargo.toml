@@ -594,3 +594,7 @@ harness = false
 [[test]]
 name = "syscall_sigsuspend_sigpending"
 harness = false
+
+[[test]]
+name = "signal_sa_nodefer_sigaltstack"
+harness = false
