@@ -33,15 +33,17 @@
 //!
 //! - FPU state (`fpstate_ptr` in `SigFrame`) is always null — signals
 //!   delivered to a task using SSE/x87 will see corrupted FP registers.
-//! - `SA_NODEFER` is not honoured. `SA_RESTART` is honoured both on the
-//!   bare-restart path (no handler) and on the handler path: the syscall
-//!   arg registers (rax, rdi, rsi, rdx, r10, r8, r9) are captured into
-//!   the `SigFrame` at delivery and restored by `sys_sigreturn` so the
-//!   re-executed SYSCALL sees the original `(nr, a0..a5)` — see issue
-//!   #522. Other `sa_flags` bits round-trip through `sigaction(2)` but
-//!   are otherwise ignored.
+//! - `SA_RESTART` is honoured both on the bare-restart path (no handler)
+//!   and on the handler path: the syscall arg registers (rax, rdi, rsi,
+//!   rdx, r10, r8, r9) are captured into the `SigFrame` at delivery and
+//!   restored by `sys_sigreturn` so the re-executed SYSCALL sees the
+//!   original `(nr, a0..a5)` — see issue #522.
+//! - `SA_NODEFER` is honoured: when set, the signal is not automatically
+//!   blocked during handler execution, allowing recursive handlers.
+//! - `SA_ONSTACK` is honoured: when set and an alternate signal stack is
+//!   registered via `sigaltstack(2)`, the handler runs on the alternate
+//!   stack.
 //! - Real-time signals (`SIGRTMIN`..`SIGRTMAX`) are not implemented.
-//! - `sigaltstack` is not implemented.
 //! - Multi-threaded signal delivery is not implemented (single-CPU, single-
 //!   threaded for now).
 
@@ -100,6 +102,15 @@ pub const SIG_IGN: u64 = 1;
 /// signal is delivered via a user handler. Without this flag, the syscall
 /// is converted to `-EINTR` instead.
 pub const SA_RESTART: u64 = 0x1000_0000;
+
+/// `SA_NODEFER` — do not automatically add the signal to the blocked mask
+/// while the handler is executing. This allows the handler to be
+/// re-entered by the same signal (recursive signal handling).
+pub const SA_NODEFER: u64 = 0x4000_0000;
+
+/// `SA_ONSTACK` — deliver this signal on the alternate signal stack
+/// registered via `sigaltstack(2)`, if one is available.
+pub const SA_ONSTACK: u64 = 0x0800_0000;
 
 /// Per-signal disposition.
 #[derive(Clone, Copy, Debug)]
@@ -188,6 +199,23 @@ pub const SIG_BLOCK: u64 = 0;
 pub const SIG_UNBLOCK: u64 = 1;
 pub const SIG_SETMASK: u64 = 2;
 
+// ── sigaltstack constants and struct ─────────────────────────────────────
+
+/// `SS_ONSTACK` — returned by `sigaltstack(2)` in `ss_flags` when the
+/// process is currently executing on the alternate signal stack.
+pub const SS_ONSTACK: u64 = 1;
+/// `SS_DISABLE` — passed in `ss_flags` to disable the alternate stack.
+pub const SS_DISABLE: u64 = 2;
+
+/// Per-task alternate signal stack registration, matching Linux `stack_t`.
+#[derive(Clone, Copy, Debug)]
+pub struct SigaltStack {
+    /// Base address of the alternate stack (user VA).
+    pub ss_sp: u64,
+    /// Size of the alternate stack in bytes.
+    pub ss_size: u64,
+}
+
 // ── Per-process signal state ──────────────────────────────────────────────
 
 /// Per-process signal state — one instance per `ProcessEntry`, shared via
@@ -210,6 +238,10 @@ pub struct SignalState {
     /// rather than the temporary one installed by `sigsuspend`.
     /// Cleared after use.
     pub saved_mask: Option<u64>,
+    /// Alternate signal stack registered via `sigaltstack(2)`.
+    /// When `Some`, signals whose `sa_flags` include `SA_ONSTACK` are
+    /// delivered on this stack instead of the current user stack.
+    pub alt_stack: Option<SigaltStack>,
 }
 
 impl SignalState {
@@ -224,6 +256,7 @@ impl SignalState {
             dispositions,
             sa_flags: [0; NSIG as usize],
             saved_mask: None,
+            alt_stack: None,
         }
     }
 
@@ -480,6 +513,83 @@ pub unsafe fn sys_sigpending(set_uva: u64) -> i64 {
     result.unwrap_or(-3) // ESRCH
 }
 
+/// `sigaltstack(ss_uva, old_ss_uva)` — register or query the alternate
+/// signal stack.
+///
+/// `ss_uva` and `old_ss_uva` are user pointers to `stack_t`
+/// (Linux x86_64 layout: `ss_sp: u64, ss_flags: i32, _pad: i32,
+/// ss_size: u64` — total 24 bytes).
+///
+/// When `ss_uva` is non-null:
+///   - If `ss_flags & SS_DISABLE`, the alternate stack is disabled.
+///   - Otherwise, `ss_sp` and `ss_size` define the new alternate stack.
+///     `ss_size` must be >= `MINSIGSTKSZ` (2048 on x86_64).
+///
+/// When `old_ss_uva` is non-null, the current alternate stack state is
+/// written there before any change.
+///
+/// # Safety
+/// User pointers are validated via `uaccess`.
+pub unsafe fn sys_sigaltstack(ss_uva: u64, old_ss_uva: u64) -> i64 {
+    const MINSIGSTKSZ: u64 = 2048;
+    let task_id = crate::task::current_id();
+
+    let result = crate::process::with_signal_state_for_task(task_id, |state| {
+        // Write the current state to old_ss_uva if requested.
+        if old_ss_uva != 0 {
+            let mut buf = [0u8; 24];
+            match &state.alt_stack {
+                Some(ss) => {
+                    buf[..8].copy_from_slice(&ss.ss_sp.to_ne_bytes());
+                    // ss_flags: 0 = alternate stack is registered but not
+                    // currently active. We do not track on-stack status
+                    // dynamically yet (would require checking the current
+                    // RSP against the alt-stack range), so report 0.
+                    buf[8..12].copy_from_slice(&0u32.to_ne_bytes());
+                    buf[12..16].copy_from_slice(&0u32.to_ne_bytes()); // padding
+                    buf[16..24].copy_from_slice(&ss.ss_size.to_ne_bytes());
+                }
+                None => {
+                    // No alternate stack: ss_sp=0, ss_flags=SS_DISABLE, ss_size=0
+                    buf[8..12].copy_from_slice(&(SS_DISABLE as u32).to_ne_bytes());
+                }
+            }
+            if uaccess::copy_to_user(old_ss_uva as usize, &buf).is_err() {
+                return -14i64; // EFAULT
+            }
+        }
+
+        // Install a new alternate stack if requested.
+        // TODO: Linux returns -EPERM when attempting to change the alt stack
+        // while the thread is currently executing on it (SS_ONSTACK).  We
+        // would need to check the current RSP against [ss_sp, ss_sp+ss_size)
+        // to enforce this.  Track as a follow-up once we have a reliable way
+        // to read the user RSP from within the syscall handler.
+        if ss_uva != 0 {
+            let mut buf = [0u8; 24];
+            if uaccess::copy_from_user(&mut buf, ss_uva as usize).is_err() {
+                return -14i64; // EFAULT
+            }
+            let ss_sp = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            let ss_flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap()) as u64;
+            let ss_size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+
+            if ss_flags & SS_DISABLE != 0 {
+                // Disable the alternate stack.
+                state.alt_stack = None;
+            } else {
+                if ss_size < MINSIGSTKSZ {
+                    return -12i64; // ENOMEM
+                }
+                state.alt_stack = Some(SigaltStack { ss_sp, ss_size });
+            }
+        }
+
+        0i64
+    });
+    result.unwrap_or(-3) // ESRCH
+}
+
 /// Per-task wait queue used by `sigsuspend`.  Tasks park here and are
 /// woken by [`raise_signal_on_task`] (which calls `task::wake`).
 ///
@@ -594,18 +704,24 @@ pub unsafe fn deliver_fault_signal_iret(
 
     let task_id = crate::task::current_id();
     // Raise, immediately clear the pending bit (we service synchronously),
-    // and read the disposition + pre-delivery mask under a single lock
-    // acquisition.  Capturing the mask here matches `deliver_signal` semantics:
-    // the saved `uc_sigmask` in the frame is what was in effect before delivery,
-    // so `sigreturn` restores it correctly.
-    let (disp, pre_block_mask) = crate::process::with_signal_state_for_task(task_id, |state| {
-        state.raise(sig);
-        state.pending &= !sig_bit(sig);
-        let pre = state.blocked;
-        state.blocked |= sig_bit(sig); // block signal for duration of handler
-        (state.dispositions[(sig - 1) as usize], pre)
-    })
-    .unwrap_or((Disposition::Default, 0));
+    // and read the disposition + pre-delivery mask + sa_flags + alt_stack
+    // under a single lock acquisition.  Capturing the mask here matches
+    // `deliver_signal` semantics: the saved `uc_sigmask` in the frame is
+    // what was in effect before delivery, so `sigreturn` restores it
+    // correctly.
+    let (disp, pre_block_mask, flags, alt) =
+        crate::process::with_signal_state_for_task(task_id, |state| {
+            state.raise(sig);
+            state.pending &= !sig_bit(sig);
+            let pre = state.blocked;
+            let f = state.sa_flags[(sig - 1) as usize];
+            // SA_NODEFER: do NOT automatically add the signal to blocked.
+            if f & SA_NODEFER == 0 {
+                state.blocked |= sig_bit(sig);
+            }
+            (state.dispositions[(sig - 1) as usize], pre, f, state.alt_stack)
+        })
+        .unwrap_or((Disposition::Default, 0, 0, None));
 
     match disp {
         Disposition::Handler(handler_va) => {
@@ -627,9 +743,20 @@ pub unsafe fn deliver_fault_signal_iret(
             let saved_rflags = frame.cpu_flags.bits();
             let saved_rsp = frame.stack_pointer.as_u64();
 
+            // Determine the stack to push the signal frame onto.
+            let frame_rsp = if flags & SA_ONSTACK != 0 {
+                if let Some(ss) = alt {
+                    ss.ss_sp + ss.ss_size
+                } else {
+                    saved_rsp
+                }
+            } else {
+                saved_rsp
+            };
+
             // Push signal frame.  On failure (bad user RSP) terminate.
             let new_rsp = match frame::push_fault_signal_frame(
-                saved_rsp,
+                frame_rsp,
                 sig,
                 saved_rip,
                 saved_rflags,
@@ -968,9 +1095,9 @@ pub unsafe extern "C" fn check_and_deliver_signals(ctx: *mut SyscallReturnContex
 unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pending: bool) {
     let task_id = crate::task::current_id();
 
-    // Capture the pre-delivery mask and block the signal in one lock window.
-    // The pre-delivery mask is what sigreturn must restore; capturing it before
-    // setting the block bit ensures uc_sigmask in the frame is correct.
+    // Capture the pre-delivery mask, sa_flags, and optionally the
+    // alternate stack in one lock window.  Block the signal unless
+    // SA_NODEFER is set.
     //
     // When `saved_mask` is `Some` (set by `sigsuspend`), the frame's
     // `uc_sigmask` must be the *original* mask that was saved before
@@ -979,13 +1106,17 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
     // the ephemeral temporary mask. The `saved_mask` is consumed (taken)
     // here so a second delivery in the same syscall-return window does
     // not re-use a stale value.
-    let (disp, pre_block_mask) =
+    let (disp, pre_block_mask, flags, alt) =
         match crate::process::with_signal_state_for_task(task_id, |state| {
             let pre = state.saved_mask.take().unwrap_or(state.blocked);
-            state.blocked |= sig_bit(sig);
-            (state.dispositions[(sig - 1) as usize], pre)
+            let f = state.sa_flags[(sig - 1) as usize];
+            // SA_NODEFER: do NOT automatically add the signal to blocked.
+            if f & SA_NODEFER == 0 {
+                state.blocked |= sig_bit(sig);
+            }
+            (state.dispositions[(sig - 1) as usize], pre, f, state.alt_stack)
         }) {
-            Some(pair) => pair,
+            Some(tuple) => tuple,
             None => return,
         };
 
@@ -1020,6 +1151,21 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
             }
         }
         Disposition::Handler(handler_va) => {
+            // Determine the stack to push the signal frame onto.
+            // If SA_ONSTACK is set and an alternate stack is registered,
+            // use the top of the alternate stack; otherwise use the
+            // current user RSP.
+            let frame_rsp = if flags & SA_ONSTACK != 0 {
+                if let Some(ss) = alt {
+                    // Top of the alternate stack (stack grows down).
+                    ss.ss_sp + ss.ss_size
+                } else {
+                    ctx.user_rsp
+                }
+            } else {
+                ctx.user_rsp
+            };
+
             // Capture the syscall arg registers from the caller's own
             // SyscallReturnContext. On the SA_RESTART+handler path,
             // `check_and_deliver_signals` rewound `ctx.user_rip` to the
@@ -1037,9 +1183,10 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
                 r8: ctx.user_r8,
                 r9: ctx.user_r9,
             };
-            // Push signal frame onto the user stack and redirect SYSRETQ.
+            // Push signal frame onto the (possibly alternate) stack
+            // and redirect SYSRETQ.
             let new_user_rsp = match frame::push_signal_frame(
-                ctx.user_rsp,
+                frame_rsp,
                 sig,
                 ctx.user_rip,
                 ctx.user_rflags,
@@ -1461,5 +1608,72 @@ mod tests {
         assert_eq!(result, sig_bit(SIGUSR1) | sig_bit(SIGTERM));
         // SIGUSR2 is pending but not blocked, so not in sigpending.
         assert_eq!(result & sig_bit(SIGUSR2), 0);
+    }
+
+    // ── SA_NODEFER flag ─────────────────────────────────────────────────
+
+    #[test]
+    fn sa_nodefer_constant_matches_linux() {
+        // Linux x86_64: SA_NODEFER = 0x40000000
+        assert_eq!(SA_NODEFER, 0x4000_0000);
+    }
+
+    #[test]
+    fn sa_onstack_constant_matches_linux() {
+        // Linux x86_64: SA_ONSTACK = 0x08000000
+        assert_eq!(SA_ONSTACK, 0x0800_0000);
+    }
+
+    #[test]
+    fn sa_nodefer_does_not_collide_with_sa_restart() {
+        assert_eq!(SA_NODEFER & SA_RESTART, 0);
+    }
+
+    #[test]
+    fn sa_onstack_does_not_collide_with_other_flags() {
+        assert_eq!(SA_ONSTACK & SA_RESTART, 0);
+        assert_eq!(SA_ONSTACK & SA_NODEFER, 0);
+    }
+
+    // ── sigaltstack state ───────────────────────────────────────────────
+
+    #[test]
+    fn alt_stack_starts_none() {
+        let s = SignalState::new();
+        assert!(s.alt_stack.is_none());
+    }
+
+    #[test]
+    fn alt_stack_roundtrip() {
+        let mut s = SignalState::new();
+        let ss = SigaltStack {
+            ss_sp: 0x7000_0000,
+            ss_size: 8192,
+        };
+        s.alt_stack = Some(ss);
+        let stored = s.alt_stack.unwrap();
+        assert_eq!(stored.ss_sp, 0x7000_0000);
+        assert_eq!(stored.ss_size, 8192);
+    }
+
+    #[test]
+    fn alt_stack_disable() {
+        let mut s = SignalState::new();
+        s.alt_stack = Some(SigaltStack {
+            ss_sp: 0x7000_0000,
+            ss_size: 8192,
+        });
+        s.alt_stack = None; // SS_DISABLE
+        assert!(s.alt_stack.is_none());
+    }
+
+    #[test]
+    fn ss_disable_constant_matches_linux() {
+        assert_eq!(SS_DISABLE, 2);
+    }
+
+    #[test]
+    fn ss_onstack_constant_matches_linux() {
+        assert_eq!(SS_ONSTACK, 1);
     }
 }

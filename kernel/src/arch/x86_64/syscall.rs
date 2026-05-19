@@ -925,6 +925,9 @@ pub unsafe extern "C" fn syscall_dispatch(
         // a signal is delivered, then restore the original mask.
         SIGSUSPEND => crate::signal::sys_sigsuspend(a0),
 
+        // sigaltstack(ss, old_ss) — register or query alternate signal stack.
+        SIGALTSTACK => crate::signal::sys_sigaltstack(a0, a1),
+
         // ioctl(fd, cmd, arg) — device-specific control. Only the tty-like
         // `SerialBackend` handles non-trivial `cmd`s today; all other
         // backends inherit the `-ENOTTY` default.
@@ -2358,6 +2361,7 @@ pub mod syscall_nr {
     pub const PRLIMIT64: u64 = 302;
     pub const SIGPENDING: u64 = 127;
     pub const SIGSUSPEND: u64 = 130;
+    pub const SIGALTSTACK: u64 = 131;
     pub const FUTEX: u64 = 202;
     pub const SET_TID_ADDRESS: u64 = 218;
 }
@@ -2416,6 +2420,7 @@ mod tests {
         assert_eq!(syscall_nr::KILL, 62, "SYS_kill must be 62");
         assert_eq!(syscall_nr::SIGPENDING, 127, "SYS_rt_sigpending must be 127");
         assert_eq!(syscall_nr::SIGSUSPEND, 130, "SYS_rt_sigsuspend must be 130");
+        assert_eq!(syscall_nr::SIGALTSTACK, 131, "SYS_sigaltstack must be 131");
 
         // Poll / select
         assert_eq!(syscall_nr::POLL, 7, "SYS_poll must be 7");
