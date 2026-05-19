@@ -61,10 +61,7 @@ fn run_tests() {
             "reap_any_child_returns_zombie",
             &(reap_any_child_returns_zombie as fn()),
         ),
-        (
-            "reap_specific_child",
-            &(reap_specific_child as fn()),
-        ),
+        ("reap_specific_child", &(reap_specific_child as fn())),
         (
             "reap_nonexistent_returns_none",
             &(reap_nonexistent_returns_none as fn()),
@@ -77,10 +74,7 @@ fn run_tests() {
             "multiple_children_all_reapable",
             &(multiple_children_all_reapable as fn()),
         ),
-        (
-            "exit_status_zero",
-            &(exit_status_zero as fn()),
-        ),
+        ("exit_status_zero", &(exit_status_zero as fn())),
         (
             "exit_status_wraps_at_8_bits",
             &(exit_status_wraps_at_8_bits as fn()),
@@ -194,7 +188,11 @@ fn signal_terminated_status_encoding() {
     assert!(reaped.is_some());
     let (pid, raw_status) = reaped.unwrap();
     assert_eq!(pid, PARENT + 1);
-    assert_eq!(raw_status, -(SIGSEGV as i32), "raw status should be -SIGSEGV");
+    assert_eq!(
+        raw_status,
+        -(SIGSEGV as i32),
+        "raw status should be -SIGSEGV"
+    );
 
     // Verify what wait4 would encode: the current kernel shifts the raw
     // status, which for a negative value wraps through 0xFF masking.
@@ -292,7 +290,11 @@ fn multiple_children_all_reapable() {
         );
     }
 
-    assert_eq!(reaped_pids.len(), N as usize, "should reap all {N} children");
+    assert_eq!(
+        reaped_pids.len(),
+        N as usize,
+        "should reap all {N} children"
+    );
 
     // Verify all pids appeared.
     for i in 1..=N {
@@ -330,10 +332,7 @@ fn exit_status_wraps_at_8_bits() {
 fn wifexited_wexitstatus_encoding() {
     for code in 0u8..=255 {
         let wstatus = encode_wstatus(code as i32);
-        assert!(
-            wifexited(wstatus),
-            "exit({code}) must set WIFEXITED"
-        );
+        assert!(wifexited(wstatus), "exit({code}) must set WIFEXITED");
         assert_eq!(
             wexitstatus(wstatus),
             code as u32,

@@ -17,8 +17,8 @@ use core::panic::PanicInfo;
 
 use vibix::process::{self, test_helpers as h};
 use vibix::signal::{
-    sig_bit, SignalState, SIGINT, SIGKILL, SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2,
-    SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
+    sig_bit, SignalState, SIGINT, SIGKILL, SIGSTOP, SIGTERM, SIGUSR1, SIGUSR2, SIG_BLOCK,
+    SIG_SETMASK, SIG_UNBLOCK,
 };
 use vibix::{
     exit_qemu, serial_println,
@@ -41,10 +41,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        (
-            "block_defers_delivery",
-            &(block_defers_delivery as fn()),
-        ),
+        ("block_defers_delivery", &(block_defers_delivery as fn())),
         (
             "unblock_drains_in_priority_order",
             &(unblock_drains_in_priority_order as fn()),
@@ -85,10 +82,7 @@ fn run_tests() {
             "invalid_how_leaves_mask_unchanged",
             &(invalid_how_leaves_mask_unchanged as fn()),
         ),
-        (
-            "mask_via_process_entry",
-            &(mask_via_process_entry as fn()),
-        ),
+        ("mask_via_process_entry", &(mask_via_process_entry as fn())),
     ];
     serial_println!("running {} tests", tests.len());
     for (name, t) in tests {
@@ -104,9 +98,17 @@ fn block_defers_delivery() {
     let mut s = SignalState::new();
     s.raise(SIGUSR1);
     s.blocked = sig_bit(SIGUSR1);
-    assert_eq!(s.pop_next_pending(), None, "blocked signal should not be delivered");
+    assert_eq!(
+        s.pop_next_pending(),
+        None,
+        "blocked signal should not be delivered"
+    );
     // Signal is still pending.
-    assert_ne!(s.pending & sig_bit(SIGUSR1), 0, "signal should remain pending while blocked");
+    assert_ne!(
+        s.pending & sig_bit(SIGUSR1),
+        0,
+        "signal should remain pending while blocked"
+    );
 }
 
 /// After unblocking, previously blocked signals drain in ascending order.
@@ -174,14 +176,25 @@ fn block_accumulates_signals() {
     let mut s = SignalState::new();
     s.update_mask(SIG_BLOCK, sig_bit(SIGUSR1));
     s.update_mask(SIG_BLOCK, sig_bit(SIGUSR2));
-    assert_ne!(s.blocked & sig_bit(SIGUSR1), 0, "SIGUSR1 should still be blocked");
-    assert_ne!(s.blocked & sig_bit(SIGUSR2), 0, "SIGUSR2 should still be blocked");
+    assert_ne!(
+        s.blocked & sig_bit(SIGUSR1),
+        0,
+        "SIGUSR1 should still be blocked"
+    );
+    assert_ne!(
+        s.blocked & sig_bit(SIGUSR2),
+        0,
+        "SIGUSR2 should still be blocked"
+    );
 }
 
 /// SIG_UNBLOCK removes only the specified signals; others stay blocked.
 fn unblock_partial_leaves_others() {
     let mut s = SignalState::new();
-    s.update_mask(SIG_BLOCK, sig_bit(SIGUSR1) | sig_bit(SIGUSR2) | sig_bit(SIGINT));
+    s.update_mask(
+        SIG_BLOCK,
+        sig_bit(SIGUSR1) | sig_bit(SIGUSR2) | sig_bit(SIGINT),
+    );
     s.update_mask(SIG_UNBLOCK, sig_bit(SIGUSR1));
     assert_eq!(
         s.blocked & sig_bit(SIGUSR1),
@@ -260,7 +273,11 @@ fn invalid_how_leaves_mask_unchanged() {
     s.blocked = sig_bit(SIGUSR1);
     let old = s.update_mask(999, sig_bit(SIGTERM));
     assert_eq!(old, sig_bit(SIGUSR1));
-    assert_eq!(s.blocked, sig_bit(SIGUSR1), "invalid how should leave mask unchanged");
+    assert_eq!(
+        s.blocked,
+        sig_bit(SIGUSR1),
+        "invalid how should leave mask unchanged"
+    );
 }
 
 /// Blocking and unblocking via process-table entry round-trips correctly.
@@ -280,7 +297,10 @@ fn mask_via_process_entry() {
 
     // Should not be deliverable.
     let popped = process::with_signal_state_for_task(200, |s| s.pop_next_pending()).flatten();
-    assert_eq!(popped, None, "SIGUSR1 blocked via process entry should not pop");
+    assert_eq!(
+        popped, None,
+        "SIGUSR1 blocked via process entry should not pop"
+    );
 
     // Unblock.
     process::with_signal_state_for_task(200, |s| {

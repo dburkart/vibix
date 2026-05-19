@@ -168,10 +168,7 @@ fn default_disposition_is_default_for_all() {
 fn sigchld_default_is_ignore() {
     let s = SignalState::new();
     assert!(
-        matches!(
-            s.dispositions[(SIGCHLD - 1) as usize],
-            Disposition::Ignore
-        ),
+        matches!(s.dispositions[(SIGCHLD - 1) as usize], Disposition::Ignore),
         "SIGCHLD should start as Ignore"
     );
 }
@@ -278,10 +275,7 @@ fn fault_frame_preserves_rip_rflags_rsp() {
                 restored.rflags, rflags,
                 "rflags mismatch for rflags={rflags:#x}"
             );
-            assert_eq!(
-                restored.rsp, new_stack,
-                "rsp mismatch for rip={rip:#x}"
-            );
+            assert_eq!(restored.rsp, new_stack, "rsp mismatch for rip={rip:#x}");
         }
     }
 }

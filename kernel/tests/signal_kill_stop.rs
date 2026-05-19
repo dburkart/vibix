@@ -25,8 +25,8 @@ use core::panic::PanicInfo;
 
 use vibix::process::{self, test_helpers as h};
 use vibix::signal::{
-    default_action, is_unblockable, sig_bit, DefaultAction, SignalState, SIGCONT, SIGKILL,
-    SIGSTOP, SIGUSR1, SIG_BLOCK, SIG_SETMASK,
+    default_action, is_unblockable, sig_bit, DefaultAction, SignalState, SIGCONT, SIGKILL, SIGSTOP,
+    SIGUSR1, SIG_BLOCK, SIG_SETMASK,
 };
 use vibix::{
     exit_qemu, serial_println,
@@ -51,14 +51,8 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn run_tests() {
     let tests: &[(&str, &dyn Testable)] = &[
-        (
-            "sigkill_is_unblockable",
-            &(sigkill_is_unblockable as fn()),
-        ),
-        (
-            "sigstop_is_unblockable",
-            &(sigstop_is_unblockable as fn()),
-        ),
+        ("sigkill_is_unblockable", &(sigkill_is_unblockable as fn())),
+        ("sigstop_is_unblockable", &(sigstop_is_unblockable as fn())),
         (
             "sigkill_default_action_is_terminate",
             &(sigkill_default_action_is_terminate as fn()),
@@ -163,11 +157,7 @@ fn sigkill_delivered_before_blocked_signals() {
     // SIGKILL (9) is lower-numbered than SIGUSR1 (10), and it bypasses the
     // mask, so it comes out first. The blocked SIGUSR1 stays pending.
     assert_eq!(s.pop_next_pending(), Some(SIGKILL));
-    assert_eq!(
-        s.pop_next_pending(),
-        None,
-        "SIGUSR1 should remain blocked"
-    );
+    assert_eq!(s.pop_next_pending(), None, "SIGUSR1 should remain blocked");
 
     // Unblock and verify SIGUSR1 is still there.
     s.update_mask(SIG_SETMASK, 0);
@@ -194,7 +184,11 @@ fn sigkill_terminates_via_mark_zombie() {
     assert!(reaped.is_some(), "child should be reapable after SIGKILL");
     let (pid, status) = reaped.unwrap();
     assert_eq!(pid, CHILD);
-    assert_eq!(status, -(SIGKILL as i32), "exit status should encode -SIGKILL");
+    assert_eq!(
+        status,
+        -(SIGKILL as i32),
+        "exit status should encode -SIGKILL"
+    );
 
     h::reset_table();
 }
