@@ -535,17 +535,17 @@ pub unsafe fn sys_sigsuspend(mask_uva: u64) -> i64 {
         .unwrap_or(false) // if process gone, stop waiting
     });
 
-    // Restore the original mask.  If a signal handler was already
-    // set up by `check_and_deliver_signals` (which consumed
-    // `saved_mask` to fill the SigFrame's uc_sigmask), restore here
-    // is a no-op on the handler path because sigreturn will restore
-    // from the frame. If no handler ran (default-terminate, ignore),
-    // we still need the old mask back.
-    let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-        if let Some(old) = state.saved_mask.take() {
-            state.blocked = old;
-        }
-    });
+    // Do NOT restore the original mask here.  Restoring before
+    // `check_and_deliver_signals` runs would re-block the wake signal
+    // under the original mask, so `pop_next_pending` would return
+    // `None` and the syscall would livelock on restart.
+    //
+    // Instead, `deliver_signal` consumes `saved_mask` to fill the
+    // SigFrame's `uc_sigmask` (handler path — sigreturn restores it)
+    // or directly restores `blocked` from it (Ignore / non-terminate
+    // Default paths).  Both paths ensure the pre-sigsuspend mask is
+    // eventually reinstated without re-blocking the wake signal
+    // before delivery.
 
     // Return KERN_ERESTARTSYS so check_and_deliver_signals picks up
     // the now-deliverable signal and either delivers a handler or
@@ -991,15 +991,19 @@ unsafe fn deliver_signal(sig: u8, ctx: &mut SyscallReturnContext, restart_pendin
 
     match disp {
         Disposition::Ignore => {
-            // Unblock the signal again (we blocked it above).
+            // Restore the mask to the pre-delivery state.  When
+            // sigsuspend is in effect, `pre_block_mask` is the
+            // *original* mask (from `saved_mask`), so this restores
+            // the pre-sigsuspend mask. Otherwise it just undoes the
+            // signal-blocking we added above.
             let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-                state.blocked &= !sig_bit(sig);
+                state.blocked = pre_block_mask;
                 ()
             });
         }
         Disposition::Default => {
             let _ = crate::process::with_signal_state_for_task(task_id, |state| {
-                state.blocked &= !sig_bit(sig);
+                state.blocked = pre_block_mask;
                 ()
             });
             match default_action(sig) {

@@ -243,18 +243,22 @@ fn sigsuspend_wakes_on_signal() {
 
     SUSPEND_WOKE.store(true, Ordering::Release);
 
-    // Restore the original mask.
-    let _ = process::with_signal_state_for_task(task_id, |state| {
-        if let Some(old) = state.saved_mask.take() {
-            state.blocked = old;
-        }
-    });
-
     // Verify we woke up.
     assert!(
         SUSPEND_WOKE.load(Ordering::Acquire),
         "sigsuspend should have woken up on SIGUSR1 delivery"
     );
+
+    // Simulate what deliver_signal does on the Ignore path: consume
+    // saved_mask and restore blocked to the pre-sigsuspend mask.
+    // In the real syscall path, check_and_deliver_signals calls
+    // deliver_signal which does this automatically. We mirror that
+    // here since we cannot invoke the full syscall dispatch from a
+    // ring-0 integration test.
+    let _ = process::with_signal_state_for_task(task_id, |state| {
+        let pre = state.saved_mask.take().unwrap_or(state.blocked);
+        state.blocked = pre;
+    });
 
     // Verify the mask was restored (SIGUSR1 should be blocked again).
     let blocked = process::with_signal_state_for_task(task_id, |state| state.blocked).unwrap();
