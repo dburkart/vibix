@@ -230,7 +230,9 @@ pub fn init() {
         // Query the actual XSAVE area size for the configured XCR0.
         // Re-query after programming XCR0 for accuracy.
         let cpuid_d0_post = core::arch::x86_64::__cpuid_count(0xD, 0);
-        let xsave_size = (cpuid_d0_post.ebx as usize).max(FXSAVE_SIZE).min(MAX_XSAVE_SIZE);
+        let xsave_size = (cpuid_d0_post.ebx as usize)
+            .max(FXSAVE_SIZE)
+            .min(MAX_XSAVE_SIZE);
 
         XSAVE_ENABLED.store(true, Ordering::Relaxed);
 

@@ -68,8 +68,8 @@ pub struct Features {
     leaf7_ecx: u32, // reserved for future features
     #[allow(dead_code)]
     leaf7_edx: u32, // reserved for future features
-    ext_edx: u32,   // leaf 0x8000_0001 EDX
-    ext_ecx: u32,   // leaf 0x8000_0001 ECX
+    ext_edx: u32,     // leaf 0x8000_0001 EDX
+    ext_ecx: u32,     // leaf 0x8000_0001 ECX
     leafd_1_eax: u32, // leaf 0xD sub-leaf 1, EAX (XSAVEOPT etc.)
 }
 

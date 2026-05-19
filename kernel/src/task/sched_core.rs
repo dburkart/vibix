@@ -1712,7 +1712,17 @@ pub fn block_current() {
     let was_on = interrupts::are_enabled();
     interrupts::disable();
 
-    let (prev_rsp_ptr, prev_fpu_ptr, next_fpu_ptr, next_rsp, next_cr3, prev_task_id, next_task_id, prev_task_ptr, next_task_ptr) = {
+    let (
+        prev_rsp_ptr,
+        prev_fpu_ptr,
+        next_fpu_ptr,
+        next_rsp,
+        next_cr3,
+        prev_task_id,
+        next_task_id,
+        prev_task_ptr,
+        next_task_ptr,
+    ) = {
         let mut sched = SCHED.lock();
 
         // Fast path: a prior wake() set wake_pending while we were
