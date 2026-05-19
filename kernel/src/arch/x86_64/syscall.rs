@@ -1579,21 +1579,60 @@ unsafe fn sys_execve(
 /// - VFS path: the `Vec<u8>` from `read_all` is leaked (bounded by
 ///   file size; same pattern as `read_interp_from_fs`).
 /// - Limine module: already `'static` (lives in boot memory).
+///
+/// ## MS_NOEXEC enforcement (issue #624)
+///
+/// When the VFS path resolves successfully, the function checks the
+/// hosting mount's [`MountFlags::NOEXEC`] and the superblock's
+/// [`SbFlags::NOEXEC`] before reading the file contents.  If either
+/// flag is set, `-EACCES` is returned — the filesystem was mounted
+/// with `MS_NOEXEC` and execution is forbidden.
 #[cfg(target_os = "none")]
 pub fn resolve_execve_binary(path: &[u8]) -> Result<&'static [u8], i64> {
     // Try VFS first.
     if crate::fs::vfs::root().is_some() {
-        match crate::shell::vfs_helpers::read_all(path) {
-            Ok(bytes) if !bytes.is_empty() => {
-                // Leak the Vec to get &'static [u8]. The leaked memory
-                // is bounded by the file size and lives as long as the
-                // process (the demand-paged loader reads from it on
-                // page faults).
-                return Ok(&*bytes.leak());
+        match crate::shell::vfs_helpers::resolve(path, /* follow */ true) {
+            Ok(resolved) => {
+                // --- MS_NOEXEC gate (issue #624) ---
+                // Check both the superblock flags and the per-mount
+                // flags.  Either one carrying NOEXEC is sufficient to
+                // reject the exec.
+                if let Some(sb) = resolved.inode.sb.upgrade() {
+                    use crate::fs::vfs::dentry::MountFlags;
+                    use crate::fs::vfs::super_block::SbFlags;
+
+                    if sb.flags.contains(SbFlags::NOEXEC) {
+                        return Err(crate::fs::EACCES);
+                    }
+                    let mflags = crate::fs::vfs::mount_flags_for_sb(&sb);
+                    if mflags.contains(MountFlags::NOEXEC) {
+                        return Err(crate::fs::EACCES);
+                    }
+                }
+
+                // Read the file contents.
+                let of = crate::shell::vfs_helpers::open_inode(&resolved.inode, &resolved.dentry)?;
+                let mut out = alloc::vec::Vec::new();
+                let mut off: u64 = 0;
+                let mut chunk = [0u8; 512];
+                loop {
+                    let n = match resolved.inode.file_ops.read(&of, &mut chunk, off) {
+                        Ok(n) => n,
+                        Err(e) => return Err(e),
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&chunk[..n]);
+                    off += n as u64;
+                }
+                if !out.is_empty() {
+                    return Ok(&*out.leak());
+                }
+                // empty file — fall through to module lookup
             }
-            Ok(_) => {} // empty file — fall through to module lookup
             Err(e) if e == crate::fs::ENOENT => {} // not found in VFS — try modules
-            Err(e) => return Err(e), // other VFS error — propagate
+            Err(e) => return Err(e),               // other VFS error — propagate
         }
     }
 

@@ -380,6 +380,24 @@ pub fn unmount(target: &Arc<Dentry>, flags: UmountFlags) -> Result<(), i64> {
     Ok(())
 }
 
+/// Return the [`MountFlags`] for the mount edge whose superblock
+/// matches `sb`, or `MountFlags::default()` if no edge is found (e.g.
+/// the root filesystem before any mount has been published).
+///
+/// Used by `execve` to enforce `MS_NOEXEC`: the flag lives on the
+/// `MountEdge`, not on the `SuperBlock` itself, because per-mount
+/// flags and per-FS flags are distinct (a read-only bind mount of
+/// a read-write FS, etc.).
+pub fn mount_flags_for_sb(sb: &Arc<SuperBlock>) -> MountFlags {
+    let table = MOUNT_TABLE.read();
+    for edge in table.iter() {
+        if Arc::ptr_eq(&edge.super_block, sb) {
+            return edge.flags;
+        }
+    }
+    MountFlags::default()
+}
+
 /// Production [`MountResolver`] backed by [`MOUNT_TABLE`]. `path_walk`
 /// uses this in the live kernel; tests still use `NullMountResolver`
 /// or a fake that pre-installs edges directly on `Dentry.mount`.
@@ -861,5 +879,35 @@ mod tests {
         assert!(parent_target.mount.read().is_none());
         // Cleanup the child.
         unmount(&child_mp, UmountFlags::default()).expect("cleanup child");
+    }
+
+    #[test]
+    fn mount_flags_for_sb_returns_noexec() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let target = make_dir_dentry();
+        let fs = make_fs();
+        let edge = mount(MountSource::None, &target, fs.clone(), MountFlags::NOEXEC)
+            .expect("mount with NOEXEC");
+        let flags = mount_flags_for_sb(&edge.super_block);
+        assert!(flags.contains(MountFlags::NOEXEC));
+        unmount(&target, UmountFlags::default()).expect("unmount");
+    }
+
+    #[test]
+    fn mount_flags_for_sb_returns_default_when_not_mounted() {
+        let _g = TEST_LOCK.lock();
+        drain_table();
+        let sb = Arc::new(SuperBlock::new(
+            alloc_fs_id(),
+            Arc::new(StubSuper {
+                unmount_calls: AtomicUsize::new(0),
+            }),
+            "orphan",
+            512,
+            SbFlags::default(),
+        ));
+        let flags = mount_flags_for_sb(&sb);
+        assert_eq!(flags, MountFlags::default());
     }
 }
