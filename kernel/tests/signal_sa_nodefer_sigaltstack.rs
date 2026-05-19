@@ -42,9 +42,8 @@ use vibix::arch::x86_64::uaccess;
 use vibix::mem::pf::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use vibix::process::{self, test_helpers as h};
 use vibix::signal::{
-    sig_bit, SigaltStack, SyscallReturnContext, Disposition,
-    SA_NODEFER, SA_ONSTACK,
-    SIGUSR1, SIGUSR2,
+    sig_bit, Disposition, SigaltStack, SyscallReturnContext, SA_NODEFER, SA_ONSTACK, SIGUSR1,
+    SIGUSR2,
 };
 use vibix::{
     exit_qemu, serial_println,
@@ -93,10 +92,7 @@ fn run_tests() {
             "sigaltstack_register_and_query",
             &(sigaltstack_register_and_query as fn()),
         ),
-        (
-            "sigaltstack_disable",
-            &(sigaltstack_disable as fn()),
-        ),
+        ("sigaltstack_disable", &(sigaltstack_disable as fn())),
         (
             "sa_onstack_delivers_on_alt_stack",
             &(sa_onstack_delivers_on_alt_stack as fn()),
