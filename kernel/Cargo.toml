@@ -598,3 +598,23 @@ harness = false
 [[test]]
 name = "signal_sa_nodefer_sigaltstack"
 harness = false
+
+[[test]]
+name = "signal_delivery"
+harness = false
+
+[[test]]
+name = "signal_mask"
+harness = false
+
+[[test]]
+name = "signal_kill_stop"
+harness = false
+
+[[test]]
+name = "process_wait"
+harness = false
+
+[[test]]
+name = "process_reparent"
+harness = false
