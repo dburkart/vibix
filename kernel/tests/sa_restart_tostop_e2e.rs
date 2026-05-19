@@ -191,10 +191,15 @@ fn tostop_sa_restart_handler_preserves_write_args() {
     SYSCALL_RESTART_PENDING.store(0, Ordering::Relaxed);
 
     // Drive check_and_deliver_signals as the asm trampoline would.
-    let rv = unsafe { check_and_deliver_signals(&mut ctx as *mut SyscallReturnContext, KERN_ERESTARTSYS) };
+    let rv = unsafe {
+        check_and_deliver_signals(&mut ctx as *mut SyscallReturnContext, KERN_ERESTARTSYS)
+    };
 
     // rv should be 0 (ERESTARTSYS consumed by Restart decision).
-    assert_eq!(rv, 0, "check_and_deliver_signals should return 0 on Restart, got {rv}");
+    assert_eq!(
+        rv, 0,
+        "check_and_deliver_signals should return 0 on Restart, got {rv}"
+    );
 
     // ctx.user_rip must now point at the handler VA.
     assert_eq!(
@@ -207,7 +212,8 @@ fn tostop_sa_restart_handler_preserves_write_args() {
     assert!(
         ctx.user_rsp < user_stack_top,
         "ctx.user_rsp should be below user_stack_top after frame push: rsp={:#x} top={:#x}",
-        ctx.user_rsp, user_stack_top,
+        ctx.user_rsp,
+        user_stack_top,
     );
 
     // SYSCALL_RESTART_PENDING must NOT be set yet — it would be wrong to
@@ -223,20 +229,33 @@ fn tostop_sa_restart_handler_preserves_write_args() {
 
     // ── Verify the SigFrame contains the original WRITE arg regs ──
     let restored = unsafe {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            restore_signal_frame(sigframe_rsp)
-        })
+        x86_64::instructions::interrupts::without_interrupts(|| restore_signal_frame(sigframe_rsp))
     }
     .expect("restore_signal_frame failed on the frame pushed by check_and_deliver_signals");
 
-    assert_eq!(restored.syscall_regs.rax, orig_rax, "SigFrame rax (syscall nr) mismatch");
-    assert_eq!(restored.syscall_regs.rdi, orig_rdi, "SigFrame rdi (fd) mismatch");
-    assert_eq!(restored.syscall_regs.rsi, orig_rsi, "SigFrame rsi (buf) mismatch");
-    assert_eq!(restored.syscall_regs.rdx, orig_rdx, "SigFrame rdx (len) mismatch");
+    assert_eq!(
+        restored.syscall_regs.rax, orig_rax,
+        "SigFrame rax (syscall nr) mismatch"
+    );
+    assert_eq!(
+        restored.syscall_regs.rdi, orig_rdi,
+        "SigFrame rdi (fd) mismatch"
+    );
+    assert_eq!(
+        restored.syscall_regs.rsi, orig_rsi,
+        "SigFrame rsi (buf) mismatch"
+    );
+    assert_eq!(
+        restored.syscall_regs.rdx, orig_rdx,
+        "SigFrame rdx (len) mismatch"
+    );
     assert_eq!(restored.syscall_regs.r10, orig_r10, "SigFrame r10 mismatch");
     assert_eq!(restored.syscall_regs.r8, orig_r8, "SigFrame r8 mismatch");
     assert_eq!(restored.syscall_regs.r9, orig_r9, "SigFrame r9 mismatch");
-    assert!(restored.restart_pending, "SigFrame restart_flag should be set");
+    assert!(
+        restored.restart_pending,
+        "SigFrame restart_flag should be set"
+    );
 
     // ── Simulate handler returning via sigreturn ──
     //
@@ -264,7 +283,12 @@ fn tostop_sa_restart_handler_preserves_write_args() {
         vibix::arch::x86_64::syscall::syscall_dispatch(
             &mut sigreturn_ctx as *mut SyscallReturnContext,
             15, // SIGRETURN
-            0, 0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
     };
     assert_eq!(rv, 0, "SIGRETURN returned non-zero: {rv}");
@@ -290,9 +314,18 @@ fn tostop_sa_restart_handler_preserves_write_args() {
         "after sigreturn: rdx (len) not restored: got {:#x}, want {:#x}",
         sigreturn_ctx.user_rdx, orig_rdx,
     );
-    assert_eq!(sigreturn_ctx.user_r10, orig_r10, "after sigreturn: r10 not restored");
-    assert_eq!(sigreturn_ctx.user_r8, orig_r8, "after sigreturn: r8 not restored");
-    assert_eq!(sigreturn_ctx.user_r9, orig_r9, "after sigreturn: r9 not restored");
+    assert_eq!(
+        sigreturn_ctx.user_r10, orig_r10,
+        "after sigreturn: r10 not restored"
+    );
+    assert_eq!(
+        sigreturn_ctx.user_r8, orig_r8,
+        "after sigreturn: r8 not restored"
+    );
+    assert_eq!(
+        sigreturn_ctx.user_r9, orig_r9,
+        "after sigreturn: r9 not restored"
+    );
 
     // The asm-trampoline flag must be asserted so the replay happens.
     assert_eq!(
@@ -362,9 +395,7 @@ fn sigframe_captures_rewound_rip_and_original_rsp() {
 
     let sigframe_rsp = ctx.user_rsp;
     let restored = unsafe {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            restore_signal_frame(sigframe_rsp)
-        })
+        x86_64::instructions::interrupts::without_interrupts(|| restore_signal_frame(sigframe_rsp))
     }
     .expect("restore_signal_frame failed");
 
@@ -425,9 +456,8 @@ fn handler_mask_restored_after_sigreturn() {
     }
 
     // During handler execution, SIGTTOU should be blocked.
-    let blocked_during_handler = process::with_signal_state_for_task(0, |state| {
-        state.blocked
-    }).unwrap();
+    let blocked_during_handler =
+        process::with_signal_state_for_task(0, |state| state.blocked).unwrap();
     assert_ne!(
         blocked_during_handler & sig_bit(SIGTTOU),
         0,
@@ -460,15 +490,18 @@ fn handler_mask_restored_after_sigreturn() {
         vibix::arch::x86_64::syscall::syscall_dispatch(
             &mut sigreturn_ctx as *mut SyscallReturnContext,
             15, // SIGRETURN
-            0, 0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
     }
 
     // After sigreturn, the blocked mask should be restored to the
     // pre-delivery state (initial_mask = SIGUSR1 only, SIGTTOU unblocked).
-    let restored_mask = process::with_signal_state_for_task(0, |state| {
-        state.blocked
-    }).unwrap();
+    let restored_mask = process::with_signal_state_for_task(0, |state| state.blocked).unwrap();
     assert_eq!(
         restored_mask, initial_mask,
         "signal mask not restored after sigreturn: got {:#x}, want {:#x}",
