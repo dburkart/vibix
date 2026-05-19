@@ -734,13 +734,13 @@ pub unsafe extern "C" fn syscall_dispatch(
             }
 
             crate::fork_trace!("fork-trace: [syscall:FORK] → fork_current_task()");
-            let child_task_id = match crate::task::fork_current_task(&regs) {
-                Ok(id) => {
+            let (child_task_id, child_task) = match crate::task::fork_current_task(&regs) {
+                Ok(pair) => {
                     crate::fork_trace!(
                         "fork-trace: [syscall:FORK] ← fork_current_task() child_task_id={}",
-                        id
+                        pair.0
                     );
-                    id
+                    pair
                 }
                 Err(_) => {
                     crate::fork_trace!(
@@ -756,7 +756,12 @@ pub unsafe extern "C" fn syscall_dispatch(
             );
             let child_pid = crate::process::register(child_task_id, parent_pid);
             crate::fork_trace!(
-                "fork-trace: [syscall:FORK] ← process::register child_pid={} — returning to user",
+                "fork-trace: [syscall:FORK] ← process::register child_pid={} — making child runnable",
+                child_pid
+            );
+            crate::task::make_child_runnable(child_task);
+            crate::fork_trace!(
+                "fork-trace: [syscall:FORK] child now runnable — returning pid={} to parent",
                 child_pid
             );
             child_pid as i64
