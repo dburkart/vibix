@@ -779,8 +779,8 @@ fn register_demand_vmas(
             if let Some(existing) = aspace.find(overlap_start) {
                 let nx = PageTableFlags::NO_EXECUTE.bits();
                 // OR all positive-grant bits, AND the negative-grant NX bit.
-                let merged_pte = (existing.prot_pte | prot_pte) & !(nx)
-                    | (existing.prot_pte & prot_pte & nx);
+                let merged_pte =
+                    (existing.prot_pte | prot_pte) & !(nx) | (existing.prot_pte & prot_pte & nx);
                 let merged_user = existing.prot_user | 0x3;
                 if merged_pte != existing.prot_pte {
                     aspace.vmas.change_protection(
@@ -985,12 +985,10 @@ fn map_user_segment(
                 //    first LOAD covers only 0..0x249, leaving
                 //    0x249..0xFFF as zeroes, but the second LOAD's
                 //    .text starts at 0x250 and must be copied in).
-                if let Some((existing_frame, existing_flags)) =
-                    paging::translate_in_pml4(pml4, va)
+                if let Some((existing_frame, existing_flags)) = paging::translate_in_pml4(pml4, va)
                 {
                     let nx = PageTableFlags::NO_EXECUTE;
-                    let merged = (existing_flags | flags) - nx
-                        | (existing_flags & flags & nx);
+                    let merged = (existing_flags | flags) - nx | (existing_flags & flags & nx);
                     if merged != existing_flags {
                         let _ = paging::update_flags_in_pml4(pml4, page, merged);
                     }

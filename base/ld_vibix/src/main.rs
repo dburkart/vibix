@@ -321,7 +321,8 @@ unsafe fn self_relocate() {
                     let sym_idx = (r.r_info >> 32) as usize;
                     let sym = &*symtab_ptr.add(sym_idx);
                     let target = (base + r.r_offset) as *mut u64;
-                    *target = base.wrapping_add(sym.st_value)
+                    *target = base
+                        .wrapping_add(sym.st_value)
                         .wrapping_add(r.r_addend as u64);
                 }
             }
@@ -341,7 +342,8 @@ unsafe fn self_relocate() {
                     let sym_idx = (r.r_info >> 32) as usize;
                     let sym = &*symtab_ptr.add(sym_idx);
                     let target = (base + r.r_offset) as *mut u64;
-                    *target = base.wrapping_add(sym.st_value)
+                    *target = base
+                        .wrapping_add(sym.st_value)
                         .wrapping_add(r.r_addend as u64);
                 }
                 elf::R_X86_64_RELATIVE => {
