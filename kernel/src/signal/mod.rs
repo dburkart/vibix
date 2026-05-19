@@ -560,6 +560,11 @@ pub unsafe fn sys_sigaltstack(ss_uva: u64, old_ss_uva: u64) -> i64 {
         }
 
         // Install a new alternate stack if requested.
+        // TODO: Linux returns -EPERM when attempting to change the alt stack
+        // while the thread is currently executing on it (SS_ONSTACK).  We
+        // would need to check the current RSP against [ss_sp, ss_sp+ss_size)
+        // to enforce this.  Track as a follow-up once we have a reliable way
+        // to read the user RSP from within the syscall handler.
         if ss_uva != 0 {
             let mut buf = [0u8; 24];
             if uaccess::copy_from_user(&mut buf, ss_uva as usize).is_err() {
