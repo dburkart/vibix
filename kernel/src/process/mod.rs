@@ -358,6 +358,9 @@ pub fn mark_zombie(pid: u32, status: i32) {
          this is the wait4 wakeup path; spinning on TABLE/CHILD_WAIT \
          with IF=0 starves the timer ISR (#478/#647/#709/#710)"
     );
+    // DAPRA: revoke all poll-group tokens on exit (RFC 0003).
+    #[cfg(target_os = "none")]
+    crate::poll::syscalls::dapra_clear_groups(pid);
     {
         let mut t = lock_table_with_soak_check("mark_zombie");
         if let Some(entry) = t.by_pid.get_mut(&pid) {
